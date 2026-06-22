@@ -1,0 +1,12 @@
+[package]
+name = "velstra-orchestrator"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+velstra-common = { path = "../velstra-common" }
+velstra-config = { path = "../velstra-config" }
+
+anyhow = { workspace = true, default-features = true }
+serde = { workspace = true, features = ["derive"] }

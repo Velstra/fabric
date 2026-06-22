@@ -1,0 +1,27 @@
+[package]
+name = "velstra-controller"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "velstra-controller"
+path = "src/main.rs"
+
+[dependencies]
+velstra-common = { path = "../velstra-common" }
+velstra-config = { path = "../velstra-config" }
+velstra-orchestrator = { path = "../velstra-orchestrator" }
+velstra-proto = { path = "../velstra-proto" }
+velstra-raft = { path = "../velstra-raft" }
+
+anyhow = { workspace = true, default-features = true }
+clap = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
+env_logger = { workspace = true }
+log = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+toml = { workspace = true, features = ["display"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "signal", "fs"] }
+tokio-stream = { workspace = true }

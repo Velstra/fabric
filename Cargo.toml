@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+    "velstra-app",
+    "velstra-cni",
+    "velstra-common",
+    "velstra-config",
+    "velstra-controller",
+    "velstra-ebpf",
+    "velstra-orchestrator",
+    "velstra-proto",
+    "velstra-raft",
+]
+default-members = [
+    "velstra-app",
+    "velstra-cni",
+    "velstra-common",
+    "velstra-config",
+    "velstra-controller",
+    "velstra-orchestrator",
+    "velstra-proto",
+    "velstra-raft",
+]
+
+# The product (control plane + agent) is AGPL-3.0-or-later — see LICENSING.md for
+# the per-component breakdown. Shared ABI libraries and the eBPF object override
+# this with permissive / kernel-compatible licenses in their own Cargo.toml.
+[workspace.package]
+license = "AGPL-3.0-or-later"
+edition = "2024"
+
+[workspace.dependencies]
+aya = { git = "https://github.com/aya-rs/aya", default-features = false }
+aya-build = { git = "https://github.com/aya-rs/aya", default-features = false }
+aya-ebpf = { git = "https://github.com/aya-rs/aya", default-features = false }
+aya-log = { git = "https://github.com/aya-rs/aya", default-features = false }
+aya-log-ebpf = { git = "https://github.com/aya-rs/aya", default-features = false }
+
+anyhow = { version = "1", default-features = false }
+cargo_metadata = { version = "0.23.0", default-features = false }
+# `std` feature is currently required to build `clap`.
+#
+# See https://github.com/clap-rs/clap/blob/61f5ee5/clap_builder/src/lib.rs#L15.
+clap = { version = "4.5.20", default-features = false, features = ["std"] }
+env_logger = { version = "0.11.5", default-features = false }
+libc = { version = "0.2.159", default-features = false }
+log = { version = "0.4.22", default-features = false }
+tokio = { version = "1.40.0", default-features = false }
+which = { version = "6.0.0", default-features = false }
+serde = { version = "1.0.210", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0.128", default-features = false, features = ["std"] }
+toml = { version = "0.8.19", default-features = false, features = ["parse"] }
+tonic = { version = "0.12", default-features = false, features = ["transport", "codegen", "prost", "tls"] }
+tonic-build = { version = "0.12", default-features = false, features = ["prost", "transport"] }
+prost = { version = "0.13", default-features = false, features = ["derive", "std"] }
+tokio-stream = { version = "0.1", default-features = false }
+
+[profile.release.package.velstra-ebpf]
+debug = 2
+codegen-units = 1
+strip = false
+[profile.dev]
+panic = "abort"
+[profile.release]
+panic = "abort"

@@ -1,0 +1,40 @@
+# Example Velstra Phase 3 policy: an L4 load balancer (DNAT).
+#
+#   velstra validate examples/loadbalancer.toml      # no root
+#   sudo -E ./target/release/velstra run \
+#       --iface eth0 --config examples/loadbalancer.toml
+#
+# Load balancing is opt-in: with no [[service]] blocks, Velstra is a firewall.
+
+default_action = "pass"
+
+# Turn on per-packet logging so you can watch the DNAT decisions in the daemon's
+# output (set RUST_LOG=info). Costly on the hot path — for testing/demo only.
+log = true
+
+# Still a firewall first: drop abusive sources before load balancing.
+blocklist = ["203.0.113.0/24"]
+
+# --- Service: HTTP VIP -----------------------------------------------------
+# Clients hit 10.0.0.100:80. Each *source* is hashed to one backend (so a TCP
+# connection always lands on the same server) and the packet is DNAT-rewritten
+# to that backend; the kernel then routes it there.
+[[service]]
+vip   = "10.0.0.100"
+port  = 80
+proto = "tcp"
+backends = [
+    { ip = "10.0.0.7", port = 8080 },
+    { ip = "10.0.0.8", port = 8080 },
+    { ip = "10.0.0.9" },            # port omitted: keep the original (80)
+]
+
+# --- Service: UDP DNS VIP --------------------------------------------------
+[[service]]
+vip   = "10.0.0.1"
+port  = 53
+proto = "udp"
+backends = [
+    { ip = "10.0.0.7", port = 5353 },
+    { ip = "10.0.0.8", port = 5353 },
+]

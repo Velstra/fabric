@@ -1,0 +1,15 @@
+syntax = "proto3";
+package velstra.raft.v1;
+
+// A generic transport for openraft RPCs: each message carries the
+// serde-serialized openraft request/response as opaque bytes, so the wire
+// schema never has to track openraft's internal types.
+service RaftService {
+  rpc Append(RaftMsg) returns (RaftMsg);
+  rpc Vote(RaftMsg) returns (RaftMsg);
+  rpc Snapshot(RaftMsg) returns (RaftMsg);
+}
+
+message RaftMsg {
+  bytes data = 1;
+}

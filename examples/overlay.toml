@@ -1,0 +1,62 @@
+# Example Velstra overlay config for HOST A (VTEP 10.10.0.1).
+#
+# Two hosts, A (10.10.0.1) and B (10.10.0.2), each run a tenant VM on the same
+# virtual network (VNI 100). The underlay between them only carries routed IP;
+# Velstra bridges the tenant L2 across it with a VXLAN/Geneve tunnel.
+#
+#   tenant VM (A)  ──tap──►  Velstra(A)  ──[encap VNI 100]──►  underlay
+#                                                                  │
+#   tenant VM (B)  ◄─tap──   Velstra(B)  ◄──[decap VNI 100]──    underlay
+#
+# Validate:  velstra validate examples/overlay.toml
+# Run (root): sudo -E ./target/release/velstra run \
+#               --iface tapA --iface eth0 --config examples/overlay.toml
+#
+# Attach to BOTH the tenant tap (to encap egress) and the underlay NIC (to decap
+# ingress); one process shares the maps.
+
+default_action = "pass"
+
+# This host's tunnel endpoint (VTEP). `underlay_iface`'s MAC stamps the outer
+# source unless `local_mac` overrides it. `encap` is "vxlan" (default, UDP/4789)
+# or "geneve" (UDP/6081); `udp_port` overrides the standard port.
+[overlay]
+local_vtep     = "10.10.0.1"
+underlay_iface = "eth0"
+encap          = "vxlan"
+underlay_mtu   = 1500          # inner frames must be <= 1464 bytes (mtu - 36)
+
+# The tenant's firewall policy (its security group). This is *independent* of the
+# overlay segment: the same ruleset can front ports on different VNIs, and one VNI
+# can host ports with different rules.
+[[policy]]
+id             = 7
+name           = "web-tier"
+default_action = "pass"
+drop_icmp      = false
+
+# The tenant tap: firewall policy 7, overlay segment (VNI) 5000. Omit `vni` to
+# default it to `policy` (the convenient single-tenant case).
+[[interface]]
+name   = "tapA"
+policy = 7
+vni    = 5000
+
+# Overlay forwarding: where *remote* tenant addresses live. `inner_dst` is a CIDR,
+# so a whole remote subnet is **one** LPM entry, not one per host. A miss means
+# "local" (delivered by normal switching). `via_mac` is the next hop on the
+# underlay toward `remote_vtep`. The controller pushes these per host.
+[[tunnel]]
+vni         = 5000
+inner_dst   = "192.168.100.0/24"  # the whole tenant subnet on host B
+remote_vtep = "10.10.0.2"         # host B's VTEP
+via_mac     = "02:00:00:00:00:02"
+out_iface   = "eth0"
+
+# ARP suppression: the MAC that answers for each remote tenant address, so a
+# local VM's ARP is answered here instead of flooding the overlay. The controller
+# pushes one per known tenant address (it knows every port's IP+MAC).
+[[neighbor]]
+vni = 5000
+ip  = "192.168.100.2"             # the remote tenant VM on host B
+mac = "02:00:00:00:0b:02"         # its MAC

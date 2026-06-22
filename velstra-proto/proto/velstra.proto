@@ -1,0 +1,258 @@
+syntax = "proto3";
+
+// Velstra control-plane distribution API.
+//
+// A central controller serves each data-plane node its desired policy
+// (firewall rules, routes, load-balancer services) and pushes live updates;
+// nodes report their statistics back. The message shapes mirror Velstra's
+// TOML config so one schema describes both the file and the wire format.
+package velstra.v1;
+
+// The control service implemented by the controller and consumed by agents.
+service VelstraControl {
+  // Fetch the current desired config for a node (one-shot).
+  rpc GetConfig(NodeRequest) returns (NodeConfig);
+
+  // Stream the node's config: the current value immediately, then a fresh
+  // message every time it changes. The agent re-applies on each one.
+  rpc WatchConfig(NodeRequest) returns (stream NodeConfig);
+
+  // Report a node's per-counter statistics back to the controller.
+  rpc ReportStats(StatsReport) returns (Ack);
+}
+
+// Administrative service for pushing config at runtime (instead of, or layered
+// over, the per-node TOML files). Intended to be reached over a separate,
+// privileged channel (see the controller's `--admin-listen`).
+service VelstraAdmin {
+  // Set (or replace) a node's config. Takes precedence over its file until
+  // deleted.
+  rpc SetConfig(SetConfigRequest) returns (Ack);
+
+  // Drop a runtime override, reverting the node to its file (or the default).
+  rpc DeleteConfig(NodeRequest) returns (Ack);
+
+  // List the nodes the controller currently serves.
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+}
+
+// High-level fabric orchestration: declare hosts, networks, and ports at
+// runtime and let the controller derive + push each host's config (Track C).
+// Reached over the same privileged admin channel.
+service VelstraOrchestrator {
+  // Register (or replace) a host (VTEP).
+  rpc AddHost(HostSpec) returns (Ack);
+  // Define a network (tenant). Fails on a duplicate or invalid VNI.
+  rpc AddNetwork(NetworkSpec) returns (Ack);
+  // Create a port (VM NIC), allocating an IP/MAC if not pinned. Returns it.
+  rpc CreatePort(CreatePortRequest) returns (PortInfo);
+  // Remove a port by id.
+  rpc RemovePort(RemovePortRequest) returns (Ack);
+  // List all ports in the fabric.
+  rpc ListPorts(ListPortsRequest) returns (ListPortsResponse);
+}
+
+message HostSpec {
+  string id = 1;
+  string vtep = 2;            // underlay VTEP IPv4
+  string underlay_iface = 3;
+  string underlay_mac = 4;
+  Encap encap = 5;
+  uint32 udp_port = 6;        // 0 = encap default
+  uint32 underlay_mtu = 7;    // 0 = default (1500)
+}
+
+message NetworkSpec {
+  uint32 vni = 1;
+  string name = 2;
+  string subnet = 3;          // CIDR for IPAM
+  Action default_action = 4;
+  bool drop_icmp = 5;
+}
+
+message CreatePortRequest {
+  uint32 network = 1;         // VNI
+  string host = 2;            // host id
+  string tap = 3;             // tap/veth name on the host
+  string ip = 4;              // empty = auto-allocate from the subnet
+}
+
+message PortInfo {
+  string id = 1;
+  uint32 vni = 2;
+  string host = 3;
+  string ip = 4;
+  string mac = 5;
+  string tap = 6;
+}
+
+message RemovePortRequest {
+  string id = 1;
+}
+
+message ListPortsRequest {}
+
+message ListPortsResponse {
+  repeated PortInfo ports = 1;
+}
+
+message SetConfigRequest {
+  string node_id = 1;
+  NodeConfig config = 2;
+}
+
+message ListNodesRequest {}
+
+message ListNodesResponse {
+  repeated NodeSummary nodes = 1;
+}
+
+message NodeSummary {
+  string node_id = 1;
+  uint64 version = 2;
+  bool from_admin = 3;  // true if a runtime override is active for this node
+  string source = 4;    // which layer it came from: admin / derived / file / default
+}
+
+// Identifies the calling node.
+message NodeRequest {
+  string node_id = 1;
+}
+
+message Ack {
+  bool ok = 1;
+}
+
+// Firewall verdict.
+enum Action {
+  ACTION_PASS = 0;
+  ACTION_DROP = 1;
+}
+
+// Transport protocol.
+enum Proto {
+  PROTO_TCP = 0;
+  PROTO_UDP = 1;
+  PROTO_ICMP = 2;
+}
+
+// Forwarding behaviour for a route.
+enum ForwardMode {
+  FORWARD_MODE_ROUTE = 0;  // L3 router: decrement TTL
+  FORWARD_MODE_SWITCH = 1; // L2 switch: re-address only
+}
+
+// The complete desired policy for one data-plane node.
+message NodeConfig {
+  // Monotonic version, bumped by the controller on every change. Lets an agent
+  // skip re-applying an identical config.
+  uint64 version = 1;
+
+  Action default_action = 2;
+  bool drop_icmp = 3;
+  bool log = 4;
+  bool stateful = 11;                // stateful firewall (policy 0)
+
+  repeated string blocklist = 5;     // source CIDRs to drop (policy 0)
+  repeated PortRule port_rules = 6;  // (proto, port) allow/deny (policy 0)
+  repeated Route routes = 7;         // Phase 2 forwarding (global)
+  repeated Service services = 8;     // Phase 3 load balancing (global)
+
+  repeated Policy policies = 9;            // additional tenant policies
+  repeated InterfaceAssignment interfaces = 10; // interface -> policy
+
+  Overlay overlay = 12;             // Phase 4 VXLAN/Geneve endpoint (optional)
+  repeated Tunnel tunnels = 13;     // Phase 4 overlay forwarding entries
+  repeated Neighbor neighbors = 14; // Phase 4 ARP-suppression neighbours
+}
+
+// Encapsulation format for the overlay.
+enum Encap {
+  ENCAP_VXLAN = 0;  // UDP/4789
+  ENCAP_GENEVE = 1; // UDP/6081
+}
+
+// This host's overlay tunnel endpoint (VTEP). Absent on non-overlay hosts.
+message Overlay {
+  string local_vtep = 1;     // this host's VTEP underlay IPv4 (outer source)
+  string underlay_iface = 2; // egress interface (its MAC = outer source MAC)
+  Encap encap = 3;
+  uint32 udp_port = 4;       // 0 = the encap's default (4789 / 6081)
+  string local_mac = 5;      // override outer source MAC; empty = iface's MAC
+  uint32 underlay_mtu = 6;   // 0 = default (1500)
+}
+
+// A tenant address → MAC, for local ARP suppression (no overlay flood).
+message Neighbor {
+  uint32 vni = 1;   // tenant segment the address lives on
+  string ip = 2;    // tenant IPv4
+  string mac = 3;   // the MAC that answers for it
+}
+
+// One overlay forwarding entry: which remote VTEP hosts a tenant IP.
+message Tunnel {
+  uint32 vni = 1;          // tenant VNI (24-bit; also the policy id)
+  string inner_dst = 2;    // inner destination IPv4 this entry matches
+  string remote_vtep = 3;  // remote VTEP underlay IPv4 (outer destination)
+  string via_mac = 4;      // next-hop MAC on the underlay
+  string out_iface = 5;    // underlay egress interface
+}
+
+// A named tenant policy (the top-level fields above are policy 0).
+message Policy {
+  uint32 id = 1;
+  string name = 2;
+  Action default_action = 3;
+  bool drop_icmp = 4;
+  bool log = 5;
+  repeated string blocklist = 6;
+  repeated PortRule port_rules = 7;
+  bool stateful = 8;
+}
+
+// Maps an interface to a policy id and (optionally) an overlay segment (VNI).
+message InterfaceAssignment {
+  string name = 1;
+  uint32 policy = 2;
+  // Overlay VNI. Absent ⇒ defaults to `policy`; present (incl. 0) is used
+  // verbatim (0 = local-only, never tunneled). `optional` so "unset" and
+  // "explicitly 0" stay distinct across the wire.
+  optional uint32 vni = 3;
+}
+
+message PortRule {
+  Proto proto = 1;
+  uint32 port = 2;
+  Action action = 3;
+}
+
+message Route {
+  string dest = 1;       // destination CIDR
+  string out_iface = 2;  // egress interface
+  string via_mac = 3;    // next-hop MAC
+  string src_mac = 4;    // source MAC, empty = use the egress interface's
+  ForwardMode mode = 5;
+}
+
+message Service {
+  string vip = 1;
+  uint32 port = 2;
+  Proto proto = 3;
+  repeated Backend backends = 4;
+}
+
+message Backend {
+  string ip = 1;
+  uint32 port = 2; // 0 = keep the client's original destination port
+}
+
+// A node's statistics snapshot.
+message StatsReport {
+  string node_id = 1;
+  repeated Counter counters = 2;
+}
+
+message Counter {
+  string name = 1;
+  uint64 value = 2;
+}

@@ -1,0 +1,56 @@
+# Example Velstra firewall policy.
+#
+# Validate it without root:    velstra validate examples/rules.toml
+# Run it (root):               sudo -E ./target/release/velstra run \
+#                                  --iface eth0 --config examples/rules.toml
+
+# Verdict for any packet that matches no rule below.
+# "pass" = allow-by-default (a deny-list firewall).
+# "drop" = deny-by-default  (an allow-list firewall — combine with `pass` rules).
+default_action = "pass"
+
+# Drop every ICMP packet (ping floods, smurf attacks). This is checked before
+# the per-port rules, but after the blocklist.
+drop_icmp = true
+
+# Emit an aya-log line for every notable action (drop / forward / NAT). Great
+# for debugging (run the daemon with RUST_LOG=info), but it adds work to the hot
+# path — keep it off under real load.
+log = false
+
+# Source-IP CIDR blocklist (an LPM trie in the kernel). Any packet whose source
+# address falls in one of these ranges is dropped before anything else — this is
+# the DDoS / abuse-mitigation lever. A bare address is treated as a host route
+# (/32 for IPv4, /128 for IPv6).
+#
+# The list is dual-stack: any entry containing a ":" is parsed as IPv6 and lands
+# in the kernel's separate IPv6 blocklist trie. IPv4 and IPv6 share the same
+# `drop_icmp` (covers ICMPv6) and the same `[[port_rule]]` set.
+blocklist = [
+    "203.0.113.0/24",   # a noisy /24
+    "198.51.100.13",    # one specific host
+    "10.66.0.0/16",     # an internal range that must never reach this NIC
+    "2001:db8:bad::/48",# an IPv6 range to drop
+    "fe80::dead:beef",  # one specific IPv6 host (/128)
+]
+
+# Per-(protocol, destination-port) rules. `action` defaults to "drop".
+# ICMP is not allowed here (it has no ports — use `drop_icmp`).
+
+# Block inbound SSH at the NIC.
+[[port_rule]]
+proto  = "tcp"
+port   = 22
+action = "drop"
+
+# Explicitly allow HTTPS even if the default were "drop".
+[[port_rule]]
+proto  = "tcp"
+port   = 443
+action = "pass"
+
+# Drop a UDP service (e.g. an exposed DNS resolver you don't want hit).
+[[port_rule]]
+proto  = "udp"
+port   = 53
+action = "drop"

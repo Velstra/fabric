@@ -1,0 +1,1031 @@
+#![no_std]
+#![no_main]
+
+//! # Velstra data plane (XDP)
+//!
+//! The kernel-space half of Velstra: a single XDP program, attached at the
+//! earliest possible point in the receive path (the NIC driver, before the
+//! kernel allocates an `sk_buff`), that decides the fate of every incoming
+//! packet in a handful of instructions.
+//!
+//! ## What it does
+//!
+//! For each frame it parses Ethernet → IPv4 → (TCP/UDP ports) with strict bounds
+//! checks, then runs three stages, each driven by maps the control plane fills:
+//!
+//! 1. **Firewall (Phase 1):** [`velstra_common::decide`] → `XDP_DROP` or pass.
+//! 2. **Load balancer + NAT (Phase 3):** a tracked flow (`CONNTRACK`) or a new
+//!    connection to a `SERVICES` VIP is NAT-rewritten ([`plan_nat`]) — DNAT to a
+//!    backend on the way in, SNAT back to the VIP on the reply path — and passed
+//!    for the kernel to route.
+//! 3. **Router/switch (Phase 2):** a matching `ROUTES` entry rewrites the L2
+//!    header ([`plan_forward`]) and `XDP_REDIRECT`s it out another interface.
+//!
+//! Each stage either takes over the verdict or falls through to the next; a
+//! packet that survives all three is passed to the kernel stack.
+//!
+//! ## Maps (the control-plane interface)
+//!
+//! | Map            | Type            | Purpose                                    |
+//! |----------------|-----------------|--------------------------------------------|
+//! | `IFACE_POLICY` | `HashMap`       | ingress ifindex → policy id (per-tenant)   |
+//! | `CONFIG`       | `HashMap`       | policy id → [`GlobalConfig`]               |
+//! | `BLOCKLIST`    | `LpmTrie`       | `(policy, src CIDR)` drop list (DDoS lever)|
+//! | `BLOCKLIST6`   | `LpmTrie`       | `(policy, src IPv6 CIDR)` drop list        |
+//! | `PORT_RULES`   | `HashMap`       | `(policy, proto, dport)` → [`Action`]      |
+//! | `ROUTES`      | `LpmTrie`        | Dest-IP prefix → [`RouteEntry`] (Phase 2)  |
+//! | `TX_PORTS`    | `DevMap`         | Redirect device map (Phase 2)              |
+//! | `SERVICES`    | `HashMap`        | `ServiceKey` → backend window (Phase 3)    |
+//! | `BACKENDS`    | `Array`          | Flat backend pool (Phase 3)                |
+//! | `CONNTRACK`   | `LruHashMap`     | Flow 5-tuple → NAT target/direction (Ph 3) |
+//! | `STATS`       | `PerCpuArray`    | Lock-free counters indexed by [`Counter`]  |
+//!
+//! Per-CPU stats mean the hot path never contends a lock or a shared cache
+//! line; the control plane sums across CPUs when it reports.
+//!
+//! All the *decision logic* — the firewall policy, the forwarding plan, the DNAT
+//! arithmetic — lives in `velstra-common` and is unit tested there, so the
+//! kernel and the tests can never disagree.
+
+use aya_ebpf::{
+    bindings::{TC_ACT_OK, TC_ACT_SHOT, xdp_action},
+    helpers::bpf_xdp_adjust_head,
+    macros::{classifier, map, xdp},
+    maps::{Array, DevMap, HashMap, LpmTrie, LruHashMap, PerCpuArray, lpm_trie::Key},
+    programs::{TcContext, XdpContext},
+};
+use aya_log_ebpf::info;
+use network_types::{
+    eth::EthHdr,
+    ip::{Ipv4Hdr, Ipv6Hdr},
+};
+use velstra_common::{
+    ARP_REPLY, ARP_REQUEST, Action, ArpEntry, ArpKey, Backend, ConfigFlags, Counter, ETHERTYPE_ARP,
+    ETHERTYPE_IPV4, ETHERTYPE_IPV6, FlowKey, FlowState, ForwardOutcome, GlobalConfig, Nat,
+    OVERLAY_OUTER_LEN, OverlayConfig, PacketMeta, PolicyId, Rewrite, RouteEntry, ScopedAddr,
+    ScopedAddr6, ScopedPortKey, ServiceKey, ServiceValue, TunnelEndpoint, TunnelKey, build_encap,
+    decide, ip_proto, is_overlay_dport, lpm_key_addr, plan_arp_reply, plan_forward, plan_nat,
+    select_backend, session_hash,
+};
+
+/// Maps an ingress interface index to its policy id, so one XDP program can
+/// enforce a different firewall per interface/tenant. Interfaces absent here use
+/// policy `0` (the default), so a single-tenant deployment needs no entries.
+#[map]
+static IFACE_POLICY: HashMap<u32, PolicyId> = HashMap::with_max_entries(1024, 0);
+
+/// Maps an ingress interface index to its overlay segment (VNI), independent of
+/// its firewall policy. Absent / `0` means the interface is local-only and its
+/// traffic is never encapsulated.
+#[map]
+static IFACE_VNI: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
+
+/// Per-policy global configuration (`policy_id` → default action + flags).
+#[map]
+static CONFIG: HashMap<PolicyId, GlobalConfig> = HashMap::with_max_entries(1024, 0);
+
+/// Per-policy source-IP CIDR blocklist, keyed by [`ScopedAddr`] (policy id +
+/// address prefix).
+#[map]
+static BLOCKLIST: LpmTrie<ScopedAddr, u32> = LpmTrie::with_max_entries(8192, 0);
+
+/// Per-policy source-IPv6 CIDR blocklist, keyed by [`ScopedAddr6`] (policy id +
+/// IPv6 address prefix). The IPv4 ([`BLOCKLIST`]) and IPv6 lists are separate
+/// maps because the LPM key widths differ, but they share the same `policy_id`
+/// space and the same `[[policy]]` config — one blocklist, two address families.
+#[map]
+static BLOCKLIST6: LpmTrie<ScopedAddr6, u32> = LpmTrie::with_max_entries(8192, 0);
+
+/// Per-policy `(proto, destination port)` → [`Action`] allow/deny rules. Shared
+/// across address families: a port rule applies to IPv4 *and* IPv6 alike.
+#[map]
+static PORT_RULES: HashMap<ScopedPortKey, u32> = HashMap::with_max_entries(8192, 0);
+
+/// Phase 2 forwarding table: destination-IP prefix → [`RouteEntry`]. Empty by
+/// default, so routing is entirely opt-in and never interferes with a
+/// firewall-only deployment.
+#[map]
+static ROUTES: LpmTrie<u32, RouteEntry> = LpmTrie::with_max_entries(4096, 0);
+
+/// Redirect target devices, indexed by interface index. Required by
+/// `bpf_redirect_map`; the control plane mirrors each route's egress ifindex
+/// into it.
+#[map]
+static TX_PORTS: DevMap = DevMap::with_max_entries(256, 0);
+
+/// Phase 3 load-balancer services: `(VIP, port, proto)` → a window into
+/// [`BACKENDS`]. Empty by default, so load balancing is opt-in.
+#[map]
+static SERVICES: HashMap<ServiceKey, ServiceValue> = HashMap::with_max_entries(1024, 0);
+
+/// Phase 3 flat backend table, indexed by `ServiceValue::backend_start + offset`.
+#[map]
+static BACKENDS: Array<Backend> = Array::with_max_entries(4096, 0);
+
+/// Phase 3 connection tracking: a flow's 5-tuple → its NAT target/direction.
+/// An LRU map so it self-evicts under pressure without any user-space pruning.
+/// Populated by the data plane itself (forward + reverse entries per new flow);
+/// shared across every interface the program is attached to.
+#[map]
+static CONNTRACK: LruHashMap<FlowKey, FlowState> = LruHashMap::with_max_entries(65536, 0);
+
+/// Stateful-firewall connection table: a flow (both directions) that the
+/// firewall allowed, so replies are permitted even under deny-by-default. An LRU
+/// map, populated and read entirely by the data plane.
+#[map]
+static FW_FLOWS: LruHashMap<FlowKey, u8> = LruHashMap::with_max_entries(65536, 0);
+
+/// Phase 4 overlay endpoint for this host — a single-entry array holding the
+/// [`OverlayConfig`]. Absent/disabled by default, so encap/decap never trigger
+/// until the control plane writes it.
+#[map]
+static OVERLAY_CONFIG: Array<OverlayConfig> = Array::with_max_entries(1, 0);
+
+/// Phase 4 ARP suppression table: `(vni, tenant IP)` → the MAC that answers for
+/// it. Pushed by the controller; lets the host reply to a tenant's ARP locally
+/// instead of flooding the overlay.
+#[map]
+static ARP_TABLE: HashMap<ArpKey, ArpEntry> = HashMap::with_max_entries(8192, 0);
+
+/// Phase 4 overlay forwarding database: an **LPM trie** keyed by [`TunnelKey`]
+/// (`vni` exact + inner-destination prefix) → the remote [`TunnelEndpoint`].
+/// Longest-prefix matching lets one entry cover a whole remote subnet. Pushed by
+/// the controller (Andromeda-style); a miss means the destination is local, so
+/// the packet falls through to normal switching/routing.
+#[map]
+static OVERLAY_FDB: LpmTrie<TunnelKey, TunnelEndpoint> = LpmTrie::with_max_entries(8192, 0);
+
+/// Per-CPU statistics, one slot per [`Counter`] variant.
+#[map]
+static STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(Counter::COUNT, 0);
+
+/// XDP entry point. Kept tiny: it delegates to [`try_velstra`] and turns a
+/// parse failure into a safe `XDP_PASS` (fail-open) rather than aborting.
+#[xdp]
+pub fn velstra(ctx: XdpContext) -> u32 {
+    match try_velstra(&ctx) {
+        Ok(action) => action,
+        // A `ptr_at` bounds failure lands here. Count it and let the packet
+        // through — a firewall should never black-hole traffic because of its
+        // own parsing error.
+        Err(()) => {
+            bump(Counter::Malformed);
+            xdp_action::XDP_PASS
+        }
+    }
+}
+
+/// TC **egress** entry point (Phase B). Where the XDP hook above filters traffic
+/// arriving at a NIC, this filters traffic *leaving* one — closing the gap XDP
+/// can't reach: host-originated egress, and the receive side of a tenant tap.
+/// Delegates to [`try_egress`]; a parse failure fails open (`TC_ACT_OK`).
+#[classifier]
+pub fn velstra_egress(ctx: TcContext) -> i32 {
+    match try_egress(&ctx) {
+        Ok(action) => action,
+        Err(()) => TC_ACT_OK as i32,
+    }
+}
+
+/// Increment a per-CPU counter by one. Infallible and lock-free.
+#[inline(always)]
+fn bump(counter: Counter) {
+    add(counter, 1);
+}
+
+/// Add `n` to a per-CPU counter.
+#[inline(always)]
+fn add(counter: Counter, n: u64) {
+    if let Some(slot) = STATS.get_ptr_mut(counter.index()) {
+        // SAFETY: `get_ptr_mut` returned a valid pointer into this CPU's slot;
+        // per-CPU maps are not shared, so no other context races this write.
+        unsafe { *slot += n };
+    }
+}
+
+/// Bounds-checked pointer into the packet at `offset`.
+///
+/// Returns `Err(())` unless the whole `T` lies within `[data, data_end)`. The
+/// explicit check is also what the eBPF verifier requires before any packet
+/// dereference.
+#[inline(always)]
+unsafe fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
+    let start = ctx.data();
+    let end = ctx.data_end();
+    let len = core::mem::size_of::<T>();
+    if start + offset + len > end {
+        return Err(());
+    }
+    Ok((start + offset) as *const T)
+}
+
+/// [`ptr_at`] for the TC (skb) context. The same bounds-check pattern, against
+/// the linear portion of the socket buffer (`data..data_end`) — which always
+/// holds the small headers the firewall reads.
+#[inline(always)]
+unsafe fn ptr_at_tc<T>(ctx: &TcContext, offset: usize) -> Result<*const T, ()> {
+    let start = ctx.data();
+    let end = ctx.data_end();
+    let len = core::mem::size_of::<T>();
+    if start + offset + len > end {
+        return Err(());
+    }
+    Ok((start + offset) as *const T)
+}
+
+/// Phase B egress firewall. Mirrors the Phase 1 ingress firewall in
+/// [`try_velstra`], but runs at TC **egress** and matches on the **destination**
+/// (the source is always "us" on the way out): the per-policy CIDR blocklist is
+/// applied to the *destination* address, port rules to the destination port, plus
+/// the ICMP filter and default action — all via the shared [`decide`]. The policy
+/// is selected by the **egress** interface (`IFACE_POLICY`), so a tap delivering
+/// to a tenant VM is filtered against that tenant's rules.
+///
+/// On a stateful policy an allowed flow is recorded in `FW_FLOWS` (both
+/// directions) so the *reply*, arriving at the XDP ingress hook, is permitted —
+/// this is what makes replies to **host-originated** connections work, the gap
+/// the ingress-only stateful firewall could not cover. IPv4 only for now (IPv6
+/// egress and overlay-aware egress are follow-ups).
+#[inline(always)]
+fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
+    bump(Counter::TxPackets);
+
+    let eth: *const EthHdr = unsafe { ptr_at_tc(ctx, 0)? };
+    if u16::from_be(unsafe { (*eth).ether_type }) != ETHERTYPE_IPV4 {
+        return Ok(TC_ACT_OK as i32);
+    }
+    let ipv4: *const Ipv4Hdr = unsafe { ptr_at_tc(ctx, EthHdr::LEN)? };
+    let ipv4 = unsafe { &*ipv4 };
+    let ihl_bytes = ipv4.ihl() as usize;
+    if ipv4.version() != 4 || ihl_bytes < Ipv4Hdr::LEN {
+        return Ok(TC_ACT_OK as i32);
+    }
+    let proto = ipv4.proto;
+    let src_addr = ipv4.src_addr;
+    let dst_addr = ipv4.dst_addr;
+
+    let (mut src_port, mut dst_port) = (0u16, 0u16);
+    if proto == ip_proto::TCP || proto == ip_proto::UDP {
+        if let Ok(ports) = unsafe { ptr_at_tc::<[u8; 4]>(ctx, EthHdr::LEN + ihl_bytes) } {
+            let ports = unsafe { *ports };
+            src_port = u16::from_be_bytes([ports[0], ports[1]]);
+            dst_port = u16::from_be_bytes([ports[2], ports[3]]);
+        }
+    }
+
+    // Egress policy is keyed by the *egress* interface index.
+    let ifindex = unsafe { (*ctx.skb.skb).ifindex };
+    let policy_id = unsafe { IFACE_POLICY.get(&ifindex) }.copied().unwrap_or(0);
+    let cfg = unsafe { CONFIG.get(&policy_id) }
+        .copied()
+        .unwrap_or(GlobalConfig::DEFAULT);
+
+    // Blocklist matches the DESTINATION on egress ("don't talk to these").
+    let blocklisted = BLOCKLIST
+        .get(Key::new(
+            ScopedAddr::FULL_PREFIX,
+            ScopedAddr::new(policy_id, lpm_key_addr(dst_addr)),
+        ))
+        .is_some();
+    let rule = lookup_port_rule(policy_id, proto, dst_port);
+    let meta = PacketMeta::new(
+        src_addr,
+        dst_addr,
+        proto,
+        src_port,
+        dst_port,
+        ipv4.tot_len(),
+    );
+    let verdict = decide(&meta, &cfg, blocklisted, rule);
+
+    if verdict.action == Action::Drop {
+        bump(Counter::EgressDropped);
+        if cfg.has_flag(ConfigFlags::LOG) {
+            info!(
+                ctx,
+                "EGRESS DROP -> {}.{}.{}.{} proto={} dport={} reason={}",
+                dst_addr[0],
+                dst_addr[1],
+                dst_addr[2],
+                dst_addr[3],
+                proto,
+                dst_port,
+                verdict.counter.label(),
+            );
+        }
+        return Ok(TC_ACT_SHOT as i32);
+    }
+
+    // Allowed: on a stateful policy, record the flow (and its reverse) so the
+    // reply is permitted when it arrives at the XDP ingress hook.
+    let stateful = cfg.has_flag(ConfigFlags::STATEFUL)
+        && (proto == ip_proto::TCP || proto == ip_proto::UDP)
+        && ihl_bytes == Ipv4Hdr::LEN;
+    if stateful {
+        let fkey = FlowKey::new(src_addr, dst_addr, src_port, dst_port, proto);
+        let _ = FW_FLOWS.insert(&fkey, &1u8, 0);
+        let rkey = FlowKey::new(dst_addr, src_addr, dst_port, src_port, proto);
+        let _ = FW_FLOWS.insert(&rkey, &1u8, 0);
+    }
+
+    Ok(TC_ACT_OK as i32)
+}
+
+// Constant byte offsets into an Ethernet + 20-byte-IPv4 (+ TCP/UDP) frame. The
+// forwarding/NAT paths write through these so the verifier sees *constant*
+// offsets from a single, freshly bounds-checked `data` pointer — the only
+// pattern the eBPF verifier reliably accepts for packet writes.
+const O_ETH_DST: usize = 0; //                 Ethernet destination MAC
+const O_ETH_SRC: usize = 6; //                 Ethernet source MAC
+const O_IP: usize = EthHdr::LEN; //         14: IPv4 header start
+const O_IP_TTL: usize = O_IP + 8; //        22: IPv4 TTL
+const O_IP_CSUM: usize = O_IP + 10; //      24: IPv4 header checksum
+const O_IP_SRC: usize = O_IP + 12; //       26: IPv4 source address
+const O_IP_DST: usize = O_IP + 16; //       30: IPv4 destination address
+const O_L4: usize = O_IP + Ipv4Hdr::LEN; // 34: L4 header start (requires IHL=20)
+const O_L4_SPORT: usize = O_L4; //          34: TCP/UDP source port
+const O_L4_DPORT: usize = O_L4 + 2; //      36: TCP/UDP destination port
+const O_TCP_CSUM: usize = O_L4 + 16; //     50: TCP checksum
+const O_UDP_CSUM: usize = O_L4 + 6; //      40: UDP checksum
+
+/// Write a [`Nat`] rewrite's IPv4 address/port and repaired IPv4 checksum at
+/// their constant offsets. `reverse` selects the **source** fields (SNAT) over
+/// the **destination** fields (DNAT). The L4 checksum is written separately by
+/// the caller (its offset is protocol-specific). `data` must already be
+/// bounds-checked by the caller to cover the L4 header.
+#[inline(always)]
+unsafe fn write_l3_nat(data: usize, nat: &Nat, reverse: bool) {
+    unsafe {
+        *((data + O_IP_CSUM) as *mut [u8; 2]) = nat.new_ip_checksum.to_be_bytes();
+        if reverse {
+            *((data + O_IP_SRC) as *mut [u8; 4]) = nat.new_ip;
+            if nat.rewrite_port {
+                *((data + O_L4_SPORT) as *mut [u8; 2]) = nat.new_port.to_be_bytes();
+            }
+        } else {
+            *((data + O_IP_DST) as *mut [u8; 4]) = nat.new_ip;
+            if nat.rewrite_port {
+                *((data + O_L4_DPORT) as *mut [u8; 2]) = nat.new_port.to_be_bytes();
+            }
+        }
+    }
+}
+
+/// Apply a [`Nat`] to the packet: one fresh bounds check (per protocol, so the
+/// furthest byte is a constant) followed by constant-offset writes. Returns
+/// `Err` if the packet is too short to carry the L4 checksum.
+#[inline(always)]
+fn apply_nat(ctx: &XdpContext, nat: &Nat, reverse: bool, proto: u8) -> Result<(), ()> {
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    unsafe {
+        if proto == ip_proto::TCP {
+            if data + O_TCP_CSUM + 2 > data_end {
+                return Err(());
+            }
+            write_l3_nat(data, nat, reverse);
+            if nat.rewrite_l4_checksum {
+                *((data + O_TCP_CSUM) as *mut [u8; 2]) = nat.new_l4_checksum.to_be_bytes();
+            }
+        } else {
+            if data + O_UDP_CSUM + 2 > data_end {
+                return Err(());
+            }
+            write_l3_nat(data, nat, reverse);
+            if nat.rewrite_l4_checksum {
+                *((data + O_UDP_CSUM) as *mut [u8; 2]) = nat.new_l4_checksum.to_be_bytes();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parse and classify one packet. Mirrors `velstra_common::parse::parse_frame`
+/// (its unit-tested reference implementation) but on raw, verifier-friendly
+/// pointers.
+fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
+    let frame_len = (ctx.data_end() - ctx.data()) as u64;
+    bump(Counter::RxPackets);
+    add(Counter::RxBytes, frame_len);
+
+    // --- Ethernet -----------------------------------------------------------
+    let eth: *const EthHdr = unsafe { ptr_at(ctx, 0)? };
+    // `EtherType` constants in `network-types` are stored already byte-swapped,
+    // so we normalise the wire value to host order and compare against our own
+    // host-order constant. (The previous code double-swapped and never matched.)
+    let ethertype = u16::from_be(unsafe { (*eth).ether_type });
+    if ethertype != ETHERTYPE_IPV4 {
+        // IPv6 gets its own stateless firewall path (blocklist + ICMPv6 + port
+        // rules + default).
+        if ethertype == ETHERTYPE_IPV6 {
+            return try_velstra_v6(ctx);
+        }
+        // ARP on a tenant port may be answered locally (overlay suppression).
+        if ethertype == ETHERTYPE_ARP {
+            return try_arp(ctx);
+        }
+        bump(Counter::NonIpv4);
+        return Ok(xdp_action::XDP_PASS);
+    }
+
+    // --- IPv4 ---------------------------------------------------------------
+    let ipv4: *const Ipv4Hdr = unsafe { ptr_at(ctx, EthHdr::LEN)? };
+    let ipv4 = unsafe { &*ipv4 };
+    // `network_types::Ipv4Hdr::ihl()` already returns the header length in
+    // *bytes* (it does the `* 4` internally) — do NOT multiply again.
+    let ihl_bytes = ipv4.ihl() as usize;
+    if ipv4.version() != 4 || ihl_bytes < Ipv4Hdr::LEN {
+        bump(Counter::Malformed);
+        return Ok(xdp_action::XDP_PASS);
+    }
+
+    let proto = ipv4.proto;
+    let src_addr = ipv4.src_addr;
+    let dst_addr = ipv4.dst_addr;
+    let ttl = ipv4.ttl;
+    let checksum = ipv4.checksum();
+
+    // --- L4 ports (TCP/UDP, best effort) ------------------------------------
+    let (mut src_port, mut dst_port) = (0u16, 0u16);
+    if proto == ip_proto::TCP || proto == ip_proto::UDP {
+        // The L4 header begins after the variable-length IPv4 header. We only
+        // need the first four bytes (source + destination port).
+        if let Ok(ports) = unsafe { ptr_at::<[u8; 4]>(ctx, EthHdr::LEN + ihl_bytes) } {
+            let ports = unsafe { *ports };
+            src_port = u16::from_be_bytes([ports[0], ports[1]]);
+            dst_port = u16::from_be_bytes([ports[2], ports[3]]);
+        }
+    }
+
+    // --- Phase 4: overlay decapsulation -------------------------------------
+    // A UDP datagram addressed to our tunnel port is one of our own
+    // encapsulated frames. Strip the outer headers and let the kernel deliver
+    // the inner frame (e.g. to a local tenant tap via the host bridge).
+    let ocfg = overlay_config();
+    if proto == ip_proto::UDP && is_overlay_dport(&ocfg, dst_port) {
+        return try_decap(ctx, ihl_bytes);
+    }
+
+    let meta = PacketMeta::new(
+        src_addr,
+        dst_addr,
+        proto,
+        src_port,
+        dst_port,
+        ipv4.tot_len(),
+    );
+
+    // --- Per-policy firewall lookups ----------------------------------------
+    // The packet's ingress interface selects its policy (tenant); absent any
+    // mapping it falls into policy 0, the default. All firewall lookups are then
+    // scoped by that policy id, so one program enforces many tenants' rules.
+    let ifindex = ctx.ingress_ifindex() as u32;
+    let policy_id = unsafe { IFACE_POLICY.get(&ifindex) }.copied().unwrap_or(0);
+    // The overlay segment is independent of the firewall policy (a port's
+    // security group vs. its virtual network). `0` ⇒ local-only, no encap.
+    let vni = unsafe { IFACE_VNI.get(&ifindex) }.copied().unwrap_or(0);
+
+    let cfg = unsafe { CONFIG.get(&policy_id) }
+        .copied()
+        .unwrap_or(GlobalConfig::DEFAULT);
+    let blocklisted = BLOCKLIST
+        .get(Key::new(
+            ScopedAddr::FULL_PREFIX,
+            ScopedAddr::new(policy_id, lpm_key_addr(src_addr)),
+        ))
+        .is_some();
+    let rule = lookup_port_rule(policy_id, proto, dst_port);
+
+    let verdict = decide(&meta, &cfg, blocklisted, rule);
+
+    // Stateful firewall: track allowed TCP/UDP flows so replies are permitted in
+    // either direction, even under deny-by-default. The blocklist still wins.
+    let stateful = cfg.has_flag(ConfigFlags::STATEFUL)
+        && (proto == ip_proto::TCP || proto == ip_proto::UDP)
+        && ihl_bytes == Ipv4Hdr::LEN;
+    let fkey = FlowKey::new(src_addr, dst_addr, src_port, dst_port, proto);
+    let established = stateful && unsafe { FW_FLOWS.get(&fkey) }.is_some();
+
+    // The firewall's final action, and the counter explaining it.
+    let (action, fw_counter) = if blocklisted {
+        (Action::Drop, Counter::DroppedBlocklist)
+    } else if established {
+        (Action::Pass, Counter::EstablishedAllowed)
+    } else {
+        (verdict.action, verdict.counter)
+    };
+
+    // Phase 1: a firewall drop is final.
+    if action == Action::Drop {
+        bump(fw_counter);
+        if cfg.has_flag(ConfigFlags::LOG) {
+            info!(
+                ctx,
+                "DROP {}.{}.{}.{} proto={} dport={} reason={}",
+                src_addr[0],
+                src_addr[1],
+                src_addr[2],
+                src_addr[3],
+                proto,
+                dst_port,
+                fw_counter.label(),
+            );
+        }
+        return Ok(xdp_action::XDP_DROP);
+    }
+
+    // Allowed. On a stateful policy, remember a new flow (and its reverse) so the
+    // reply is permitted regardless of the reverse direction's policy.
+    if stateful && !established {
+        let _ = FW_FLOWS.insert(&fkey, &1u8, 0);
+        let rkey = FlowKey::new(dst_addr, src_addr, dst_port, src_port, proto);
+        let _ = FW_FLOWS.insert(&rkey, &1u8, 0);
+    }
+
+    let log = cfg.has_flag(ConfigFlags::LOG);
+
+    // Phase 4: overlay encapsulation. If this tenant's (vni == policy) inner
+    // destination lives on another host, wrap the frame in a VXLAN/Geneve tunnel
+    // and redirect it onto the underlay. A miss means "local" — fall through to
+    // ordinary switching/routing.
+    if let Some(action) = try_encap(
+        ctx, &ocfg, vni, src_addr, dst_addr, src_port, dst_port, proto, log,
+    )? {
+        return Ok(action);
+    }
+
+    // Phase 3: load balancer / DNAT. A matching service rewrites the packet to a
+    // backend and we PASS it for the kernel to route there.
+    if let Some(action) = try_load_balance(
+        ctx, ihl_bytes, src_addr, dst_addr, src_port, dst_port, proto, checksum, log,
+    )? {
+        return Ok(action);
+    }
+
+    // Phase 2: routing. A matching route takes over; otherwise fall through.
+    let route = ROUTES.get(Key::new(32, lpm_key_addr(dst_addr))).copied();
+    match plan_forward(ttl, checksum, proto, route) {
+        ForwardOutcome::Pass => {}
+        ForwardOutcome::TtlExceeded => {
+            bump(Counter::ForwardTtlExceeded);
+            return Ok(xdp_action::XDP_DROP);
+        }
+        ForwardOutcome::Redirect(rewrite) => return forward(ctx, rewrite, log),
+    }
+
+    // Nothing took over: honour the firewall's pass decision.
+    bump(fw_counter);
+    Ok(xdp_action::XDP_PASS)
+}
+
+/// IPv6 firewall path: a dual-stack mirror of the IPv4 firewall in
+/// [`try_velstra`], covering the **blocklist, ICMPv6 filter, port rules and
+/// default policy** — scoped by the same per-interface `policy_id`.
+///
+/// It is deliberately **stateless** and never routes or load-balances: Phase 2/3
+/// stay IPv4-only for now, so any IPv6 packet the firewall allows is `XDP_PASS`ed
+/// to the kernel stack. Extension headers are not walked — if the fixed header's
+/// next-header is not TCP/UDP the L4 ports stay zero (no port rule can match),
+/// which is the safe default. ICMPv6 (next-header 58) is still recognised by
+/// [`decide`] for the ICMP filter.
+#[inline(always)]
+fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
+    // The fixed 40-byte IPv6 header, copied out in one bounds-checked read. We
+    // read raw bytes rather than `Ipv6Hdr` to sidestep its `in6_addr` unions.
+    let hdr: *const [u8; Ipv6Hdr::LEN] = unsafe { ptr_at(ctx, EthHdr::LEN)? };
+    let hdr = unsafe { *hdr };
+
+    // payload length @4..6 (big-endian), next-header @6, addresses @8 and @24.
+    let payload_len = u16::from_be_bytes([hdr[4], hdr[5]]);
+    let next_hdr = hdr[6];
+    let src_addr: [u8; 16] = [
+        hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15], hdr[16], hdr[17],
+        hdr[18], hdr[19], hdr[20], hdr[21], hdr[22], hdr[23],
+    ];
+
+    // --- L4 ports (TCP/UDP directly after the fixed header, best effort) -----
+    let (mut src_port, mut dst_port) = (0u16, 0u16);
+    if next_hdr == ip_proto::TCP || next_hdr == ip_proto::UDP {
+        if let Ok(ports) = unsafe { ptr_at::<[u8; 4]>(ctx, EthHdr::LEN + Ipv6Hdr::LEN) } {
+            let ports = unsafe { *ports };
+            src_port = u16::from_be_bytes([ports[0], ports[1]]);
+            dst_port = u16::from_be_bytes([ports[2], ports[3]]);
+        }
+    }
+
+    // --- Per-policy firewall lookups (same policy space as IPv4) -------------
+    let ifindex = ctx.ingress_ifindex() as u32;
+    let policy_id = unsafe { IFACE_POLICY.get(&ifindex) }.copied().unwrap_or(0);
+    let cfg = unsafe { CONFIG.get(&policy_id) }
+        .copied()
+        .unwrap_or(GlobalConfig::DEFAULT);
+    let blocklisted = BLOCKLIST6
+        .get(Key::new(
+            ScopedAddr6::FULL_PREFIX,
+            ScopedAddr6::new(policy_id, src_addr),
+        ))
+        .is_some();
+    let rule = lookup_port_rule(policy_id, next_hdr, dst_port);
+
+    // IPv6 addresses do not fit `PacketMeta`'s IPv4 fields, but `decide` only
+    // reads `proto`/`dst_port` plus the `blocklisted`/`rule` inputs we computed,
+    // so zero placeholders are harmless. The blocklist verdict already came from
+    // the real IPv6 source above.
+    let meta = PacketMeta::new([0; 4], [0; 4], next_hdr, src_port, dst_port, payload_len);
+    let verdict = decide(&meta, &cfg, blocklisted, rule);
+
+    bump(verdict.counter);
+    if verdict.action == Action::Drop {
+        if cfg.has_flag(ConfigFlags::LOG) {
+            info!(
+                ctx,
+                "DROP6 proto={} dport={} reason={}",
+                next_hdr,
+                dst_port,
+                verdict.counter.label(),
+            );
+        }
+        return Ok(xdp_action::XDP_DROP);
+    }
+    Ok(xdp_action::XDP_PASS)
+}
+
+/// Phase 4 **ARP suppression**: answer a tenant's ARP request locally from
+/// `ARP_TABLE` (pushed by the controller) and bounce the reply back out the same
+/// interface (`XDP_TX`), so the broadcast never floods the overlay.
+///
+/// Only requests on a tenant port (its `IFACE_VNI != 0`) for a *known* address
+/// are answered; anything else (unknown target, non-tenant port, a reply) is
+/// passed through untouched, preserving normal ARP as a fallback.
+#[inline(always)]
+fn try_arp(ctx: &XdpContext) -> Result<u32, ()> {
+    if !overlay_config().is_enabled() {
+        return Ok(xdp_action::XDP_PASS);
+    }
+    let ifindex = ctx.ingress_ifindex() as u32;
+    let vni = unsafe { IFACE_VNI.get(&ifindex) }.copied().unwrap_or(0);
+    if vni == 0 {
+        return Ok(xdp_action::XDP_PASS);
+    }
+
+    // The 28-byte ARP payload sits right after the 14-byte Ethernet header.
+    let arp: *const [u8; 28] = unsafe { ptr_at(ctx, EthHdr::LEN)? };
+    let arp = unsafe { *arp };
+    // oper @6, sender hw @8, sender proto @14, target proto @24 (see RFC 826).
+    if u16::from_be_bytes([arp[6], arp[7]]) != ARP_REQUEST {
+        return Ok(xdp_action::XDP_PASS);
+    }
+    let sha = [arp[8], arp[9], arp[10], arp[11], arp[12], arp[13]];
+    let spa = [arp[14], arp[15], arp[16], arp[17]];
+    let tpa = [arp[24], arp[25], arp[26], arp[27]];
+
+    // Only answer addresses the controller told us about; else let it flood.
+    let entry = match unsafe { ARP_TABLE.get(&ArpKey::new(vni, tpa)) } {
+        Some(entry) => *entry,
+        None => return Ok(xdp_action::XDP_PASS),
+    };
+    let reply = plan_arp_reply(sha, spa, tpa, entry.mac);
+
+    // Rewrite the request into its reply in place, then bounce it (XDP_TX). All
+    // writes go through one freshly bounds-checked pointer at constant offsets.
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    if data + EthHdr::LEN + 28 > data_end {
+        return Err(());
+    }
+    const O_ARP: usize = EthHdr::LEN;
+    unsafe {
+        *((data + O_ETH_DST) as *mut [u8; 6]) = reply.eth_dst;
+        *((data + O_ETH_SRC) as *mut [u8; 6]) = reply.eth_src;
+        *((data + O_ARP + 6) as *mut [u8; 2]) = (ARP_REPLY).to_be_bytes();
+        *((data + O_ARP + 8) as *mut [u8; 6]) = reply.sha;
+        *((data + O_ARP + 14) as *mut [u8; 4]) = reply.spa;
+        *((data + O_ARP + 18) as *mut [u8; 6]) = reply.tha;
+        *((data + O_ARP + 24) as *mut [u8; 4]) = reply.tpa;
+    }
+    bump(Counter::ArpSuppressed);
+    Ok(xdp_action::XDP_TX)
+}
+
+/// Read this host's [`OverlayConfig`] from the single-entry array map, falling
+/// back to the disabled default when the control plane has not written one.
+#[inline(always)]
+fn overlay_config() -> OverlayConfig {
+    OVERLAY_CONFIG
+        .get(0)
+        .copied()
+        .unwrap_or(OverlayConfig::DISABLED)
+}
+
+/// Phase 4 **decapsulation**: strip the outer Ethernet/IPv4/UDP/shim headers of a
+/// tunnel packet and `XDP_PASS` the inner frame to the kernel stack.
+///
+/// `bpf_xdp_adjust_head` with a positive delta removes `delta` bytes from the
+/// front of the packet. We remove exactly the outer stack — `eth + ihl + udp +
+/// shim` — which for our own (option-less) encapsulation equals
+/// [`OVERLAY_OUTER_LEN`]. The VNI is read first, purely for the log line.
+#[inline(always)]
+fn try_decap(ctx: &XdpContext, ihl_bytes: usize) -> Result<u32, ()> {
+    // Outer headers to strip: eth + IPv4(ihl) + UDP(8) + shim(8). (The shim's VNI
+    // is left for a future inner-firewall pass; v1 decaps and lets the kernel
+    // bridge deliver by inner MAC.)
+    let delta = (EthHdr::LEN + ihl_bytes + 8 + 8) as i32;
+    // SAFETY: `ctx.ctx` is the live `xdp_md`; a positive delta only shrinks the
+    // packet. A non-zero return means the kernel refused — pass the frame as-is.
+    if unsafe { bpf_xdp_adjust_head(ctx.ctx, delta) } != 0 {
+        bump(Counter::Malformed);
+        return Ok(xdp_action::XDP_PASS);
+    }
+    bump(Counter::OverlayDecap);
+    Ok(xdp_action::XDP_PASS)
+}
+
+/// Phase 4 **encapsulation**: if the inner destination of a tenant frame lives on
+/// a remote VTEP, prepend the VXLAN/Geneve outer stack and redirect it onto the
+/// underlay.
+///
+/// Returns `Ok(Some(action))` when it took over the packet (redirected, or passed
+/// after a failed head-grow), or `Ok(None)` to fall through (no FDB entry / the
+/// overlay is disabled — the destination is treated as local).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn try_encap(
+    ctx: &XdpContext,
+    ocfg: &OverlayConfig,
+    vni: u32,
+    src_addr: [u8; 4],
+    dst_addr: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    proto: u8,
+    log: bool,
+) -> Result<Option<u32>, ()> {
+    // No overlay configured, or the ingress port is not on a tenant segment.
+    if !ocfg.is_enabled() || vni == 0 {
+        return Ok(None);
+    }
+    // Longest-prefix match on `(vni, inner dst)`: one entry can cover a whole
+    // remote subnet. A miss means the destination is local.
+    let key = Key::new(
+        TunnelKey::FULL_PREFIX,
+        TunnelKey::new(vni, lpm_key_addr(dst_addr)),
+    );
+    let ep = match OVERLAY_FDB.get(&key) {
+        Some(ep) => *ep,
+        None => return Ok(None),
+    };
+
+    // Entropy for the outer UDP source port: hash the inner flow so the underlay
+    // spreads tunnels across ECMP paths while pinning each flow to one path.
+    let entropy = session_hash(src_addr, src_port, proto) ^ ((dst_port as u32) << 16);
+    let inner_len = (ctx.data_end() - ctx.data()) as u16;
+
+    // MTU guard: encapsulating would add the outer headers; if the result would
+    // exceed the underlay MTU, drop loudly (a counter) rather than emit a frame
+    // the underlay silently black-holes. Operators must size the tenant MTU to
+    // `underlay_mtu - 36` (or enable jumbo frames on the underlay).
+    if inner_len > ocfg.max_inner_len() {
+        bump(Counter::OverlayTooBig);
+        return Ok(Some(xdp_action::XDP_DROP));
+    }
+
+    let encap = build_encap(ocfg, &ep, vni, inner_len, entropy);
+
+    // Grow the head by exactly the outer stack length.
+    // SAFETY: negative delta adds headroom; checked for failure below.
+    if unsafe { bpf_xdp_adjust_head(ctx.ctx, -(OVERLAY_OUTER_LEN as i32)) } != 0 {
+        bump(Counter::Malformed);
+        return Ok(Some(xdp_action::XDP_PASS));
+    }
+
+    // Write the outer headers as one fixed-size store at constant offset 0,
+    // through a freshly bounds-checked pointer (the verifier-friendly pattern).
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    if data + OVERLAY_OUTER_LEN > data_end {
+        return Err(());
+    }
+    // SAFETY: the bounds check above proves all `OVERLAY_OUTER_LEN` bytes from
+    // `data` are within the (now larger) packet.
+    unsafe {
+        *(data as *mut [u8; OVERLAY_OUTER_LEN]) = encap.headers;
+    }
+
+    bump(Counter::OverlayEncap);
+    if log {
+        info!(ctx, "ENCAP vni={} -> ifindex {}", vni, encap.out_ifindex);
+    }
+    // Redirect onto the underlay; an absent devmap entry aborts (the control
+    // plane mirrors every overlay egress ifindex into `TX_PORTS`).
+    Ok(Some(
+        TX_PORTS
+            .redirect(encap.out_ifindex, 0)
+            .unwrap_or(xdp_action::XDP_ABORTED),
+    ))
+}
+
+/// Phase 3 load balancer. Looks the packet's `(dst, dport, proto)` up in
+/// [`SERVICES`], picks a backend by source hash, and DNAT-rewrites the packet in
+/// place. Returns `Ok(Some(XDP_PASS))` when it rewrote the packet (the kernel
+/// then routes it to the backend), or `Ok(None)` to fall through to routing.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn try_load_balance(
+    ctx: &XdpContext,
+    ihl_bytes: usize,
+    src_addr: [u8; 4],
+    dst_addr: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    proto: u8,
+    ip_checksum: u16,
+    log: bool,
+) -> Result<Option<u32>, ()> {
+    // Only L4 protocols with ports are load balanced.
+    if proto != ip_proto::TCP && proto != ip_proto::UDP {
+        return Ok(None);
+    }
+    // The NAT fast path requires a standard 20-byte IPv4 header (no options) so
+    // every L4 offset is a compile-time constant — which is what lets the eBPF
+    // verifier accept the packet writes. Real XDP load balancers make the same
+    // assumption; option-bearing packets simply fall through to routing.
+    if ihl_bytes != Ipv4Hdr::LEN {
+        return Ok(None);
+    }
+
+    // The current L4 checksum (constant offset, header is fixed at 20 bytes).
+    let l4_csum_off = if proto == ip_proto::TCP {
+        O_TCP_CSUM
+    } else {
+        O_UDP_CSUM
+    };
+    let old_l4 = {
+        let ptr: *const [u8; 2] = unsafe { ptr_at(ctx, l4_csum_off)? };
+        u16::from_be_bytes(unsafe { *ptr })
+    };
+
+    // 1. Established flow? Conntrack tells us the NAT target and direction.
+    let fkey = FlowKey::new(src_addr, dst_addr, src_port, dst_port, proto);
+    // SAFETY: see `lookup_port_rule`; we copy the value out immediately.
+    if let Some(state) = (unsafe { CONNTRACK.get(&fkey) }).copied() {
+        let reverse = state.is_reverse();
+        let (old_ip, old_port) = if reverse {
+            (src_addr, src_port)
+        } else {
+            (dst_addr, dst_port)
+        };
+        let nat = plan_nat(
+            old_ip,
+            old_port,
+            state.nat_ip,
+            state.nat_port,
+            ip_checksum,
+            old_l4,
+            proto,
+        );
+        apply_nat(ctx, &nat, reverse, proto)?;
+        bump(if reverse {
+            Counter::LbReverse
+        } else {
+            Counter::LbEstablished
+        });
+        if log {
+            info!(
+                ctx,
+                "NAT(ct) reverse={} -> {}.{}.{}.{}:{}",
+                reverse as u8,
+                nat.new_ip[0],
+                nat.new_ip[1],
+                nat.new_ip[2],
+                nat.new_ip[3],
+                nat.new_port
+            );
+        }
+        return Ok(Some(xdp_action::XDP_PASS));
+    }
+
+    // 2. New connection to a service VIP?
+    let Some(service) =
+        (unsafe { SERVICES.get(ServiceKey::new(dst_addr, dst_port, proto)) }).copied()
+    else {
+        return Ok(None);
+    };
+    if service.backend_count == 0 {
+        bump(Counter::LbNoBackend);
+        return Ok(None);
+    }
+
+    let hash = session_hash(src_addr, src_port, proto);
+    let index = service.backend_start + select_backend(hash, service.backend_count);
+    let Some(backend) = BACKENDS.get(index).copied() else {
+        return Ok(None);
+    };
+
+    // Record both directions so this and the reply path stay consistent. The
+    // reverse key is what a reply looks like: backend -> client. Best effort —
+    // a full table just means the flow isn't sticky, not incorrect.
+    let backend_port = if backend.port == 0 {
+        dst_port
+    } else {
+        backend.port
+    };
+    let _ = CONNTRACK.insert(&fkey, &FlowState::forward(backend.ip, backend.port), 0);
+    let rkey = FlowKey::new(backend.ip, src_addr, backend_port, src_port, proto);
+    let _ = CONNTRACK.insert(&rkey, &FlowState::reverse(dst_addr, dst_port), 0);
+
+    // DNAT this first packet to the chosen backend.
+    let nat = plan_nat(
+        dst_addr,
+        dst_port,
+        backend.ip,
+        backend.port,
+        ip_checksum,
+        old_l4,
+        proto,
+    );
+    apply_nat(ctx, &nat, false, proto)?;
+    bump(Counter::LoadBalanced);
+    if log {
+        info!(
+            ctx,
+            "DNAT {}.{}.{}.{}:{} -> {}.{}.{}.{}:{}",
+            dst_addr[0],
+            dst_addr[1],
+            dst_addr[2],
+            dst_addr[3],
+            dst_port,
+            nat.new_ip[0],
+            nat.new_ip[1],
+            nat.new_ip[2],
+            nat.new_ip[3],
+            nat.new_port,
+        );
+    }
+
+    Ok(Some(xdp_action::XDP_PASS))
+}
+
+/// Apply a [`Rewrite`] to the packet in place and redirect it out of the target
+/// interface. Writes go through one freshly bounds-checked `data` pointer at
+/// constant offsets (the verifier-friendly packet-write pattern).
+#[inline(always)]
+fn forward(ctx: &XdpContext, rewrite: Rewrite, log: bool) -> Result<u32, ()> {
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+
+    unsafe {
+        if let Some(new_ttl) = rewrite.new_ttl {
+            // Router mode: rewrite L2 addresses + IPv4 TTL + header checksum.
+            // Furthest byte touched is the IPv4 checksum at O_IP_CSUM..+2.
+            if data + O_IP_CSUM + 2 > data_end {
+                return Err(());
+            }
+            *((data + O_ETH_DST) as *mut [u8; 6]) = rewrite.dst_mac;
+            *((data + O_ETH_SRC) as *mut [u8; 6]) = rewrite.src_mac;
+            *((data + O_IP_TTL) as *mut u8) = new_ttl;
+            *((data + O_IP_CSUM) as *mut [u8; 2]) = rewrite.new_checksum.to_be_bytes();
+        } else {
+            // Switch mode: rewrite the L2 addresses only (bytes 0..12).
+            if data + O_ETH_SRC + 6 > data_end {
+                return Err(());
+            }
+            *((data + O_ETH_DST) as *mut [u8; 6]) = rewrite.dst_mac;
+            *((data + O_ETH_SRC) as *mut [u8; 6]) = rewrite.src_mac;
+        }
+    }
+
+    bump(Counter::Forwarded);
+    if log {
+        info!(ctx, "FWD -> ifindex {}", rewrite.out_ifindex);
+    }
+    // `redirect` returns `XDP_REDIRECT` on success; if the devmap has no entry
+    // for this ifindex we abort (the control plane always mirrors live routes).
+    Ok(TX_PORTS
+        .redirect(rewrite.out_ifindex, 0)
+        .unwrap_or(xdp_action::XDP_ABORTED))
+}
+
+/// Look up an explicit `(policy, proto, dst_port)` rule, decoding the stored
+/// `u32` into an [`Action`].
+#[inline(always)]
+fn lookup_port_rule(policy_id: PolicyId, proto: u8, dst_port: u16) -> Option<Action> {
+    let key = ScopedPortKey::new(policy_id, proto, dst_port);
+    // SAFETY: `HashMap::get` is `unsafe` only because the returned reference
+    // borrows map memory; we copy the value out immediately and never hold it.
+    let value = unsafe { PORT_RULES.get(key) }?;
+    Some(Action::from_u32(*value))
+}
+
+#[cfg(not(test))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    // XDP programs cannot unwind; the verifier also rejects real panics. This
+    // is unreachable in practice but required to satisfy `no_std`.
+    loop {}
+}
+
+/// Dual licence marker required by the kernel to load programs that call
+/// GPL-only BPF helpers (e.g. those behind `aya-log`).
+#[unsafe(link_section = "license")]
+#[unsafe(no_mangle)]
+static LICENSE: [u8; 13] = *b"Dual MIT/GPL\0";

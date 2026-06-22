@@ -1,0 +1,43 @@
+# Multi-tenant firewall: one Velstra agent, a different policy per interface.
+# This is the foundation for VM "security groups" and multi-firewall hosts — the
+# ingress interface selects which tenant's rules a packet is evaluated against.
+#
+#   velstra validate examples/multitenant.toml
+#   sudo -E velstra run --iface tap-a --iface tap-b --config examples/multitenant.toml
+
+# --- Policy 0: the default, applied to any unassigned interface ---------------
+default_action = "pass"
+drop_icmp      = true
+blocklist      = ["203.0.113.0/24"]
+
+# --- Tenant A: deny-by-default, only HTTPS in ---------------------------------
+[[policy]]
+id   = 1
+name = "tenant-a"
+default_action = "drop"
+blocklist = ["198.51.100.0/24"]
+[[policy.port_rule]]
+proto  = "tcp"
+port   = 443
+action = "pass"
+
+# --- Tenant B: allow-by-default but block SSH and ping ------------------------
+[[policy]]
+id   = 2
+name = "tenant-b"
+default_action = "pass"
+drop_icmp = true
+[[policy.port_rule]]
+proto  = "tcp"
+port   = 22
+action = "drop"
+
+# --- Interface assignments ----------------------------------------------------
+# Each VM's tap (or any interface) is evaluated against its tenant's policy.
+[[interface]]
+name   = "tap-a"
+policy = 1
+
+[[interface]]
+name   = "tap-b"
+policy = 2
