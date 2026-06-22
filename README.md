@@ -434,17 +434,30 @@ apply the same log (so IPAM is deterministic) and each serves agents the derived
 config independently. If the leader dies, the cluster re-elects one.
 
 ```shell
-# Three controllers; bootstrap once on node 1.
-velstra-controller serve --node-id 1 --raft-listen 10.0.0.1:50053 \
+# Three controllers; bootstrap once on node 1. --raft-dir persists snapshots so
+# the fabric survives a full-cluster restart (reloaded as the committed state).
+velstra-controller serve --node-id 1 --raft-listen 10.0.0.1:50053 --raft-dir /var/lib/velstra \
     --bootstrap --peer 1=10.0.0.1:50053 --peer 2=10.0.0.2:50053 --peer 3=10.0.0.3:50053
-velstra-controller serve --node-id 2 --raft-listen 10.0.0.2:50053   # on host 2
-velstra-controller serve --node-id 3 --raft-listen 10.0.0.3:50053   # on host 3
+velstra-controller serve --node-id 2 --raft-listen 10.0.0.2:50053 --raft-dir /var/lib/velstra  # host 2
+velstra-controller serve --node-id 3 --raft-listen 10.0.0.3:50053 --raft-dir /var/lib/velstra  # host 3
 ```
 
 `orch`/`admin` writes must go to the leader — a follower refuses with *"not the
 leader; current leader is node N"*. Reads (`list-ports`, the agent config stream)
 work on any node. Single-controller mode (the file-backed `--topology` store) stays
 the default when `--node-id` is omitted.
+
+Point each agent at **every** controller — `--controller` is repeatable. The agent
+streams its config from the first one that answers and, if that controller goes
+down, transparently fails over to the next (config reads are served by any cluster
+member). Its data plane keeps running on the last-applied config the whole time:
+
+```shell
+sudo -E velstra run --iface eth0 --node-id web-1 \
+    --controller https://10.0.0.1:50051 \
+    --controller https://10.0.0.2:50051 \
+    --controller https://10.0.0.3:50051
+```
 
 [`velstra-raft`]: velstra-raft/
 [openraft]: https://github.com/datafuselabs/openraft
@@ -519,7 +532,9 @@ For a guided manual walkthrough of all three phases (incl. routing & LB), follow
 * **Controller HA (done):** controllers form an embedded **Raft** cluster
   (`velstra-raft` over openraft) — the fabric is the replicated state machine,
   the leader serves writes, followers replicate + serve reads, automatic
-  re-election. No external datastore, no message queue.
+  re-election. Snapshots persist to `--raft-dir` (survives a full-cluster
+  restart); agents take a repeatable `--controller` list and fail over to any
+  reachable member. No external datastore, no message queue.
 * **Distribution (done):** a central **gRPC** (`tonic`) controller serves and
   live-updates per-node config across a fleet (file + runtime admin overrides),
   secured with **mTLS**; agents report stats back.

@@ -67,20 +67,22 @@ struct RunArgs {
     auto_policy: u32,
 
     /// Path to a local TOML config. Mutually exclusive with `--controller`.
-    #[arg(short, long, conflicts_with = "controller")]
+    #[arg(short, long, conflicts_with = "controllers")]
     config: Option<PathBuf>,
 
-    /// Controller endpoint, e.g. `https://10.0.0.1:50051`. The node fetches its
-    /// config from here and applies live updates the controller pushes.
-    #[arg(long)]
-    controller: Option<String>,
+    /// Controller endpoint(s), e.g. `https://10.0.0.1:50051`. Repeatable for an
+    /// HA controller cluster: the node fetches its config from the first
+    /// reachable controller and, if that one goes down, fails over to the next.
+    /// Config reads are served by any cluster member (leader or follower).
+    #[arg(long = "controller")]
+    controllers: Vec<String>,
 
     /// Node identity sent to the controller. Defaults to the system hostname.
     #[arg(long)]
     node_id: Option<String>,
 
     /// PEM CA certificate to verify the controller (enables TLS).
-    #[arg(long, requires = "controller")]
+    #[arg(long, requires = "controllers")]
     tls_ca: Option<PathBuf>,
     /// Client certificate for mutual TLS to the controller.
     #[arg(long, requires = "tls_key")]
@@ -161,19 +163,24 @@ async fn run(args: RunArgs) -> Result<()> {
             domain: args.tls_domain.clone(),
         });
 
-    // Resolve the initial config and, in controller mode, the live update stream.
-    let mut watch_stream = None;
-    let initial = if let Some(endpoint) = &args.controller {
+    // Resolve the initial config. In controller mode, fetch it from the first
+    // reachable controller; the background watch loop (re)connects on its own.
+    let mut initial_version = 0;
+    let initial = if !args.controllers.is_empty() {
         let node_id = args.node_id.clone().unwrap_or_else(default_node_id);
-        info!("connecting to controller {endpoint} as node {node_id:?}");
-        let mut stream = controller_client::watch(endpoint.clone(), node_id, tls.clone()).await?;
+        info!(
+            "connecting to controller(s) {:?} as node {node_id:?}",
+            args.controllers
+        );
+        let (mut stream, endpoint) =
+            controller_client::watch_any(&args.controllers, &node_id, &tls).await?;
+        info!("got initial config from {endpoint}");
         let first = stream
             .message()
             .await?
             .ok_or_else(|| anyhow!("controller closed the stream before sending a config"))?;
-        let cfg = velstra_config::runtime_from_proto(&first)?;
-        watch_stream = Some((stream, first.version));
-        cfg
+        initial_version = first.version;
+        velstra_config::runtime_from_proto(&first)?
     } else if let Some(path) = &args.config {
         velstra_config::load_file(path)?
     } else {
@@ -205,20 +212,27 @@ async fn run(args: RunArgs) -> Result<()> {
         ));
     }
 
-    // In controller mode, apply pushed updates to the maps in the background.
-    if let Some((stream, version)) = watch_stream {
-        tokio::spawn(watch_updates(firewall.clone(), stream, version));
+    // In controller mode, apply pushed updates in the background — reconnecting
+    // (and failing over to another controller) whenever the stream breaks.
+    if !args.controllers.is_empty() {
+        let node_id = args.node_id.clone().unwrap_or_else(default_node_id);
+        tokio::spawn(watch_updates(
+            firewall.clone(),
+            args.controllers.clone(),
+            node_id,
+            tls.clone(),
+            initial_version,
+        ));
     }
 
     // In controller mode, also report statistics back periodically.
-    let reporter = match (&args.controller, args.stats_interval) {
-        (Some(endpoint), interval) if interval > 0 => {
-            let node_id = args.node_id.clone().unwrap_or_else(default_node_id);
-            Reporter::connect(endpoint.clone(), node_id, tls.clone())
-                .await
-                .ok()
-        }
-        _ => None,
+    let reporter = if !args.controllers.is_empty() && args.stats_interval > 0 {
+        let node_id = args.node_id.clone().unwrap_or_else(default_node_id);
+        Reporter::connect_any(&args.controllers, node_id, &tls)
+            .await
+            .ok()
+    } else {
+        None
     };
 
     serve(&firewall, args.stats_interval, reporter).await?;
@@ -242,43 +256,81 @@ fn log_policy(label: &str, cfg: &RuntimeConfig) {
     );
 }
 
-/// Background task: re-apply each config the controller pushes.
+/// Background task: re-apply each config the controller pushes, reconnecting to
+/// any reachable controller whenever the stream breaks. The agent keeps running
+/// on its last-applied config the whole time a controller is unreachable, so a
+/// controller outage never interrupts the data plane.
 async fn watch_updates(
     firewall: Arc<Mutex<Firewall>>,
-    mut stream: tonic::Streaming<velstra_proto::NodeConfig>,
+    endpoints: Vec<String>,
+    node_id: String,
+    tls: Option<controller_client::TlsOptions>,
     mut last_version: u64,
 ) {
+    // Backoff between reconnect attempts, capped — reset to the floor on success.
+    const BACKOFF_FLOOR: Duration = Duration::from_millis(500);
+    const BACKOFF_CEIL: Duration = Duration::from_secs(10);
+    let mut backoff = BACKOFF_FLOOR;
+
     loop {
-        match stream.message().await {
-            Ok(Some(node_config)) => {
-                if node_config.version == last_version {
-                    continue; // same config re-sent; nothing to do
-                }
-                last_version = node_config.version;
-                match velstra_config::runtime_from_proto(&node_config) {
-                    Ok(cfg) => {
-                        let mut fw = firewall.lock().await;
-                        match fw.reconfigure(&cfg) {
-                            Ok(()) => {
-                                drop(fw);
-                                log_policy(
-                                    &format!("applied controller update v{last_version}"),
-                                    &cfg,
-                                );
-                            }
-                            Err(e) => error!("failed to apply controller update: {e:#}"),
-                        }
-                    }
-                    Err(e) => warn!("controller sent an invalid config: {e:#}"),
-                }
-            }
-            Ok(None) => {
-                warn!("controller closed the config stream; keeping the last config");
-                break;
+        let mut stream = match controller_client::watch_any(&endpoints, &node_id, &tls).await {
+            Ok((stream, endpoint)) => {
+                info!("watching config from {endpoint}");
+                backoff = BACKOFF_FLOOR;
+                stream
             }
             Err(e) => {
-                warn!("controller config stream error: {e}; keeping the last config");
-                break;
+                warn!(
+                    "no controller reachable ({e:#}); retrying in {}s, keeping the last config",
+                    backoff.as_secs_f32()
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(BACKOFF_CEIL);
+                continue;
+            }
+        };
+
+        // Version numbers are per-controller, so they are not comparable across
+        // a failover. Always apply the first config after a (re)connect — even if
+        // its version collides with the last one we saw from another controller —
+        // and only use the dedup to skip identical re-sends on the same stream.
+        // `reconfigure` is idempotent, so a redundant apply is harmless.
+        let mut fresh_connection = true;
+
+        // Drain this stream until it breaks, then loop to reconnect/fail over.
+        loop {
+            match stream.message().await {
+                Ok(Some(node_config)) => {
+                    if !fresh_connection && node_config.version == last_version {
+                        continue; // same config re-sent on this stream; nothing to do
+                    }
+                    fresh_connection = false;
+                    last_version = node_config.version;
+                    match velstra_config::runtime_from_proto(&node_config) {
+                        Ok(cfg) => {
+                            let mut fw = firewall.lock().await;
+                            match fw.reconfigure(&cfg) {
+                                Ok(()) => {
+                                    drop(fw);
+                                    log_policy(
+                                        &format!("applied controller update v{last_version}"),
+                                        &cfg,
+                                    );
+                                }
+                                Err(e) => error!("failed to apply controller update: {e:#}"),
+                            }
+                        }
+                        Err(e) => warn!("controller sent an invalid config: {e:#}"),
+                    }
+                }
+                Ok(None) => {
+                    warn!("controller closed the config stream; reconnecting");
+                    break;
+                }
+                Err(e) => {
+                    warn!("controller config stream error: {e}; reconnecting");
+                    break;
+                }
             }
         }
     }

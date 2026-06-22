@@ -13,7 +13,7 @@
 //!
 //! [`Topology`]: velstra_orchestrator::Topology
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow};
 use openraft::{BasicNode, Config, Raft, ServerState};
@@ -52,18 +52,32 @@ fn raft_config() -> Result<Arc<Config>> {
 }
 
 impl RaftNode {
-    /// Start a Raft instance with the gRPC peer network. Not yet a member of any
-    /// cluster — call [`RaftNode::bootstrap`] on exactly one node to form it.
+    /// Start a Raft instance with the gRPC peer network, keeping all state in
+    /// memory (no snapshot durability). Not yet a member of any cluster — call
+    /// [`RaftNode::bootstrap`] on exactly one node to form it.
     pub async fn start(id: NodeId) -> Result<Self> {
-        let sm = StateMachineStore::default();
-        let raft = Raft::new(
-            id,
-            raft_config()?,
-            NetworkFactory,
-            LogStore::default(),
-            sm.clone(),
-        )
-        .await?;
+        Self::start_with_dir(id, None).await
+    }
+
+    /// Like [`RaftNode::start`], but persisting snapshots under `dir` (created if
+    /// missing) and resuming from one already there. This gives the cluster
+    /// durability across a full restart: every controller reloads the last
+    /// snapshot — the committed fabric — instead of coming up empty.
+    pub async fn start_with_dir(id: NodeId, dir: Option<PathBuf>) -> Result<Self> {
+        let loaded = match &dir {
+            Some(d) => {
+                std::fs::create_dir_all(d)
+                    .map_err(|e| anyhow!("creating raft dir {}: {e}", d.display()))?;
+                store::load_snapshot(d)?
+            }
+            None => None,
+        };
+        // Seed the (volatile) log's purge point so its reported last_log_id lines
+        // up with the state machine's restored last_applied.
+        let last_purged = loaded.as_ref().and_then(|s| s.meta.last_log_id);
+        let log = LogStore::new(last_purged);
+        let sm = StateMachineStore::new(dir, loaded)?;
+        let raft = Raft::new(id, raft_config()?, NetworkFactory, log, sm.clone()).await?;
         Ok(Self { raft, sm, id })
     }
 
@@ -253,5 +267,78 @@ mod tests {
             }
             assert!(ok, "node {} never received the replicated port", node.id);
         }
+    }
+
+    #[tokio::test]
+    async fn snapshot_persists_and_reloads_across_a_restart() {
+        // A unique scratch dir for this node's persisted snapshots.
+        let dir =
+            std::env::temp_dir().join(format!("velstra-raft-durability-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // First boot: a single-node cluster, write a fabric, snapshot it, stop.
+        {
+            let node = RaftNode::start_with_dir(1, Some(dir.clone()))
+                .await
+                .unwrap();
+            let mut members = BTreeMap::new();
+            members.insert(1u64, "127.0.0.1:24031".to_string());
+            node.bootstrap(members).await.unwrap();
+            node.wait_leader(Duration::from_secs(5)).await.unwrap();
+
+            node.propose(TopoRequest::AddHost(host_spec(
+                "h1",
+                "10.10.0.1",
+                "02:00:00:00:00:11",
+            )))
+            .await
+            .unwrap();
+            node.propose(TopoRequest::AddNetwork(NetworkSpec {
+                vni: 5000,
+                name: "blue".into(),
+                subnet: "192.168.100.0/24".into(),
+                default_action: ActionName::Pass,
+                drop_icmp: false,
+            }))
+            .await
+            .unwrap();
+            node.propose(TopoRequest::CreatePort {
+                vni: 5000,
+                host: "h1".into(),
+                tap: "tapA".into(),
+                ip: None,
+            })
+            .await
+            .unwrap();
+
+            // Force a snapshot and wait for it to be built and persisted.
+            node.raft.trigger().snapshot().await.unwrap();
+            let mut built = false;
+            for _ in 0..50 {
+                if node.raft.metrics().borrow().snapshot.is_some() {
+                    built = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(built, "snapshot was never built");
+            node.shutdown().await.unwrap();
+        }
+
+        // The snapshot file must exist on disk.
+        assert!(
+            dir.join("snapshot.json").exists(),
+            "no snapshot file was persisted"
+        );
+
+        // Second boot from the same dir: the fabric is restored without any peer.
+        let node = RaftNode::start_with_dir(1, Some(dir.clone()))
+            .await
+            .unwrap();
+        let topo = node.topology().await;
+        assert_eq!(topo.ports().len(), 1, "port did not survive the restart");
+        assert_eq!(topo.ports()[0].ip.to_string(), "192.168.100.1");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

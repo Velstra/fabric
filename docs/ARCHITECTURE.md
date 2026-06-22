@@ -259,9 +259,13 @@ of network namespaces, see [TESTING.md](TESTING.md).
   (`--node-id`/`--raft-listen`/`--peer`/`--bootstrap`) holds a `RaftNode`: the
   leader serves orchestration writes (`raft.propose`), followers redirect writes
   and re-derive from the replicated topology on each apply (so any node serves
-  agents). Single-controller mode (file-backed) stays the default. No external
-  datastore, no message queue — the Andromeda "central, consistent brain" without
-  the OpenStack baggage. *Follow-ups:* agent multi-endpoint failover, log-index
-  versioning, on-disk Raft snapshots for full-cluster-restart durability.
+  agents). Snapshots persist to `--raft-dir` and are reloaded on boot, so the
+  fabric survives a full-cluster restart instead of coming up empty. Agents take a
+  repeatable `--controller` list and fail over to any reachable controller (config
+  reads are served by every member), re-applying the first config after each
+  reconnect since per-controller versions aren't comparable across a failover.
+  Single-controller mode (file-backed) stays the default. No external datastore, no
+  message queue — the Andromeda "central, consistent brain" without the OpenStack
+  baggage. *Follow-ups:* log-index-based global-monotonic config versioning.
 * **Distribution** introduces a gRPC (`tonic`) control channel so multiple
   data planes share one brain, and a Kubernetes CNI front-end.
