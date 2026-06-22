@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use tonic::{
     Streaming,
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity},
@@ -53,20 +53,34 @@ async fn connect(endpoint: &str, tls: &Option<TlsOptions>) -> Result<Channel> {
         .with_context(|| format!("connecting to controller {endpoint}"))
 }
 
-/// Open a `WatchConfig` stream for `node_id`. The first message is the current
-/// config; each subsequent message is a fresh config the controller pushed.
-pub async fn watch(
-    endpoint: String,
-    node_id: String,
-    tls: Option<TlsOptions>,
-) -> Result<Streaming<NodeConfig>> {
-    let mut client = VelstraControlClient::new(connect(&endpoint, &tls).await?);
-    let stream = client
-        .watch_config(NodeRequest { node_id })
-        .await
-        .context("WatchConfig RPC")?
-        .into_inner();
-    Ok(stream)
+/// Open a `WatchConfig` stream for `node_id` against the **first reachable**
+/// controller in `endpoints`, returning the stream and which endpoint answered.
+/// Config reads are served by any cluster member (leader or follower), so the
+/// agent simply uses whichever controller is up — this is its HA failover.
+pub async fn watch_any(
+    endpoints: &[String],
+    node_id: &str,
+    tls: &Option<TlsOptions>,
+) -> Result<(Streaming<NodeConfig>, String)> {
+    let mut last_err = None;
+    for endpoint in endpoints {
+        match connect(endpoint, tls).await {
+            Ok(channel) => {
+                let mut client = VelstraControlClient::new(channel);
+                match client
+                    .watch_config(NodeRequest {
+                        node_id: node_id.to_string(),
+                    })
+                    .await
+                {
+                    Ok(resp) => return Ok((resp.into_inner(), endpoint.clone())),
+                    Err(e) => last_err = Some(anyhow!("{endpoint}: WatchConfig RPC: {e}")),
+                }
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("no controller endpoints configured")))
 }
 
 /// A client for pushing periodic statistics back to the controller.
@@ -76,14 +90,25 @@ pub struct Reporter {
 }
 
 impl Reporter {
-    /// Connect a reporter (a separate channel from the config watch stream).
-    pub async fn connect(
-        endpoint: String,
+    /// Connect a reporter to the first reachable controller in `endpoints`.
+    pub async fn connect_any(
+        endpoints: &[String],
         node_id: String,
-        tls: Option<TlsOptions>,
+        tls: &Option<TlsOptions>,
     ) -> Result<Self> {
-        let client = VelstraControlClient::new(connect(&endpoint, &tls).await?);
-        Ok(Self { client, node_id })
+        let mut last_err = None;
+        for endpoint in endpoints {
+            match connect(endpoint, tls).await {
+                Ok(channel) => {
+                    return Ok(Self {
+                        client: VelstraControlClient::new(channel),
+                        node_id,
+                    });
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("no controller endpoints configured")))
     }
 
     /// Send the current per-counter statistics to the controller.

@@ -9,6 +9,7 @@ use std::{
     fmt::Debug,
     io::Cursor,
     ops::RangeBounds,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -203,11 +204,25 @@ struct LogInner {
 }
 
 /// In-memory Raft log store (durability comes from snapshots persisted by the
-/// caller; the uncommitted log tail is volatile, which is acceptable for a
-/// small control-plane cluster that re-replicates on restart).
+/// state machine; the uncommitted log tail is volatile, which is acceptable for
+/// a small control-plane cluster that re-replicates on restart).
 #[derive(Clone, Debug, Default)]
 pub struct LogStore {
     inner: Arc<Mutex<LogInner>>,
+}
+
+impl LogStore {
+    /// A log store seeded with `last_purged` — used after reloading a persisted
+    /// snapshot so the log's reported `last_log_id` is consistent with the state
+    /// machine's `last_applied` (both point at the snapshot's last log id).
+    pub fn new(last_purged: Option<LogId<NodeId>>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(LogInner {
+                last_purged,
+                ..Default::default()
+            })),
+        }
+    }
 }
 
 impl RaftLogReader<TypeConfig> for LogStore {
@@ -311,6 +326,34 @@ pub struct StoredSnapshot {
     pub data: Vec<u8>,
 }
 
+/// On-disk form of a snapshot: its metadata plus the serialized fabric. Written
+/// atomically so a crash mid-write never leaves a torn file.
+#[derive(Serialize, Deserialize)]
+struct PersistedSnapshot {
+    meta: SnapshotMeta<NodeId, BasicNode>,
+    data: Vec<u8>,
+}
+
+const SNAPSHOT_FILE: &str = "snapshot.json";
+
+/// Read the persisted snapshot from `dir`, if one exists. Returns `Ok(None)`
+/// when the directory holds no snapshot yet (a fresh node).
+pub fn load_snapshot(dir: &Path) -> Result<Option<StoredSnapshot>> {
+    let path = dir.join(SNAPSHOT_FILE);
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let p: PersistedSnapshot = serde_json::from_slice(&bytes)
+                .map_err(|e| anyhow!("parsing {}: {e}", path.display()))?;
+            Ok(Some(StoredSnapshot {
+                meta: p.meta,
+                data: p.data,
+            }))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow!("reading {}: {e}", path.display())),
+    }
+}
+
 struct SmInner {
     last_applied: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, BasicNode>,
@@ -337,6 +380,8 @@ pub struct StateMachineStore {
     inner: Arc<Mutex<SmInner>>,
     snapshot_idx: Arc<AtomicU64>,
     changed: Arc<watch::Sender<u64>>,
+    /// Where snapshots are persisted, if durability is enabled.
+    dir: Option<Arc<PathBuf>>,
 }
 
 impl Default for StateMachineStore {
@@ -345,11 +390,57 @@ impl Default for StateMachineStore {
             inner: Arc::new(Mutex::new(SmInner::default())),
             snapshot_idx: Arc::new(AtomicU64::new(0)),
             changed: Arc::new(watch::channel(0).0),
+            dir: None,
         }
     }
 }
 
 impl StateMachineStore {
+    /// Build a state machine, optionally persisting snapshots under `dir` and
+    /// resuming from a previously persisted snapshot (`loaded`). With no `loaded`
+    /// snapshot it starts empty; with one it restores the fabric, `last_applied`,
+    /// and membership so the node rejoins the cluster from where it left off.
+    pub fn new(dir: Option<PathBuf>, loaded: Option<StoredSnapshot>) -> Result<Self> {
+        let inner = match &loaded {
+            Some(s) => {
+                let payload: SnapshotPayload = serde_json::from_slice(&s.data)
+                    .map_err(|e| anyhow!("parsing persisted snapshot payload: {e}"))?;
+                SmInner {
+                    last_applied: s.meta.last_log_id,
+                    last_membership: s.meta.last_membership.clone(),
+                    topology: Topology::from_snapshot(&payload.fabric),
+                    current_snapshot: Some(s.clone()),
+                }
+            }
+            None => SmInner::default(),
+        };
+        Ok(Self {
+            inner: Arc::new(Mutex::new(inner)),
+            snapshot_idx: Arc::new(AtomicU64::new(0)),
+            changed: Arc::new(watch::channel(0).0),
+            dir: dir.map(Arc::new),
+        })
+    }
+
+    /// Atomically persist `snap` to the snapshot directory, if one is configured.
+    /// Writes to a temp file and renames, so readers never see a partial file.
+    fn persist(&self, snap: &StoredSnapshot) -> Result<(), StorageError<NodeId>> {
+        let Some(dir) = &self.dir else {
+            return Ok(());
+        };
+        let payload = PersistedSnapshot {
+            meta: snap.meta.clone(),
+            data: snap.data.clone(),
+        };
+        let bytes = serde_json::to_vec(&payload).map_err(io_err)?;
+        let path = dir.join(SNAPSHOT_FILE);
+        let tmp = dir.join(format!("{SNAPSHOT_FILE}.tmp"));
+        std::fs::write(&tmp, &bytes)
+            .and_then(|()| std::fs::rename(&tmp, &path))
+            .map_err(io_err)?;
+        Ok(())
+    }
+
     /// A clone of the current applied topology (for deriving per-host configs).
     pub async fn topology(&self) -> Topology {
         self.inner.lock().await.topology.clone()
@@ -390,10 +481,12 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
             last_membership,
             snapshot_id,
         };
-        self.inner.lock().await.current_snapshot = Some(StoredSnapshot {
+        let stored = StoredSnapshot {
             meta: meta.clone(),
             data: data.clone(),
-        });
+        };
+        self.persist(&stored)?;
+        self.inner.lock().await.current_snapshot = Some(stored);
         Ok(Snapshot {
             meta,
             snapshot: Box::new(Cursor::new(data)),
@@ -454,15 +547,17 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
     ) -> Result<(), StorageError<NodeId>> {
         let data = snapshot.into_inner();
         let payload: SnapshotPayload = serde_json::from_slice(&data).map_err(io_err)?;
+        let stored = StoredSnapshot {
+            meta: meta.clone(),
+            data,
+        };
+        self.persist(&stored)?;
         {
             let mut inner = self.inner.lock().await;
             inner.topology = Topology::from_snapshot(&payload.fabric);
             inner.last_applied = meta.last_log_id;
             inner.last_membership = meta.last_membership.clone();
-            inner.current_snapshot = Some(StoredSnapshot {
-                meta: meta.clone(),
-                data,
-            });
+            inner.current_snapshot = Some(stored);
         }
         self.notify();
         Ok(())

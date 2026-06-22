@@ -130,6 +130,13 @@ struct ServeArgs {
     /// node). Other nodes just start and wait to be contacted.
     #[arg(long, requires = "node_id")]
     bootstrap: bool,
+
+    /// Directory for persisted Raft snapshots (cluster mode). With it, the node
+    /// survives a full restart by reloading the committed fabric; without it,
+    /// state is in-memory only and a node comes up empty (re-replicating from a
+    /// surviving peer, or losing the fabric on a full-cluster restart).
+    #[arg(long, requires = "node_id")]
+    raft_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -802,7 +809,11 @@ async fn serve(args: ServeArgs) -> Result<()> {
 
     // Cluster mode: start the embedded Raft node and its peer service.
     let raft = if let Some(id) = args.node_id {
-        let node = Arc::new(velstra_raft::RaftNode::start(id).await?);
+        let node =
+            Arc::new(velstra_raft::RaftNode::start_with_dir(id, args.raft_dir.clone()).await?);
+        if let Some(dir) = &args.raft_dir {
+            info!("raft snapshots persisted under {}", dir.display());
+        }
         let raft_addr = args
             .raft_listen
             .parse()
