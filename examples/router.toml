@@ -1,0 +1,40 @@
+# Example Velstra Phase 2 policy: a firewall *and* a small software router.
+#
+#   velstra validate examples/router.toml          # no root
+#   sudo -E ./target/release/velstra run \
+#       --iface eth0 --config examples/router.toml   # root
+#
+# Forwarding is opt-in: with no [[route]] blocks, Velstra is a pure firewall.
+
+default_action = "pass"
+drop_icmp      = false
+
+# Still a firewall: drop abusive sources before any forwarding happens.
+blocklist = ["203.0.113.0/24"]
+
+# --- Routing (L3) ----------------------------------------------------------
+# Packets destined for 10.20.0.0/16 are routed out of eth1 to the next hop
+# 02:00:00:00:00:01. "route" mode decrements the IPv4 TTL and fixes the
+# checksum, exactly like a hardware router. src_mac defaults to eth1's own MAC.
+[[route]]
+dest      = "10.20.0.0/16"
+out_iface = "eth1"
+via_mac   = "02:00:00:00:00:01"
+mode      = "route"
+
+# A more specific route wins (longest-prefix match): this /24 inside the /16
+# above goes to a different next hop.
+[[route]]
+dest      = "10.20.30.0/24"
+out_iface = "eth2"
+via_mac   = "02:00:00:00:00:02"
+
+# --- Switching (L2) --------------------------------------------------------
+# "switch" mode re-addresses the frame and forwards it unchanged (no TTL
+# decrement) — an L2 bridge port. Here we also pin an explicit source MAC.
+[[route]]
+dest      = "192.168.50.0/24"
+out_iface = "eth3"
+via_mac   = "02:00:00:00:00:03"
+src_mac   = "02:00:00:00:00:30"
+mode      = "switch"

@@ -1,0 +1,11 @@
+# NOTE: We deliberately do *not* set a global `runner = "sudo -E"` here.
+#
+# Attaching an XDP program needs root, but a blanket runner also wraps the unit
+# test binaries in `sudo`, which breaks `cargo test` on machines with an
+# interactive sudo prompt (fingerprint/password). Instead, run the daemon with
+# root explicitly:
+#
+#     cargo build --release
+#     sudo -E ./target/release/velstra run --iface eth0
+#
+# `make run` / the README wrap this for you.

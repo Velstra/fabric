@@ -1,0 +1,71 @@
+# Keep this congruent with `Brewfile` (the LLVM that bpf-linker needs).
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Fast lane: the std-testable crates (logic, config, gRPC). No eBPF toolchain,
+  # no root — this gate runs in seconds and catches most regressions. `protoc`
+  # is needed to compile the controller's `.proto`.
+  logic:
+    name: host crates — fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      # Exclude `velstra-ebpf` (BPF-only, no host std) and `velstra` (the agent,
+      # whose build script needs bpf-linker — covered by the `build` job). The
+      # rest is the host control plane: common/config/proto/controller/cni/
+      # orchestrator/raft.
+      - name: clippy (host crates)
+        run: cargo clippy --workspace --exclude velstra-ebpf --exclude velstra --all-targets -- -D warnings
+      - name: test (host crates)
+        run: cargo test --workspace --exclude velstra-ebpf --exclude velstra
+
+  # Full lane: builds the eBPF data plane (needs nightly rust-src + bpf-linker)
+  # and the control plane, then runs the control-plane tests.
+  build:
+    name: ebpf + control plane — build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          # `rust-src` is required to cross-compile std for the BPF target;
+          # clippy lints the host control-plane crate.
+          components: rust-src, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install bpf-linker
+        run: cargo install bpf-linker --locked
+      - name: clippy (control plane)
+        # The eBPF crate is only ever built for the bpf target via the app's
+        # build script, so it is intentionally excluded from host clippy
+        # (it is `no_std`/`no_main` and cannot link against the host std).
+        run: cargo clippy -p velstra --all-targets -- -D warnings
+      - name: Build (release, embeds the eBPF object)
+        run: cargo build --release
+      - name: Test control plane
+        run: cargo test -p velstra
+      - name: Smoke-test the agent CLI (no root needed)
+        run: |
+          # Agent-side policy files only; topology.toml is a controller file.
+          for cfg in examples/rules.toml examples/loadbalancer.toml \
+                     examples/multitenant.toml examples/router.toml examples/overlay.toml; do
+            ./target/release/velstra validate "$cfg"
+          done

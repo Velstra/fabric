@@ -1,0 +1,11 @@
+{
+  "cniVersion": "1.0.0",
+  "name": "velstra",
+  "plugins": [
+    {
+      "type": "velstra-cni",
+      "subnet": "10.244.0.0/16",
+      "gateway": "10.244.0.1"
+    }
+  ]
+}

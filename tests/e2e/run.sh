@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+# Velstra end-to-end suite. Loads the real eBPF programs and exercises every
+# phase against a throwaway netns/veth topology.
+#
+#   sudo ./tests/e2e/run.sh            # run all scenarios
+#   sudo ./tests/e2e/run.sh fw_icmp    # run one scenario by name
+#
+# Needs root, a recent kernel, iproute2, and (optionally) ethtool / arping.
+# Build the agent first: cargo build --release
+#
+# Each scenario builds its own uniquely-named topology so they never collide;
+# the EXIT trap in lib.sh tears everything down.
+
+cd "$(dirname "${BASH_SOURCE[0]}")"
+# shellcheck source=lib.sh
+source ./lib.sh
+
+# A TCP connect attempt using bash's /dev/tcp (no `nc` dependency). Succeeds if
+# the SYN gets through and is accepted/refused; fails (times out) if dropped.
+tcp_connect() { # ns host port
+  nse "$1" timeout 2 bash -c "exec 3<>/dev/tcp/$2/$3" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+scenario_fw_pass() {
+  section "Phase 1 — default pass lets traffic through"
+  ns_add fpa; ns_add fpb
+  veth_pair fpa va 10.10.1.1/24 fpb vb 10.10.1.2/24
+  printf 'default_action = "pass"\n' >"$WORKDIR/pass.toml"
+  agent_start fpb -- --iface vb --config "$WORKDIR/pass.toml" || { bad "agent start"; return; }
+  nse fpa ping -c2 -W1 10.10.1.2 >/dev/null 2>&1 || true
+  settle
+  assert_ge   "$LAST_LOG" rx_packets     1 "agent saw ingress traffic"
+  assert_ge   "$LAST_LOG" passed_default 1 "ICMP passed by default"
+  assert_cmd  "ping succeeds under default-pass" -- nse fpa ping -c1 -W1 10.10.1.2
+  agent_stop
+}
+
+scenario_fw_default_drop() {
+  section "Phase 1 — default drop blocks unmatched traffic"
+  ns_add fda; ns_add fdb
+  veth_pair fda va 10.10.2.1/24 fdb vb 10.10.2.2/24
+  printf 'default_action = "drop"\n' >"$WORKDIR/drop.toml"
+  agent_start fdb -- --iface vb --config "$WORKDIR/drop.toml" || { bad "agent start"; return; }
+  nse fda ping -c2 -W1 10.10.2.2 >/dev/null 2>&1 || true
+  settle
+  assert_ge   "$LAST_LOG" dropped_default 1 "ICMP dropped by default-drop"
+  assert_fail "ping fails under default-drop" -- nse fda ping -c1 -W1 10.10.2.2
+  agent_stop
+}
+
+scenario_fw_blocklist_v4() {
+  section "Phase 1 — IPv4 source blocklist"
+  ns_add fba; ns_add fbb
+  veth_pair fba va 10.10.3.1/24 fbb vb 10.10.3.2/24
+  cat >"$WORKDIR/bl4.toml" <<-EOF
+	default_action = "pass"
+	blocklist = ["10.10.3.1/32"]
+	EOF
+  agent_start fbb -- --iface vb --config "$WORKDIR/bl4.toml" || { bad "agent start"; return; }
+  nse fba ping -c2 -W1 10.10.3.2 >/dev/null 2>&1 || true
+  settle
+  assert_ge   "$LAST_LOG" dropped_blocklist 1 "blocklisted source dropped"
+  assert_fail "ping from blocklisted source fails" -- nse fba ping -c1 -W1 10.10.3.2
+  agent_stop
+}
+
+scenario_fw_icmp() {
+  section "Phase 1 — ICMP filter"
+  ns_add fia; ns_add fib
+  veth_pair fia va 10.10.4.1/24 fib vb 10.10.4.2/24
+  cat >"$WORKDIR/icmp.toml" <<-EOF
+	default_action = "pass"
+	drop_icmp = true
+	EOF
+  agent_start fib -- --iface vb --config "$WORKDIR/icmp.toml" || { bad "agent start"; return; }
+  nse fia ping -c2 -W1 10.10.4.2 >/dev/null 2>&1 || true
+  settle
+  assert_ge   "$LAST_LOG" dropped_icmp 1 "ICMP dropped by the filter"
+  assert_fail "ping fails with drop_icmp" -- nse fia ping -c1 -W1 10.10.4.2
+  agent_stop
+}
+
+scenario_fw_port() {
+  section "Phase 1 — per-port rule (tcp/9999 drop)"
+  ns_add fpoa; ns_add fpob
+  veth_pair fpoa va 10.10.5.1/24 fpob vb 10.10.5.2/24
+  cat >"$WORKDIR/port.toml" <<-EOF
+	default_action = "pass"
+	[[port_rule]]
+	proto = "tcp"
+	port = 9999
+	action = "drop"
+	EOF
+  agent_start fpob -- --iface vb --config "$WORKDIR/port.toml" || { bad "agent start"; return; }
+  tcp_connect fpoa 10.10.5.2 9999 || true
+  settle
+  assert_ge   "$LAST_LOG" dropped_rule 1 "SYN to tcp/9999 dropped by rule"
+  assert_fail "connect to blocked port fails" -- tcp_connect fpoa 10.10.5.2 9999
+  agent_stop
+}
+
+scenario_fw_blocklist_v6() {
+  section "Phase 1 — IPv6 source blocklist (dual-stack)"
+  if ! ping -6 -c0 ::1 >/dev/null 2>&1 && ! ping6 -c0 ::1 >/dev/null 2>&1; then
+    skip "no working IPv6 ping; skipping"
+    return
+  fi
+  ns_add f6a; ns_add f6b
+  veth_pair f6a va 10.10.6.1/24 f6b vb 10.10.6.2/24
+  add6 f6a va fd00:6::1/64
+  add6 f6b vb fd00:6::2/64
+  sleep 1 # DAD settle
+  cat >"$WORKDIR/bl6.toml" <<-EOF
+	default_action = "pass"
+	blocklist = ["fd00:6::1"]
+	EOF
+  agent_start f6b -- --iface vb --config "$WORKDIR/bl6.toml" || { bad "agent start"; return; }
+  nse f6a ping -6 -c2 -W1 fd00:6::2 >/dev/null 2>&1 || nse f6a ping6 -c2 -W1 fd00:6::2 >/dev/null 2>&1 || true
+  settle
+  assert_ge "$LAST_LOG" dropped_blocklist 1 "blocklisted IPv6 source dropped"
+  agent_stop
+}
+
+scenario_egress_blocklist() {
+  section "Phase B — egress firewall (destination blocklist)"
+  ns_add ega; ns_add egb
+  veth_pair ega va 10.10.7.1/24 egb vb 10.10.7.2/24
+  cat >"$WORKDIR/egress.toml" <<-EOF
+	default_action = "pass"
+	blocklist = ["10.10.7.1/32"]
+	EOF
+  # Agent on vb with --egress; traffic LEAVING vb toward 10.10.7.1 is filtered.
+  agent_start egb -- --iface vb --egress --config "$WORKDIR/egress.toml" || { bad "agent start"; return; }
+  nse egb ping -c2 -W1 10.10.7.1 >/dev/null 2>&1 || true
+  settle
+  assert_ge   "$LAST_LOG" tx_packets     1 "egress hook saw outgoing traffic"
+  assert_ge   "$LAST_LOG" egress_dropped 1 "egress to blocklisted dst dropped"
+  assert_fail "egress ping to blocklisted dst fails" -- nse egb ping -c1 -W1 10.10.7.1
+  agent_stop
+}
+
+scenario_overlay_arp() {
+  section "Phase 4 — overlay ARP suppression"
+  if ! have arping; then skip "arping not installed; skipping"; return; fi
+  ns_add oah  # host (VTEP)
+  ns_add oac  # tenant VM
+  veth_pair oah tap0 - oac tap0c 192.168.100.1/24
+  # A dummy underlay device so the overlay's local_vtep MAC resolves.
+  nse oah ip link add uplink0 type dummy
+  nse oah ip addr add 10.20.0.1/24 dev uplink0
+  nse oah ip link set uplink0 up
+  cat >"$WORKDIR/arp.toml" <<-EOF
+	default_action = "pass"
+	[overlay]
+	local_vtep = "10.20.0.1"
+	underlay_iface = "uplink0"
+	[[interface]]
+	name = "tap0"
+	policy = 0
+	vni = 5000
+	[[neighbor]]
+	vni = 5000
+	ip = "192.168.100.2"
+	mac = "02:00:00:00:0b:02"
+	EOF
+  agent_start oah -- --iface tap0 --config "$WORKDIR/arp.toml" || { bad "agent start"; return; }
+  # The VM ARPs for a peer that lives "on another host"; the agent answers.
+  nse oac arping -c2 -w2 -I tap0c 192.168.100.2 >/dev/null 2>&1 || true
+  settle
+  assert_ge  "$LAST_LOG" arp_suppressed 1 "ARP answered locally from the table"
+  assert_cmd "arping gets a (synthetic) reply" -- nse oac arping -c1 -w2 -I tap0c 192.168.100.2
+  agent_stop
+}
+
+scenario_overlay_encap() {
+  section "Phase 4 — overlay encap + MTU guard"
+  ns_add oeh  # host (VTEP)
+  ns_add oec  # tenant VM
+  ns_add oeu  # remote underlay peer
+  veth_pair oeh tap0 - oec tap0c 192.168.100.1/24
+  veth_pair oeh uplink0 10.20.0.1/24 oeu under0 10.20.0.2/24
+  local umac
+  umac="$(nse oeu cat /sys/class/net/under0/address)"
+  cat >"$WORKDIR/encap.toml" <<-EOF
+	default_action = "pass"
+	[overlay]
+	local_vtep = "10.20.0.1"
+	underlay_iface = "uplink0"
+	underlay_mtu = 1500
+	[[interface]]
+	name = "tap0"
+	policy = 0
+	vni = 5000
+	[[tunnel]]
+	vni = 5000
+	inner_dst = "192.168.100.0/24"
+	remote_vtep = "10.20.0.2"
+	via_mac = "$umac"
+	out_iface = "uplink0"
+	EOF
+  agent_start oeh -- --iface tap0 --iface uplink0 --config "$WORKDIR/encap.toml" \
+    || { bad "agent start"; return; }
+  # Pre-seed the VM's neighbour so it emits an IP frame (no ARP) into tap0.
+  nse oec ip neigh replace 192.168.100.2 lladdr 02:00:00:00:0b:02 dev tap0c
+  nse oec ping -c2 -W1 192.168.100.2 >/dev/null 2>&1 || true
+  settle
+  assert_ge "$LAST_LOG" overlay_encap 1 "tenant frame to remote subnet encapsulated"
+  # Oversized frame must be dropped by the MTU guard, not silently black-holed.
+  nse oec ping -c1 -W1 -s 1600 192.168.100.2 >/dev/null 2>&1 || true
+  settle
+  assert_ge "$LAST_LOG" overlay_too_big 1 "oversized inner frame dropped by MTU guard"
+  agent_stop
+}
+
+scenario_routing() {
+  section "Phase 2 — routing redirect"
+  ns_add rtc; ns_add rtr; ns_add rtb
+  veth_pair rtc vc 10.20.0.1/24 rtr vrc 10.20.0.254/24    # client ── router
+  veth_pair rtr vrb 10.30.0.254/24 rtb vb 10.30.0.2/24    # router ── backend
+  nse rtc ip route add 10.30.0.0/24 via 10.20.0.254       # client → backend via router
+  local bmac
+  bmac="$(nse rtb cat /sys/class/net/vb/address)"
+  cat >"$WORKDIR/route.toml" <<-EOF
+	default_action = "pass"
+	[[route]]
+	dest = "10.30.0.0/24"
+	out_iface = "vrb"
+	via_mac = "$bmac"
+	mode = "switch"
+	EOF
+  # Attach on the router; the packet ingresses vrc and is redirected out vrb.
+  agent_start rtr -- --iface vrc --iface vrb --config "$WORKDIR/route.toml" \
+    || { bad "agent start"; return; }
+  nse rtc ping -c2 -W1 10.30.0.2 >/dev/null 2>&1 || true
+  settle
+  # `forwarded` is bumped when a route matches and the packet is redirected
+  # (asserting the counter, not a full round-trip, which needs reverse routing).
+  assert_ge "$LAST_LOG" forwarded 1 "packet redirected by a matching route"
+  agent_stop
+}
+
+scenario_lb() {
+  section "Phase 3 — load balancer DNAT"
+  ns_add lbc; ns_add lbh
+  veth_pair lbc vc 10.40.0.1/24 lbh vh 10.40.0.254/24
+  nse lbc ip route add 10.40.99.0/24 via 10.40.0.254      # client → VIP via lb host
+  cat >"$WORKDIR/lb.toml" <<-EOF
+	default_action = "pass"
+	[[service]]
+	vip = "10.40.99.10"
+	port = 80
+	proto = "tcp"
+	backends = [{ ip = "10.40.0.5", port = 8080 }]
+	EOF
+  agent_start lbh -- --iface vh --config "$WORKDIR/lb.toml" || { bad "agent start"; return; }
+  tcp_connect lbc 10.40.99.10 80 || true
+  settle
+  # The SYN to the VIP is DNAT-rewritten to the backend (counter fires before the
+  # rewritten packet is passed on; a completed round-trip needs host prep — see
+  # docs/TESTING.md §4).
+  assert_ge "$LAST_LOG" load_balanced 1 "SYN to the VIP DNAT-rewritten to a backend"
+  agent_stop
+}
+
+# ---------------------------------------------------------------------------
+ALL=(
+  fw_pass fw_default_drop fw_blocklist_v4 fw_icmp fw_port fw_blocklist_v6
+  egress_blocklist routing lb overlay_arp overlay_encap
+)
+
+main() {
+  require_root
+  require_bin
+  local sel=("$@")
+  [ "${#sel[@]}" -eq 0 ] && sel=("${ALL[@]}")
+  for s in "${sel[@]}"; do
+    if declare -F "scenario_$s" >/dev/null; then
+      "scenario_$s"
+    else
+      echo "unknown scenario: $s (have: ${ALL[*]})" >&2
+      FAIL=$((FAIL + 1))
+    fi
+  done
+  summary
+}
+
+main "$@"

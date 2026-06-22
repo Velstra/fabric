@@ -1,0 +1,13 @@
+[package]
+name = "velstra-config"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+velstra-common = { path = "../velstra-common", features = ["user"] }
+velstra-proto = { path = "../velstra-proto" }
+
+anyhow = { workspace = true, default-features = true }
+serde = { workspace = true, features = ["std"] }
+toml = { workspace = true }

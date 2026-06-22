@@ -1,0 +1,47 @@
+# Example Velstra fabric topology (Track C).
+#
+# This single file declares the whole virtual fabric — hosts (VTEPs), networks
+# (tenants), and ports (VM NICs). The controller derives each host's concrete
+# config from it and serves it to that node:
+#
+#   velstra-controller serve --topology examples/topology.toml
+#
+# Two hosts, one tenant network spanning both. The orchestrator automatically:
+#   * binds each port's tap to its network's policy + VNI on the right host,
+#   * creates a tunnel + ARP entry on each host for the *other* host's port,
+#   * allocates IPs/MACs for ports that don't pin one.
+
+[[host]]
+id             = "host-1"
+vtep           = "10.10.0.1"          # underlay VTEP address
+underlay_iface = "eth0"
+underlay_mac   = "02:00:00:00:00:11"
+# encap = "vxlan"   # or "geneve"; default vxlan
+# underlay_mtu = 1500
+
+[[host]]
+id             = "host-2"
+vtep           = "10.10.0.2"
+underlay_iface = "eth0"
+underlay_mac   = "02:00:00:00:00:22"
+
+[[network]]
+vni            = 5000
+name           = "blue"
+subnet         = "192.168.100.0/24"   # IPAM allocates port addresses from here
+default_action = "pass"
+# drop_icmp = false
+
+# A VM NIC on host-1. Omit `ip` to auto-allocate the next free address.
+[[port]]
+network = 5000
+host    = "host-1"
+tap     = "tap-blue-1"
+ip      = "192.168.100.10"
+
+# A VM NIC for the same tenant, on host-2.
+[[port]]
+network = 5000
+host    = "host-2"
+tap     = "tap-blue-2"
+ip      = "192.168.100.20"

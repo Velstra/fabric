@@ -1,0 +1,19 @@
+# Per-node config for an edge/router node `edge-1`: a stricter firewall plus a
+# Phase 2 route. The src_mac defaults to the egress interface's own MAC.
+
+default_action = "drop"   # deny-by-default; only allow what's listed
+drop_icmp      = false
+log            = false
+
+blocklist = ["10.66.0.0/16"]
+
+[[port_rule]]
+proto  = "tcp"
+port   = 443
+action = "pass"           # allow inbound HTTPS
+
+[[route]]
+dest      = "10.20.0.0/16"
+out_iface = "eth1"
+via_mac   = "02:00:00:00:00:01"
+mode      = "route"

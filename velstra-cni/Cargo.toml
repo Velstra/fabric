@@ -1,0 +1,18 @@
+[package]
+name = "velstra-cni"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "velstra-cni"
+path = "src/main.rs"
+
+[dependencies]
+velstra-common = { path = "../velstra-common" }
+
+anyhow = { workspace = true, default-features = true }
+serde = { workspace = true, features = ["std"] }
+serde_json = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
