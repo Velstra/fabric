@@ -101,6 +101,9 @@ spec:
                 --orchestrator "http://velstra-controller-0.${DOMAIN}:50052" \
                 --orchestrator "http://velstra-controller-1.${DOMAIN}:50052" \
                 --orchestrator "http://velstra-controller-2.${DOMAIN}:50052"
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }
           volumeMounts:
             - { name: bpffs, mountPath: /sys/fs/bpf }
             - { name: run-velstra, mountPath: /run/velstra }

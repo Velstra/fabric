@@ -75,6 +75,9 @@ spec:
             tcpSocket: { port: 50051 }
             initialDelaySeconds: 3
             periodSeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 512Mi }
   volumeClaimTemplates:
     - metadata:
         name: raft-data
@@ -83,3 +86,16 @@ spec:
         resources:
           requests:
             storage: 1Gi
+---
+# Keep a Raft quorum during voluntary disruptions (node drains, rollouts): never
+# let more than one of the three controllers be evicted at once.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: velstra-controller
+  namespace: velstra-system
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: velstra-controller

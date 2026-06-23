@@ -132,9 +132,14 @@ kubectl -n velstra-system exec velstra-controller-0 -- \
 
 ## Other hardening
 
-- **Lock down the orchestrator channel.** Even with mTLS, add a `NetworkPolicy`
-  so only the agents/CNI can reach `:50052`/`:50053`.
-- **Resource requests/limits** and a `PodDisruptionBudget` for the controller.
+- **Resource requests/limits** are set on both workloads, and a
+  `PodDisruptionBudget` (`minAvailable: 2`) keeps a Raft quorum during drains and
+  rollouts — both in the base manifests.
+- **Lock down the orchestrator channel.** A plain pod-selector `NetworkPolicy`
+  on `:50052`/`:50053` does **not** work here: the agents run with
+  `hostNetwork`, so their traffic appears to originate from the node IP, not a
+  pod. Restrict by node CIDR (an `ipBlock` peer) instead, on top of the mTLS
+  client-cert auth — which is the real access control.
 
 ## End-to-end test
 
