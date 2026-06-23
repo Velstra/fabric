@@ -41,7 +41,9 @@ use tokio::sync::{RwLock, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{
     Request, Response, Status,
-    transport::{Certificate, Identity, Server, ServerTlsConfig},
+    transport::{
+        Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Server, ServerTlsConfig,
+    },
 };
 use velstra_config::{ActionName, EncapName, FileConfig, file_config_to_proto};
 use velstra_orchestrator::Topology;
@@ -100,13 +102,14 @@ struct ServeArgs {
     #[arg(long, default_value_t = 2)]
     poll_interval: u64,
 
-    /// PEM server certificate for the agent channel (enables TLS).
+    /// PEM server certificate for the agent **and** admin/orchestrator channels
+    /// (enables TLS on both).
     #[arg(long, requires = "tls_key")]
     tls_cert: Option<PathBuf>,
-    /// PEM server private key for the agent channel.
+    /// PEM server private key for the agent and admin channels.
     #[arg(long, requires = "tls_cert")]
     tls_key: Option<PathBuf>,
-    /// PEM CA used to verify agent client certificates (enables mTLS).
+    /// PEM CA used to verify client certificates on both channels (enables mTLS).
     #[arg(long, requires = "tls_cert")]
     client_ca: Option<PathBuf>,
 
@@ -139,11 +142,32 @@ struct ServeArgs {
     raft_dir: Option<PathBuf>,
 }
 
+/// Client TLS options for the admin/orchestrator CLIs (use an `https://`
+/// endpoint when a CA is given).
+#[derive(Debug, Args)]
+struct ClientTls {
+    /// PEM CA certificate to verify the controller (enables TLS).
+    #[arg(long)]
+    tls_ca: Option<PathBuf>,
+    /// Client certificate for mutual TLS.
+    #[arg(long, requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+    /// Client private key for mutual TLS.
+    #[arg(long, requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+    /// Server name to validate against the controller's certificate.
+    #[arg(long)]
+    tls_domain: Option<String>,
+}
+
 #[derive(Debug, Args)]
 struct AdminArgs {
     /// Admin endpoint of the running controller.
     #[arg(long, default_value = "http://127.0.0.1:50052")]
     endpoint: String,
+
+    #[command(flatten)]
+    tls: ClientTls,
 
     #[command(subcommand)]
     action: AdminAction,
@@ -154,6 +178,9 @@ struct OrchArgs {
     /// Admin endpoint of the running controller.
     #[arg(long, default_value = "http://127.0.0.1:50052")]
     endpoint: String,
+
+    #[command(flatten)]
+    tls: ClientTls,
 
     #[command(subcommand)]
     action: OrchAction,
@@ -909,15 +936,29 @@ async fn serve(args: ServeArgs) -> Result<()> {
         ));
     }
 
-    // Admin server on its own (localhost-by-default) port.
+    // Admin + orchestrator server on its own (localhost-by-default) port. It
+    // carries fabric-mutating RPCs (AddHost/CreatePort/…), so in a cluster where
+    // it is exposed to agents and the CNI it gets the **same** TLS/mTLS as the
+    // agent channel — not plaintext.
     let admin_addr = args
         .admin_listen
         .parse()
         .with_context(|| format!("invalid admin address {:?}", args.admin_listen))?;
+    let admin_tls = server_tls(&args)?;
     let admin_shared = shared.clone();
     tokio::spawn(async move {
-        info!("admin API listening on {admin_addr}");
-        if let Err(e) = Server::builder()
+        info!("admin/orchestrator API listening on {admin_addr}");
+        let mut builder = Server::builder();
+        if let Some(tls) = admin_tls {
+            match builder.tls_config(tls) {
+                Ok(b) => builder = b,
+                Err(e) => {
+                    warn!("admin TLS config failed: {e}");
+                    return;
+                }
+            }
+        }
+        if let Err(e) = builder
             .add_service(VelstraAdminServer::new(AdminSvc {
                 shared: admin_shared.clone(),
             }))
@@ -968,10 +1009,31 @@ async fn shutdown_signal() {
     }
 }
 
-async fn admin(args: AdminArgs) -> Result<()> {
-    let mut client = VelstraAdminClient::connect(args.endpoint.clone())
+/// Build a channel to the admin/orchestrator endpoint, with optional (m)TLS.
+async fn client_channel(endpoint: &str, tls: &ClientTls) -> Result<Channel> {
+    let mut ep: Endpoint =
+        Channel::from_shared(endpoint.to_string()).context("invalid endpoint")?;
+    if let Some(ca) = &tls.tls_ca {
+        let ca = std::fs::read(ca).with_context(|| format!("reading {}", ca.display()))?;
+        let mut cfg = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca));
+        if let (Some(cert), Some(key)) = (&tls.tls_cert, &tls.tls_key) {
+            cfg = cfg.identity(Identity::from_pem(
+                std::fs::read(cert).with_context(|| format!("reading {}", cert.display()))?,
+                std::fs::read(key).with_context(|| format!("reading {}", key.display()))?,
+            ));
+        }
+        if let Some(domain) = &tls.tls_domain {
+            cfg = cfg.domain_name(domain.clone());
+        }
+        ep = ep.tls_config(cfg).context("client TLS config")?;
+    }
+    ep.connect()
         .await
-        .with_context(|| format!("connecting to admin endpoint {}", args.endpoint))?;
+        .with_context(|| format!("connecting to {endpoint}"))
+}
+
+async fn admin(args: AdminArgs) -> Result<()> {
+    let mut client = VelstraAdminClient::new(client_channel(&args.endpoint, &args.tls).await?);
 
     match args.action {
         AdminAction::Set { node, file } => {
@@ -1016,9 +1078,8 @@ async fn admin(args: AdminArgs) -> Result<()> {
 }
 
 async fn orch(args: OrchArgs) -> Result<()> {
-    let mut client = VelstraOrchestratorClient::connect(args.endpoint.clone())
-        .await
-        .with_context(|| format!("connecting to admin endpoint {}", args.endpoint))?;
+    let mut client =
+        VelstraOrchestratorClient::new(client_channel(&args.endpoint, &args.tls).await?);
 
     match args.action {
         OrchAction::AddHost {
