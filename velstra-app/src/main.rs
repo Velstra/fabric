@@ -148,8 +148,10 @@ fn default_node_id() -> String {
 
 /// `velstra run` — the daemon.
 async fn run(args: RunArgs) -> Result<()> {
-    if args.iface.is_empty() && args.auto_attach.is_none() {
-        anyhow::bail!("specify at least one --iface, or --auto-attach <prefix>");
+    if args.iface.is_empty() && args.auto_attach.is_none() && args.controllers.is_empty() {
+        anyhow::bail!(
+            "specify at least one --iface, --auto-attach <prefix>, or --controller (config-driven attach)"
+        );
     }
 
     // TLS for the controller connection, if a CA was supplied.
@@ -210,6 +212,13 @@ async fn run(args: RunArgs) -> Result<()> {
             args.xdp_mode,
             args.auto_policy,
         ));
+    }
+
+    // In controller mode, attach to config-named interfaces (e.g. pod veths the
+    // controller declared) as they appear — without needing an --auto-attach
+    // prefix. The controller may name a veth before the CNI has created it.
+    if !args.controllers.is_empty() {
+        tokio::spawn(config_attach_loop(firewall.clone(), args.xdp_mode));
     }
 
     // In controller mode, apply pushed updates in the background — reconnecting
@@ -365,6 +374,20 @@ async fn auto_attach_loop(
             .lock()
             .await
             .reconcile_auto_attach(&present, &prefix, mode, default_policy);
+    }
+}
+
+/// Background task (controller mode): attach the firewall/LB to interfaces the
+/// pushed config names, as they appear, and forget them when their netdev goes.
+async fn config_attach_loop(firewall: Arc<Mutex<Firewall>>, mode: AttachMode) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(2));
+    loop {
+        ticker.tick().await;
+        let present = list_interfaces();
+        firewall
+            .lock()
+            .await
+            .reconcile_config_interfaces(&present, mode);
     }
 }
 
