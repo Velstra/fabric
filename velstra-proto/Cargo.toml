@@ -2,7 +2,14 @@
 name = "velstra-proto"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license = "MIT OR Apache-2.0"
+description = "gRPC wire types and tonic client/server stubs for the Velstra eBPF/XDP SDN control plane."
+repository.workspace = true
+homepage.workspace = true
+keywords = ["sdn", "grpc", "networking", "ebpf", "velstra"]
+categories = ["network-programming", "api-bindings"]
+readme = "README.md"
 
 [dependencies]
 tonic = { workspace = true }
@@ -10,3 +17,5 @@ prost = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }
+# A vendored protoc so downstream crates need no system protoc to build.
+protoc-bin-vendored = "3"

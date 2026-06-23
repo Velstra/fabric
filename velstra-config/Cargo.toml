@@ -2,11 +2,18 @@
 name = "velstra-config"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+description = "Configuration model for the Velstra SDN: parse/validate TOML policy + overlay config and resolve it into the data plane's map representation."
+repository.workspace = true
+homepage.workspace = true
+keywords = ["sdn", "ebpf", "networking", "config", "velstra"]
+categories = ["network-programming", "config"]
+readme = "README.md"
 
 [dependencies]
-velstra-common = { path = "../velstra-common", features = ["user"] }
-velstra-proto = { path = "../velstra-proto" }
+velstra-common = { path = "../velstra-common", version = "0.1", features = ["user"] }
+velstra-proto = { path = "../velstra-proto", version = "0.1" }
 
 anyhow = { workspace = true, default-features = true }
 serde = { workspace = true, features = ["std"] }

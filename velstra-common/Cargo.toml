@@ -2,8 +2,14 @@
 name = "velstra-common"
 version = "0.1.0"
 edition.workspace = true
-
+rust-version.workspace = true
 license = "MIT OR Apache-2.0"
+description = "Shared ABI / wire types for the Velstra eBPF/XDP SDN data plane (BPF map structs, packet and overlay headers)."
+repository.workspace = true
+homepage.workspace = true
+keywords = ["sdn", "ebpf", "xdp", "networking", "velstra"]
+categories = ["network-programming", "no-std"]
+readme = "README.md"
 
 [features]
 default = []

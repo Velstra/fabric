@@ -2,12 +2,19 @@
 name = "velstra-raft"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+description = "Embedded Raft (over openraft) for the Velstra controllers: the replicated state machine is the fabric topology, so controllers stay consistent with no external datastore."
+repository.workspace = true
+homepage.workspace = true
+keywords = ["raft", "consensus", "sdn", "openraft", "velstra"]
+categories = ["network-programming", "concurrency"]
+readme = "README.md"
 
 [dependencies]
-velstra-common = { path = "../velstra-common" }
-velstra-config = { path = "../velstra-config" }
-velstra-orchestrator = { path = "../velstra-orchestrator" }
+velstra-common = { path = "../velstra-common", version = "0.1" }
+velstra-config = { path = "../velstra-config", version = "0.1" }
+velstra-orchestrator = { path = "../velstra-orchestrator", version = "0.1" }
 
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "time", "net"] }
@@ -19,6 +26,8 @@ prost = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }
+# A vendored protoc so downstream crates need no system protoc to build.
+protoc-bin-vendored = "3"
 
 [lints.clippy]
 result_large_err = "allow"
