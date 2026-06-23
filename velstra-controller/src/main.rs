@@ -49,8 +49,8 @@ use velstra_config::{ActionName, EncapName, FileConfig, file_config_to_proto};
 use velstra_orchestrator::Topology;
 use velstra_proto::{
     Ack, Action, CreatePortRequest, Encap, HostSpec, ListNodesRequest, ListNodesResponse,
-    ListPortsRequest, ListPortsResponse, NetworkSpec, NodeConfig, NodeRequest, NodeSummary,
-    PortInfo, RemovePortRequest, SetConfigRequest, StatsReport,
+    ListPortsRequest, ListPortsResponse, MigratePortRequest, NetworkSpec, NodeConfig, NodeRequest,
+    NodeSummary, PortInfo, RemovePortRequest, SetConfigRequest, StatsReport,
     velstra_admin_client::VelstraAdminClient,
     velstra_admin_server::{VelstraAdmin, VelstraAdminServer},
     velstra_control_server::{VelstraControl, VelstraControlServer},
@@ -228,6 +228,15 @@ enum OrchAction {
     RemovePort {
         #[arg(long)]
         id: String,
+    },
+    /// Move a port to another host, keeping its IP/MAC (live migration).
+    MigratePort {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        tap: String,
     },
     /// List all ports in the fabric.
     ListPorts,
@@ -750,6 +759,30 @@ impl VelstraOrchestrator for OrchestratorSvc {
         Ok(Response::new(Ack { ok: resp.ok }))
     }
 
+    async fn migrate_port(
+        &self,
+        request: Request<MigratePortRequest>,
+    ) -> Result<Response<PortInfo>, Status> {
+        let req = request.into_inner();
+        info!("MigratePort({:?} -> {:?})", req.id, req.host);
+        let resp = propose(
+            &self.shared,
+            velstra_raft::TopoRequest::MigratePort {
+                id: req.id,
+                host: req.host,
+                tap: req.tap,
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(Status::invalid_argument(resp.error.unwrap_or_default()));
+        }
+        let port = resp
+            .port
+            .ok_or_else(|| Status::internal("migrate_port returned no port"))?;
+        Ok(Response::new(port_record_to_info(port)))
+    }
+
     async fn list_ports(
         &self,
         _request: Request<ListPortsRequest>,
@@ -1150,6 +1183,16 @@ async fn orch(args: OrchArgs) -> Result<()> {
                 .await?
                 .into_inner();
             println!("{} port {id:?}", if ack.ok { "removed" } else { "no such" });
+        }
+        OrchAction::MigratePort { id, host, tap } => {
+            let port = client
+                .migrate_port(MigratePortRequest { id, host, tap })
+                .await?
+                .into_inner();
+            println!(
+                "migrated port {} : {} ({}) now on {} via {}",
+                port.id, port.ip, port.mac, port.host, port.tap
+            );
         }
         OrchAction::ListPorts => {
             let resp = client.list_ports(ListPortsRequest {}).await?.into_inner();

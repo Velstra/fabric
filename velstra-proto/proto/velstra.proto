@@ -48,6 +48,8 @@ service VelstraOrchestrator {
   rpc CreatePort(CreatePortRequest) returns (PortInfo);
   // Remove a port by id.
   rpc RemovePort(RemovePortRequest) returns (Ack);
+  // Move a port to another host, keeping its IP/MAC/id (live migration).
+  rpc MigratePort(MigratePortRequest) returns (PortInfo);
   // List all ports in the fabric.
   rpc ListPorts(ListPortsRequest) returns (ListPortsResponse);
 }
@@ -88,6 +90,12 @@ message PortInfo {
 
 message RemovePortRequest {
   string id = 1;
+}
+
+message MigratePortRequest {
+  string id = 1;              // the port to move
+  string host = 2;            // destination host id
+  string tap = 3;             // tap/veth name on the destination host
 }
 
 message ListPortsRequest {}
