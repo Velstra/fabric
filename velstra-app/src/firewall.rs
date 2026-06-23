@@ -74,6 +74,10 @@ pub struct Firewall {
     /// Interfaces attached dynamically by auto-attach, tracked separately so they
     /// can be dropped again when the interface disappears (a VM tap going away).
     auto_attached: HashSet<String>,
+    /// Interfaces attached because the **config** named them (e.g. pod veths the
+    /// controller declared). Tracked separately from auto-attach so each is
+    /// forgotten when its netdev disappears.
+    config_attached: HashSet<String>,
 }
 
 impl Firewall {
@@ -127,6 +131,7 @@ impl Firewall {
             attached,
             applied: cfg.clone(),
             auto_attached: HashSet::new(),
+            config_attached: HashSet::new(),
         })
     }
 
@@ -212,6 +217,95 @@ impl Firewall {
             self.auto_attached.remove(&name);
             self.attached.retain(|(n, _)| n != &name);
             log::info!("auto-detached {name} (interface gone)");
+        }
+    }
+
+    /// Attach the (already-loaded) program to one **config-named** interface,
+    /// programming its policy AND overlay VNI before attaching so the first
+    /// packet already sees both.
+    fn attach_config_iface(
+        &mut self,
+        iface: &str,
+        mode: AttachMode,
+        policy_id: PolicyId,
+        vni: u32,
+    ) -> Result<XdpMode> {
+        {
+            let ifindex = if_nametoindex(iface)?;
+            {
+                let mut iface_policy: HashMap<_, u32, PolicyId> = HashMap::try_from(
+                    self.ebpf
+                        .map_mut("IFACE_POLICY")
+                        .ok_or_else(|| anyhow!("IFACE_POLICY map missing"))?,
+                )?;
+                iface_policy
+                    .insert(ifindex, policy_id, 0)
+                    .with_context(|| format!("assigning {iface} to policy {policy_id}"))?;
+            }
+            {
+                let mut iface_vni: HashMap<_, u32, u32> = HashMap::try_from(
+                    self.ebpf
+                        .map_mut("IFACE_VNI")
+                        .ok_or_else(|| anyhow!("IFACE_VNI map missing"))?,
+                )?;
+                iface_vni
+                    .insert(ifindex, vni, 0)
+                    .with_context(|| format!("assigning {iface} to vni {vni}"))?;
+            }
+        }
+        let program: &mut Xdp = self
+            .ebpf
+            .program_mut("velstra")
+            .ok_or_else(|| anyhow!("eBPF object has no `velstra` program"))?
+            .try_into()?;
+        let chosen = attach_with_fallback(program, iface, mode)?;
+        self.attached.push((iface.to_string(), chosen));
+        Ok(chosen)
+    }
+
+    /// Reconcile the **config-named** interfaces against `present`: attach (and
+    /// program the policy + VNI for) any that have appeared, and forget any whose
+    /// netdev has since gone (its XDP link detached with it).
+    ///
+    /// This is what attaches the XDP firewall/LB to a pod veth the controller
+    /// declared — possibly *before* the CNI created it — without relying on an
+    /// `--auto-attach` prefix. `program_interfaces` defers a not-yet-present
+    /// interface's maps; this loop completes the job when it appears.
+    pub fn reconcile_config_interfaces(&mut self, present: &[String], mode: AttachMode) {
+        let present_set: HashSet<&str> = present.iter().map(String::as_str).collect();
+
+        // Attach config interfaces that are present but not yet attached.
+        let todo: Vec<(String, PolicyId, u32)> = self
+            .applied
+            .interfaces
+            .iter()
+            .filter(|i| present_set.contains(i.name.as_str()))
+            .filter(|i| !self.attached.iter().any(|(n, _)| n == &i.name))
+            .map(|i| (i.name.clone(), i.policy, i.vni))
+            .collect();
+        for (name, policy, vni) in todo {
+            match self.attach_config_iface(&name, mode, policy, vni) {
+                Ok(chosen) => {
+                    self.config_attached.insert(name.clone());
+                    log::info!(
+                        "attached config interface {name} -> policy {policy} vni {vni} ({chosen:?})"
+                    );
+                }
+                Err(e) => warn!("attaching config interface {name} failed: {e:#}"),
+            }
+        }
+
+        // Forget config interfaces whose netdev has gone (link auto-detached).
+        let gone: Vec<String> = self
+            .config_attached
+            .iter()
+            .filter(|n| !present_set.contains(n.as_str()))
+            .cloned()
+            .collect();
+        for name in gone {
+            self.config_attached.remove(&name);
+            self.attached.retain(|(n, _)| n != &name);
+            log::info!("detached config interface {name} (interface gone)");
         }
     }
 
@@ -508,11 +602,23 @@ fn program_interfaces(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Resu
     if interfaces.is_empty() {
         return Ok(());
     }
-    // Resolve names to ifindexes once, then do the two map passes.
-    let prepared = interfaces
+    // Resolve names to ifindexes, skipping any interface that doesn't exist yet
+    // (e.g. a pod veth the controller named before the CNI created it). The
+    // config-interface reconcile programs + attaches it once it appears, so a
+    // not-yet-present interface must not fail the whole reconfigure.
+    let prepared: Vec<(u32, PolicyId, u32)> = interfaces
         .iter()
-        .map(|i| Ok((if_nametoindex(&i.name)?, i.policy, i.vni)))
-        .collect::<Result<Vec<_>>>()?;
+        .filter_map(|i| match if_nametoindex(&i.name) {
+            Ok(ifindex) => Some((ifindex, i.policy, i.vni)),
+            Err(_) => {
+                log::debug!("interface {} not present yet; deferring its maps", i.name);
+                None
+            }
+        })
+        .collect();
+    if prepared.is_empty() {
+        return Ok(());
+    }
 
     {
         let mut iface_policy: HashMap<_, u32, PolicyId> = HashMap::try_from(
