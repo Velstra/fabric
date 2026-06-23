@@ -21,10 +21,15 @@ Pod ADD
 
 ## 1. Build and publish the images
 
-The manifests reference `ghcr.io/velstra/{controller,agent,cni}:latest`. Build
-and push them (or `kind load docker-image` for a local Kind cluster). The images
-must contain the binaries on `PATH`: `velstra-controller`, `velstra` (agent),
-and `velstra-cni` at `/usr/local/bin/velstra-cni`.
+The manifests reference `ghcr.io/velstra/{controller,agent,cni}:latest`. CI
+builds and pushes these on every push to the default branch (tagged `latest` +
+the commit SHA) and on `v*` tags (tagged with the version) — so on a published
+cluster you can just pull them.
+
+To build locally instead: `make docker-build` (or `make kind-load` for a local
+Kind cluster). The images package the host-built binaries (`velstra-controller`,
+`velstra`, `velstra-cni`); the eBPF object is embedded in the agent binary, so no
+eBPF toolchain is needed at image-build time.
 
 ## 2. Apply
 

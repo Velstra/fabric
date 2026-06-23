@@ -4,6 +4,7 @@ name: CI
 on:
   push:
     branches: [master, main]
+    tags: ["v*"]
   pull_request:
 
 env:
@@ -40,7 +41,9 @@ jobs:
   # and the control plane, then runs the control-plane tests.
   build:
     name: ebpf + control plane — build & test
-    runs-on: ubuntu-latest
+    # Pinned to match the images' `ubuntu:24.04` base: the COPY-prebuilt binaries
+    # are dynamically linked against the runner's glibc, so runner == image base.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -68,4 +71,61 @@ jobs:
           for cfg in examples/rules.toml examples/loadbalancer.toml \
                      examples/multitenant.toml examples/router.toml examples/overlay.toml; do
             ./target/release/velstra validate "$cfg"
+          done
+      # Hand the freshly-built binaries to the `images` job so it doesn't repeat
+      # the (slow) eBPF release build. Only on push — PRs don't publish.
+      - name: Upload release binaries
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: velstra-binaries
+          path: |
+            target/release/velstra
+            target/release/velstra-controller
+            target/release/velstra-cni
+          retention-days: 1
+          if-no-files-found: error
+
+  # Build the three container images from the binaries the `build` job produced
+  # and push them to GHCR. Runs only on a push to the default branch or a version
+  # tag — never on pull requests (which can't access the registry token anyway).
+  images:
+    name: container images — build & push
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download release binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: velstra-binaries
+          path: target/release
+      - name: Restore the executable bit
+        run: chmod +x target/release/velstra target/release/velstra-controller target/release/velstra-cni
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push (controller, agent, cni)
+        run: |
+          set -eu
+          # GHCR requires a lowercase owner; the SHA is always a tag, plus
+          # `latest` on the default branch and the tag name on a version tag.
+          REGISTRY="ghcr.io/$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          SHA_TAG="${GITHUB_SHA:0:7}"
+          for c in controller agent cni; do
+            TAGS="-t ${REGISTRY}/${c}:${SHA_TAG}"
+            case "$GITHUB_REF" in
+              refs/heads/main|refs/heads/master) TAGS="${TAGS} -t ${REGISTRY}/${c}:latest" ;;
+              refs/tags/*)                       TAGS="${TAGS} -t ${REGISTRY}/${c}:${GITHUB_REF_NAME}" ;;
+            esac
+            echo "building ${c}: ${TAGS}"
+            docker buildx build --push -f "deploy/docker/Dockerfile.${c}" ${TAGS} .
           done
