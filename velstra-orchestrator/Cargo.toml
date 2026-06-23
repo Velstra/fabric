@@ -2,11 +2,18 @@
 name = "velstra-orchestrator"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+description = "The Velstra fabric model: declare hosts/networks/ports and derive each host's data-plane config (IPAM, tunnels, ARP)."
+repository.workspace = true
+homepage.workspace = true
+keywords = ["sdn", "networking", "overlay", "ipam", "velstra"]
+categories = ["network-programming"]
+readme = "README.md"
 
 [dependencies]
-velstra-common = { path = "../velstra-common" }
-velstra-config = { path = "../velstra-config" }
+velstra-common = { path = "../velstra-common", version = "0.1" }
+velstra-config = { path = "../velstra-config", version = "0.1" }
 
 anyhow = { workspace = true, default-features = true }
 serde = { workspace = true, features = ["derive"] }
