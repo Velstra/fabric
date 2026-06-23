@@ -210,7 +210,9 @@ enum OrchAction {
         name: String,
         #[arg(long)]
         subnet: String,
-        #[arg(long)]
+        /// Drop ICMP in this network's policy. Takes an explicit value
+        /// (`--drop-icmp true` / `--drop-icmp false`); defaults to false.
+        #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
         drop_icmp: bool,
     },
     /// Create a port (VM NIC); IP/MAC auto-allocated if `--ip` is omitted.
