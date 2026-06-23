@@ -24,6 +24,10 @@ test: ## Run the full test suite (no root required)
 e2e: build ## Run the end-to-end suite: loads real eBPF on dummy interfaces (needs root)
 	sudo ./tests/e2e/run.sh
 
+.PHONY: e2e-cni
+e2e-cni: build ## Run the controller-integrated CNI e2e (controller+agent+cni; needs root)
+	sudo ./tests/e2e/cni-controller.sh
+
 .PHONY: test-fast
 test-fast: ## Run only the pure-logic tests (no eBPF toolchain needed)
 	cargo test -p velstra-common
