@@ -1,0 +1,115 @@
+# The Velstra agent as a DaemonSet: one per node.
+#
+# An init container installs the CNI plugin (binary + conflist) onto the host.
+# The agent then:
+#   * self-registers this node as a VTEP host (--orchestrator + --vtep-ip),
+#   * watches its config from the controller cluster (--controller, with
+#     failover across all three), and
+#   * attaches the XDP firewall/LB to each pod veth the controller names, as the
+#     CNI creates it (config-driven attach).
+#
+# The CNI's `controllers` and the agent's --orchestrator both point at the
+# admin/orchestrator channel (:50052); --controller points at the agent channel
+# (:50051). Plaintext here for clarity — see README.md for mTLS.
+#
+# Configure for your cluster: the underlay interface (UNDERLAY_IFACE) and the
+# example network (vni 5000 / 192.168.100.0/24) — which must exist in the
+# controller (see README.md "Bootstrap a network").
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: velstra-agent
+  namespace: velstra-system
+  labels:
+    app: velstra-agent
+spec:
+  selector:
+    matchLabels:
+      app: velstra-agent
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: velstra-agent
+    spec:
+      serviceAccountName: velstra-agent
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+        - operator: Exists # run on every node, including control-plane
+      initContainers:
+        - name: install-cni
+          image: ghcr.io/velstra/cni:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              install -m 0755 /usr/local/bin/velstra-cni /host/opt/cni/bin/velstra-cni
+              DOMAIN="velstra-controller.velstra-system.svc.cluster.local"
+              cat > /host/etc/cni/net.d/10-velstra.conflist <<EOF
+              {
+                "cniVersion": "1.0.0",
+                "name": "velstra",
+                "plugins": [
+                  {
+                    "type": "velstra-cni",
+                    "vni": 5000,
+                    "subnet": "192.168.100.0/24",
+                    "nodeFile": "/run/velstra/node",
+                    "controllers": [
+                      "http://velstra-controller-0.${DOMAIN}:50052",
+                      "http://velstra-controller-1.${DOMAIN}:50052",
+                      "http://velstra-controller-2.${DOMAIN}:50052"
+                    ]
+                  }
+                ]
+              }
+              EOF
+              echo "installed velstra-cni + conflist"
+          volumeMounts:
+            - { name: cni-bin, mountPath: /host/opt/cni/bin }
+            - { name: cni-net-d, mountPath: /host/etc/cni/net.d }
+      containers:
+        - name: agent
+          image: ghcr.io/velstra/agent:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true # CAP_BPF/NET_ADMIN/SYS_ADMIN to load + attach XDP
+          env:
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            - name: HOST_IP
+              valueFrom: { fieldRef: { fieldPath: status.hostIP } }
+            - name: UNDERLAY_IFACE
+              value: "eth0"
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /run/velstra
+              printf '%s' "$NODE_NAME" > /run/velstra/node
+              DOMAIN="velstra-controller.velstra-system.svc.cluster.local"
+              exec velstra run \
+                --iface "$UNDERLAY_IFACE" \
+                --node-id "$NODE_NAME" \
+                --vtep-ip "$HOST_IP" \
+                --controller "http://velstra-controller-0.${DOMAIN}:50051" \
+                --controller "http://velstra-controller-1.${DOMAIN}:50051" \
+                --controller "http://velstra-controller-2.${DOMAIN}:50051" \
+                --orchestrator "http://velstra-controller-0.${DOMAIN}:50052" \
+                --orchestrator "http://velstra-controller-1.${DOMAIN}:50052" \
+                --orchestrator "http://velstra-controller-2.${DOMAIN}:50052"
+          volumeMounts:
+            - { name: bpffs, mountPath: /sys/fs/bpf }
+            - { name: run-velstra, mountPath: /run/velstra }
+      volumes:
+        - name: cni-bin
+          hostPath: { path: /opt/cni/bin, type: DirectoryOrCreate }
+        - name: cni-net-d
+          hostPath: { path: /etc/cni/net.d, type: DirectoryOrCreate }
+        - name: bpffs
+          hostPath: { path: /sys/fs/bpf, type: Directory }
+        - name: run-velstra
+          hostPath: { path: /run/velstra, type: DirectoryOrCreate }

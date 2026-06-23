@@ -1,0 +1,24 @@
+# Namespace and service accounts for the Velstra control plane.
+#
+# This is a deployment *skeleton*: it brings up an HA controller cluster and a
+# per-node agent + CNI. It runs over plaintext gRPC for clarity — see README.md
+# for the (required-in-production) mTLS + NetworkPolicy hardening, since the
+# orchestrator/admin channel (:50052) can mutate the fabric.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: velstra-system
+  labels:
+    app.kubernetes.io/part-of: velstra
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: velstra-controller
+  namespace: velstra-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: velstra-agent
+  namespace: velstra-system
