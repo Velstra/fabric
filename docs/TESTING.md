@@ -410,6 +410,15 @@ For a second "node" on the same host, repeat steps 3–4 with `--node-id node-b`
 a different `--vtep-ip`, and a second dummy interface — the controller derives a
 tunnel + ARP entry between the two ports (the overlay path covered in §§3–4).
 
+With two nodes you can also **migrate** a port (move a workload, keeping its
+IP/MAC) and watch every peer's tunnel re-point at the new host:
+
+```shell
+./target/release/velstra-controller orch --endpoint http://127.0.0.1:50052 \
+    migrate-port --id port-5000-192.168.100.1 --host node-b --tap tapB2
+#  -> migrated port … now on node-b via tapB2   (same ip/mac)
+```
+
 ## 9. Kubernetes (Kind)
 
 The manifests in [`deploy/k8s/`](../deploy/k8s/) bring up the HA controller

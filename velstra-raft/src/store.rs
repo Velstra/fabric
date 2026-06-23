@@ -81,6 +81,11 @@ pub enum TopoRequest {
     RemovePort {
         id: String,
     },
+    MigratePort {
+        id: String,
+        host: String,
+        tap: String,
+    },
 }
 
 /// A serializable view of an allocated port (the result of `CreatePort`).
@@ -181,6 +186,17 @@ pub fn apply(topo: &mut Topology, req: &TopoRequest) -> TopoResponse {
         TopoRequest::RemovePort { id } => {
             topo.remove_port(id);
             Ok(None)
+        }
+        TopoRequest::MigratePort { id, host, tap } => {
+            let p = topo.migrate_port(id, host, tap)?;
+            Ok(Some(PortRecord {
+                id: p.id,
+                vni: p.vni,
+                host: p.host,
+                ip: p.ip.to_string(),
+                mac: fmt_mac(p.mac),
+                tap: p.tap,
+            }))
         }
     })();
     match outcome {
@@ -571,5 +587,87 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             meta: s.meta.clone(),
             snapshot: Box::new(Cursor::new(s.data.clone())),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use velstra_config::{ActionName, EncapName};
+    use velstra_orchestrator::Topology;
+
+    use super::*;
+
+    fn host_spec(id: &str, vtep: &str) -> HostSpec {
+        HostSpec {
+            id: id.into(),
+            vtep: vtep.into(),
+            underlay_iface: "eth0".into(),
+            underlay_mac: "02:00:00:00:00:11".into(),
+            encap: EncapName::Vxlan,
+            udp_port: None,
+            underlay_mtu: None,
+        }
+    }
+
+    #[test]
+    fn apply_migrate_port_moves_host_keeping_identity() {
+        let mut t = Topology::new();
+        assert!(apply(&mut t, &TopoRequest::AddHost(host_spec("h1", "10.0.0.1"))).ok);
+        assert!(apply(&mut t, &TopoRequest::AddHost(host_spec("h2", "10.0.0.2"))).ok);
+        assert!(
+            apply(
+                &mut t,
+                &TopoRequest::AddNetwork(NetworkSpec {
+                    vni: 5000,
+                    name: "blue".into(),
+                    subnet: "192.168.100.0/24".into(),
+                    default_action: ActionName::Pass,
+                    drop_icmp: false,
+                })
+            )
+            .ok
+        );
+        let port = apply(
+            &mut t,
+            &TopoRequest::CreatePort {
+                vni: 5000,
+                host: "h1".into(),
+                tap: "tapA".into(),
+                ip: None,
+            },
+        )
+        .port
+        .expect("create returns a port");
+        assert_eq!(port.host, "h1");
+
+        // Migrate to h2 with a new tap; identity (id/ip/mac) is preserved.
+        let migrated = apply(
+            &mut t,
+            &TopoRequest::MigratePort {
+                id: port.id.clone(),
+                host: "h2".into(),
+                tap: "tapA2".into(),
+            },
+        );
+        assert!(migrated.ok, "migrate failed: {:?}", migrated.error);
+        let mp = migrated.port.expect("migrate returns the port");
+        assert_eq!(mp.id, port.id);
+        assert_eq!(mp.ip, port.ip);
+        assert_eq!(mp.mac, port.mac);
+        assert_eq!(mp.host, "h2");
+        assert_eq!(mp.tap, "tapA2");
+
+        // Migrating onto an unknown host is a failed response, not a panic.
+        assert!(
+            !apply(
+                &mut t,
+                &TopoRequest::MigratePort {
+                    id: port.id,
+                    host: "ghost".into(),
+                    tap: "x".into(),
+                },
+            )
+            .ok
+        );
     }
 }

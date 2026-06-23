@@ -196,6 +196,26 @@ impl Topology {
         self.ports.len() != before
     }
 
+    /// Move an existing port to `new_host`, binding it to `new_tap` there. The
+    /// port keeps its identity — id, VNI, IP, and MAC — so a live-migrated
+    /// workload stays reachable at the same address. `derive()` then re-points
+    /// every peer's tunnel/ARP entry at the new host's VTEP, the old host loses
+    /// the local interface binding (and gains a tunnel back to the port), and the
+    /// new host gains it. A no-op host move still updates the tap.
+    pub fn migrate_port(&mut self, id: &str, new_host: &str, new_tap: &str) -> Result<Port> {
+        if !self.hosts.contains_key(new_host) {
+            bail!("unknown host {new_host:?}");
+        }
+        let port = self
+            .ports
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or_else(|| anyhow::anyhow!("unknown port {id:?}"))?;
+        port.host = new_host.to_string();
+        port.tap = new_tap.to_string();
+        Ok(port.clone())
+    }
+
     fn subnet_contains(&self, vni: u32, ip: Ipv4Addr) -> bool {
         let Some(net) = self.networks.get(&vni) else {
             return false;
@@ -673,5 +693,47 @@ mod tests {
         let cfg = t.derive("h1").unwrap().resolve().unwrap();
         assert!(cfg.tunnels.is_empty());
         assert!(cfg.neighbors.is_empty());
+    }
+
+    #[test]
+    fn migrating_a_port_preserves_identity_and_repoints_peers() {
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.10.0.1", 0x11));
+        t.add_host(host("h2", "10.10.0.2", 0x22));
+        t.add_host(host("h3", "10.10.0.3", 0x33));
+        t.add_network(network(5000, "blue", "192.168.100.0/24"))
+            .unwrap();
+        // pa lives on h1; pc gives h3 a port on the network so it tunnels to pa.
+        let pa = t.create_port(5000, "h1", "tapA", None).unwrap();
+        t.create_port(5000, "h3", "tapC", None).unwrap();
+
+        // Before: h3 tunnels to pa via h1's VTEP.
+        let h3 = t.derive("h3").unwrap().resolve().unwrap();
+        assert_eq!(h3.tunnels[0].inner_dst.octets, pa.ip.octets());
+        assert_eq!(h3.tunnels[0].remote_vtep_ip, [10, 10, 0, 1]); // h1
+
+        // Migrate pa from h1 to h2 with a new tap.
+        let moved = t.migrate_port(&pa.id, "h2", "tapA2").unwrap();
+        // Identity preserved: same id, ip, mac, vni.
+        assert_eq!(moved.id, pa.id);
+        assert_eq!(moved.ip, pa.ip);
+        assert_eq!(moved.mac, pa.mac);
+        assert_eq!(moved.host, "h2");
+        assert_eq!(moved.tap, "tapA2");
+
+        // After: the port is local on h2 (interface tapA2), and h3's tunnel to it
+        // now points at h2's VTEP — same inner IP/MAC.
+        let h2 = t.derive("h2").unwrap().resolve().unwrap();
+        assert!(h2.interfaces.iter().any(|i| i.name == "tapA2"));
+        let h3 = t.derive("h3").unwrap().resolve().unwrap();
+        assert_eq!(h3.tunnels[0].inner_dst.octets, pa.ip.octets());
+        assert_eq!(h3.tunnels[0].remote_vtep_ip, [10, 10, 0, 2]); // now h2
+        // h1 no longer hosts it locally.
+        let h1 = t.derive("h1").unwrap().resolve().unwrap();
+        assert!(!h1.interfaces.iter().any(|i| i.name == "tapA"));
+
+        // Unknown host / port are errors.
+        assert!(t.migrate_port(&pa.id, "ghost", "tap").is_err());
+        assert!(t.migrate_port("port-nope", "h2", "tap").is_err());
     }
 }

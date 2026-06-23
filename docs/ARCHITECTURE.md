@@ -244,14 +244,18 @@ of network namespaces, see [TESTING.md](TESTING.md).
   `NodeConfig`, so the data plane and agent are untouched. This is the leap from
   "configure each host" to "declare the fabric". A `VelstraOrchestrator` gRPC
   service (on the admin channel) exposes the model at **runtime** —
-  `AddHost`/`AddNetwork`/`CreatePort`/`RemovePort`/`ListPorts` (with the `orch`
-  CLI) — mutating a live `Topology` in the controller; each mutation re-derives
-  and re-serves, so a `create-port` propagates to the affected hosts immediately.
-  The `--topology` file is the **durable store**: loaded at startup and written
-  back atomically (temp + rename) after every mutation, with ports pinning their
-  allocated IP so a reload reproduces the same ids/MACs — the appliance survives a
-  restart. *Follow-ups:* port migration (move host) and a TLS'd orchestration
-  channel.
+  `AddHost`/`AddNetwork`/`CreatePort`/`RemovePort`/`MigratePort`/`ListPorts` (with
+  the `orch` CLI) — mutating a live `Topology` in the controller; each mutation
+  re-derives and re-serves, so a `create-port` propagates to the affected hosts
+  immediately. `migrate-port` moves a port to another host while keeping its
+  id/IP/MAC, so a live-migrated workload stays reachable and every peer's
+  tunnel/ARP entry re-points at the new VTEP. The `--topology` file is the
+  **durable store**: loaded at startup and written back atomically (temp +
+  rename) after every mutation, with ports pinning their allocated IP so a reload
+  reproduces the same ids/MACs — the appliance survives a restart. The
+  orchestrator channel can require **mTLS** (`--tls-cert/--client-ca`), so the
+  earlier follow-ups — port migration and a secured orchestration channel — are
+  both done.
 * **Controller HA (Track D)** — *done.* `velstra-raft` wraps **openraft**: the
   replicated state machine **is** the orchestrator `Topology`, so a committed
   `TopoRequest` is applied in log order on every controller (deterministic IPAM).
