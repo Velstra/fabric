@@ -15,7 +15,7 @@ pub fn veth_name(container_id: &str) -> String {
         hash ^= b as u64;
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    format!("hyp{:08x}", hash as u32) // "hyp" + 8 hex = 11 chars
+    format!("vel{:08x}", hash as u32) // "vel" + 8 hex = 11 chars
 }
 
 /// Run an `ip` command, surfacing stderr on failure.
@@ -42,7 +42,7 @@ impl NetnsLink {
     fn create(netns_path: &str) -> Result<Self> {
         let dir = Path::new("/var/run/netns");
         std::fs::create_dir_all(dir).context("creating /var/run/netns")?;
-        let name = format!("hypcni{}", std::process::id());
+        let name = format!("velcni{}", std::process::id());
         let link = dir.join(&name);
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink(netns_path, &link)
@@ -63,7 +63,9 @@ impl Drop for NetnsLink {
 
 /// Wire up the pod: a veth pair with `host_veth` on the host and `ifname` inside
 /// `netns`, addressed `ip/prefix` with a default route via `gateway`, plus a
-/// host route to the pod over the host veth.
+/// host route to the pod over the host veth. If `mac` is given, the pod
+/// interface wears it — required in controller mode so the overlay's ARP
+/// suppression (which answers with the allocated MAC) routes frames to the pod.
 pub fn setup(
     netns: &str,
     ifname: &str,
@@ -71,6 +73,7 @@ pub fn setup(
     ip_addr: Ipv4Addr,
     prefix: u8,
     gateway: Ipv4Addr,
+    mac: Option<&str>,
 ) -> Result<()> {
     let link = NetnsLink::create(netns)?;
     let ns = link.name();
@@ -85,6 +88,10 @@ pub fn setup(
     ip(&["link", "set", &peer, "netns", ns])?;
     ip(&["-n", ns, "link", "set", &peer, "name", ifname])?;
     ip(&["-n", ns, "link", "set", "lo", "up"])?;
+    // Set the MAC while the interface is down, before bringing it up.
+    if let Some(mac) = mac {
+        ip(&["-n", ns, "link", "set", ifname, "address", mac])?;
+    }
     ip(&["-n", ns, "link", "set", ifname, "up"])?;
     ip(&[
         "-n",
@@ -132,6 +139,6 @@ mod tests {
         assert_eq!(a, veth_name("abc123"));
         assert_ne!(a, veth_name("abc124"));
         assert!(a.len() <= 15, "ifname too long: {a}");
-        assert!(a.starts_with("hyp"));
+        assert!(a.starts_with("vel"));
     }
 }

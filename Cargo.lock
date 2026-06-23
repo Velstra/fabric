@@ -2239,7 +2239,10 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "tokio",
+ "tonic",
  "velstra-common",
+ "velstra-proto",
 ]
 
 [[package]]

@@ -323,7 +323,7 @@ echo "$CONF" | sudo CNI_COMMAND=ADD CNI_CONTAINERID=test1 \
 
 sudo ip netns exec testpod ip addr show eth0   # has 10.244.0.2/24
 sudo ip netns exec testpod ip route            # default via 10.244.0.1
-ip link show type veth | grep hyp              # the host-side veth
+ip link show type veth | grep vel              # the host-side veth
 
 # DEL: tear it down (idempotent).
 echo "$CONF" | sudo CNI_COMMAND=DEL CNI_CONTAINERID=test1 \
@@ -336,5 +336,5 @@ sudo ip netns del testpod
 In a real cluster, install the binary to `/opt/cni/bin/velstra-cni` and the
 [`examples/cni/10-velstra.conflist`](../examples/cni/10-velstra.conflist) to
 `/etc/cni/net.d/`. The Velstra agent, run as a DaemonSet, then attaches the XDP
-firewall/LB to the `hyp*` host veths this plugin creates — that agent-side
+firewall/LB to the `vel*` host veths this plugin creates — that agent-side
 integration is the next step on the roadmap.
