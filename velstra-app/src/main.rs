@@ -17,7 +17,7 @@ mod firewall;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use log::{error, info, warn};
 use tokio::{signal, sync::Mutex};
@@ -94,6 +94,24 @@ struct RunArgs {
     #[arg(long)]
     tls_domain: Option<String>,
 
+    /// Orchestrator endpoint(s), e.g. `https://10.0.0.1:50052`. Repeatable.
+    /// When set, this node self-registers as a VTEP host with the controller
+    /// (`AddHost`) so the orchestrator can place ports on it — the agent's side
+    /// of the Kubernetes CNI integration. Uses the same TLS as `--controller`.
+    #[arg(long = "orchestrator")]
+    orchestrators: Vec<String>,
+    /// This node's underlay VTEP IPv4, advertised in self-registration. Required
+    /// with `--orchestrator`.
+    #[arg(long, requires = "orchestrators")]
+    vtep_ip: Option<String>,
+    /// Underlay interface whose MAC is advertised in self-registration. Defaults
+    /// to the first `--iface`.
+    #[arg(long)]
+    underlay_iface: Option<String>,
+    /// Encapsulation advertised in self-registration.
+    #[arg(long, value_enum, default_value_t = EncapArg::Vxlan)]
+    encap: EncapArg,
+
     /// XDP attach mode.
     #[arg(long, value_enum, default_value_t = AttachMode::Auto)]
     xdp_mode: AttachMode,
@@ -114,6 +132,24 @@ struct RunArgs {
 struct ValidateArgs {
     /// Path to the TOML config to validate.
     config: PathBuf,
+}
+
+/// Encapsulation advertised when the agent self-registers its host.
+#[derive(Copy, Clone, Debug, Default, clap::ValueEnum)]
+enum EncapArg {
+    #[default]
+    Vxlan,
+    Geneve,
+}
+
+impl EncapArg {
+    /// The matching `velstra.v1.Encap` proto value.
+    fn as_proto(self) -> i32 {
+        match self {
+            EncapArg::Vxlan => velstra_proto::Encap::Vxlan as i32,
+            EncapArg::Geneve => velstra_proto::Encap::Geneve as i32,
+        }
+    }
 }
 
 #[tokio::main]
@@ -219,6 +255,18 @@ async fn run(args: RunArgs) -> Result<()> {
     // prefix. The controller may name a veth before the CNI has created it.
     if !args.controllers.is_empty() {
         tokio::spawn(config_attach_loop(firewall.clone(), args.xdp_mode));
+    }
+
+    // Self-register this node as a VTEP host so the orchestrator can place ports
+    // on it (the agent side of the Kubernetes CNI flow).
+    if !args.orchestrators.is_empty() {
+        let spec = build_host_spec(&args)?;
+        info!("self-registering host {:?} (vtep {})", spec.id, spec.vtep);
+        tokio::spawn(register_host_loop(
+            args.orchestrators.clone(),
+            tls.clone(),
+            spec,
+        ));
     }
 
     // In controller mode, apply pushed updates in the background — reconnecting
@@ -388,6 +436,61 @@ async fn config_attach_loop(firewall: Arc<Mutex<Firewall>>, mode: AttachMode) {
             .lock()
             .await
             .reconcile_config_interfaces(&present, mode);
+    }
+}
+
+/// Read an interface's MAC address string from `/sys/class/net/<iface>/address`.
+fn read_iface_mac(iface: &str) -> Result<String> {
+    let path = format!("/sys/class/net/{iface}/address");
+    let mac = std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
+    let mac = mac.trim().to_string();
+    if mac.is_empty() {
+        anyhow::bail!("{path} is empty");
+    }
+    Ok(mac)
+}
+
+/// Build the [`HostSpec`] this node advertises when self-registering as a VTEP.
+fn build_host_spec(args: &RunArgs) -> Result<velstra_proto::HostSpec> {
+    let id = args.node_id.clone().unwrap_or_else(default_node_id);
+    let vtep = args
+        .vtep_ip
+        .clone()
+        .ok_or_else(|| anyhow!("--orchestrator requires --vtep-ip"))?;
+    let underlay_iface = args
+        .underlay_iface
+        .clone()
+        .or_else(|| args.iface.first().cloned())
+        .ok_or_else(|| anyhow!("--orchestrator requires --underlay-iface or an --iface"))?;
+    let underlay_mac = read_iface_mac(&underlay_iface)?;
+    Ok(velstra_proto::HostSpec {
+        id,
+        vtep,
+        underlay_iface,
+        underlay_mac,
+        encap: args.encap.as_proto(),
+        udp_port: 0,     // encap default
+        underlay_mtu: 0, // default (1500)
+    })
+}
+
+/// Background task: register this node's host with the controller, retrying
+/// until it succeeds once (`AddHost` is replace-idempotent).
+async fn register_host_loop(
+    endpoints: Vec<String>,
+    tls: Option<controller_client::TlsOptions>,
+    spec: velstra_proto::HostSpec,
+) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(3));
+    loop {
+        ticker.tick().await;
+        match controller_client::register_host(&endpoints, &tls, &spec).await {
+            Ok(()) => {
+                info!("registered host {:?} with the controller", spec.id);
+                return;
+            }
+            Err(e) => warn!("host registration failed: {e:#}; retrying"),
+        }
     }
 }
 
