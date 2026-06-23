@@ -9,8 +9,9 @@ use tonic::{
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity},
 };
 use velstra_proto::{
-    Counter as ProtoCounter, NodeConfig, NodeRequest, StatsReport,
+    Counter as ProtoCounter, HostSpec, NodeConfig, NodeRequest, StatsReport,
     velstra_control_client::VelstraControlClient,
+    velstra_orchestrator_client::VelstraOrchestratorClient,
 };
 
 use crate::firewall::Stats;
@@ -81,6 +82,30 @@ pub async fn watch_any(
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow!("no controller endpoints configured")))
+}
+
+/// Register (or replace) this node's Host (VTEP) with the controller, trying
+/// each orchestrator endpoint until the leader accepts (followers redirect, so
+/// we move on). `AddHost` is replace-idempotent, so re-registration is safe.
+pub async fn register_host(
+    endpoints: &[String],
+    tls: &Option<TlsOptions>,
+    spec: &HostSpec,
+) -> Result<()> {
+    let mut last_err = None;
+    for endpoint in endpoints {
+        match connect(endpoint, tls).await {
+            Ok(channel) => {
+                let mut client = VelstraOrchestratorClient::new(channel);
+                match client.add_host(spec.clone()).await {
+                    Ok(_) => return Ok(()),
+                    Err(e) => last_err = Some(anyhow!("{endpoint}: AddHost: {e}")),
+                }
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("no orchestrator endpoints configured")))
 }
 
 /// A client for pushing periodic statistics back to the controller.
