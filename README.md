@@ -539,9 +539,12 @@ For a guided manual walkthrough of all three phases (incl. routing & LB), follow
   live-updates per-node config across a fleet (file + runtime admin overrides),
   secured with **mTLS**; agents report stats back.
 * **Kubernetes CNI (in progress):** `velstra-cni` implements the CNI protocol
-  with host-local IPAM and pod veth/netns setup
-  (see [`docs/TESTING.md`](docs/TESTING.md) §7). Next: the agent attaches the XDP
-  firewall/LB to each pod veth (run as a DaemonSet).
+  with pod veth/netns setup (see [`docs/TESTING.md`](docs/TESTING.md) §7). Two
+  modes: **standalone** (host-local IPAM) and **controller-integrated**, where
+  ADD calls the controller's `CreatePort` (Raft-replicated IP/MAC allocation) and
+  the node's agent — on the pushed config — attaches the XDP firewall/LB to the
+  new pod veth. Next: the agent DaemonSet + manifests, and attaching to a
+  configured veth as it appears.
 
 ## License
 

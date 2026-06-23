@@ -1,0 +1,16 @@
+{
+  "cniVersion": "1.0.0",
+  "name": "blue",
+  "plugins": [
+    {
+      "type": "velstra-cni",
+      "vni": 5000,
+      "subnet": "192.168.100.0/24",
+      "controllers": ["https://10.0.0.1:50052", "https://10.0.0.2:50052", "https://10.0.0.3:50052"],
+      "nodeFile": "/run/velstra/node",
+      "tlsCA": "/etc/velstra/pki/ca.pem",
+      "tlsCert": "/etc/velstra/pki/cni.pem",
+      "tlsKey": "/etc/velstra/pki/cni.key"
+    }
+  ]
+}

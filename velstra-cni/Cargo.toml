@@ -10,9 +10,14 @@ path = "src/main.rs"
 
 [dependencies]
 velstra-common = { path = "../velstra-common" }
+velstra-proto = { path = "../velstra-proto" }
 
 anyhow = { workspace = true, default-features = true }
 serde = { workspace = true, features = ["std"] }
 serde_json = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
+# The CNI is a short-lived sync process; it drives the gRPC calls on a
+# current-thread runtime built for the duration of one ADD/DEL.
+tonic = { workspace = true }
+tokio = { workspace = true, features = ["rt", "net", "time"] }
