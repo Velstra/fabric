@@ -1,0 +1,85 @@
+# The controller as a 3-node embedded-Raft cluster (Track D).
+#
+# Each replica is one Raft node; the StatefulSet gives stable pod names
+# (velstra-controller-0/1/2) and, via the headless Service, stable peer DNS. The
+# node id is derived from the pod ordinal (+1); ordinal 0 also passes --bootstrap
+# (a no-op once the cluster is initialised, so restarts are safe). Snapshots
+# persist to a per-pod PVC (--raft-dir), so the fabric survives a full restart.
+apiVersion: v1
+kind: Service
+metadata:
+  name: velstra-controller
+  namespace: velstra-system
+  labels:
+    app: velstra-controller
+spec:
+  clusterIP: None # headless: gives each pod a stable DNS name for Raft peering
+  # Peers must resolve each other *before* readiness so the cluster can form.
+  publishNotReadyAddresses: true
+  selector:
+    app: velstra-controller
+  ports:
+    - { name: agent, port: 50051 }
+    - { name: admin, port: 50052 }
+    - { name: raft, port: 50053 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: velstra-controller
+  namespace: velstra-system
+spec:
+  serviceName: velstra-controller
+  replicas: 3
+  podManagementPolicy: Parallel # all peers come up together so bootstrap can form
+  selector:
+    matchLabels:
+      app: velstra-controller
+  template:
+    metadata:
+      labels:
+        app: velstra-controller
+    spec:
+      serviceAccountName: velstra-controller
+      containers:
+        - name: controller
+          image: ghcr.io/velstra/controller:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              ORD="${HOSTNAME##*-}"
+              NODE_ID=$((ORD + 1))
+              DOMAIN="velstra-controller.velstra-system.svc.cluster.local"
+              BOOTSTRAP=""
+              [ "$ORD" = "0" ] && BOOTSTRAP="--bootstrap"
+              exec velstra-controller serve \
+                --node-id "$NODE_ID" \
+                --listen 0.0.0.0:50051 \
+                --admin-listen 0.0.0.0:50052 \
+                --raft-listen 0.0.0.0:50053 \
+                --raft-dir /var/lib/velstra \
+                --peer "1=velstra-controller-0.${DOMAIN}:50053" \
+                --peer "2=velstra-controller-1.${DOMAIN}:50053" \
+                --peer "3=velstra-controller-2.${DOMAIN}:50053" \
+                $BOOTSTRAP
+          ports:
+            - { name: agent, containerPort: 50051 }
+            - { name: admin, containerPort: 50052 }
+            - { name: raft, containerPort: 50053 }
+          volumeMounts:
+            - name: raft-data
+              mountPath: /var/lib/velstra
+          readinessProbe:
+            tcpSocket: { port: 50051 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: raft-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

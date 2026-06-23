@@ -888,12 +888,17 @@ async fn serve(args: ServeArgs) -> Result<()> {
         shared.recompute(&mut state);
     }
 
-    // Bootstrap the cluster (run once, on one node).
+    // Bootstrap the cluster (run once, on one node). On a restart the cluster is
+    // already initialised — bootstrapping again is a harmless no-op, so a failure
+    // here is logged and ignored rather than crashing the controller (this is
+    // what lets a StatefulSet always pass --bootstrap on ordinal 0).
     if args.bootstrap {
         let raft = raft.as_ref().expect("--bootstrap requires --node-id");
         let members = parse_peers(&args.peers, args.node_id.unwrap(), &args.raft_listen)?;
         info!("bootstrapping cluster with {} member(s)", members.len());
-        raft.bootstrap(members).await?;
+        if let Err(e) = raft.bootstrap(members).await {
+            warn!("bootstrap skipped (cluster likely already initialised): {e:#}");
+        }
     }
 
     if let Some(dir) = &args.config_dir {
