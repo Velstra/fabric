@@ -1,0 +1,14 @@
+# Velstra agent runtime image.
+#
+# The eBPF object is embedded in the binary at compile time, so the image needs
+# no eBPF toolchain — just glibc, a shell (for the DaemonSet command wrapper),
+# and CA certificates (for mTLS to the controller). Build first: `make build`.
+#
+# Base note: ubuntu:24.04 (glibc 2.39) must be >= the host's glibc the binary was
+# linked against. A hermetic multi-stage builder removes that coupling.
+FROM ubuntu:24.04
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY target/release/velstra /usr/local/bin/velstra
+ENTRYPOINT ["/usr/local/bin/velstra"]
