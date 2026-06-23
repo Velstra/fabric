@@ -1,0 +1,11 @@
+# Keep the image build context tiny: the Dockerfiles COPY pre-built release
+# binaries (the eBPF object is already embedded), so send only those — not the
+# multi-GB target/ tree or the source.
+*
+!target
+target/*
+!target/release
+target/release/*
+!target/release/velstra
+!target/release/velstra-cni
+!target/release/velstra-controller

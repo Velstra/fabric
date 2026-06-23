@@ -1,0 +1,15 @@
+# Velstra controller runtime image.
+#
+# COPY-prebuilt: build the binary on the host first (`make build`), then this
+# image just packages it. A shell is included for the StatefulSet command
+# wrapper; ca-certificates for TLS to peers/clients.
+#
+# Base note: ubuntu:24.04 ships glibc 2.39 — the binaries are dynamically linked
+# against the host's glibc, so the base must be >= the host's. For fully portable
+# images, build hermetically in a multi-stage builder instead of COPY-prebuilt.
+FROM ubuntu:24.04
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY target/release/velstra-controller /usr/local/bin/velstra-controller
+ENTRYPOINT ["/usr/local/bin/velstra-controller"]

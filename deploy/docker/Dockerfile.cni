@@ -1,0 +1,12 @@
+# Velstra CNI plugin image.
+#
+# Used by the agent DaemonSet's init container, which copies the binary onto the
+# host's /opt/cni/bin and writes the conflist. The plugin itself then runs on the
+# host (invoked by the kubelet), using the host's `ip(8)`. Build first:
+# `make build`.
+#
+# Base note: ubuntu:24.04 (glibc 2.39) must be >= the host's glibc the binary was
+# linked against.
+FROM ubuntu:24.04
+COPY target/release/velstra-cni /usr/local/bin/velstra-cni
+ENTRYPOINT ["/usr/local/bin/velstra-cni"]
