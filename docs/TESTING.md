@@ -333,8 +333,116 @@ echo "$CONF" | sudo CNI_COMMAND=DEL CNI_CONTAINERID=test1 \
 sudo ip netns del testpod
 ```
 
-In a real cluster, install the binary to `/opt/cni/bin/velstra-cni` and the
-[`examples/cni/10-velstra.conflist`](../examples/cni/10-velstra.conflist) to
-`/etc/cni/net.d/`. The Velstra agent, run as a DaemonSet, then attaches the XDP
-firewall/LB to the `vel*` host veths this plugin creates — that agent-side
-integration is the next step on the roadmap.
+The config above is **standalone** mode: the plugin's own host-local IPAM
+allocates the address. The next section drives the **controller-integrated**
+mode, where the controller allocates and the agent attaches the data plane.
+
+## 8. Controller-integrated CNI (single host, no Kubernetes)
+
+This validates the whole control path on one machine: `CNI ADD →
+controller.CreatePort → Raft → derived config → agent attaches XDP to the pod
+veth`. Needs root (the agent loads eBPF). Run each background process in its own
+terminal, or `&` them as shown.
+
+```shell
+cargo build --release
+
+# A dummy interface only as the VTEP MAC/IP source — the agent reads its MAC for
+# self-registration but does NOT attach XDP to it (XDP on a dummy sees nothing;
+# here the firewall attaches to the pod veth, which is a real RX path).
+sudo ip link add dummy0 type dummy && sudo ip link set dummy0 up
+
+# 1. A single-node controller in cluster mode (the Raft leader of a 1-node cluster).
+./target/release/velstra-controller serve \
+    --node-id 1 --bootstrap \
+    --listen 127.0.0.1:50051 --admin-listen 127.0.0.1:50052 \
+    --raft-listen 127.0.0.1:50053 &
+sleep 2
+
+# 2. Define the tenant network the CNI will attach pods to.
+./target/release/velstra-controller orch --endpoint http://127.0.0.1:50052 \
+    add-network --vni 5000 --name blue --subnet 192.168.100.0/24 --drop-icmp false
+
+# 3. The agent: self-registers host "node-a" and does config-driven attach.
+#    No --iface: --controller alone enables config-driven attach; --underlay-iface
+#    supplies the VTEP MAC for self-registration.
+sudo ./target/release/velstra run \
+    --underlay-iface dummy0 --node-id node-a --vtep-ip 10.0.0.1 \
+    --controller http://127.0.0.1:50051 \
+    --orchestrator http://127.0.0.1:50052 &
+sleep 2   # let it register the host
+
+# 4. Drive the CNI in controller mode for a test pod.
+sudo ip netns add testpod
+CONF='{"cniVersion":"1.0.0","name":"blue","type":"velstra-cni","vni":5000,
+       "subnet":"192.168.100.0/24","node":"node-a",
+       "controllers":["http://127.0.0.1:50052"]}'
+echo "$CONF" | sudo CNI_COMMAND=ADD CNI_CONTAINERID=pod1 \
+    CNI_NETNS=/var/run/netns/testpod CNI_IFNAME=eth0 \
+    ./target/release/velstra-cni
+#  -> ip 192.168.100.1 (allocated by the controller) + its MAC 02:00:c0:a8:64:01
+```
+
+Verify the controller allocated the port and the agent picked up the veth:
+
+```shell
+sudo ip netns exec testpod ip addr show eth0          # 192.168.100.1/24, that MAC
+
+VETH=$(ip -o link show type veth | grep -o 'vel[0-9a-f]*' | head -1)
+ip link show "$VETH"                                  # within ~2s shows "prog/xdp"
+
+./target/release/velstra-controller orch --endpoint http://127.0.0.1:50052 list-ports
+#  -> port-5000-192.168.100.1  host node-a  tap vel<hash>
+```
+
+Tear down:
+
+```shell
+echo "$CONF" | sudo CNI_COMMAND=DEL CNI_CONTAINERID=pod1 \
+    CNI_NETNS=/var/run/netns/testpod CNI_IFNAME=eth0 \
+    ./target/release/velstra-cni        # also calls RemovePort
+sudo ip netns del testpod
+sudo ip link del dummy0
+kill %1 %2 2>/dev/null                   # controller + agent
+```
+
+For a second "node" on the same host, repeat steps 3–4 with `--node-id node-b`,
+a different `--vtep-ip`, and a second dummy interface — the controller derives a
+tunnel + ARP entry between the two ports (the overlay path covered in §§3–4).
+
+## 9. Kubernetes (Kind)
+
+The manifests in [`deploy/k8s/`](../deploy/k8s/) bring up the HA controller
+and the agent/CNI DaemonSet. On a host where you can load XDP:
+
+```shell
+kind create cluster --config - <<'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  disableDefaultCNI: true        # Velstra is the cluster CNI
+nodes: [{role: control-plane}, {role: worker}, {role: worker}]
+EOF
+
+# Build + side-load the images (tags must match deploy/k8s/*.yaml).
+make docker-build           # or: docker build per component
+for img in controller agent cni; do kind load docker-image "ghcr.io/velstra/$img:latest"; done
+
+kubectl apply -f deploy/k8s/
+kubectl -n velstra-system rollout status statefulset/velstra-controller
+kubectl -n velstra-system rollout status daemonset/velstra-agent
+
+# Bootstrap the network the conflist references, then schedule pods.
+kubectl -n velstra-system exec velstra-controller-0 -- \
+    velstra-controller orch --endpoint http://127.0.0.1:50052 \
+    add-network --vni 5000 --name blue --subnet 192.168.100.0/24 --drop-icmp false
+
+kubectl run a --image=nicolaka/netshoot --command -- sleep 1d
+kubectl run b --image=nicolaka/netshoot --command -- sleep 1d
+kubectl get pods -o wide                  # each gets a 192.168.100.x address
+kubectl exec a -- ping -c2 <b's IP>        # overlay reachability across nodes
+```
+
+See [`deploy/k8s/README.md`](../deploy/k8s/README.md) for configuring the
+underlay interface, multiple networks, and the (production-required) mTLS +
+NetworkPolicy hardening.
