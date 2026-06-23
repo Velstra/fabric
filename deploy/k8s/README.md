@@ -69,15 +69,72 @@ kubectl -n velstra-system exec velstra-controller-0 -- \
 - **Network** — change `vni`/`subnet` in the conflist (`20-agent.yaml`) and the
   matching `add-network`. Multiple networks = multiple conflists.
 
-## Production hardening (not in this skeleton)
+## mTLS
 
-- **mTLS.** The control channels run plaintext here. Both the agent
-  (`--tls-ca/--tls-cert/--tls-key`) and the CNI (`tlsCA`/`tlsCert`/`tlsKey` in
-  the conflist) support TLS; mount a cert Secret and switch the endpoints to
-  `https://`. Generate PKI with `scripts/gen-certs.sh`.
-- **Lock down the orchestrator channel.** `:50052` can mutate the fabric. Add a
-  `NetworkPolicy` so only agents/CNI reach it, on top of mTLS client auth.
-- **Resource requests/limits** and `PodDisruptionBudget` for the controller.
+The base manifests run plaintext for clarity. Both control channels — the agent
+channel (`:50051`) **and** the fabric-mutating admin/orchestrator channel
+(`:50052`) — support TLS with client-cert verification. Turn it on:
+
+**1. Generate the PKI and Secrets** (CA, a multi-SAN server cert, agent + cni
+client certs):
+
+```shell
+./deploy/k8s/tls/gen-pki.sh velstra-system
+```
+
+**2. Controller** (`10-controller.yaml`) — mount the server Secret and pass the
+TLS flags (they cover both channels):
+
+```yaml
+        # container:
+          # ... existing args, plus:
+          #   --tls-cert /etc/velstra/tls/tls.crt
+          #   --tls-key  /etc/velstra/tls/tls.key
+          #   --client-ca /etc/velstra/tls/ca.pem
+          volumeMounts:
+            - { name: tls, mountPath: /etc/velstra/tls, readOnly: true }
+      volumes:
+        - name: tls
+          secret: { secretName: velstra-controller-tls }
+```
+
+**3. Agent** (`20-agent.yaml`) — mount the agent + cni Secrets, switch the
+endpoints to `https://`, and add the client TLS flags
+(`--tls-ca /etc/velstra/tls/ca.pem --tls-cert /etc/velstra/tls/tls.crt
+--tls-key /etc/velstra/tls/tls.key`). The init container also copies the **cni**
+cert + CA to a host path the on-host plugin can read, and the conflist gains
+`tlsCA`/`tlsCert`/`tlsKey` (host paths) with `https://` controllers:
+
+```sh
+# in the init container, after installing the binary:
+install -m 0644 /cni-tls/ca.pem  /host/etc/velstra/pki/ca.pem
+install -m 0644 /cni-tls/tls.crt /host/etc/velstra/pki/cni.crt
+install -m 0600 /cni-tls/tls.key /host/etc/velstra/pki/cni.key
+# conflist: "controllers": ["https://…:50052"], plus
+#   "tlsCA": "/etc/velstra/pki/ca.pem",
+#   "tlsCert": "/etc/velstra/pki/cni.crt",
+#   "tlsKey": "/etc/velstra/pki/cni.key"
+```
+
+Don't set `--tls-domain` on the agent: each controller endpoint has its own pod
+DNS name, all covered by the server cert's SANs, so default hostname
+verification works.
+
+**4. Bootstrap over TLS** — the `orch`/`admin` CLIs take the same flags:
+
+```shell
+kubectl -n velstra-system exec velstra-controller-0 -- \
+  velstra-controller orch --endpoint https://127.0.0.1:50052 \
+  --tls-ca /etc/velstra/tls/ca.pem \
+  --tls-cert /etc/velstra/tls/tls.crt --tls-key /etc/velstra/tls/tls.key \
+  add-network --vni 5000 --name blue --subnet 192.168.100.0/24 --drop-icmp false
+```
+
+## Other hardening
+
+- **Lock down the orchestrator channel.** Even with mTLS, add a `NetworkPolicy`
+  so only the agents/CNI can reach `:50052`/`:50053`.
+- **Resource requests/limits** and a `PodDisruptionBudget` for the controller.
 
 ## End-to-end test
 
