@@ -62,7 +62,7 @@ use network_types::{
 use velstra_common::{
     ARP_REPLY, ARP_REQUEST, Action, ArpEntry, ArpKey, Backend, ConfigFlags, Counter, ETHERTYPE_ARP,
     ETHERTYPE_IPV4, ETHERTYPE_IPV6, FlowKey, FlowState, ForwardOutcome, GlobalConfig, Nat,
-    OVERLAY_OUTER_LEN, OverlayConfig, PacketMeta, PolicyId, Rewrite, RouteEntry, ScopedAddr,
+    OVERLAY_OUTER_LEN, OverlayConfig, PacketMeta, PolicyId, PortFwd, Rewrite, RouteEntry, ScopedAddr,
     ScopedAddr6, ScopedPortKey, ServiceKey, ServiceValue, TunnelEndpoint, TunnelKey, build_encap,
     decide, ip_proto, is_overlay_dport, lpm_key_addr, plan_arp_reply, plan_forward, plan_nat,
     select_backend, session_hash,
@@ -100,6 +100,14 @@ static BLOCKLIST6: LpmTrie<ScopedAddr6, u32> = LpmTrie::with_max_entries(8192, 0
 /// across address families: a port rule applies to IPv4 *and* IPv6 alike.
 #[map]
 static PORT_RULES: HashMap<ScopedPortKey, u32> = HashMap::with_max_entries(8192, 0);
+
+/// Per-policy 1:1 DNAT port-forwards: `(policy, proto, destination port)` → the
+/// internal `(ip, port)` an inbound connection is rewritten to. Empty by default
+/// (port-forwarding is opt-in). A match also implicitly opens the firewall for
+/// that destination port; the reply is SNAT'd back via a `CONNTRACK` reverse
+/// entry, exactly like the load-balancer path.
+#[map]
+static PORT_FORWARDS: HashMap<ScopedPortKey, PortFwd> = HashMap::with_max_entries(1024, 0);
 
 /// Phase 2 forwarding table: destination-IP prefix → [`RouteEntry`]. Empty by
 /// default, so routing is entirely opt-in and never interferes with a
@@ -495,6 +503,9 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
         ))
         .is_some();
     let rule = lookup_port_rule(policy_id, proto, dst_port);
+    // A configured port-forward for this destination port implicitly opens the
+    // firewall (the DNAT + reply SNAT are done below / in the conntrack path).
+    let port_forward = lookup_port_forward(policy_id, proto, dst_port);
 
     let verdict = decide(&meta, &cfg, blocklisted, rule);
 
@@ -511,6 +522,10 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
         (Action::Drop, Counter::DroppedBlocklist)
     } else if established {
         (Action::Pass, Counter::EstablishedAllowed)
+    } else if port_forward.is_some() {
+        // The blocklist still wins (checked first); otherwise a port-forward
+        // destination port is allowed inbound.
+        (Action::Pass, Counter::PassedRule)
     } else {
         (verdict.action, verdict.counter)
     };
@@ -552,6 +567,18 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
         ctx, &ocfg, vni, src_addr, dst_addr, src_port, dst_port, proto, log,
     )? {
         return Ok(action);
+    }
+
+    // Phase 3a: DNAT port-forward. A new inbound flow to a forwarded port is
+    // rewritten to its internal host here; established flows and the reply path
+    // are handled by the conntrack path in try_load_balance below (shared
+    // CONNTRACK map), so this only fires once per connection.
+    if let Some(target) = port_forward {
+        if let Some(action) = try_port_forward(
+            ctx, ihl_bytes, src_addr, dst_addr, src_port, dst_port, proto, checksum, target,
+        )? {
+            return Ok(action);
+        }
     }
 
     // Phase 3: load balancer / DNAT. A matching service rewrites the packet to a
@@ -965,6 +992,70 @@ fn try_load_balance(
     Ok(Some(xdp_action::XDP_PASS))
 }
 
+/// DNAT a **new** inbound flow to its configured port-forward target. Mirrors the
+/// new-connection branch of [`try_load_balance`] but for a 1:1 forward (no
+/// backend pool): rewrite the destination to the internal host, and record a
+/// `CONNTRACK` forward entry (so later packets DNAT) plus a reverse entry (so the
+/// internal host's reply SNATs its source back to us). The reverse flow is also
+/// recorded in `FW_FLOWS` so it passes a deny-by-default internal zone. Returns
+/// `None` for a flow already in conntrack (handled by [`try_load_balance`]).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn try_port_forward(
+    ctx: &XdpContext,
+    ihl_bytes: usize,
+    src_addr: [u8; 4],
+    dst_addr: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    proto: u8,
+    ip_checksum: u16,
+    target: PortFwd,
+) -> Result<Option<u32>, ()> {
+    if (proto != ip_proto::TCP && proto != ip_proto::UDP) || ihl_bytes != Ipv4Hdr::LEN {
+        return Ok(None);
+    }
+    let fkey = FlowKey::new(src_addr, dst_addr, src_port, dst_port, proto);
+    // Already tracked? The conntrack path in try_load_balance handles it.
+    if (unsafe { CONNTRACK.get(&fkey) }).is_some() {
+        return Ok(None);
+    }
+
+    let l4_csum_off = if proto == ip_proto::TCP {
+        O_TCP_CSUM
+    } else {
+        O_UDP_CSUM
+    };
+    let old_l4 = {
+        let ptr: *const [u8; 2] = unsafe { ptr_at(ctx, l4_csum_off)? };
+        u16::from_be_bytes(unsafe { *ptr })
+    };
+    let target_port = if target.port == 0 { dst_port } else { target.port };
+
+    // Forward: rewrite the destination on subsequent packets of this flow.
+    let _ = CONNTRACK.insert(&fkey, &FlowState::forward(target.ip, target.port), 0);
+    // Reverse: the reply (internal host -> client) SNATs its source back to the
+    // original destination (our public ip:port).
+    let rkey = FlowKey::new(target.ip, src_addr, target_port, src_port, proto);
+    let _ = CONNTRACK.insert(&rkey, &FlowState::reverse(dst_addr, dst_port), 0);
+    // Let that reply through a stateful, deny-by-default internal zone.
+    let _ = FW_FLOWS.insert(&rkey, &1u8, 0);
+
+    // DNAT this first packet.
+    let nat = plan_nat(
+        dst_addr,
+        dst_port,
+        target.ip,
+        target.port,
+        ip_checksum,
+        old_l4,
+        proto,
+    );
+    apply_nat(ctx, &nat, false, proto)?;
+    bump(Counter::LoadBalanced);
+    Ok(Some(xdp_action::XDP_PASS))
+}
+
 /// Apply a [`Rewrite`] to the packet in place and redirect it out of the target
 /// interface. Writes go through one freshly bounds-checked `data` pointer at
 /// constant offsets (the verifier-friendly packet-write pattern).
@@ -1014,6 +1105,14 @@ fn lookup_port_rule(policy_id: PolicyId, proto: u8, dst_port: u16) -> Option<Act
     // borrows map memory; we copy the value out immediately and never hold it.
     let value = unsafe { PORT_RULES.get(key) }?;
     Some(Action::from_u32(*value))
+}
+
+/// The DNAT target for an inbound `(policy, proto, dport)`, if a port-forward is
+/// configured for it. SAFETY as in [`lookup_port_rule`] — copied out at once.
+#[inline(always)]
+fn lookup_port_forward(policy_id: PolicyId, proto: u8, dst_port: u16) -> Option<PortFwd> {
+    let key = ScopedPortKey::new(policy_id, proto, dst_port);
+    (unsafe { PORT_FORWARDS.get(key) }).copied()
 }
 
 #[cfg(not(test))]

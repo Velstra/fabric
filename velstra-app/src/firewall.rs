@@ -19,13 +19,13 @@ use aya::{
 use clap::ValueEnum;
 use log::warn;
 use velstra_common::{
-    ArpEntry, ArpKey, Backend, Counter, GlobalConfig, OverlayConfig, PolicyId, RouteEntry,
+    ArpEntry, ArpKey, Backend, Counter, GlobalConfig, OverlayConfig, PolicyId, PortFwd, RouteEntry,
     ScopedAddr, ScopedAddr6, ScopedPortKey, ServiceKey, ServiceValue, TunnelEndpoint, TunnelKey,
     parse_mac,
 };
 use velstra_config::{
-    PolicyConfig, ResolvedInterface, ResolvedNeighbor, ResolvedOverlay, ResolvedRoute,
-    ResolvedService, ResolvedTunnel, RuntimeConfig,
+    PolicyConfig, ResolvedInterface, ResolvedNeighbor, ResolvedOverlay, ResolvedPortForward,
+    ResolvedRoute, ResolvedService, ResolvedTunnel, RuntimeConfig,
 };
 
 /// How to attach the XDP program to the interface.
@@ -520,6 +520,7 @@ fn apply_config(ebpf: &mut Ebpf, cfg: &RuntimeConfig, old: Option<&RuntimeConfig
     program_interfaces(ebpf, &cfg.interfaces)?;
     program_routes(ebpf, &cfg.routes)?;
     program_services(ebpf, &cfg.services)?;
+    program_port_forwards(ebpf, &cfg.port_forwards)?;
     program_overlay(ebpf, cfg.overlay.as_ref(), &cfg.tunnels, &cfg.neighbors)?;
 
     Ok(())
@@ -685,6 +686,28 @@ fn program_services(ebpf: &mut Ebpf, services: &[ResolvedService]) -> Result<()>
         svc_map.insert(key, value, 0).context("inserting service")?;
     }
 
+    Ok(())
+}
+
+/// Write the Phase 4 `PORT_FORWARDS` map: `(policy, proto, dport)` →
+/// internal `(ip, port)`. Keyed by [`ScopedPortKey`] like the firewall's port
+/// rules, so the data plane looks it up the same way.
+fn program_port_forwards(ebpf: &mut Ebpf, forwards: &[ResolvedPortForward]) -> Result<()> {
+    if forwards.is_empty() {
+        return Ok(());
+    }
+    let mut map: HashMap<_, ScopedPortKey, PortFwd> = HashMap::try_from(
+        ebpf.map_mut("PORT_FORWARDS")
+            .ok_or_else(|| anyhow!("PORT_FORWARDS map missing"))?,
+    )?;
+    for pf in forwards {
+        map.insert(
+            ScopedPortKey::new(pf.policy, pf.proto, pf.port),
+            PortFwd::new(pf.dst_ip, pf.dst_port),
+            0,
+        )
+        .context("inserting port-forward")?;
+    }
     Ok(())
 }
 

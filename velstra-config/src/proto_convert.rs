@@ -254,6 +254,9 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
                     .collect(),
             })
             .collect(),
+        // Port-forwards are a file-config-only (appliance) feature; the gRPC
+        // NodeConfig has no equivalent message, so they convert to/from empty.
+        port_forwards: Vec::new(),
         overlay: cfg.overlay.as_ref().map(|o| OverlayCfg {
             local_vtep: o.local_vtep.clone(),
             underlay_iface: o.underlay_iface.clone(),

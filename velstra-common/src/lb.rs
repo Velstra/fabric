@@ -326,10 +326,34 @@ impl FlowState {
     }
 }
 
+/// Value for the `PORT_FORWARDS` map: the internal destination an inbound
+/// `(policy, proto, dport)` is DNAT'd to. A 1:1 port-forward (no backend pool),
+/// the appliance counterpart to a load-balancer [`crate::ServiceValue`].
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PortFwd {
+    /// Internal host the connection is rewritten to.
+    pub ip: [u8; 4],
+    /// Internal port (`0` keeps the original destination port).
+    pub port: u16,
+    /// Explicit padding, always zero.
+    pub _pad: u16,
+}
+
+impl PortFwd {
+    /// Build a port-forward target.
+    #[inline]
+    pub const fn new(ip: [u8; 4], port: u16) -> Self {
+        Self { ip, port, _pad: 0 }
+    }
+}
+
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for FlowKey {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for FlowState {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for PortFwd {}
 
 /// Apply a checksum update for a changed 4-byte IPv4 address (two 16-bit words).
 #[inline]

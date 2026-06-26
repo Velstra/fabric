@@ -11,8 +11,8 @@ mod proto_convert;
 
 pub use config::{
     ActionName, BackendCfg, EncapName, FileConfig, ForwardMode, InterfaceFile, NeighborCfg,
-    OverlayCfg, PolicyConfig, PolicyFile, PortRule, ProtoName, ResolvedInterface, ResolvedNeighbor,
-    ResolvedOverlay, ResolvedRoute, ResolvedService, ResolvedTunnel, RouteCfg, RuntimeConfig,
-    ServiceCfg, TunnelCfg, load_file,
+    OverlayCfg, PolicyConfig, PolicyFile, PortForwardCfg, PortRule, ProtoName, ResolvedInterface,
+    ResolvedNeighbor, ResolvedOverlay, ResolvedPortForward, ResolvedRoute, ResolvedService,
+    ResolvedTunnel, RouteCfg, RuntimeConfig, ServiceCfg, TunnelCfg, load_file,
 };
 pub use proto_convert::{file_config_from_proto, file_config_to_proto, runtime_from_proto};
