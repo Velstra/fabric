@@ -122,8 +122,22 @@ impl Firewall {
             attached.push((iface.clone(), chosen));
         }
 
-        if egress {
-            attach_egress(&mut ebpf, ifaces)?;
+        // The TC egress hook is needed by two features: the opt-in egress
+        // firewall (`--egress`, applied to the `--iface` set) and masquerade
+        // (applied to every present `masquerade` interface, which does SNAT
+        // there). Attach to the union so a config-driven appliance masquerades
+        // without needing `--egress`.
+        let mut egress_ifaces: Vec<String> = if egress { ifaces.to_vec() } else { Vec::new() };
+        for i in &cfg.interfaces {
+            if i.masquerade
+                && !egress_ifaces.iter().any(|n| n == &i.name)
+                && if_nametoindex(&i.name).is_ok()
+            {
+                egress_ifaces.push(i.name.clone());
+            }
+        }
+        if !egress_ifaces.is_empty() {
+            attach_egress(&mut ebpf, &egress_ifaces)?;
         }
 
         Ok(Self {
@@ -463,6 +477,17 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
         }
     }
     {
+        let mut masq: HashMap<_, u32, [u8; 4]> = HashMap::try_from(
+            ebpf.map_mut("MASQUERADE")
+                .ok_or_else(|| anyhow!("MASQUERADE map missing"))?,
+        )?;
+        for iface in old.interfaces.iter().filter(|i| i.masquerade) {
+            if let Ok(ifindex) = if_nametoindex(&iface.name) {
+                let _ = masq.remove(&ifindex);
+            }
+        }
+    }
+    {
         let mut routes: LpmTrie<_, u32, RouteEntry> = LpmTrie::try_from(
             ebpf.map_mut("ROUTES")
                 .ok_or_else(|| anyhow!("ROUTES map missing"))?,
@@ -521,6 +546,7 @@ fn apply_config(ebpf: &mut Ebpf, cfg: &RuntimeConfig, old: Option<&RuntimeConfig
     program_routes(ebpf, &cfg.routes)?;
     program_services(ebpf, &cfg.services)?;
     program_port_forwards(ebpf, &cfg.port_forwards)?;
+    program_masquerade(ebpf, &cfg.interfaces)?;
     program_overlay(ebpf, cfg.overlay.as_ref(), &cfg.tunnels, &cfg.neighbors)?;
 
     Ok(())
@@ -709,6 +735,73 @@ fn program_port_forwards(ebpf: &mut Ebpf, forwards: &[ResolvedPortForward]) -> R
         .context("inserting port-forward")?;
     }
     Ok(())
+}
+
+/// Write the Phase 4b `MASQUERADE` map: egress ifindex → that interface's public
+/// IPv4, for every interface marked `masquerade`. The live address is read from
+/// the OS here (the data plane can't), so a not-yet-addressed interface (DHCP not
+/// up, or absent) is skipped with a warning — a later reconfigure picks it up.
+fn program_masquerade(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Result<()> {
+    let prepared: Vec<(u32, [u8; 4])> = interfaces
+        .iter()
+        .filter(|i| i.masquerade)
+        .filter_map(|i| match (if_nametoindex(&i.name), read_iface_ipv4(&i.name)) {
+            (Ok(ifindex), Ok(ip)) => Some((ifindex, ip)),
+            _ => {
+                warn!(
+                    "masquerade interface {} has no IPv4 yet; deferring its SNAT",
+                    i.name
+                );
+                None
+            }
+        })
+        .collect();
+    if prepared.is_empty() {
+        return Ok(());
+    }
+    let mut map: HashMap<_, u32, [u8; 4]> = HashMap::try_from(
+        ebpf.map_mut("MASQUERADE")
+            .ok_or_else(|| anyhow!("MASQUERADE map missing"))?,
+    )?;
+    for (ifindex, ip) in prepared {
+        map.insert(ifindex, ip, 0)
+            .with_context(|| format!("inserting masquerade ifindex {ifindex}"))?;
+    }
+    Ok(())
+}
+
+/// Read an interface's first IPv4 address via `getifaddrs(3)`. Returns an error
+/// if the interface has no IPv4 assigned (e.g. DHCP not up yet).
+fn read_iface_ipv4(iface: &str) -> Result<[u8; 4]> {
+    use std::os::raw::c_int;
+    let mut ifap: *mut libc::ifaddrs = core::ptr::null_mut();
+    // SAFETY: `getifaddrs` fills `ifap` with an owned linked list we free below.
+    if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
+        bail!("getifaddrs failed for {iface}");
+    }
+    let mut result: Option<[u8; 4]> = None;
+    let mut cur = ifap;
+    while !cur.is_null() {
+        // SAFETY: `cur` is a valid node for the duration of this iteration.
+        let node = unsafe { &*cur };
+        if !node.ifa_addr.is_null() {
+            // SAFETY: ifa_addr points at a sockaddr; we only read sa_family then,
+            // if AF_INET, reinterpret as sockaddr_in (both kernel-owned).
+            let family = unsafe { (*node.ifa_addr).sa_family } as c_int;
+            let name = unsafe { std::ffi::CStr::from_ptr(node.ifa_name) };
+            if family == libc::AF_INET && name.to_bytes() == iface.as_bytes() {
+                let sin = node.ifa_addr as *const libc::sockaddr_in;
+                // s_addr is in network byte order — its native bytes are the octets.
+                let octets = unsafe { (*sin).sin_addr.s_addr }.to_ne_bytes();
+                result = Some(octets);
+                break;
+            }
+        }
+        cur = node.ifa_next;
+    }
+    // SAFETY: frees the list `getifaddrs` allocated; `ifap` is not used after.
+    unsafe { libc::freeifaddrs(ifap) };
+    result.ok_or_else(|| anyhow!("interface {iface} has no IPv4 address"))
 }
 
 /// Program the Phase 4 overlay maps: `OVERLAY_CONFIG` (this host's VTEP, a single

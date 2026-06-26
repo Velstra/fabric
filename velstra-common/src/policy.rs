@@ -22,6 +22,11 @@ pub enum Action {
     Pass = 0,
     /// Drop the packet immediately at the driver (`XDP_DROP`).
     Drop = 1,
+    /// **Actively** refuse the packet: send a TCP RST (for TCP) or an ICMP
+    /// destination-unreachable (for everything else) back to the sender, then
+    /// `XDP_TX`. Unlike [`Action::Drop`], the peer learns the connection was
+    /// refused immediately instead of timing out.
+    Reject = 2,
 }
 
 impl Action {
@@ -32,6 +37,7 @@ impl Action {
     pub const fn from_u32(value: u32) -> Self {
         match value {
             1 => Action::Drop,
+            2 => Action::Reject,
             _ => Action::Pass,
         }
     }
@@ -96,11 +102,15 @@ pub enum Counter {
     TxPackets = 21,
     /// Dropped by the egress firewall (Phase B).
     EgressDropped = 22,
+    /// SNAT-masqueraded on egress through a masquerade (WAN) interface (Phase 4b).
+    EgressMasqueraded = 23,
+    /// Actively rejected — a TCP RST or ICMP unreachable was sent (Phase 3).
+    Rejected = 24,
 }
 
 impl Counter {
     /// Number of distinct counters — the `max_entries` of the `STATS` map.
-    pub const COUNT: u32 = 23;
+    pub const COUNT: u32 = 25;
 
     /// The array index of this counter.
     #[inline]
@@ -135,13 +145,22 @@ impl Counter {
             20 => Counter::ArpSuppressed,
             21 => Counter::TxPackets,
             22 => Counter::EgressDropped,
+            23 => Counter::EgressMasqueraded,
+            24 => Counter::Rejected,
             _ => return None,
         };
         Some(counter)
     }
 
     /// A short, stable, human-readable label (used by the CLI and in eBPF logs).
-    #[inline]
+    ///
+    /// `inline(always)`: a `&str` return is a `{ptr, len}` aggregate, which the
+    /// BPF target cannot return from a standalone function. The eBPF program
+    /// calls this inside its `info!` log lines, so it must always be inlined into
+    /// the caller (where the result is constant-folded) and never emitted as a
+    /// real function. Plain `#[inline]` is only a hint and LLVM dropped it once
+    /// the callers grew, breaking the BPF link.
+    #[inline(always)]
     pub const fn label(self) -> &'static str {
         match self {
             Counter::RxPackets => "rx_packets",
@@ -167,6 +186,8 @@ impl Counter {
             Counter::ArpSuppressed => "arp_suppressed",
             Counter::TxPackets => "tx_packets",
             Counter::EgressDropped => "egress_dropped",
+            Counter::EgressMasqueraded => "egress_masqueraded",
+            Counter::Rejected => "rejected",
         }
     }
 }
@@ -240,10 +261,12 @@ pub fn decide(
 
     match rule {
         Some(Action::Drop) => Verdict::new(Action::Drop, Counter::DroppedRule),
+        Some(Action::Reject) => Verdict::new(Action::Reject, Counter::Rejected),
         Some(Action::Pass) => Verdict::new(Action::Pass, Counter::PassedRule),
         None => match cfg.default_action() {
             Action::Pass => Verdict::new(Action::Pass, Counter::PassedDefault),
             Action::Drop => Verdict::new(Action::Drop, Counter::DroppedDefault),
+            Action::Reject => Verdict::new(Action::Reject, Counter::Rejected),
         },
     }
 }

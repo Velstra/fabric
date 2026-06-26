@@ -34,6 +34,9 @@ fn action_to_proto(a: ActionName) -> proto::Action {
     match a {
         ActionName::Pass => proto::Action::Pass,
         ActionName::Drop => proto::Action::Drop,
+        // The gRPC controller protocol has no `reject` (it's a file-config /
+        // appliance feature); it degrades to `drop` on the wire.
+        ActionName::Reject => proto::Action::Drop,
     }
 }
 
@@ -216,6 +219,9 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
                 name: i.name.clone(),
                 policy: i.policy,
                 vni: i.vni,
+                // The gRPC interface message has no masquerade field (NAT is a
+                // file-config / appliance concept); default it off.
+                masquerade: false,
             })
             .collect(),
         routes: cfg
