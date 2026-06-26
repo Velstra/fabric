@@ -39,6 +39,7 @@ mod overlay;
 mod packet;
 pub mod parse;
 mod policy;
+mod reject;
 
 pub use cidr::{Cidr4, Cidr6, CidrError, mask_v4, mask_v6, parse_cidr_v4, parse_cidr_v6};
 pub use config::{ConfigFlags, GlobalConfig};
@@ -61,3 +62,4 @@ pub use packet::{
 };
 pub use parse::{ParseResult, parse_frame};
 pub use policy::{Action, Counter, Verdict, decide};
+pub use reject::{TcpRst, plan_tcp_rst, tcp_flags};

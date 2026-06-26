@@ -41,6 +41,8 @@ pub enum ActionName {
     Pass,
     /// Drop the packet (`XDP_DROP`).
     Drop,
+    /// Actively refuse the packet — TCP RST / ICMP unreachable (`XDP_TX`).
+    Reject,
 }
 
 impl From<ActionName> for Action {
@@ -48,6 +50,7 @@ impl From<ActionName> for Action {
         match value {
             ActionName::Pass => Action::Pass,
             ActionName::Drop => Action::Drop,
+            ActionName::Reject => Action::Reject,
         }
     }
 }
@@ -284,6 +287,12 @@ pub struct InterfaceFile {
     /// single-tenant case); `0` ⇒ the interface is local-only (never tunneled).
     #[serde(default)]
     pub vni: Option<u32>,
+    /// Masquerade (source NAT) traffic **leaving** this interface to its own
+    /// public IPv4 — the classic WAN uplink. Off by default. The control plane
+    /// reads the live address and programs the `MASQUERADE` map + the TC egress
+    /// hook; the reply is un-NAT'd on ingress via connection tracking.
+    #[serde(default)]
+    pub masquerade: bool,
 }
 
 /// The raw, deserialised TOML document. The top-level firewall fields define
@@ -449,6 +458,8 @@ pub struct ResolvedInterface {
     pub policy: PolicyId,
     /// Overlay segment / VNI (`IFACE_VNI`). `0` means local-only (no overlay).
     pub vni: u32,
+    /// Masquerade (source NAT) traffic leaving this interface (`MASQUERADE`).
+    pub masquerade: bool,
 }
 
 /// A resolved overlay forwarding entry: the tenant segment, the inner-destination
@@ -632,6 +643,7 @@ impl FileConfig {
                 name: iface.name.clone(),
                 policy: iface.policy,
                 vni,
+                masquerade: iface.masquerade,
             });
         }
 
@@ -810,6 +822,7 @@ impl fmt::Display for RuntimeConfig {
             let default = match policy.global.default_action() {
                 Action::Pass => "pass",
                 Action::Drop => "drop",
+                Action::Reject => "reject",
             };
             writeln!(
                 f,
@@ -837,6 +850,7 @@ impl fmt::Display for RuntimeConfig {
                 let verdict = match action {
                     Action::Pass => "pass",
                     Action::Drop => "drop",
+                    Action::Reject => "reject",
                 };
                 writeln!(f, "      {proto}/{} -> {verdict}", key.port)?;
             }
@@ -1090,11 +1104,13 @@ mod tests {
                     name: "tap0".into(),
                     policy: 7,
                     vni: 7, // defaults to the policy id
+                    masquerade: false,
                 },
                 ResolvedInterface {
                     name: "tap1".into(),
                     policy: 0,
                     vni: 0,
+                    masquerade: false,
                 },
             ]
         );

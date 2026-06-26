@@ -48,7 +48,7 @@
 //! kernel and the tests can never disagree.
 
 use aya_ebpf::{
-    bindings::{TC_ACT_OK, TC_ACT_SHOT, xdp_action},
+    bindings::{BPF_F_PSEUDO_HDR, TC_ACT_OK, TC_ACT_SHOT, xdp_action},
     helpers::bpf_xdp_adjust_head,
     macros::{classifier, map, xdp},
     maps::{Array, DevMap, HashMap, LpmTrie, LruHashMap, PerCpuArray, lpm_trie::Key},
@@ -62,10 +62,10 @@ use network_types::{
 use velstra_common::{
     ARP_REPLY, ARP_REQUEST, Action, ArpEntry, ArpKey, Backend, ConfigFlags, Counter, ETHERTYPE_ARP,
     ETHERTYPE_IPV4, ETHERTYPE_IPV6, FlowKey, FlowState, ForwardOutcome, GlobalConfig, Nat,
-    OVERLAY_OUTER_LEN, OverlayConfig, PacketMeta, PolicyId, PortFwd, Rewrite, RouteEntry, ScopedAddr,
-    ScopedAddr6, ScopedPortKey, ServiceKey, ServiceValue, TunnelEndpoint, TunnelKey, build_encap,
-    decide, ip_proto, is_overlay_dport, lpm_key_addr, plan_arp_reply, plan_forward, plan_nat,
-    select_backend, session_hash,
+    OVERLAY_OUTER_LEN, OverlayConfig, PacketMeta, PolicyId, PortFwd, Rewrite, RouteEntry,
+    ScopedAddr, ScopedAddr6, ScopedPortKey, ServiceKey, ServiceValue, TunnelEndpoint, TunnelKey,
+    build_encap, decide, ip_proto, is_overlay_dport, lpm_key_addr, plan_arp_reply, plan_forward,
+    plan_nat, plan_tcp_rst, select_backend, session_hash, tcp_flags,
 };
 
 /// Maps an ingress interface index to its policy id, so one XDP program can
@@ -108,6 +108,15 @@ static PORT_RULES: HashMap<ScopedPortKey, u32> = HashMap::with_max_entries(8192,
 /// entry, exactly like the load-balancer path.
 #[map]
 static PORT_FORWARDS: HashMap<ScopedPortKey, PortFwd> = HashMap::with_max_entries(1024, 0);
+
+/// Per-interface masquerade (source NAT) targets: egress ifindex → that
+/// interface's public IPv4. A packet leaving an interface present here has its
+/// source rewritten to this address at the TC egress hook — the classic WAN
+/// masquerade — and the reply is un-NAT'd on ingress via the shared `CONNTRACK`
+/// map. Empty by default; masquerade is opt-in per interface. Populated by the
+/// control plane (`program_masquerade`), which reads the live interface address.
+#[map]
+static MASQUERADE: HashMap<u32, [u8; 4]> = HashMap::with_max_entries(64, 0);
 
 /// Phase 2 forwarding table: destination-IP prefix → [`RouteEntry`]. Empty by
 /// default, so routing is entirely opt-in and never interferes with a
@@ -283,6 +292,17 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
 
     // Egress policy is keyed by the *egress* interface index.
     let ifindex = unsafe { (*ctx.skb.skb).ifindex };
+
+    // Masquerade takes over a packet leaving a masquerade (WAN) interface,
+    // *before* and *instead of* the egress firewall: a router's outbound traffic
+    // must leave even though the WAN zone's ingress posture is deny-by-default,
+    // so the egress firewall's drop logic must not apply here.
+    if let Some(wan_ip) = unsafe { MASQUERADE.get(&ifindex) }.copied() {
+        return masquerade_egress(
+            ctx, ihl_bytes, src_addr, dst_addr, src_port, dst_port, proto, wan_ip,
+        );
+    }
+
     let policy_id = unsafe { IFACE_POLICY.get(&ifindex) }.copied().unwrap_or(0);
     let cfg = unsafe { CONFIG.get(&policy_id) }
         .copied()
@@ -306,7 +326,9 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
     );
     let verdict = decide(&meta, &cfg, blocklisted, rule);
 
-    if verdict.action == Action::Drop {
+    // On egress we can't bounce a RST back the way the XDP ingress path does, so
+    // an active reject degrades to a silent drop here.
+    if verdict.action != Action::Pass {
         bump(Counter::EgressDropped);
         if cfg.has_flag(ConfigFlags::LOG) {
             info!(
@@ -339,6 +361,83 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
     Ok(TC_ACT_OK as i32)
 }
 
+/// Phase 4b **masquerade** (source NAT). A packet leaving a masquerade interface
+/// has its source rewritten to that interface's public `wan_ip`, so a private
+/// network reaches the internet behind one address. A reverse `CONNTRACK` entry
+/// is recorded so the reply — arriving at the XDP ingress hook — is DNAT'd back
+/// to the original client by [`try_load_balance`]'s conntrack path (shared map),
+/// and an `FW_FLOWS` entry lets that reply through the WAN zone's deny-by-default
+/// ingress posture. Only TCP/UDP over a 20-byte IPv4 header are masqueraded
+/// (the 5-tuple conntrack needs ports + constant L4 offsets); anything else, or
+/// a packet whose source is already `wan_ip` (host-originated), passes unchanged.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn masquerade_egress(
+    ctx: &TcContext,
+    ihl_bytes: usize,
+    src_addr: [u8; 4],
+    dst_addr: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    proto: u8,
+    wan_ip: [u8; 4],
+) -> Result<i32, ()> {
+    bump(Counter::TxPackets);
+    if (proto != ip_proto::TCP && proto != ip_proto::UDP)
+        || ihl_bytes != Ipv4Hdr::LEN
+        || src_addr == wan_ip
+    {
+        return Ok(TC_ACT_OK as i32);
+    }
+
+    // The reply (remote -> wan_ip) seen at XDP ingress: DNAT its destination back
+    // to the original client. The conntrack key is exactly that reply 5-tuple.
+    let rkey = FlowKey::new(dst_addr, wan_ip, dst_port, src_port, proto);
+    let _ = CONNTRACK.insert(&rkey, &FlowState::forward(src_addr, src_port), 0);
+    // …and let that reply pass the WAN zone's deny-by-default stateful firewall.
+    let _ = FW_FLOWS.insert(&rkey, &1u8, 0);
+
+    if snat_tc(ctx, src_addr, wan_ip, proto).is_err() {
+        // Too short to rewrite — let it out un-NAT'd rather than black-hole it.
+        return Ok(TC_ACT_OK as i32);
+    }
+    bump(Counter::EgressMasqueraded);
+    Ok(TC_ACT_OK as i32)
+}
+
+/// Rewrite the IPv4 **source** address to `new_src` in the skb and repair the
+/// IPv4 + L4 checksums via the kernel's incremental csum helpers (which also fix
+/// `skb->csum`, the correct way to mutate a forwarded packet at TC). Assumes a
+/// 20-byte IPv4 header, so the L4 checksum offset is a constant — the caller
+/// guarantees it.
+#[inline(always)]
+fn snat_tc(ctx: &TcContext, old_src: [u8; 4], new_src: [u8; 4], proto: u8) -> Result<(), ()> {
+    // `bpf_l3/l4_csum_replace` take the changed field as a native-endian integer
+    // whose in-memory bytes are the on-the-wire (network-order) bytes — i.e. the
+    // packet's 4 address bytes read in native order. `from_ne_bytes` does exactly
+    // that; `from_be_bytes` would byte-swap and corrupt the checksum.
+    let from = u32::from_ne_bytes(old_src) as u64;
+    let to = u32::from_ne_bytes(new_src) as u64;
+    let l4_csum_off = if proto == ip_proto::TCP {
+        O_TCP_CSUM
+    } else {
+        O_UDP_CSUM
+    };
+
+    // A UDP datagram with a zero checksum has L4 checksums disabled — leave it.
+    let cur_l4: [u8; 2] = ctx.load(l4_csum_off).map_err(|_| ())?;
+    if !(proto == ip_proto::UDP && cur_l4 == [0, 0]) {
+        // BPF_F_PSEUDO_HDR | size(4): the L4 checksum covers the IP pseudo-header,
+        // so a source-address change must update it too.
+        ctx.l4_csum_replace(l4_csum_off, from, to, (BPF_F_PSEUDO_HDR as u64) | 4)
+            .map_err(|_| ())?;
+    }
+    ctx.l3_csum_replace(O_IP_CSUM, from, to, 4)
+        .map_err(|_| ())?;
+    ctx.store(O_IP_SRC, &new_src, 0).map_err(|_| ())?;
+    Ok(())
+}
+
 // Constant byte offsets into an Ethernet + 20-byte-IPv4 (+ TCP/UDP) frame. The
 // forwarding/NAT paths write through these so the verifier sees *constant*
 // offsets from a single, freshly bounds-checked `data` pointer — the only
@@ -346,14 +445,24 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
 const O_ETH_DST: usize = 0; //                 Ethernet destination MAC
 const O_ETH_SRC: usize = 6; //                 Ethernet source MAC
 const O_IP: usize = EthHdr::LEN; //         14: IPv4 header start
+const O_IP_TOTLEN: usize = O_IP + 2; //     16: IPv4 total length
+const O_IP_ID: usize = O_IP + 4; //         18: IPv4 identification
+const O_IP_FRAG: usize = O_IP + 6; //       20: IPv4 flags + fragment offset
 const O_IP_TTL: usize = O_IP + 8; //        22: IPv4 TTL
+const O_IP_PROTO: usize = O_IP + 9; //      23: IPv4 protocol
 const O_IP_CSUM: usize = O_IP + 10; //      24: IPv4 header checksum
 const O_IP_SRC: usize = O_IP + 12; //       26: IPv4 source address
 const O_IP_DST: usize = O_IP + 16; //       30: IPv4 destination address
 const O_L4: usize = O_IP + Ipv4Hdr::LEN; // 34: L4 header start (requires IHL=20)
 const O_L4_SPORT: usize = O_L4; //          34: TCP/UDP source port
 const O_L4_DPORT: usize = O_L4 + 2; //      36: TCP/UDP destination port
+const O_TCP_SEQ: usize = O_L4 + 4; //       38: TCP sequence number
+const O_TCP_ACK: usize = O_L4 + 8; //       42: TCP acknowledgement number
+const O_TCP_OFF: usize = O_L4 + 12; //      46: TCP data offset + reserved
+const O_TCP_FLAGS: usize = O_L4 + 13; //    47: TCP flags
+const O_TCP_WIN: usize = O_L4 + 14; //      48: TCP window
 const O_TCP_CSUM: usize = O_L4 + 16; //     50: TCP checksum
+const O_TCP_URG: usize = O_L4 + 18; //      52: TCP urgent pointer
 const O_UDP_CSUM: usize = O_L4 + 6; //      40: UDP checksum
 
 /// Write a [`Nat`] rewrite's IPv4 address/port and repaired IPv4 checksum at
@@ -549,6 +658,26 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_DROP);
     }
 
+    // Phase 3: an active reject answers the sender — a TCP RST (or a drop for
+    // non-TCP) bounced back out the ingress interface — instead of black-holing.
+    if action == Action::Reject {
+        if cfg.has_flag(ConfigFlags::LOG) {
+            info!(
+                ctx,
+                "REJECT {}.{}.{}.{} proto={} dport={}",
+                src_addr[0],
+                src_addr[1],
+                src_addr[2],
+                src_addr[3],
+                proto,
+                dst_port,
+            );
+        }
+        return reject_packet(
+            ctx, ihl_bytes, src_addr, dst_addr, src_port, dst_port, proto,
+        );
+    }
+
     // Allowed. On a stateful policy, remember a new flow (and its reverse) so the
     // reply is permitted regardless of the reverse direction's policy.
     if stateful && !established {
@@ -662,7 +791,8 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
     let verdict = decide(&meta, &cfg, blocklisted, rule);
 
     bump(verdict.counter);
-    if verdict.action == Action::Drop {
+    // Reject has no IPv6 RST path yet, so it drops here like Drop.
+    if verdict.action != Action::Pass {
         if cfg.has_flag(ConfigFlags::LOG) {
             info!(
                 ctx,
@@ -1030,7 +1160,11 @@ fn try_port_forward(
         let ptr: *const [u8; 2] = unsafe { ptr_at(ctx, l4_csum_off)? };
         u16::from_be_bytes(unsafe { *ptr })
     };
-    let target_port = if target.port == 0 { dst_port } else { target.port };
+    let target_port = if target.port == 0 {
+        dst_port
+    } else {
+        target.port
+    };
 
     // Forward: rewrite the destination on subsequent packets of this flow.
     let _ = CONNTRACK.insert(&fkey, &FlowState::forward(target.ip, target.port), 0);
@@ -1054,6 +1188,100 @@ fn try_port_forward(
     apply_nat(ctx, &nat, false, proto)?;
     bump(Counter::LoadBalanced);
     Ok(Some(xdp_action::XDP_PASS))
+}
+
+/// Phase 3 **reject**: actively refuse a packet. For a TCP segment, rewrite the
+/// frame in place into a RST aimed back at the sender and `XDP_TX` it, so the
+/// peer gets an immediate "connection refused" instead of a timeout. Non-TCP (or
+/// option-bearing) packets drop instead — an ICMP destination-unreachable
+/// response is a follow-up. A packet that is itself a RST is dropped without
+/// reply, to avoid two rejecting firewalls trading RSTs forever.
+///
+/// The RST's sequence/ack/flags and checksums come from the pure, unit-tested
+/// [`plan_tcp_rst`]; this only swaps the L2/L3/L4 endpoints and writes the
+/// computed fields at constant offsets through one freshly bounds-checked
+/// pointer. The IP total length is set to 40, so any trailing bytes of a longer
+/// original segment are ignored by the receiver (no tail trim needed).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn reject_packet(
+    ctx: &XdpContext,
+    ihl_bytes: usize,
+    src_addr: [u8; 4],
+    dst_addr: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    proto: u8,
+) -> Result<u32, ()> {
+    // Only a standard 20-byte-IPv4 TCP segment becomes a RST; the rest drop.
+    if proto != ip_proto::TCP || ihl_bytes != Ipv4Hdr::LEN {
+        bump(Counter::Rejected);
+        return Ok(xdp_action::XDP_DROP);
+    }
+
+    // Read the incoming TCP fields + IP total length (each bounds-checked).
+    let in_seq = u32::from_be_bytes(unsafe { *ptr_at::<[u8; 4]>(ctx, O_TCP_SEQ)? });
+    let in_ack = u32::from_be_bytes(unsafe { *ptr_at::<[u8; 4]>(ctx, O_TCP_ACK)? });
+    let data_off = unsafe { *ptr_at::<u8>(ctx, O_TCP_OFF)? };
+    let in_flags = unsafe { *ptr_at::<u8>(ctx, O_TCP_FLAGS)? };
+    let total_len = u16::from_be_bytes(unsafe { *ptr_at::<[u8; 2]>(ctx, O_IP_TOTLEN)? });
+
+    // Never answer a RST with a RST.
+    if in_flags & tcp_flags::RST != 0 {
+        bump(Counter::Rejected);
+        return Ok(xdp_action::XDP_DROP);
+    }
+
+    // Sequence space the sender consumed: payload + 1 per SYN/FIN.
+    let tcp_hdr_len = ((data_off >> 4) as u16) * 4;
+    let payload_len = total_len.saturating_sub(Ipv4Hdr::LEN as u16 + tcp_hdr_len) as u32;
+    let syn = (in_flags & tcp_flags::SYN != 0) as u32;
+    let fin = (in_flags & tcp_flags::FIN != 0) as u32;
+    let seg_len = payload_len + syn + fin;
+
+    let rst = plan_tcp_rst(
+        src_addr, dst_addr, src_port, dst_port, in_seq, in_ack, in_flags, seg_len,
+    );
+
+    // The original MACs, to swap them on the response.
+    let eth_dst = unsafe { *ptr_at::<[u8; 6]>(ctx, O_ETH_DST)? };
+    let eth_src = unsafe { *ptr_at::<[u8; 6]>(ctx, O_ETH_SRC)? };
+
+    // Rewrite the frame in place into the RST, through one freshly bounds-checked
+    // pointer at constant offsets (the verifier-friendly packet-write pattern).
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    if data + O_TCP_URG + 2 > data_end {
+        return Ok(xdp_action::XDP_DROP);
+    }
+    // SAFETY: the check above proves all bytes through the TCP urgent pointer
+    // (offset 54) are in-bounds; every write below is at a constant offset.
+    unsafe {
+        // Ethernet: swap source/destination.
+        *((data + O_ETH_DST) as *mut [u8; 6]) = eth_src;
+        *((data + O_ETH_SRC) as *mut [u8; 6]) = eth_dst;
+        // IPv4: swap addresses, fix length/ttl/proto/checksum, clear id+frag.
+        *((data + O_IP_SRC) as *mut [u8; 4]) = dst_addr;
+        *((data + O_IP_DST) as *mut [u8; 4]) = src_addr;
+        *((data + O_IP_TOTLEN) as *mut [u8; 2]) = 40u16.to_be_bytes();
+        *((data + O_IP_ID) as *mut [u8; 2]) = [0, 0];
+        *((data + O_IP_FRAG) as *mut [u8; 2]) = [0, 0];
+        *((data + O_IP_TTL) as *mut u8) = 64;
+        *((data + O_IP_PROTO) as *mut u8) = ip_proto::TCP;
+        *((data + O_IP_CSUM) as *mut [u8; 2]) = rst.ip_checksum.to_be_bytes();
+        // TCP: swap ports, new seq/ack/flags, zero window/urgent, data offset 5.
+        *((data + O_L4_SPORT) as *mut [u8; 2]) = dst_port.to_be_bytes();
+        *((data + O_L4_DPORT) as *mut [u8; 2]) = src_port.to_be_bytes();
+        *((data + O_TCP_SEQ) as *mut [u8; 4]) = rst.seq.to_be_bytes();
+        *((data + O_TCP_ACK) as *mut [u8; 4]) = rst.ack.to_be_bytes();
+        *((data + O_TCP_OFF) as *mut u8) = 5 << 4;
+        *((data + O_TCP_FLAGS) as *mut u8) = rst.flags;
+        *((data + O_TCP_WIN) as *mut [u8; 2]) = [0, 0];
+        *((data + O_TCP_CSUM) as *mut [u8; 2]) = rst.tcp_checksum.to_be_bytes();
+        *((data + O_TCP_URG) as *mut [u8; 2]) = [0, 0];
+    }
+    bump(Counter::Rejected);
+    Ok(xdp_action::XDP_TX)
 }
 
 /// Apply a [`Rewrite`] to the packet in place and redirect it out of the target
