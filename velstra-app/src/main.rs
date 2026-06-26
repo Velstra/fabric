@@ -250,10 +250,13 @@ async fn run(args: RunArgs) -> Result<()> {
         ));
     }
 
-    // In controller mode, attach to config-named interfaces (e.g. pod veths the
-    // controller declared) as they appear — without needing an --auto-attach
-    // prefix. The controller may name a veth before the CNI has created it.
-    if !args.controllers.is_empty() {
+    // Attach to config-named interfaces (every `[[interface]]` in the policy, not
+    // just the `--iface` attach points) as they appear — without needing an
+    // --auto-attach prefix. Needed in BOTH modes: a controller may name a veth
+    // before the CNI creates it, and a file-config appliance (e.g. a
+    // firewall/router) names every zoned NIC + VLAN it must filter and NAT on,
+    // which `--iface` alone (one primary) would otherwise miss.
+    if !args.controllers.is_empty() || args.config.is_some() {
         tokio::spawn(config_attach_loop(firewall.clone(), args.xdp_mode));
     }
 

@@ -316,6 +316,9 @@ pub struct FileConfig {
     /// Phase 3 load-balancer services. Spelled `[[service]]` in TOML.
     #[serde(rename = "service")]
     pub services: Vec<ServiceCfg>,
+    /// Phase 4 1:1 DNAT port-forwards. Spelled `[[port_forward]]` in TOML.
+    #[serde(default, rename = "port_forward")]
+    pub port_forwards: Vec<PortForwardCfg>,
     /// Phase 4 overlay endpoint for this host. Spelled `[overlay]` in TOML.
     #[serde(default)]
     pub overlay: Option<OverlayCfg>,
@@ -351,6 +354,41 @@ pub struct ResolvedRoute {
     pub dst_mac: [u8; 6],
     /// [`RouteEntry`] flag bits (e.g. decrement TTL).
     pub flags: u16,
+}
+
+/// A 1:1 inbound DNAT port-forward (TOML `[[port_forward]]`): rewrite a
+/// `(policy, proto, port)` arriving on a zone to an internal `dst_ip:dst_port`.
+/// The reply is SNAT'd back automatically (conntrack), and the rule implicitly
+/// opens the firewall for that port.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PortForwardCfg {
+    /// Policy (zone) the forward applies to — the public/ingress side.
+    pub policy: PolicyId,
+    /// Matched L4 protocol (tcp or udp).
+    pub proto: ProtoName,
+    /// Public destination port matched inbound.
+    pub port: u16,
+    /// Internal host the connection is rewritten to.
+    pub dst_ip: String,
+    /// Internal port (`0` keeps the public port).
+    #[serde(default)]
+    pub dst_port: u16,
+}
+
+/// A resolved port-forward, ready for the `PORT_FORWARDS` map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPortForward {
+    /// Policy (zone) id on the public side.
+    pub policy: PolicyId,
+    /// L4 protocol number.
+    pub proto: u8,
+    /// Public destination port.
+    pub port: u16,
+    /// Internal host (network-order octets).
+    pub dst_ip: [u8; 4],
+    /// Internal port (`0` keeps the public port).
+    pub dst_port: u16,
 }
 
 /// A resolved tenant policy: the firewall map contents for one `policy_id`.
@@ -443,6 +481,8 @@ pub struct RuntimeConfig {
     /// Load-balancer services for the `SERVICES`/`BACKENDS` maps (Phase 3).
     /// Currently global.
     pub services: Vec<ResolvedService>,
+    /// 1:1 DNAT port-forwards for the `PORT_FORWARDS` map (Phase 4).
+    pub port_forwards: Vec<ResolvedPortForward>,
     /// This host's overlay endpoint (Phase 4), or `None` if not participating.
     pub overlay: Option<ResolvedOverlay>,
     /// Overlay forwarding entries for the `OVERLAY_FDB` map (Phase 4).
@@ -466,6 +506,7 @@ impl RuntimeConfig {
             interfaces: Vec::new(),
             routes: Vec::new(),
             services: Vec::new(),
+            port_forwards: Vec::new(),
             overlay: None,
             tunnels: Vec::new(),
             neighbors: Vec::new(),
@@ -643,6 +684,30 @@ impl FileConfig {
             });
         }
 
+        // Phase 4: 1:1 DNAT port-forwards.
+        let mut port_forwards = Vec::with_capacity(self.port_forwards.len());
+        for pf in &self.port_forwards {
+            let proto = match pf.proto {
+                ProtoName::Tcp => ip_proto::TCP,
+                ProtoName::Udp => ip_proto::UDP,
+                ProtoName::Icmp => bail!("port-forward protocol must be tcp or udp"),
+            };
+            if !policies.iter().any(|p| p.id == pf.policy) {
+                bail!("port-forward references unknown policy id {}", pf.policy);
+            }
+            let dst_ip: Ipv4Addr = pf
+                .dst_ip
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid port-forward dst_ip {:?}", pf.dst_ip))?;
+            port_forwards.push(ResolvedPortForward {
+                policy: pf.policy,
+                proto,
+                port: pf.port,
+                dst_ip: dst_ip.octets(),
+                dst_port: pf.dst_port,
+            });
+        }
+
         // Phase 4: overlay endpoint + forwarding entries.
         let overlay = match &self.overlay {
             Some(o) => {
@@ -720,6 +785,7 @@ impl FileConfig {
             interfaces,
             routes,
             services,
+            port_forwards,
             overlay,
             tunnels,
             neighbors,

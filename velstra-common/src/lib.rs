@@ -46,7 +46,7 @@ pub use forward::{
     ForwardOutcome, Rewrite, RouteEntry, csum_replace_u16, ipv4_checksum, plan_forward,
 };
 pub use lb::{
-    Backend, FlowKey, FlowState, Nat, ServiceKey, ServiceValue, plan_dnat, plan_nat,
+    Backend, FlowKey, FlowState, Nat, PortFwd, ServiceKey, ServiceValue, plan_dnat, plan_nat,
     select_backend, session_hash,
 };
 pub use mac::{MacError, parse_mac};
