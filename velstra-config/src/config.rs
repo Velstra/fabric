@@ -88,6 +88,10 @@ pub struct PortRule {
     /// service" case.
     #[serde(default = "default_rule_action")]
     pub action: ActionName,
+    /// Log packets matching this rule, regardless of the policy-wide `log` flag.
+    /// Off by default.
+    #[serde(default)]
+    pub log: bool,
 }
 
 fn default_rule_action() -> ActionName {
@@ -413,8 +417,9 @@ pub struct PolicyConfig {
     /// Filled from the same TOML `blocklist` list — entries containing a `:` are
     /// parsed as IPv6.
     pub blocklist6: Vec<Cidr6>,
-    /// `(key, action)` entries for this policy's `PORT_RULES`.
-    pub port_rules: Vec<(PortKey, Action)>,
+    /// `(key, action, log)` entries for this policy's `PORT_RULES`. `log` asks
+    /// the data plane to log packets matching this rule.
+    pub port_rules: Vec<(PortKey, Action, bool)>,
 }
 
 /// This host's resolved overlay endpoint. The underlay MAC and egress ifindex
@@ -577,6 +582,7 @@ fn resolve_firewall(
         rules.push((
             PortKey::new(rule.proto.number(), rule.port),
             rule.action.into(),
+            rule.log,
         ));
     }
 
@@ -838,7 +844,7 @@ impl fmt::Display for RuntimeConfig {
             for cidr in &policy.blocklist6 {
                 writeln!(f, "      block6 {cidr}")?;
             }
-            for (key, action) in &policy.port_rules {
+            for (key, action, _log) in &policy.port_rules {
                 let proto = match key.proto {
                     ip_proto::TCP => "tcp",
                     ip_proto::UDP => "udp",
@@ -1000,12 +1006,12 @@ mod tests {
         // Explicit pass rule on tcp/443.
         assert_eq!(
             p0.port_rules[0],
-            (PortKey::new(ip_proto::TCP, 443), Action::Pass)
+            (PortKey::new(ip_proto::TCP, 443), Action::Pass, false)
         );
         // udp/53 defaults to drop.
         assert_eq!(
             p0.port_rules[1],
-            (PortKey::new(ip_proto::UDP, 53), Action::Drop)
+            (PortKey::new(ip_proto::UDP, 53), Action::Drop, false)
         );
     }
 
