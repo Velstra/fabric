@@ -19,9 +19,9 @@ use aya::{
 use clap::ValueEnum;
 use log::warn;
 use velstra_common::{
-    ArpEntry, ArpKey, Backend, Counter, GlobalConfig, OverlayConfig, PolicyId, PortFwd, RouteEntry,
-    ScopedAddr, ScopedAddr6, ScopedPortKey, ServiceKey, ServiceValue, TunnelEndpoint, TunnelKey,
-    parse_mac, port_rule_value,
+    ArpEntry, ArpKey, Backend, Cidr4, Counter, GlobalConfig, OverlayConfig, PolicyId, PortFwd,
+    RouteEntry, ScopedAddr, ScopedAddr6, ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue,
+    TunnelEndpoint, TunnelKey, parse_mac, port_rule_value,
 };
 use velstra_config::{
     PolicyConfig, ResolvedInterface, ResolvedNeighbor, ResolvedOverlay, ResolvedPortForward,
@@ -357,6 +357,20 @@ impl Firewall {
 
 /// Raise the locked-memory rlimit so map allocation succeeds on older kernels
 /// that still account BPF memory against `RLIMIT_MEMLOCK`.
+/// LPM `(prefix_len, addr)` for a port rule's optional source constraint. `None`
+/// ("from any") becomes a `/0` source — prefix == `FIXED_BITS`, address `0` —
+/// which the trie matches for every packet; a `Some` CIDR extends the prefix by
+/// the block's bits so a specific source outranks a `from any` rule.
+fn port_rule_src_lpm(src: &Option<Cidr4>) -> (u32, u32) {
+    match src {
+        Some(c) => {
+            let (bits, addr) = c.lpm_key();
+            (ScopedSrcPortKey::FIXED_BITS + bits, addr)
+        }
+        None => (ScopedSrcPortKey::prefix_len(0), 0),
+    }
+}
+
 fn bump_memlock_rlimit() {
     let limit = libc::rlimit {
         rlim_cur: libc::RLIM_INFINITY,
@@ -444,13 +458,17 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
         }
     }
     {
-        let mut rules: HashMap<_, ScopedPortKey, u32> = HashMap::try_from(
+        let mut rules: LpmTrie<_, ScopedSrcPortKey, u32> = LpmTrie::try_from(
             ebpf.map_mut("PORT_RULES")
                 .ok_or_else(|| anyhow!("PORT_RULES map missing"))?,
         )?;
         for policy in &old.policies {
-            for (key, _, _) in &policy.port_rules {
-                let _ = rules.remove(&ScopedPortKey::new(policy.id, key.proto, key.port));
+            for (key, src, _, _) in &policy.port_rules {
+                let (prefix, addr) = port_rule_src_lpm(src);
+                let _ = rules.remove(&Key::new(
+                    prefix,
+                    ScopedSrcPortKey::new(policy.id, key.proto, key.port, addr),
+                ));
             }
         }
     }
@@ -603,15 +621,19 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
         }
     }
     {
-        let mut rules: HashMap<_, ScopedPortKey, u32> = HashMap::try_from(
+        let mut rules: LpmTrie<_, ScopedSrcPortKey, u32> = LpmTrie::try_from(
             ebpf.map_mut("PORT_RULES")
                 .ok_or_else(|| anyhow!("PORT_RULES map missing"))?,
         )?;
         for policy in policies {
-            for (key, action, log) in &policy.port_rules {
+            for (key, src, action, log) in &policy.port_rules {
+                let (prefix, addr) = port_rule_src_lpm(src);
                 rules
                     .insert(
-                        ScopedPortKey::new(policy.id, key.proto, key.port),
+                        &Key::new(
+                            prefix,
+                            ScopedSrcPortKey::new(policy.id, key.proto, key.port, addr),
+                        ),
                         port_rule_value(*action, *log),
                         0,
                     )
