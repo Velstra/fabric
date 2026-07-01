@@ -63,11 +63,11 @@ use velstra_common::{
     ARP_REPLY, ARP_REQUEST, Action, ArpEntry, ArpKey, Backend, ConfigFlags, Counter, ETHERTYPE_ARP,
     ETHERTYPE_IPV4, ETHERTYPE_IPV6, FlowKey, FlowState, ForwardOutcome, GlobalConfig, Nat,
     OVERLAY_OUTER_LEN, OverlayConfig, PacketMeta, PolicyId, PortFwd, Rewrite, RouteEntry,
-    ScopedAddr, ScopedAddr6, ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue,
-    TunnelEndpoint, TunnelKey,
-    build_encap, decide, ip_proto, is_overlay_dport, lpm_key_addr, plan_arp_reply, plan_forward,
-    plan_nat, plan_tcp_rst, port_rule_action, port_rule_logs, select_backend, session_hash,
-    tcp_flags,
+    ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, ScopedAddr, ScopedAddr6, ScopedPortKey,
+    ScopedSrcPortKey, ServiceKey, ServiceValue, TunnelEndpoint, TunnelKey,
+    build_encap, decide, icmp, icmp_checksum, ip_proto, is_overlay_dport, lpm_key_addr,
+    plan_arp_reply, plan_forward, plan_icmp_unreachable, plan_nat, plan_tcp_rst, port_rule_action,
+    port_rule_logs, select_backend, session_hash, tcp_flags,
 };
 
 /// Maps an ingress interface index to its policy id, so one XDP program can
@@ -1243,10 +1243,15 @@ fn reject_packet(
     dst_port: u16,
     proto: u8,
 ) -> Result<u32, ()> {
-    // Only a standard 20-byte-IPv4 TCP segment becomes a RST; the rest drop.
-    if proto != ip_proto::TCP || ihl_bytes != Ipv4Hdr::LEN {
+    // Reject needs a standard 20-byte IPv4 header (no options) to rewrite.
+    if ihl_bytes != Ipv4Hdr::LEN {
         bump(Counter::Rejected);
         return Ok(xdp_action::XDP_DROP);
+    }
+    // Non-TCP is answered with an ICMP port-unreachable (UDP only; ICMP and other
+    // protocols drop, to avoid ICMP-error-to-error loops and amplification).
+    if proto != ip_proto::TCP {
+        return reject_icmp_unreachable(ctx, src_addr, dst_addr, proto);
     }
 
     // Read the incoming TCP fields + IP total length (each bounds-checked).
@@ -1310,6 +1315,86 @@ fn reject_packet(
         *((data + O_TCP_CSUM) as *mut [u8; 2]) = rst.tcp_checksum.to_be_bytes();
         *((data + O_TCP_URG) as *mut [u8; 2]) = [0, 0];
     }
+    bump(Counter::Rejected);
+    Ok(xdp_action::XDP_TX)
+}
+
+/// Answer a rejected **UDP** packet with an ICMP destination-unreachable /
+/// port-unreachable (type 3, code 3), reflected back out the ingress interface.
+///
+/// The response embeds the offending packet's IP header + first 8 bytes in the
+/// ICMP body. We grow the frame by [`ICMP_UNREACH_PREPEND`] (= new IP header 20 +
+/// ICMP header 8) bytes at the head: that shifts the offending packet forward by
+/// exactly 28 bytes, so its IP header lands at offset 42 — precisely the ICMP body
+/// position — and we only have to write the fresh Ethernet + IP + ICMP headers
+/// over the first 42 bytes, never touching the embedded body. Non-UDP protocols
+/// (including ICMP, to avoid error-to-error loops) drop.
+#[inline(always)]
+fn reject_icmp_unreachable(
+    ctx: &XdpContext,
+    src_addr: [u8; 4],
+    dst_addr: [u8; 4],
+    proto: u8,
+) -> Result<u32, ()> {
+    if proto != ip_proto::UDP {
+        bump(Counter::Rejected);
+        return Ok(xdp_action::XDP_DROP);
+    }
+
+    // The original MACs, read before we grow/overwrite the head.
+    let eth_dst = unsafe { *ptr_at::<[u8; 6]>(ctx, O_ETH_DST)? };
+    let eth_src = unsafe { *ptr_at::<[u8; 6]>(ctx, O_ETH_SRC)? };
+    let plan = plan_icmp_unreachable(src_addr, dst_addr);
+    let (new_src, new_dst) = (dst_addr, src_addr);
+
+    // Grow the head by IP(20)+ICMP(8). Negative delta adds headroom; a non-zero
+    // return means the kernel refused (no headroom) — drop rather than send junk.
+    if unsafe { bpf_xdp_adjust_head(ctx.ctx, -(ICMP_UNREACH_PREPEND as i32)) } != 0 {
+        bump(Counter::Malformed);
+        return Ok(xdp_action::XDP_DROP);
+    }
+
+    // Full response: eth(14) + IP(20) + ICMP(8) + embedded(28) = 70 bytes. One
+    // bounds check, then every write is at a constant offset through `data`.
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    if data + O_L4 + 36 > data_end {
+        return Ok(xdp_action::XDP_DROP);
+    }
+    // SAFETY: the check proves all 70 bytes from `data` are in-bounds; the writes
+    // below stop at offset 42 and never disturb the embedded body at [42..70].
+    unsafe {
+        // Ethernet [0..14]: swap the original MACs; IPv4 ethertype.
+        *((data + O_ETH_DST) as *mut [u8; 6]) = eth_src;
+        *((data + O_ETH_SRC) as *mut [u8; 6]) = eth_dst;
+        *((data + O_IP - 2) as *mut [u8; 2]) = ETHERTYPE_IPV4.to_be_bytes();
+        // IPv4 [14..34]: version/IHL, zeroed DSCP/len/id/frag, TTL, ICMP, csum,
+        // swapped addresses.
+        *((data + O_IP) as *mut u8) = 0x45;
+        *((data + O_IP + 1) as *mut u8) = 0;
+        *((data + O_IP_TOTLEN) as *mut [u8; 2]) = ICMP_UNREACH_TOTAL_LEN.to_be_bytes();
+        *((data + O_IP_ID) as *mut [u8; 2]) = [0, 0];
+        *((data + O_IP_FRAG) as *mut [u8; 2]) = [0, 0];
+        *((data + O_IP_TTL) as *mut u8) = 64;
+        *((data + O_IP_PROTO) as *mut u8) = ip_proto::ICMP;
+        *((data + O_IP_CSUM) as *mut [u8; 2]) = plan.ip_checksum.to_be_bytes();
+        *((data + O_IP_SRC) as *mut [u8; 4]) = new_src;
+        *((data + O_IP_DST) as *mut [u8; 4]) = new_dst;
+        // ICMP [34..42]: type, code, checksum placeholder, unused.
+        *((data + O_L4) as *mut u8) = icmp::DEST_UNREACHABLE;
+        *((data + O_L4 + 1) as *mut u8) = icmp::PORT_UNREACHABLE;
+        *((data + O_L4 + 2) as *mut [u8; 2]) = [0, 0];
+        *((data + O_L4 + 4) as *mut [u8; 4]) = [0, 0, 0, 0];
+    }
+    // ICMP checksum over its 8-byte header + the 28-byte embedded body [34..70].
+    // SAFETY: [34..70] is within the 70 bytes proven in-bounds above.
+    let message = unsafe { *((data + O_L4) as *const [u8; 36]) };
+    let csum = icmp_checksum(&message);
+    // SAFETY: the checksum field [36..38] is within the same proven bounds.
+    unsafe {
+        *((data + O_L4 + 2) as *mut [u8; 2]) = csum.to_be_bytes();
+    }
+
     bump(Counter::Rejected);
     Ok(xdp_action::XDP_TX)
 }

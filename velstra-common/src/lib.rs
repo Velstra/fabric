@@ -65,4 +65,7 @@ pub use policy::{
     Action, Counter, PORT_RULE_LOG, Verdict, decide, port_rule_action, port_rule_logs,
     port_rule_value,
 };
-pub use reject::{TcpRst, plan_tcp_rst, tcp_flags};
+pub use reject::{
+    ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, IcmpUnreach, TcpRst, icmp, icmp_checksum,
+    plan_icmp_unreachable, plan_tcp_rst, tcp_flags,
+};

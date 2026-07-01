@@ -170,6 +170,77 @@ fn tcp_checksum(src: [u8; 4], dst: [u8; 4], segment: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+/// ICMP message types/codes Velstra emits for a non-TCP reject.
+pub mod icmp {
+    /// ICMP type 3 — Destination Unreachable.
+    pub const DEST_UNREACHABLE: u8 = 3;
+    /// Code 3 under [`DEST_UNREACHABLE`] — Port Unreachable (what a host sends
+    /// for a closed UDP port; the natural non-TCP analogue of a TCP RST).
+    pub const PORT_UNREACHABLE: u8 = 3;
+}
+
+/// Total IPv4 length of an ICMP port-unreachable response: IP(20) + ICMP(8) +
+/// the embedded offending IP header(20) + its first 8 datagram bytes = 56. The
+/// data plane grows the frame by IP(20)+ICMP(8) = 28 bytes at the head so the
+/// offending packet's own header lands exactly in the ICMP body.
+pub const ICMP_UNREACH_TOTAL_LEN: u16 = 56;
+/// Bytes the data plane prepends (grows at head) to turn the offending packet
+/// into the ICMP error: a fresh IP header (20) + the ICMP header (8).
+pub const ICMP_UNREACH_PREPEND: usize = 28;
+
+/// The pure part of an ICMP destination-unreachable response: the repaired IPv4
+/// header checksum. The ICMP checksum covers the embedded offending packet, which
+/// lives in the frame, so the data plane computes that one with [`icmp_checksum`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct IcmpUnreach {
+    /// Repaired IPv4 header checksum for the 56-byte response.
+    pub ip_checksum: u16,
+}
+
+/// Plan an ICMP **destination unreachable / port unreachable** (type 3, code 3)
+/// in reply to a rejected non-TCP packet, per RFC 792. `ip_src`/`ip_dst` are the
+/// **incoming** packet's addresses (the response swaps them).
+pub fn plan_icmp_unreachable(ip_src: [u8; 4], ip_dst: [u8; 4]) -> IcmpUnreach {
+    let (new_src, new_dst) = (ip_dst, ip_src);
+    IcmpUnreach {
+        ip_checksum: ipv4_checksum(&icmp_unreach_ip_header(new_src, new_dst)),
+    }
+}
+
+/// The 20-byte IPv4 header wrapping an ICMP unreachable (checksum field left zero
+/// for [`ipv4_checksum`]). Total length 56, TTL 64, protocol ICMP.
+fn icmp_unreach_ip_header(src: [u8; 4], dst: [u8; 4]) -> [u8; 20] {
+    let mut h = [0u8; 20];
+    h[0] = 0x45; // version 4, IHL 5
+    h[2..4].copy_from_slice(&ICMP_UNREACH_TOTAL_LEN.to_be_bytes());
+    h[8] = 64; // TTL
+    h[9] = crate::packet::ip_proto::ICMP;
+    h[12..16].copy_from_slice(&src);
+    h[16..20].copy_from_slice(&dst);
+    h
+}
+
+/// Internet checksum (RFC 1071) over an ICMP message — its 8-byte header (with
+/// the checksum field zeroed) followed by the embedded offending packet. The data
+/// plane passes the header + embedded bytes as one slice.
+pub fn icmp_checksum(message: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < message.len() {
+        sum += u16::from_be_bytes([message[i], message[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < message.len() {
+        sum += (message[i] as u32) << 8;
+    }
+    // Two folds reduce any u32 to 16 bits without a data-dependent loop (the
+    // verifier rejects the `while sum >> 16 != 0` form), matching the crate's
+    // other checksum code.
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
+    !(sum as u16)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,5 +360,44 @@ mod tests {
             1,
         );
         assert_ne!(a.tcp_checksum, b.tcp_checksum);
+    }
+
+    #[test]
+    fn icmp_unreach_ip_checksum_validates_from_scratch() {
+        let in_src = [203, 0, 113, 7];
+        let in_dst = [10, 0, 0, 1];
+        let plan = plan_icmp_unreachable(in_src, in_dst);
+        // Rebuild the response IP header (swapped addresses) with the computed
+        // checksum in place; a valid header folds to zero.
+        let mut ip = icmp_unreach_ip_header(in_dst, in_src);
+        ip[10..12].copy_from_slice(&plan.ip_checksum.to_be_bytes());
+        assert_eq!(ones_complement(&ip), 0, "ICMP-unreachable IP checksum invalid");
+        // Header carries protocol ICMP and total length 56.
+        assert_eq!(ip[9], crate::packet::ip_proto::ICMP);
+        assert_eq!(u16::from_be_bytes([ip[2], ip[3]]), ICMP_UNREACH_TOTAL_LEN);
+    }
+
+    #[test]
+    fn icmp_checksum_validates_and_covers_the_body() {
+        // An 8-byte ICMP header (type 3, code 3, csum 0, unused 0) + a 28-byte
+        // embedded offending packet, checksum field left zero.
+        let mut base = [0u8; 36];
+        base[0] = icmp::DEST_UNREACHABLE;
+        base[1] = icmp::PORT_UNREACHABLE;
+        for (i, b) in base[8..].iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(3);
+        }
+        let csum = icmp_checksum(&base);
+
+        // Placing the checksum back makes the whole message fold to zero.
+        let mut with_csum = base;
+        with_csum[2..4].copy_from_slice(&csum.to_be_bytes());
+        assert_eq!(ones_complement(&with_csum), 0, "ICMP checksum invalid");
+
+        // The checksum genuinely covers the body: flipping an embedded byte (csum
+        // field still zero on both) changes it.
+        let mut flipped = base;
+        flipped[20] ^= 0xff;
+        assert_ne!(icmp_checksum(&flipped), csum);
     }
 }
