@@ -131,6 +131,66 @@ impl ScopedPortKey {
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for ScopedPortKey {}
 
+/// Key for the per-policy firewall-rule LPM trie: a `(proto, dst_port)` scoped by
+/// policy id, plus a **source address prefix** matched longest-first.
+///
+/// The kernel LPM trie walks the key bytes from offset 0, so the fixed head —
+/// `policy_id`, `proto`, `_pad`, `port` (the first [`Self::FIXED_BITS`] bits) — is
+/// always matched in full (every entry and every lookup carry all of it), and the
+/// trailing [`src`](Self::src) is the only variable-length part. That gives the
+/// firewall the natural precedence: a rule with a more specific source wins over a
+/// `from any` rule on the same port. A rule with **no** source constraint is stored
+/// as a `/0` source (prefix == `FIXED_BITS`), which matches every packet.
+///
+/// `src` is a [`lpm_key_addr`] value so its in-memory bytes are network order,
+/// exactly like [`ScopedAddr::addr`].
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct ScopedSrcPortKey {
+    /// Policy id, matched exactly.
+    pub policy_id: PolicyId,
+    /// IP protocol number.
+    pub proto: u8,
+    /// Explicit padding, always zero.
+    pub _pad: u8,
+    /// Destination port, host byte order.
+    pub port: u16,
+    /// Source address in [`lpm_key_addr`] form, matched longest-prefix.
+    pub src: u32,
+}
+
+impl ScopedSrcPortKey {
+    /// Prefix bits covering the exactly-matched head (`policy_id` + `proto` +
+    /// `_pad` + `port` = 32 + 8 + 8 + 16).
+    pub const FIXED_BITS: u32 = 64;
+
+    /// Build a scoped source/port key.
+    #[inline]
+    pub const fn new(policy_id: PolicyId, proto: u8, port: u16, src: u32) -> Self {
+        Self {
+            policy_id,
+            proto,
+            _pad: 0,
+            port,
+            src,
+        }
+    }
+
+    /// The LPM prefix length for a rule whose source is a `/cidr_bits` block
+    /// (`cidr_bits == 0` for `from any`).
+    #[inline]
+    pub const fn prefix_len(cidr_bits: u8) -> u32 {
+        Self::FIXED_BITS + cidr_bits as u32
+    }
+
+    /// The LPM prefix length for a lookup (all source bits known).
+    pub const FULL_PREFIX: u32 = Self::FIXED_BITS + 32;
+}
+
+// SAFETY: `#[repr(C)]`, integer fields, padding zeroed — POD.
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ScopedSrcPortKey {}
+
 /// Per-policy IPv6 blocklist LPM key: a policy id (matched exactly) followed by
 /// an IPv6 address prefix. IPv6 octets are already network-order (most
 /// significant first), so they need no `lpm_key_addr`-style transform.

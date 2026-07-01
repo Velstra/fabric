@@ -32,7 +32,7 @@
 //! | `CONFIG`       | `HashMap`       | policy id → [`GlobalConfig`]               |
 //! | `BLOCKLIST`    | `LpmTrie`       | `(policy, src CIDR)` drop list (DDoS lever)|
 //! | `BLOCKLIST6`   | `LpmTrie`       | `(policy, src IPv6 CIDR)` drop list        |
-//! | `PORT_RULES`   | `HashMap`       | `(policy, proto, dport)` → [`Action`]      |
+//! | `PORT_RULES`   | `LpmTrie`       | `(policy, proto, dport, src CIDR)` → action |
 //! | `ROUTES`      | `LpmTrie`        | Dest-IP prefix → [`RouteEntry`] (Phase 2)  |
 //! | `TX_PORTS`    | `DevMap`         | Redirect device map (Phase 2)              |
 //! | `SERVICES`    | `HashMap`        | `ServiceKey` → backend window (Phase 3)    |
@@ -63,7 +63,8 @@ use velstra_common::{
     ARP_REPLY, ARP_REQUEST, Action, ArpEntry, ArpKey, Backend, ConfigFlags, Counter, ETHERTYPE_ARP,
     ETHERTYPE_IPV4, ETHERTYPE_IPV6, FlowKey, FlowState, ForwardOutcome, GlobalConfig, Nat,
     OVERLAY_OUTER_LEN, OverlayConfig, PacketMeta, PolicyId, PortFwd, Rewrite, RouteEntry,
-    ScopedAddr, ScopedAddr6, ScopedPortKey, ServiceKey, ServiceValue, TunnelEndpoint, TunnelKey,
+    ScopedAddr, ScopedAddr6, ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue,
+    TunnelEndpoint, TunnelKey,
     build_encap, decide, ip_proto, is_overlay_dport, lpm_key_addr, plan_arp_reply, plan_forward,
     plan_nat, plan_tcp_rst, port_rule_action, port_rule_logs, select_backend, session_hash,
     tcp_flags,
@@ -100,7 +101,7 @@ static BLOCKLIST6: LpmTrie<ScopedAddr6, u32> = LpmTrie::with_max_entries(8192, 0
 /// Per-policy `(proto, destination port)` → [`Action`] allow/deny rules. Shared
 /// across address families: a port rule applies to IPv4 *and* IPv6 alike.
 #[map]
-static PORT_RULES: HashMap<ScopedPortKey, u32> = HashMap::with_max_entries(8192, 0);
+static PORT_RULES: LpmTrie<ScopedSrcPortKey, u32> = LpmTrie::with_max_entries(8192, 0);
 
 /// Per-policy 1:1 DNAT port-forwards: `(policy, proto, destination port)` → the
 /// internal `(ip, port)` an inbound connection is rewritten to. Empty by default
@@ -316,7 +317,7 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
             ScopedAddr::new(policy_id, lpm_key_addr(dst_addr)),
         ))
         .is_some();
-    let rule = lookup_port_rule(policy_id, proto, dst_port);
+    let rule = lookup_port_rule(policy_id, proto, dst_port, lpm_key_addr(src_addr));
     let meta = PacketMeta::new(
         src_addr,
         dst_addr,
@@ -614,7 +615,7 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
             ScopedAddr::new(policy_id, lpm_key_addr(src_addr)),
         ))
         .is_some();
-    let rule = lookup_port_rule(policy_id, proto, dst_port);
+    let rule = lookup_port_rule(policy_id, proto, dst_port, lpm_key_addr(src_addr));
     // A configured port-forward for this destination port implicitly opens the
     // firewall (the DNAT + reply SNAT are done below / in the conntrack path).
     let port_forward = lookup_port_forward(policy_id, proto, dst_port);
@@ -806,7 +807,10 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
             ScopedAddr6::new(policy_id, src_addr),
         ))
         .is_some();
-    let rule = lookup_port_rule(policy_id, next_hdr, dst_port);
+    // The rule map's source match is IPv4-only, so an IPv4 source-CIDR rule can
+    // never apply to a v6 packet; look up with `src = 0` to match only the
+    // source-less (`/0`, from-any) rules for this `(policy, proto, dport)`.
+    let rule = lookup_port_rule(policy_id, next_hdr, dst_port, 0);
 
     // IPv6 addresses do not fit `PacketMeta`'s IPv4 fields, but `decide` only
     // reads `proto`/`dst_port` plus the `blocklisted`/`rule` inputs we computed,
@@ -1353,14 +1357,18 @@ fn forward(ctx: &XdpContext, rewrite: Rewrite, log: bool) -> Result<u32, ()> {
 /// Look up an explicit `(policy, proto, dst_port)` rule, decoding the stored
 /// `u32` into an [`Action`].
 #[inline(always)]
-/// Look up the packed `PORT_RULES` value for `(policy, proto, dst_port)`. The low
-/// byte is the [`Action`] (`port_rule_action`); bit 8 is the per-rule log flag
+/// Look up the packed `PORT_RULES` value for `(policy, proto, dst_port)` and the
+/// packet's `src` address ([`lpm_key_addr`] form). The trie matches the fixed
+/// `(policy, proto, dport)` head exactly and the source longest-prefix, so a rule
+/// with a specific source outranks a `from any` rule on the same port; pass `src`
+/// as `0` to match only source-less (`/0`) rules. The low byte of the value is the
+/// [`Action`] (`port_rule_action`); bit 8 is the per-rule log flag
 /// (`port_rule_logs`). Returns `None` when no rule matches.
-fn lookup_port_rule(policy_id: PolicyId, proto: u8, dst_port: u16) -> Option<u32> {
-    let key = ScopedPortKey::new(policy_id, proto, dst_port);
-    // SAFETY: `HashMap::get` is `unsafe` only because the returned reference
-    // borrows map memory; we copy the value out immediately and never hold it.
-    let value = unsafe { PORT_RULES.get(key) }?;
+fn lookup_port_rule(policy_id: PolicyId, proto: u8, dst_port: u16, src: u32) -> Option<u32> {
+    let value = PORT_RULES.get(Key::new(
+        ScopedSrcPortKey::FULL_PREFIX,
+        ScopedSrcPortKey::new(policy_id, proto, dst_port, src),
+    ))?;
     Some(*value)
 }
 

@@ -58,7 +58,7 @@ pub use overlay::{
 };
 pub use packet::{
     ETHERTYPE_IPV4, ETHERTYPE_IPV6, PacketMeta, PolicyId, PortKey, ScopedAddr, ScopedAddr6,
-    ScopedPortKey, ip_proto, lpm_key_addr,
+    ScopedPortKey, ScopedSrcPortKey, ip_proto, lpm_key_addr,
 };
 pub use parse::{ParseResult, parse_frame};
 pub use policy::{

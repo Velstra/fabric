@@ -92,6 +92,11 @@ pub struct PortRule {
     /// Off by default.
     #[serde(default)]
     pub log: bool,
+    /// Optional source-address constraint (an IPv4 CIDR like `"10.0.0.0/24"` or a
+    /// bare `"198.51.100.7"` host). Absent means "from any source". A rule with a
+    /// more specific source wins over a `from any` rule on the same port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub src: Option<String>,
 }
 
 fn default_rule_action() -> ActionName {
@@ -417,9 +422,10 @@ pub struct PolicyConfig {
     /// Filled from the same TOML `blocklist` list — entries containing a `:` are
     /// parsed as IPv6.
     pub blocklist6: Vec<Cidr6>,
-    /// `(key, action, log)` entries for this policy's `PORT_RULES`. `log` asks
-    /// the data plane to log packets matching this rule.
-    pub port_rules: Vec<(PortKey, Action, bool)>,
+    /// `(key, src, action, log)` entries for this policy's `PORT_RULES`. `src` is
+    /// the optional source-CIDR constraint (`None` == from any); `log` asks the
+    /// data plane to log packets matching this rule.
+    pub port_rules: Vec<(PortKey, Option<Cidr4>, Action, bool)>,
 }
 
 /// This host's resolved overlay endpoint. The underlay MAC and egress ifindex
@@ -579,8 +585,15 @@ fn resolve_firewall(
                 "policy {id}: port rule on ICMP is invalid (ICMP has no ports); use `drop_icmp = true`"
             );
         }
+        let src = match &rule.src {
+            Some(cidr) => Some(parse_cidr_v4(cidr).map_err(|e| {
+                anyhow::anyhow!("policy {id}: invalid rule source {cidr:?}: {e}")
+            })?),
+            None => None,
+        };
         rules.push((
             PortKey::new(rule.proto.number(), rule.port),
+            src,
             rule.action.into(),
             rule.log,
         ));
@@ -844,12 +857,16 @@ impl fmt::Display for RuntimeConfig {
             for cidr in &policy.blocklist6 {
                 writeln!(f, "      block6 {cidr}")?;
             }
-            for (key, action, _log) in &policy.port_rules {
+            for (key, src, action, _log) in &policy.port_rules {
+                let from = match src {
+                    Some(c) => format!(" from {}/{}", c.octets.map(|o| o.to_string()).join("."), c.prefix),
+                    None => String::new(),
+                };
                 let proto = match key.proto {
                     ip_proto::TCP => "tcp",
                     ip_proto::UDP => "udp",
                     other => {
-                        writeln!(f, "      proto {other} port {} -> {action:?}", key.port)?;
+                        writeln!(f, "      proto {other} port {} ->{from} {action:?}", key.port)?;
                         continue;
                     }
                 };
@@ -858,7 +875,7 @@ impl fmt::Display for RuntimeConfig {
                     Action::Drop => "drop",
                     Action::Reject => "reject",
                 };
-                writeln!(f, "      {proto}/{} -> {verdict}", key.port)?;
+                writeln!(f, "      {proto}/{} ->{from} {verdict}", key.port)?;
             }
         }
 
@@ -1006,12 +1023,12 @@ mod tests {
         // Explicit pass rule on tcp/443.
         assert_eq!(
             p0.port_rules[0],
-            (PortKey::new(ip_proto::TCP, 443), Action::Pass, false)
+            (PortKey::new(ip_proto::TCP, 443), None, Action::Pass, false)
         );
         // udp/53 defaults to drop.
         assert_eq!(
             p0.port_rules[1],
-            (PortKey::new(ip_proto::UDP, 53), Action::Drop, false)
+            (PortKey::new(ip_proto::UDP, 53), None, Action::Drop, false)
         );
     }
 

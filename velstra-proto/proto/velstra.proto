@@ -233,6 +233,7 @@ message PortRule {
   uint32 port = 2;
   Action action = 3;
   bool log = 4;  // log packets matching this rule (independent of policy log)
+  string src = 5;  // optional source CIDR ("10.0.0.0/24"); empty = from any
 }
 
 message Route {
