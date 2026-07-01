@@ -318,6 +318,9 @@ impl Topology {
                     name: port.tap.clone(),
                     policy: port.vni,
                     vni: Some(port.vni),
+                    // Orchestrator-managed tap ports are tenant overlay endpoints,
+                    // never a WAN uplink, so they are not masqueraded.
+                    masquerade: false,
                 });
             } else if local_vnis.contains(&port.vni) {
                 let remote = &self.hosts[&port.host];

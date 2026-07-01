@@ -21,7 +21,7 @@ use log::warn;
 use velstra_common::{
     ArpEntry, ArpKey, Backend, Counter, GlobalConfig, OverlayConfig, PolicyId, PortFwd, RouteEntry,
     ScopedAddr, ScopedAddr6, ScopedPortKey, ServiceKey, ServiceValue, TunnelEndpoint, TunnelKey,
-    parse_mac,
+    parse_mac, port_rule_value,
 };
 use velstra_config::{
     PolicyConfig, ResolvedInterface, ResolvedNeighbor, ResolvedOverlay, ResolvedPortForward,
@@ -449,7 +449,7 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
                 .ok_or_else(|| anyhow!("PORT_RULES map missing"))?,
         )?;
         for policy in &old.policies {
-            for (key, _) in &policy.port_rules {
+            for (key, _, _) in &policy.port_rules {
                 let _ = rules.remove(&ScopedPortKey::new(policy.id, key.proto, key.port));
             }
         }
@@ -608,11 +608,11 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
                 .ok_or_else(|| anyhow!("PORT_RULES map missing"))?,
         )?;
         for policy in policies {
-            for (key, action) in &policy.port_rules {
+            for (key, action, log) in &policy.port_rules {
                 rules
                     .insert(
                         ScopedPortKey::new(policy.id, key.proto, key.port),
-                        action.as_u32(),
+                        port_rule_value(*action, *log),
                         0,
                     )
                     .context("inserting port rule")?;

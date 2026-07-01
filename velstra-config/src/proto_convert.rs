@@ -19,6 +19,7 @@ fn port_rule_to_proto(r: &PortRule) -> proto::PortRule {
         proto: proto_to_proto(r.proto) as i32,
         port: u32::from(r.port),
         action: action_to_proto(r.action) as i32,
+        log: r.log,
     }
 }
 
@@ -27,6 +28,7 @@ fn port_rule_from_proto(r: &proto::PortRule) -> PortRule {
         proto: proto_from_proto(r.proto()),
         port: r.port as u16,
         action: action_from_proto(r.action()),
+        log: r.log,
     }
 }
 

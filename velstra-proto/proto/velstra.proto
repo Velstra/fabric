@@ -232,6 +232,7 @@ message PortRule {
   Proto proto = 1;
   uint32 port = 2;
   Action action = 3;
+  bool log = 4;  // log packets matching this rule (independent of policy log)
 }
 
 message Route {

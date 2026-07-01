@@ -61,5 +61,8 @@ pub use packet::{
     ScopedPortKey, ip_proto, lpm_key_addr,
 };
 pub use parse::{ParseResult, parse_frame};
-pub use policy::{Action, Counter, Verdict, decide};
+pub use policy::{
+    Action, Counter, PORT_RULE_LOG, Verdict, decide, port_rule_action, port_rule_logs,
+    port_rule_value,
+};
 pub use reject::{TcpRst, plan_tcp_rst, tcp_flags};

@@ -49,6 +49,31 @@ impl Action {
     }
 }
 
+/// Bit set in a `PORT_RULES` map value, above the [`Action`] byte, to request
+/// **per-rule logging**: a packet matching this rule is logged regardless of the
+/// policy-wide [`ConfigFlags::LOG`] flag. Packing it into the existing `u32`
+/// value keeps the map ABI (and key/value sizes) unchanged.
+pub const PORT_RULE_LOG: u32 = 1 << 8;
+
+/// Pack a port rule's `(action, log)` into its `PORT_RULES` map value.
+#[inline]
+pub const fn port_rule_value(action: Action, log: bool) -> u32 {
+    action.as_u32() | if log { PORT_RULE_LOG } else { 0 }
+}
+
+/// The [`Action`] of a packed `PORT_RULES` value (its low byte; unknown values
+/// fail open to [`Action::Pass`] like [`Action::from_u32`]).
+#[inline]
+pub const fn port_rule_action(value: u32) -> Action {
+    Action::from_u32(value & 0xff)
+}
+
+/// Whether a packed `PORT_RULES` value asks for this rule's matches to be logged.
+#[inline]
+pub const fn port_rule_logs(value: u32) -> bool {
+    value & PORT_RULE_LOG != 0
+}
+
 /// Statistics counters, one per slot in the per-CPU `STATS` array map.
 ///
 /// The discriminant is the array index, so the order is part of the map ABI.
@@ -285,6 +310,21 @@ mod tests {
         assert_eq!(Action::from_u32(Action::Drop.as_u32()), Action::Drop);
         // Unknown / corrupt values must never drop traffic.
         assert_eq!(Action::from_u32(42), Action::Pass);
+    }
+
+    #[test]
+    fn port_rule_value_packs_action_and_log() {
+        for action in [Action::Pass, Action::Drop, Action::Reject] {
+            for log in [false, true] {
+                let v = port_rule_value(action, log);
+                assert_eq!(port_rule_action(v), action);
+                assert_eq!(port_rule_logs(v), log);
+            }
+        }
+        // A bare action value (no log bit) decodes as log-off — backward
+        // compatible with values written before per-rule logging existed.
+        assert_eq!(port_rule_action(Action::Drop.as_u32()), Action::Drop);
+        assert!(!port_rule_logs(Action::Drop.as_u32()));
     }
 
     #[test]

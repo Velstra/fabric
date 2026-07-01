@@ -65,7 +65,8 @@ use velstra_common::{
     OVERLAY_OUTER_LEN, OverlayConfig, PacketMeta, PolicyId, PortFwd, Rewrite, RouteEntry,
     ScopedAddr, ScopedAddr6, ScopedPortKey, ServiceKey, ServiceValue, TunnelEndpoint, TunnelKey,
     build_encap, decide, ip_proto, is_overlay_dport, lpm_key_addr, plan_arp_reply, plan_forward,
-    plan_nat, plan_tcp_rst, select_backend, session_hash, tcp_flags,
+    plan_nat, plan_tcp_rst, port_rule_action, port_rule_logs, select_backend, session_hash,
+    tcp_flags,
 };
 
 /// Maps an ingress interface index to its policy id, so one XDP program can
@@ -324,13 +325,15 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
         dst_port,
         ipv4.tot_len(),
     );
-    let verdict = decide(&meta, &cfg, blocklisted, rule);
+    let verdict = decide(&meta, &cfg, blocklisted, rule.map(port_rule_action));
 
     // On egress we can't bounce a RST back the way the XDP ingress path does, so
     // an active reject degrades to a silent drop here.
     if verdict.action != Action::Pass {
         bump(Counter::EgressDropped);
-        if cfg.has_flag(ConfigFlags::LOG) {
+        // The policy-wide log flag, or this rule's own per-rule log bit.
+        let want_log = cfg.has_flag(ConfigFlags::LOG) || rule.map_or(false, port_rule_logs);
+        if want_log {
             info!(
                 ctx,
                 "EGRESS DROP -> {}.{}.{}.{} proto={} dport={} reason={}",
@@ -616,7 +619,12 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     // firewall (the DNAT + reply SNAT are done below / in the conntrack path).
     let port_forward = lookup_port_forward(policy_id, proto, dst_port);
 
-    let verdict = decide(&meta, &cfg, blocklisted, rule);
+    let verdict = decide(&meta, &cfg, blocklisted, rule.map(port_rule_action));
+    // Per-rule logging: this rule's own log bit, and the effective flag combining
+    // it with the policy-wide log. `rule_log` alone gates logging of *allowed*
+    // traffic so a globally-logging policy doesn't start logging every pass.
+    let rule_log = rule.map_or(false, port_rule_logs);
+    let want_log = cfg.has_flag(ConfigFlags::LOG) || rule_log;
 
     // Stateful firewall: track allowed TCP/UDP flows so replies are permitted in
     // either direction, even under deny-by-default. The blocklist still wins.
@@ -642,7 +650,7 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     // Phase 1: a firewall drop is final.
     if action == Action::Drop {
         bump(fw_counter);
-        if cfg.has_flag(ConfigFlags::LOG) {
+        if want_log {
             info!(
                 ctx,
                 "DROP {}.{}.{}.{} proto={} dport={} reason={}",
@@ -661,7 +669,7 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     // Phase 3: an active reject answers the sender — a TCP RST (or a drop for
     // non-TCP) bounced back out the ingress interface — instead of black-holing.
     if action == Action::Reject {
-        if cfg.has_flag(ConfigFlags::LOG) {
+        if want_log {
             info!(
                 ctx,
                 "REJECT {}.{}.{}.{} proto={} dport={}",
@@ -684,6 +692,23 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
         let _ = FW_FLOWS.insert(&fkey, &1u8, 0);
         let rkey = FlowKey::new(dst_addr, src_addr, dst_port, src_port, proto);
         let _ = FW_FLOWS.insert(&rkey, &1u8, 0);
+    }
+
+    // Per-rule logging of allowed traffic: a rule with `log = true` records each
+    // new (non-established) flow it admits. Gated on the rule's own bit so a
+    // policy that logs globally still only logs drops/rejects, not every pass.
+    if rule_log && action == Action::Pass && !established {
+        info!(
+            ctx,
+            "ALLOW {}.{}.{}.{} proto={} dport={} reason={}",
+            src_addr[0],
+            src_addr[1],
+            src_addr[2],
+            src_addr[3],
+            proto,
+            dst_port,
+            fw_counter.label(),
+        );
     }
 
     let log = cfg.has_flag(ConfigFlags::LOG);
@@ -788,12 +813,13 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
     // so zero placeholders are harmless. The blocklist verdict already came from
     // the real IPv6 source above.
     let meta = PacketMeta::new([0; 4], [0; 4], next_hdr, src_port, dst_port, payload_len);
-    let verdict = decide(&meta, &cfg, blocklisted, rule);
+    let verdict = decide(&meta, &cfg, blocklisted, rule.map(port_rule_action));
 
     bump(verdict.counter);
     // Reject has no IPv6 RST path yet, so it drops here like Drop.
     if verdict.action != Action::Pass {
-        if cfg.has_flag(ConfigFlags::LOG) {
+        let want_log = cfg.has_flag(ConfigFlags::LOG) || rule.map_or(false, port_rule_logs);
+        if want_log {
             info!(
                 ctx,
                 "DROP6 proto={} dport={} reason={}",
@@ -1327,12 +1353,15 @@ fn forward(ctx: &XdpContext, rewrite: Rewrite, log: bool) -> Result<u32, ()> {
 /// Look up an explicit `(policy, proto, dst_port)` rule, decoding the stored
 /// `u32` into an [`Action`].
 #[inline(always)]
-fn lookup_port_rule(policy_id: PolicyId, proto: u8, dst_port: u16) -> Option<Action> {
+/// Look up the packed `PORT_RULES` value for `(policy, proto, dst_port)`. The low
+/// byte is the [`Action`] (`port_rule_action`); bit 8 is the per-rule log flag
+/// (`port_rule_logs`). Returns `None` when no rule matches.
+fn lookup_port_rule(policy_id: PolicyId, proto: u8, dst_port: u16) -> Option<u32> {
     let key = ScopedPortKey::new(policy_id, proto, dst_port);
     // SAFETY: `HashMap::get` is `unsafe` only because the returned reference
     // borrows map memory; we copy the value out immediately and never hold it.
     let value = unsafe { PORT_RULES.get(key) }?;
-    Some(Action::from_u32(*value))
+    Some(*value)
 }
 
 /// The DNAT target for an inbound `(policy, proto, dport)`, if a port-forward is
