@@ -22,6 +22,7 @@ env_logger = { workspace = true }
 log = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
+x509-parser = "0.16"
 toml = { workspace = true, features = ["display"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "signal", "fs"] }
 tokio-stream = { workspace = true }
