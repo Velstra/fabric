@@ -52,6 +52,10 @@ service VelstraOrchestrator {
   rpc MigratePort(MigratePortRequest) returns (PortInfo);
   // List all ports in the fabric.
   rpc ListPorts(ListPortsRequest) returns (ListPortsResponse);
+  // Retire a host. Fails while any port is still bound to it.
+  rpc RemoveHost(RemoveHostRequest) returns (Ack);
+  // Decommission a network. Fails while any port is still on it.
+  rpc RemoveNetwork(RemoveNetworkRequest) returns (Ack);
 }
 
 message HostSpec {
@@ -90,6 +94,14 @@ message PortInfo {
 
 message RemovePortRequest {
   string id = 1;
+}
+
+message RemoveHostRequest {
+  string id = 1;
+}
+
+message RemoveNetworkRequest {
+  uint32 vni = 1;
 }
 
 message MigratePortRequest {
@@ -242,6 +254,7 @@ message Route {
   string via_mac = 3;    // next-hop MAC
   string src_mac = 4;    // source MAC, empty = use the egress interface's
   ForwardMode mode = 5;
+  uint32 policy = 6;     // owning tenant policy (0 = default routing table)
 }
 
 message Service {
@@ -249,6 +262,7 @@ message Service {
   uint32 port = 2;
   Proto proto = 3;
   repeated Backend backends = 4;
+  uint32 policy = 5;     // owning tenant policy (0 = default service table)
 }
 
 message Backend {
