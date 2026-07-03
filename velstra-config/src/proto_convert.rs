@@ -142,6 +142,7 @@ pub fn file_config_to_proto(cfg: &FileConfig, version: u64) -> proto::NodeConfig
                 via_mac: r.via_mac.clone(),
                 src_mac: r.src_mac.clone().unwrap_or_default(),
                 mode: mode_to_proto(r.mode) as i32,
+                policy: r.policy,
             })
             .collect(),
         services: cfg
@@ -159,6 +160,7 @@ pub fn file_config_to_proto(cfg: &FileConfig, version: u64) -> proto::NodeConfig
                         port: u32::from(b.port.unwrap_or(0)),
                     })
                     .collect(),
+                policy: s.policy,
             })
             .collect(),
         overlay: cfg.overlay.as_ref().map(|o| proto::Overlay {
@@ -236,6 +238,7 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
             .routes
             .iter()
             .map(|r| RouteCfg {
+                policy: r.policy,
                 dest: r.dest.clone(),
                 out_iface: r.out_iface.clone(),
                 via_mac: r.via_mac.clone(),
@@ -251,6 +254,7 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
             .services
             .iter()
             .map(|s| ServiceCfg {
+                policy: s.policy,
                 vip: s.vip.clone(),
                 port: s.port as u16,
                 proto: proto_from_proto(s.proto()),
@@ -447,6 +451,7 @@ mod tests {
                     ip: "10.0.1.9".into(),
                     port: 0,
                 }],
+                policy: 0,
             }],
             ..Default::default()
         };

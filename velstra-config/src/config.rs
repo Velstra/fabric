@@ -129,6 +129,11 @@ impl ForwardMode {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteCfg {
+    /// Policy (tenant) this route belongs to; `0` (the default) is the top-level
+    /// routing table. Scoping the FIB by policy lets two tenants with
+    /// overlapping prefixes each keep their own next hop (C3).
+    #[serde(default)]
+    pub policy: PolicyId,
     /// Destination prefix to match, e.g. `"10.0.0.0/24"`.
     pub dest: String,
     /// Egress interface name.
@@ -159,6 +164,11 @@ pub struct BackendCfg {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceCfg {
+    /// Policy (tenant) this service belongs to; `0` (the default) is the
+    /// top-level service table. Scoping the LB by policy lets two tenants front
+    /// the same VIP:port without their conntrack/service entries colliding (C3).
+    #[serde(default)]
+    pub policy: PolicyId,
     /// Virtual IP clients connect to.
     pub vip: String,
     /// Virtual service port.
@@ -362,6 +372,8 @@ pub struct ResolvedService {
 /// plane, since that requires touching the OS.
 #[derive(Debug, Clone)]
 pub struct ResolvedRoute {
+    /// Owning policy (tenant); `0` is the default routing table (C3).
+    pub policy: PolicyId,
     /// Destination prefix to match.
     pub dest: Cidr4,
     /// Egress interface name.
@@ -668,6 +680,13 @@ impl FileConfig {
 
         let mut routes = Vec::with_capacity(self.routes.len());
         for route in &self.routes {
+            if !policies.iter().any(|p| p.id == route.policy) {
+                bail!(
+                    "route {:?} references unknown policy id {}",
+                    route.dest,
+                    route.policy
+                );
+            }
             let dest = parse_cidr_v4(&route.dest)
                 .map_err(|e| anyhow::anyhow!("invalid route dest {:?}: {e}", route.dest))?;
             let dst_mac = parse_mac(&route.via_mac)
@@ -679,6 +698,7 @@ impl FileConfig {
                 None => None,
             };
             routes.push(ResolvedRoute {
+                policy: route.policy,
                 dest,
                 out_iface: route.out_iface.clone(),
                 src_mac,
@@ -689,6 +709,14 @@ impl FileConfig {
 
         let mut services = Vec::with_capacity(self.services.len());
         for service in &self.services {
+            if !policies.iter().any(|p| p.id == service.policy) {
+                bail!(
+                    "service {}:{} references unknown policy id {}",
+                    service.vip,
+                    service.port,
+                    service.policy
+                );
+            }
             let proto = match service.proto {
                 ProtoName::Tcp => ip_proto::TCP,
                 ProtoName::Udp => ip_proto::UDP,
@@ -710,7 +738,7 @@ impl FileConfig {
                 backends.push(Backend::new(ip.octets(), backend.port.unwrap_or(0)));
             }
             services.push(ResolvedService {
-                key: ServiceKey::new(vip.octets(), service.port, proto),
+                key: ServiceKey::new(service.policy, vip.octets(), service.port, proto),
                 backends,
             });
         }

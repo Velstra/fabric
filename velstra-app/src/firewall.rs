@@ -506,13 +506,16 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
         }
     }
     {
-        let mut routes: LpmTrie<_, u32, RouteEntry> = LpmTrie::try_from(
+        let mut routes: LpmTrie<_, ScopedAddr, RouteEntry> = LpmTrie::try_from(
             ebpf.map_mut("ROUTES")
                 .ok_or_else(|| anyhow!("ROUTES map missing"))?,
         )?;
         for route in &old.routes {
             let (prefix, data) = route.dest.lpm_key();
-            let _ = routes.remove(&Key::new(prefix, data));
+            let _ = routes.remove(&Key::new(
+                ScopedAddr::POLICY_BITS + prefix,
+                ScopedAddr::new(route.policy, data),
+            ));
         }
     }
     {
@@ -968,6 +971,7 @@ fn program_overlay(
 /// A route resolved against the live system: ifindex looked up, source MAC
 /// settled, ready to drop straight into the `ROUTES` and `TX_PORTS` maps.
 struct PreparedRoute {
+    policy: PolicyId,
     prefix: u32,
     data: u32,
     entry: RouteEntry,
@@ -1006,13 +1010,20 @@ fn program_routes(ebpf: &mut Ebpf, routes: &[ResolvedRoute]) -> Result<()> {
     }
 
     {
-        let mut fib: LpmTrie<_, u32, RouteEntry> = LpmTrie::try_from(
+        let mut fib: LpmTrie<_, ScopedAddr, RouteEntry> = LpmTrie::try_from(
             ebpf.map_mut("ROUTES")
                 .ok_or_else(|| anyhow!("ROUTES map missing"))?,
         )?;
         for route in &prepared {
-            fib.insert(&Key::new(route.prefix, route.data), route.entry, 0)
-                .context("inserting route")?;
+            fib.insert(
+                &Key::new(
+                    ScopedAddr::POLICY_BITS + route.prefix,
+                    ScopedAddr::new(route.policy, route.data),
+                ),
+                route.entry,
+                0,
+            )
+            .context("inserting route")?;
         }
     }
 
@@ -1041,6 +1052,7 @@ fn prepare_route(route: &ResolvedRoute) -> Result<PreparedRoute> {
     };
     let (prefix, data) = route.dest.lpm_key();
     Ok(PreparedRoute {
+        policy: route.policy,
         prefix,
         data,
         entry: RouteEntry::new(ifindex, src_mac, route.dst_mac, route.flags),

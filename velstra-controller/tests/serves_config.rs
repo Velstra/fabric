@@ -166,6 +166,7 @@ async fn controller_serves_and_updates_config() {
                 ip: "10.9.9.9".into(),
                 port: 8443,
             }],
+            policy: 0,
         }],
         ..Default::default()
     };

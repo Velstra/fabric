@@ -28,12 +28,20 @@
 //! per RFC 1624 via [`crate::csum_replace_u16`]. A UDP datagram with a zero
 //! checksum (checksum disabled) is left untouched.
 
-use crate::{forward::csum_replace_u16, packet::ip_proto};
+use crate::{
+    forward::csum_replace_u16,
+    packet::{PolicyId, ip_proto},
+};
 
-/// Exact-match key for the `SERVICES` hash map: a virtual service endpoint.
+/// Exact-match key for the `SERVICES` hash map: a virtual service endpoint,
+/// scoped by `policy` so two tenants can host the same VIP:port without their
+/// load-balancer entries colliding (C3 tenant-scoping — mirrors how the
+/// blocklist and port rules already scope by [`PolicyId`]).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct ServiceKey {
+    /// Owning policy (tenant); `0` is the default policy.
+    pub policy: PolicyId,
     /// Virtual IP, network-order octets.
     pub vip: [u8; 4],
     /// Service port, host byte order.
@@ -47,8 +55,9 @@ pub struct ServiceKey {
 impl ServiceKey {
     /// Build a service key.
     #[inline]
-    pub const fn new(vip: [u8; 4], port: u16, proto: u8) -> Self {
+    pub const fn new(policy: PolicyId, vip: [u8; 4], port: u16, proto: u8) -> Self {
         Self {
+            policy,
             vip,
             port,
             proto,
@@ -242,11 +251,18 @@ pub fn plan_dnat(
     )
 }
 
-/// Lookup key for the `CONNTRACK` LRU map: a flow's 5-tuple. Addresses are
+/// Lookup key for the `CONNTRACK` and `FW_FLOWS` maps: a flow's 5-tuple, scoped
+/// by `policy` so a tracked/allowed flow in one tenant never matches an
+/// identical 5-tuple in another (C3 tenant-scoping). Two tenants routinely reuse
+/// the same private ranges (e.g. `10.0.0.0/24`); without the scope, tenant A's
+/// established flow would let tenant B's identical 5-tuple through the firewall
+/// and its conntrack entry would DNAT/SNAT onto A's backend. Addresses are
 /// network-order octets, ports host order.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct FlowKey {
+    /// Owning policy (tenant); `0` is the default policy.
+    pub policy: PolicyId,
     /// Source address.
     pub src_ip: [u8; 4],
     /// Destination address.
@@ -265,6 +281,7 @@ impl FlowKey {
     /// Build a flow key.
     #[inline]
     pub const fn new(
+        policy: PolicyId,
         src_ip: [u8; 4],
         dst_ip: [u8; 4],
         src_port: u16,
@@ -272,6 +289,7 @@ impl FlowKey {
         proto: u8,
     ) -> Self {
         Self {
+            policy,
             src_ip,
             dst_ip,
             src_port,
@@ -589,11 +607,31 @@ mod tests {
     }
 
     #[test]
+    fn keys_are_scoped_by_policy() {
+        // C3: an identical 5-tuple under two policies must be two distinct keys,
+        // so tenant A's tracked flow can never match tenant B's traffic.
+        let a = FlowKey::new(1, [10, 0, 0, 5], [10, 0, 0, 1], 1234, 80, ip_proto::TCP);
+        let b = FlowKey::new(2, [10, 0, 0, 5], [10, 0, 0, 1], 1234, 80, ip_proto::TCP);
+        assert_ne!(a, b);
+        // Same policy + same tuple still collapses to one key (a real flow match).
+        assert_eq!(
+            a,
+            FlowKey::new(1, [10, 0, 0, 5], [10, 0, 0, 1], 1234, 80, ip_proto::TCP)
+        );
+
+        // The same VIP:port in two tenants are two distinct services.
+        let sa = ServiceKey::new(1, [192, 0, 2, 1], 443, ip_proto::TCP);
+        let sb = ServiceKey::new(2, [192, 0, 2, 1], 443, ip_proto::TCP);
+        assert_ne!(sa, sb);
+    }
+
+    #[test]
     fn map_types_are_pod_sized() {
-        assert_eq!(core::mem::size_of::<ServiceKey>(), 8);
+        // Both keys carry a leading u32 `policy` scope (C3): +4 bytes each.
+        assert_eq!(core::mem::size_of::<ServiceKey>(), 12);
         assert_eq!(core::mem::size_of::<ServiceValue>(), 8);
         assert_eq!(core::mem::size_of::<Backend>(), 8);
-        assert_eq!(core::mem::size_of::<FlowKey>(), 16);
+        assert_eq!(core::mem::size_of::<FlowKey>(), 20);
         assert_eq!(core::mem::size_of::<FlowState>(), 8);
     }
 }

@@ -120,11 +120,13 @@ static PORT_FORWARDS: HashMap<ScopedPortKey, PortFwd> = HashMap::with_max_entrie
 #[map]
 static MASQUERADE: HashMap<u32, [u8; 4]> = HashMap::with_max_entries(64, 0);
 
-/// Phase 2 forwarding table: destination-IP prefix → [`RouteEntry`]. Empty by
-/// default, so routing is entirely opt-in and never interferes with a
-/// firewall-only deployment.
+/// Phase 2 forwarding table: `(policy, destination-IP prefix)` → [`RouteEntry`].
+/// The FIB is scoped by policy (C3) so two tenants with overlapping prefixes
+/// each resolve to their own next hop — the same [`ScopedAddr`] key the
+/// blocklist uses. Empty by default, so routing is entirely opt-in and never
+/// interferes with a firewall-only deployment.
 #[map]
-static ROUTES: LpmTrie<u32, RouteEntry> = LpmTrie::with_max_entries(4096, 0);
+static ROUTES: LpmTrie<ScopedAddr, RouteEntry> = LpmTrie::with_max_entries(4096, 0);
 
 /// Redirect target devices, indexed by interface index. Required by
 /// `bpf_redirect_map`; the control plane mirrors each route's egress ifindex
@@ -310,8 +312,12 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
     // must leave even though the WAN zone's ingress posture is deny-by-default,
     // so the egress firewall's drop logic must not apply here.
     if let Some(wan_ip) = unsafe { MASQUERADE.get(&ifindex) }.copied() {
+        // The reply arrives on this same (WAN) interface, so its conntrack/
+        // firewall entries must be scoped under the WAN interface's policy — the
+        // scope the XDP ingress path will look them up under (C3).
+        let wan_policy = unsafe { IFACE_POLICY.get(&ifindex) }.copied().unwrap_or(0);
         return masquerade_egress(
-            ctx, ihl_bytes, src_addr, dst_addr, src_port, dst_port, proto, wan_ip,
+            ctx, ihl_bytes, wan_policy, src_addr, dst_addr, src_port, dst_port, proto, wan_ip,
         );
     }
 
@@ -366,9 +372,9 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
         && (proto == ip_proto::TCP || proto == ip_proto::UDP)
         && ihl_bytes == Ipv4Hdr::LEN;
     if stateful {
-        let fkey = FlowKey::new(src_addr, dst_addr, src_port, dst_port, proto);
+        let fkey = FlowKey::new(policy_id, src_addr, dst_addr, src_port, dst_port, proto);
         let _ = FW_FLOWS.insert(&fkey, &1u8, 0);
-        let rkey = FlowKey::new(dst_addr, src_addr, dst_port, src_port, proto);
+        let rkey = FlowKey::new(policy_id, dst_addr, src_addr, dst_port, src_port, proto);
         let _ = FW_FLOWS.insert(&rkey, &1u8, 0);
     }
 
@@ -389,6 +395,7 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
 fn masquerade_egress(
     ctx: &TcContext,
     ihl_bytes: usize,
+    policy_id: PolicyId,
     src_addr: [u8; 4],
     dst_addr: [u8; 4],
     src_port: u16,
@@ -406,7 +413,7 @@ fn masquerade_egress(
 
     // The reply (remote -> wan_ip) seen at XDP ingress: DNAT its destination back
     // to the original client. The conntrack key is exactly that reply 5-tuple.
-    let rkey = FlowKey::new(dst_addr, wan_ip, dst_port, src_port, proto);
+    let rkey = FlowKey::new(policy_id, dst_addr, wan_ip, dst_port, src_port, proto);
     let _ = CONNTRACK.insert(&rkey, &FlowState::forward(src_addr, src_port), 0);
     // …and let that reply pass the WAN zone's deny-by-default stateful firewall.
     let _ = FW_FLOWS.insert(&rkey, &1u8, 0);
@@ -653,7 +660,7 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     let stateful = cfg.has_flag(ConfigFlags::STATEFUL)
         && (proto == ip_proto::TCP || proto == ip_proto::UDP)
         && ihl_bytes == Ipv4Hdr::LEN;
-    let fkey = FlowKey::new(src_addr, dst_addr, src_port, dst_port, proto);
+    let fkey = FlowKey::new(policy_id, src_addr, dst_addr, src_port, dst_port, proto);
     let established = stateful && unsafe { FW_FLOWS.get(&fkey) }.is_some();
 
     // The firewall's final action, and the counter explaining it.
@@ -712,7 +719,7 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     // reply is permitted regardless of the reverse direction's policy.
     if stateful && !established {
         let _ = FW_FLOWS.insert(&fkey, &1u8, 0);
-        let rkey = FlowKey::new(dst_addr, src_addr, dst_port, src_port, proto);
+        let rkey = FlowKey::new(policy_id, dst_addr, src_addr, dst_port, src_port, proto);
         let _ = FW_FLOWS.insert(&rkey, &1u8, 0);
     }
 
@@ -751,7 +758,8 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     // CONNTRACK map), so this only fires once per connection.
     if let Some(target) = port_forward {
         if let Some(action) = try_port_forward(
-            ctx, ihl_bytes, src_addr, dst_addr, src_port, dst_port, proto, checksum, target,
+            ctx, ihl_bytes, policy_id, src_addr, dst_addr, src_port, dst_port, proto, checksum,
+            target,
         )? {
             return Ok(action);
         }
@@ -760,13 +768,18 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     // Phase 3: load balancer / DNAT. A matching service rewrites the packet to a
     // backend and we PASS it for the kernel to route there.
     if let Some(action) = try_load_balance(
-        ctx, ihl_bytes, src_addr, dst_addr, src_port, dst_port, proto, checksum, log,
+        ctx, ihl_bytes, policy_id, src_addr, dst_addr, src_port, dst_port, proto, checksum, log,
     )? {
         return Ok(action);
     }
 
     // Phase 2: routing. A matching route takes over; otherwise fall through.
-    let route = ROUTES.get(Key::new(32, lpm_key_addr(dst_addr))).copied();
+    let route = ROUTES
+        .get(Key::new(
+            ScopedAddr::FULL_PREFIX,
+            ScopedAddr::new(policy_id, lpm_key_addr(dst_addr)),
+        ))
+        .copied();
     match plan_forward(ttl, checksum, proto, route) {
         ForwardOutcome::Pass => {}
         ForwardOutcome::TtlExceeded => {
@@ -1041,6 +1054,7 @@ fn try_encap(
 fn try_load_balance(
     ctx: &XdpContext,
     ihl_bytes: usize,
+    policy_id: PolicyId,
     src_addr: [u8; 4],
     dst_addr: [u8; 4],
     src_port: u16,
@@ -1073,7 +1087,7 @@ fn try_load_balance(
     };
 
     // 1. Established flow? Conntrack tells us the NAT target and direction.
-    let fkey = FlowKey::new(src_addr, dst_addr, src_port, dst_port, proto);
+    let fkey = FlowKey::new(policy_id, src_addr, dst_addr, src_port, dst_port, proto);
     // SAFETY: see `lookup_port_rule`; we copy the value out immediately.
     if let Some(state) = (unsafe { CONNTRACK.get(&fkey) }).copied() {
         let reverse = state.is_reverse();
@@ -1114,7 +1128,7 @@ fn try_load_balance(
 
     // 2. New connection to a service VIP?
     let Some(service) =
-        (unsafe { SERVICES.get(ServiceKey::new(dst_addr, dst_port, proto)) }).copied()
+        (unsafe { SERVICES.get(ServiceKey::new(policy_id, dst_addr, dst_port, proto)) }).copied()
     else {
         return Ok(None);
     };
@@ -1138,7 +1152,7 @@ fn try_load_balance(
         backend.port
     };
     let _ = CONNTRACK.insert(&fkey, &FlowState::forward(backend.ip, backend.port), 0);
-    let rkey = FlowKey::new(backend.ip, src_addr, backend_port, src_port, proto);
+    let rkey = FlowKey::new(policy_id, backend.ip, src_addr, backend_port, src_port, proto);
     let _ = CONNTRACK.insert(&rkey, &FlowState::reverse(dst_addr, dst_port), 0);
 
     // DNAT this first packet to the chosen backend.
@@ -1185,6 +1199,7 @@ fn try_load_balance(
 fn try_port_forward(
     ctx: &XdpContext,
     ihl_bytes: usize,
+    policy_id: PolicyId,
     src_addr: [u8; 4],
     dst_addr: [u8; 4],
     src_port: u16,
@@ -1196,7 +1211,7 @@ fn try_port_forward(
     if (proto != ip_proto::TCP && proto != ip_proto::UDP) || ihl_bytes != Ipv4Hdr::LEN {
         return Ok(None);
     }
-    let fkey = FlowKey::new(src_addr, dst_addr, src_port, dst_port, proto);
+    let fkey = FlowKey::new(policy_id, src_addr, dst_addr, src_port, dst_port, proto);
     // Already tracked? The conntrack path in try_load_balance handles it.
     if (unsafe { CONNTRACK.get(&fkey) }).is_some() {
         return Ok(None);
@@ -1221,7 +1236,7 @@ fn try_port_forward(
     let _ = CONNTRACK.insert(&fkey, &FlowState::forward(target.ip, target.port), 0);
     // Reverse: the reply (internal host -> client) SNATs its source back to the
     // original destination (our public ip:port).
-    let rkey = FlowKey::new(target.ip, src_addr, target_port, src_port, proto);
+    let rkey = FlowKey::new(policy_id, target.ip, src_addr, target_port, src_port, proto);
     let _ = CONNTRACK.insert(&rkey, &FlowState::reverse(dst_addr, dst_port), 0);
     // Let that reply through a stateful, deny-by-default internal zone.
     let _ = FW_FLOWS.insert(&rkey, &1u8, 0);
