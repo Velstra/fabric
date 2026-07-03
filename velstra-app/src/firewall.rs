@@ -541,6 +541,17 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
         }
     }
     {
+        // Trusted-VTEP set (C2): drop the old peers; program_overlay re-adds every
+        // still-current one, so a peer shared by another live tunnel survives.
+        let mut peers: HashMap<_, [u8; 4], u8> = HashMap::try_from(
+            ebpf.map_mut("VTEP_PEERS")
+                .ok_or_else(|| anyhow!("VTEP_PEERS map missing"))?,
+        )?;
+        for tunnel in &old.tunnels {
+            let _ = peers.remove(&tunnel.remote_vtep_ip);
+        }
+    }
+    {
         let mut arp: HashMap<_, ArpKey, ArpEntry> = HashMap::try_from(
             ebpf.map_mut("ARP_TABLE")
                 .ok_or_else(|| anyhow!("ARP_TABLE map missing"))?,
@@ -886,22 +897,33 @@ fn program_overlay(
 
     // Resolve every tunnel's egress ifindex up front (needs the OS), then do the
     // two map-borrow passes. Each tunnel becomes an LPM key `(vni exact, inner
-    // dst prefix)` → endpoint.
-    let prepared = tunnels
+    // dst prefix)` → endpoint. Skip (defer) a tunnel whose out_iface isn't
+    // present yet rather than hard-aborting the whole reconfigure — consistent
+    // with program_interfaces/program_routes; a hard abort would blackhole
+    // overlay traffic after remove_stale already ran.
+    let prepared: Vec<(Key<TunnelKey>, TunnelEndpoint)> = tunnels
         .iter()
-        .map(|t| {
-            let ifindex = if_nametoindex(&t.out_iface)?;
-            let (_, addr) = t.inner_dst.lpm_key();
-            let key = Key::new(
-                TunnelKey::prefix_len(t.inner_dst.prefix),
-                TunnelKey::new(t.vni, addr),
-            );
-            Ok((
-                key,
-                TunnelEndpoint::new(ifindex, t.remote_vtep_ip, t.outer_dst_mac),
-            ))
+        .filter_map(|t| match if_nametoindex(&t.out_iface) {
+            Ok(ifindex) => {
+                let (_, addr) = t.inner_dst.lpm_key();
+                let key = Key::new(
+                    TunnelKey::prefix_len(t.inner_dst.prefix),
+                    TunnelKey::new(t.vni, addr),
+                );
+                Some((
+                    key,
+                    TunnelEndpoint::new(ifindex, t.remote_vtep_ip, t.outer_dst_mac),
+                ))
+            }
+            Err(_) => {
+                log::debug!(
+                    "tunnel egress {} not present yet; deferring its FDB entry",
+                    t.out_iface
+                );
+                None
+            }
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect();
 
     {
         let mut fdb: LpmTrie<_, TunnelKey, TunnelEndpoint> = LpmTrie::try_from(
@@ -911,6 +933,22 @@ fn program_overlay(
         for (key, endpoint) in &prepared {
             fdb.insert(key, endpoint, 0)
                 .context("inserting overlay FDB entry")?;
+        }
+    }
+
+    {
+        // Trusted-VTEP set (C2): every distinct remote VTEP we tunnel with is an
+        // authorized decap source. remove_stale dropped the old set first, and we
+        // re-add every current peer here, so a still-valid VTEP survives a
+        // reconfigure (mirrors the OVERLAY_FDB reconcile).
+        let mut peers: HashMap<_, [u8; 4], u8> = HashMap::try_from(
+            ebpf.map_mut("VTEP_PEERS")
+                .ok_or_else(|| anyhow!("VTEP_PEERS map missing"))?,
+        )?;
+        for t in tunnels {
+            peers
+                .insert(t.remote_vtep_ip, 1, 0)
+                .context("inserting trusted VTEP peer")?;
         }
     }
 
@@ -945,10 +983,27 @@ fn program_routes(ebpf: &mut Ebpf, routes: &[ResolvedRoute]) -> Result<()> {
 
     // Resolve everything that needs the OS up front, so the two map-borrow
     // passes below don't each have to (and can't both hold `ebpf` at once).
-    let prepared = routes
+    // Skip (defer) a route whose out_iface isn't resolvable yet instead of
+    // hard-aborting the whole reconfigure — consistent with program_interfaces
+    // and program_masquerade. A hard abort here would leave apply_config half
+    // applied (remove_stale already ran) and blackhole traffic; the config
+    // reconcile re-runs once the interface appears.
+    let prepared: Vec<PreparedRoute> = routes
         .iter()
-        .map(prepare_route)
-        .collect::<Result<Vec<_>>>()?;
+        .filter_map(|r| match prepare_route(r) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                log::debug!(
+                    "route via {} not programmable yet ({e}); deferring",
+                    r.out_iface
+                );
+                None
+            }
+        })
+        .collect();
+    if prepared.is_empty() {
+        return Ok(());
+    }
 
     {
         let mut fib: LpmTrie<_, u32, RouteEntry> = LpmTrie::try_from(
