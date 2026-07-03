@@ -77,6 +77,9 @@ pub enum TopoRequest {
         host: String,
         tap: String,
         ip: Option<String>,
+        /// Explicit security-group policy, or `None` to default to the VNI (M4).
+        #[serde(default)]
+        policy: Option<u32>,
     },
     RemovePort {
         id: String,
@@ -85,6 +88,12 @@ pub enum TopoRequest {
         id: String,
         host: String,
         tap: String,
+    },
+    RemoveHost {
+        id: String,
+    },
+    RemoveNetwork {
+        vni: u32,
     },
 }
 
@@ -168,12 +177,18 @@ pub fn apply(topo: &mut Topology, req: &TopoRequest) -> TopoResponse {
             topo.add_network(network_from_spec(s)?)?;
             Ok(None)
         }
-        TopoRequest::CreatePort { vni, host, tap, ip } => {
+        TopoRequest::CreatePort {
+            vni,
+            host,
+            tap,
+            ip,
+            policy,
+        } => {
             let ip = match ip {
                 Some(s) => Some(s.parse().map_err(|_| anyhow!("invalid ip {s:?}"))?),
                 None => None,
             };
-            let p = topo.create_port(*vni, host, tap, ip)?;
+            let p = topo.create_port(*vni, host, tap, ip, *policy)?;
             Ok(Some(PortRecord {
                 id: p.id,
                 vni: p.vni,
@@ -185,6 +200,14 @@ pub fn apply(topo: &mut Topology, req: &TopoRequest) -> TopoResponse {
         }
         TopoRequest::RemovePort { id } => {
             topo.remove_port(id);
+            Ok(None)
+        }
+        TopoRequest::RemoveHost { id } => {
+            topo.remove_host(id)?;
+            Ok(None)
+        }
+        TopoRequest::RemoveNetwork { vni } => {
+            topo.remove_network(*vni)?;
             Ok(None)
         }
         TopoRequest::MigratePort { id, host, tap } => {
@@ -634,6 +657,7 @@ mod tests {
                 host: "h1".into(),
                 tap: "tapA".into(),
                 ip: None,
+                policy: None,
             },
         )
         .port

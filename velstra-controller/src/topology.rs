@@ -85,6 +85,10 @@ struct PortFile {
     tap: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ip: Option<String>,
+    /// Security-group policy id, decoupled from the VNI (M4). Omitted ⇒ default
+    /// to the network VNI (single-tenant).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    policy: Option<u32>,
 }
 
 /// Build the orchestrator [`Topology`] from a parsed file (validating addresses,
@@ -132,7 +136,7 @@ fn build(tf: &TopologyFile) -> Result<Topology> {
             ),
             None => None,
         };
-        topo.create_port(p.network, &p.host, &p.tap, ip)?;
+        topo.create_port(p.network, &p.host, &p.tap, ip, p.policy)?;
     }
     Ok(topo)
 }
@@ -206,6 +210,7 @@ fn to_file(topo: &Topology) -> TopologyFile {
             host: p.host.clone(),
             tap: p.tap.clone(),
             ip: Some(p.ip.to_string()),
+            policy: p.policy,
         })
         .collect();
 

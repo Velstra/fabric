@@ -248,6 +248,9 @@ enum OrchAction {
         tap: String,
         #[arg(long)]
         ip: Option<String>,
+        /// Security-group policy id (M4); omitted ⇒ defaults to the network VNI.
+        #[arg(long)]
+        policy: Option<u32>,
     },
     /// Remove a port by id.
     RemovePort {
@@ -790,6 +793,7 @@ impl VelstraOrchestrator for OrchestratorSvc {
                 host: req.host,
                 tap: req.tap,
                 ip: (!req.ip.is_empty()).then_some(req.ip),
+                policy: req.policy,
             },
         )
         .await?;
@@ -1324,6 +1328,7 @@ async fn orch(args: OrchArgs) -> Result<()> {
             host,
             tap,
             ip,
+            policy,
         } => {
             let port = client
                 .create_port(CreatePortRequest {
@@ -1331,6 +1336,7 @@ async fn orch(args: OrchArgs) -> Result<()> {
                     host,
                     tap,
                     ip: ip.unwrap_or_default(),
+                    policy,
                 })
                 .await?
                 .into_inner();

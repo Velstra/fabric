@@ -276,6 +276,7 @@ mod tests {
                 host: "h1".into(),
                 tap: "tapA".into(),
                 ip: None,
+                policy: None,
             })
             .await
             .unwrap();
@@ -334,6 +335,7 @@ mod tests {
                 host: "h1".into(),
                 tap: "tapA".into(),
                 ip: None,
+                policy: None,
             })
             .await
             .unwrap();
