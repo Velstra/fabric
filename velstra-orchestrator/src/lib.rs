@@ -96,6 +96,14 @@ pub struct Port {
     pub id: String,
     /// The network (VNI) this port lives on.
     pub vni: u32,
+    /// Firewall policy (security group) applied to this port, **decoupled** from
+    /// its VNI (M4): `None` means "use the VNI as the policy id" — the
+    /// single-tenant default where one number names both the segment and the
+    /// ruleset. A distinct `Some(id)` lets several ports share one overlay
+    /// segment while enforcing different rules (per-port security groups), or one
+    /// ruleset span several segments. The eBPF map layer already keeps
+    /// `IFACE_POLICY` and `IFACE_VNI` separate; this is the model catching up.
+    pub policy: Option<u32>,
     /// The host id this port currently runs on.
     pub host: String,
     /// Allocated inner IPv4 address.
@@ -104,6 +112,15 @@ pub struct Port {
     pub mac: [u8; 6],
     /// The tap/veth interface name on the host that carries this port.
     pub tap: String,
+}
+
+impl Port {
+    /// The effective firewall policy id: the explicit security-group policy if
+    /// set, else the VNI (the single-tenant default).
+    #[inline]
+    pub fn effective_policy(&self) -> u32 {
+        self.policy.unwrap_or(self.vni)
+    }
 }
 
 /// The whole virtual fabric: networks, hosts, and the ports binding them.
@@ -203,6 +220,7 @@ impl Topology {
         host: &str,
         tap: &str,
         requested_ip: Option<Ipv4Addr>,
+        policy: Option<u32>,
     ) -> Result<Port> {
         if !self.networks.contains_key(&vni) {
             bail!("unknown network vni {vni}");
@@ -232,6 +250,7 @@ impl Topology {
         let port = Port {
             id: format!("port-{vni}-{ip}"),
             vni,
+            policy,
             host: host.to_string(),
             ip,
             mac: mac_for(ip),
@@ -377,7 +396,9 @@ impl Topology {
             if port.host == host_id {
                 cfg.interfaces.push(InterfaceFile {
                     name: port.tap.clone(),
-                    policy: port.vni,
+                    // Decoupled from the VNI (M4): a port's security-group policy
+                    // if set, else the VNI as the default single-tenant policy id.
+                    policy: port.effective_policy(),
                     vni: Some(port.vni),
                     // Orchestrator-managed tap ports are tenant overlay endpoints,
                     // never a WAN uplink, so they are not masqueraded.
@@ -449,6 +470,11 @@ pub struct NetworkRec {
 pub struct PortRec {
     pub id: String,
     pub vni: u32,
+    /// Explicit security-group policy, or `None` to default to the VNI (M4).
+    /// `#[serde(default)]` so snapshots written before this field deserialize as
+    /// `None` (the pre-M4 policy-equals-VNI behaviour).
+    #[serde(default)]
+    pub policy: Option<u32>,
     pub host: String,
     pub ip: [u8; 4],
     pub mac: [u8; 6],
@@ -490,6 +516,7 @@ impl Topology {
                 .map(|p| PortRec {
                     id: p.id.clone(),
                     vni: p.vni,
+                    policy: p.policy,
                     host: p.host.clone(),
                     ip: p.ip.octets(),
                     mac: p.mac,
@@ -536,6 +563,7 @@ impl Topology {
             t.ports.push(Port {
                 id: p.id.clone(),
                 vni: p.vni,
+                policy: p.policy,
                 host: p.host.clone(),
                 ip: Ipv4Addr::from(p.ip),
                 mac: p.mac,
@@ -579,11 +607,11 @@ mod tests {
         let mut t = Topology::new();
         t.add_host(host("h1", "10.0.0.1", 1));
         t.add_network(network(100, "blue", "192.168.50.0/24")).unwrap();
-        t.create_port(100, "h1", "tap0", None).unwrap();
+        t.create_port(100, "h1", "tap0", None, None).unwrap();
         // Same (host, tap) → rejected, even on a different IP/allocation.
-        assert!(t.create_port(100, "h1", "tap0", None).is_err());
+        assert!(t.create_port(100, "h1", "tap0", None, None).is_err());
         // A different tap on the same host is fine.
-        assert!(t.create_port(100, "h1", "tap1", None).is_ok());
+        assert!(t.create_port(100, "h1", "tap1", None, None).is_ok());
     }
 
     #[test]
@@ -591,7 +619,7 @@ mod tests {
         let mut t = Topology::new();
         t.add_host(host("h1", "10.0.0.1", 1));
         t.add_network(network(100, "blue", "192.168.50.0/24")).unwrap();
-        let p = t.create_port(100, "h1", "tap0", None).unwrap();
+        let p = t.create_port(100, "h1", "tap0", None, None).unwrap();
         // Both are blocked while the port exists.
         assert!(t.remove_host("h1").is_err());
         assert!(t.remove_network(100).is_err());
@@ -610,8 +638,8 @@ mod tests {
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
 
-        let p1 = t.create_port(100, "h1", "tap0", None).unwrap();
-        let p2 = t.create_port(100, "h1", "tap1", None).unwrap();
+        let p1 = t.create_port(100, "h1", "tap0", None, None).unwrap();
+        let p2 = t.create_port(100, "h1", "tap1", None, None).unwrap();
         assert_eq!(p1.ip, "192.168.50.1".parse::<Ipv4Addr>().unwrap());
         assert_eq!(p2.ip, "192.168.50.2".parse::<Ipv4Addr>().unwrap());
         // MAC is locally-administered + the address octets.
@@ -624,10 +652,11 @@ mod tests {
                 "h1",
                 "tap2",
                 Some("192.168.50.9".parse::<Ipv4Addr>().unwrap()),
+                None,
             )
             .unwrap();
         assert_eq!(p3.ip, "192.168.50.9".parse::<Ipv4Addr>().unwrap());
-        let p4 = t.create_port(100, "h1", "tap3", None).unwrap();
+        let p4 = t.create_port(100, "h1", "tap3", None, None).unwrap();
         assert_eq!(p4.ip, "192.168.50.3".parse::<Ipv4Addr>().unwrap()); // skips .9
     }
 
@@ -642,6 +671,7 @@ mod tests {
             "h1",
             "tap0",
             Some("192.168.50.5".parse::<Ipv4Addr>().unwrap()),
+            None,
         )
         .unwrap();
         assert!(
@@ -649,7 +679,8 @@ mod tests {
                 100,
                 "h1",
                 "tap1",
-                Some("192.168.50.5".parse::<Ipv4Addr>().unwrap())
+                Some("192.168.50.5".parse::<Ipv4Addr>().unwrap()),
+                None,
             )
             .is_err()
         );
@@ -658,7 +689,8 @@ mod tests {
                 100,
                 "h1",
                 "tap2",
-                Some("10.0.0.5".parse::<Ipv4Addr>().unwrap())
+                Some("10.0.0.5".parse::<Ipv4Addr>().unwrap()),
+                None,
             )
             .is_err()
         );
@@ -668,10 +700,10 @@ mod tests {
     fn rejects_unknown_network_or_host_and_bad_vni() {
         let mut t = Topology::new();
         t.add_host(host("h1", "10.0.0.1", 1));
-        assert!(t.create_port(100, "h1", "tap0", None).is_err()); // no network
+        assert!(t.create_port(100, "h1", "tap0", None, None).is_err()); // no network
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
-        assert!(t.create_port(100, "ghost", "tap0", None).is_err()); // no host
+        assert!(t.create_port(100, "ghost", "tap0", None, None).is_err()); // no host
         assert!(t.add_network(network(0, "bad", "10.0.0.0/24")).is_err()); // vni 0
     }
 
@@ -703,8 +735,8 @@ mod tests {
         t.add_network(network(5000, "blue", "192.168.100.0/24"))
             .unwrap();
 
-        let pa = t.create_port(5000, "h1", "tapA", None).unwrap(); // .1 on h1
-        let pb = t.create_port(5000, "h2", "tapB", None).unwrap(); // .2 on h2
+        let pa = t.create_port(5000, "h1", "tapA", None, None).unwrap(); // .1 on h1
+        let pb = t.create_port(5000, "h2", "tapB", None, None).unwrap(); // .2 on h2
 
         // --- h1's derived config ---
         let cfg = t.derive("h1").unwrap();
@@ -752,8 +784,8 @@ mod tests {
         t.add_host(host("h3", "10.10.0.3", 0x33));
         t.add_network(network(5000, "blue", "192.168.100.0/24"))
             .unwrap();
-        t.create_port(5000, "h1", "tapA", None).unwrap();
-        t.create_port(5000, "h2", "tapB", None).unwrap();
+        t.create_port(5000, "h1", "tapA", None, None).unwrap();
+        t.create_port(5000, "h2", "tapB", None, None).unwrap();
 
         // h3 has no port on network 5000 → it gets no policy, no tunnels.
         let cfg3 = t.derive("h3").unwrap().resolve().unwrap();
@@ -771,7 +803,7 @@ mod tests {
         t.add_host(host("h1", "10.10.0.1", 0x11));
         t.add_network(network(5000, "blue", "192.168.100.0/24"))
             .unwrap();
-        let p = t.create_port(5000, "h1", "tapA", None).unwrap();
+        let p = t.create_port(5000, "h1", "tapA", None, None).unwrap();
 
         let snap = t.to_snapshot();
         let restored = Topology::from_snapshot(&snap);
@@ -797,8 +829,8 @@ mod tests {
         t.add_host(host("h2", "10.10.0.2", 0x22));
         t.add_network(network(5000, "blue", "192.168.100.0/24"))
             .unwrap();
-        t.create_port(5000, "h1", "tapA", None).unwrap();
-        let pb = t.create_port(5000, "h2", "tapB", None).unwrap();
+        t.create_port(5000, "h1", "tapA", None, None).unwrap();
+        let pb = t.create_port(5000, "h2", "tapB", None, None).unwrap();
 
         assert_eq!(t.derive("h1").unwrap().resolve().unwrap().tunnels.len(), 1);
         assert!(t.remove_port(&pb.id));
@@ -817,8 +849,8 @@ mod tests {
         t.add_network(network(5000, "blue", "192.168.100.0/24"))
             .unwrap();
         // pa lives on h1; pc gives h3 a port on the network so it tunnels to pa.
-        let pa = t.create_port(5000, "h1", "tapA", None).unwrap();
-        t.create_port(5000, "h3", "tapC", None).unwrap();
+        let pa = t.create_port(5000, "h1", "tapA", None, None).unwrap();
+        t.create_port(5000, "h3", "tapC", None, None).unwrap();
 
         // Before: h3 tunnels to pa via h1's VTEP.
         let h3 = t.derive("h3").unwrap().resolve().unwrap();
@@ -848,5 +880,35 @@ mod tests {
         // Unknown host / port are errors.
         assert!(t.migrate_port(&pa.id, "ghost", "tap").is_err());
         assert!(t.migrate_port("port-nope", "h2", "tap").is_err());
+    }
+
+    #[test]
+    fn port_policy_decouples_from_vni() {
+        // M4: a port may carry a security-group policy distinct from its VNI. The
+        // derived interface then binds that policy while staying on the VNI's
+        // overlay segment — the eBPF IFACE_POLICY vs IFACE_VNI split the model now
+        // exposes.
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.10.0.1", 0x11));
+        t.add_network(network(5000, "blue", "192.168.100.0/24"))
+            .unwrap();
+
+        // Explicit security-group policy 42, on VNI 5000.
+        let p = t.create_port(5000, "h1", "tapSG", None, Some(42)).unwrap();
+        assert_eq!(p.effective_policy(), 42);
+
+        let cfg = t.derive("h1").unwrap();
+        let iface = cfg.interfaces.iter().find(|i| i.name == "tapSG").unwrap();
+        assert_eq!(iface.policy, 42, "interface firewall policy == security group");
+        assert_eq!(iface.vni, Some(5000), "…while staying on VNI 5000's segment");
+
+        // The default (policy = None) still collapses to the VNI.
+        let d = t.create_port(5000, "h1", "tapDef", None, None).unwrap();
+        assert_eq!(d.effective_policy(), 5000);
+
+        // Survives a snapshot round-trip.
+        let restored = Topology::from_snapshot(&t.to_snapshot());
+        let rp = restored.ports().iter().find(|q| q.id == p.id).unwrap();
+        assert_eq!(rp.policy, Some(42));
     }
 }

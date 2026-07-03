@@ -81,6 +81,9 @@ message CreatePortRequest {
   string host = 2;            // host id
   string tap = 3;             // tap/veth name on the host
   string ip = 4;              // empty = auto-allocate from the subnet
+  // Security-group policy, decoupled from the VNI (M4). Absent ⇒ default to the
+  // VNI (single-tenant: one number names both segment and ruleset).
+  optional uint32 policy = 5;
 }
 
 message PortInfo {

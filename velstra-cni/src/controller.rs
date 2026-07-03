@@ -120,6 +120,9 @@ pub fn create_port(
             host: host.to_string(),
             tap: tap.to_string(),
             ip: ip.unwrap_or_default().to_string(),
+            // CNI-created pod ports default their firewall policy to the VNI (M4);
+            // a distinct security-group policy is a K8s NetworkPolicy follow-up.
+            policy: None,
         };
         async move {
             let info: PortInfo = client
