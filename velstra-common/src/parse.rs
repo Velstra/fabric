@@ -68,9 +68,17 @@ pub fn parse_frame(data: &[u8]) -> ParseResult {
     let src_addr = [ip[12], ip[13], ip[14], ip[15]];
     let dst_addr = [ip[16], ip[17], ip[18], ip[19]];
 
-    // --- L4 ports (best effort, TCP/UDP only) -------------------------------
+    // Fragmentation: the flags + 13-bit fragment offset live in bytes 6..8. Only
+    // the FIRST fragment (offset 0) carries the L4 header; a non-first fragment's
+    // bytes at the L4 position are payload continuation. Reading them as ports
+    // would let an attacker smuggle a packet past a `(proto, port)` rule
+    // (fragmentation firewall evasion), and NAT-rewriting them would corrupt the
+    // payload — so we treat a non-first fragment as having no ports (M1).
+    let frag_offset = be_u16(ip, 6).map_or(0, |f| f & 0x1FFF);
+
+    // --- L4 ports (best effort, TCP/UDP, first fragment only) ---------------
     let (mut src_port, mut dst_port) = (0u16, 0u16);
-    if proto == ip_proto::TCP || proto == ip_proto::UDP {
+    if (proto == ip_proto::TCP || proto == ip_proto::UDP) && frag_offset == 0 {
         // Source/destination ports are the first two u16s of the L4 header,
         // which begins right after the (variable-length) IPv4 header.
         if let (Some(s), Some(d)) = (be_u16(ip, ihl_bytes), be_u16(ip, ihl_bytes + 2)) {
@@ -202,6 +210,55 @@ mod tests {
         let mut f = frame(ETHERTYPE_IPV4, 5, ip_proto::TCP, [1; 4], [1; 4], None);
         f[ETH_HDR_LEN] = (4 << 4) | 1; // version=4, ihl=1
         assert_eq!(parse_frame(&f), ParseResult::Malformed);
+    }
+
+    #[test]
+    fn non_first_fragment_ignores_l4_bytes_as_ports() {
+        // A TCP-proto packet whose fragment offset is non-zero: the four "L4"
+        // bytes are really payload continuation and must NOT be read as ports
+        // (fragmentation firewall evasion / NAT corruption — M1).
+        let mut f = frame(
+            ETHERTYPE_IPV4,
+            5,
+            ip_proto::TCP,
+            [203, 0, 113, 9],
+            [10, 0, 0, 1],
+            Some((40000, 443)),
+        );
+        // Set fragment offset = 185 (in 8-byte units) in IP header bytes 6..8.
+        let frag = 185u16;
+        f[ETH_HDR_LEN + 6..ETH_HDR_LEN + 8].copy_from_slice(&frag.to_be_bytes());
+        let ParseResult::Ipv4(m) = parse_frame(&f) else {
+            panic!("expected ipv4");
+        };
+        assert_eq!(
+            (m.src_port, m.dst_port),
+            (0, 0),
+            "non-first fragment must not expose L4 ports"
+        );
+        // L3 fields are still parsed so the blocklist/default action apply.
+        assert_eq!(m.src_addr, [203, 0, 113, 9]);
+        assert_eq!(m.proto, ip_proto::TCP);
+    }
+
+    #[test]
+    fn first_fragment_still_reads_ports() {
+        // First fragment (offset 0, More-Fragments set) DOES carry the L4 header.
+        let mut f = frame(
+            ETHERTYPE_IPV4,
+            5,
+            ip_proto::UDP,
+            [1, 2, 3, 4],
+            [5, 6, 7, 8],
+            Some((1234, 53)),
+        );
+        // flags = More Fragments (0x2000), offset = 0.
+        let frag = 0x2000u16;
+        f[ETH_HDR_LEN + 6..ETH_HDR_LEN + 8].copy_from_slice(&frag.to_be_bytes());
+        let ParseResult::Ipv4(m) = parse_frame(&f) else {
+            panic!("expected ipv4");
+        };
+        assert_eq!((m.src_port, m.dst_port), (1234, 53));
     }
 
     #[test]

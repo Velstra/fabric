@@ -295,8 +295,10 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
     let src_addr = ipv4.src_addr;
     let dst_addr = ipv4.dst_addr;
 
+    // Ports only from the first fragment; a non-first fragment's bytes there are
+    // payload, not L4 (M1 — see the ingress path and `parse_frame`).
     let (mut src_port, mut dst_port) = (0u16, 0u16);
-    if proto == ip_proto::TCP || proto == ip_proto::UDP {
+    if (proto == ip_proto::TCP || proto == ip_proto::UDP) && ipv4.frag_offset() == 0 {
         if let Ok(ports) = unsafe { ptr_at_tc::<[u8; 4]>(ctx, EthHdr::LEN + ihl_bytes) } {
             let ports = unsafe { *ports };
             src_port = u16::from_be_bytes([ports[0], ports[1]]);
@@ -583,9 +585,15 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     let ttl = ipv4.ttl;
     let checksum = ipv4.checksum();
 
-    // --- L4 ports (TCP/UDP, best effort) ------------------------------------
+    // --- L4 ports (TCP/UDP, best effort, first fragment only) ---------------
+    // Only the first fragment (offset 0) carries the L4 header; a non-first
+    // fragment's bytes there are payload, so reading them as ports would allow
+    // fragmentation firewall evasion and NAT payload corruption. Leaving ports
+    // at 0 means no `(proto, port)` rule, service, port-forward or conntrack
+    // entry can match, so the fragment is neither misclassified nor rewritten
+    // (M1 — mirrors `velstra_common::parse::parse_frame`).
     let (mut src_port, mut dst_port) = (0u16, 0u16);
-    if proto == ip_proto::TCP || proto == ip_proto::UDP {
+    if (proto == ip_proto::TCP || proto == ip_proto::UDP) && ipv4.frag_offset() == 0 {
         // The L4 header begins after the variable-length IPv4 header. We only
         // need the first four bytes (source + destination port).
         if let Ok(ports) = unsafe { ptr_at::<[u8; 4]>(ctx, EthHdr::LEN + ihl_bytes) } {
@@ -1144,16 +1152,31 @@ fn try_load_balance(
     };
 
     // Record both directions so this and the reply path stay consistent. The
-    // reverse key is what a reply looks like: backend -> client. Best effort —
-    // a full table just means the flow isn't sticky, not incorrect.
+    // reverse key is what a reply looks like: backend -> client.
+    //
+    // The two inserts can't be one atomic operation (they are two independent
+    // BPF-map keys), so we order them to self-heal a partial failure (M2):
+    // insert the **reverse** entry first and only create the **forward** entry —
+    // which is what makes step 1 above take the established fast path — once the
+    // reverse insert succeeded. If the reverse insert fails (a full LRU), the
+    // forward entry is not written either, so the next packet of this flow still
+    // falls through to this "new connection" branch and retries *both*. Because
+    // `session_hash` is deterministic the retry picks the same backend, so the
+    // pair stays consistent — the flow self-heals within a retransmit instead of
+    // waiting for LRU eviction. A stray reverse entry with no forward is inert
+    // (nothing sends backend -> client until a forward flow exists).
     let backend_port = if backend.port == 0 {
         dst_port
     } else {
         backend.port
     };
-    let _ = CONNTRACK.insert(&fkey, &FlowState::forward(backend.ip, backend.port), 0);
     let rkey = FlowKey::new(policy_id, backend.ip, src_addr, backend_port, src_port, proto);
-    let _ = CONNTRACK.insert(&rkey, &FlowState::reverse(dst_addr, dst_port), 0);
+    if CONNTRACK
+        .insert(&rkey, &FlowState::reverse(dst_addr, dst_port), 0)
+        .is_ok()
+    {
+        let _ = CONNTRACK.insert(&fkey, &FlowState::forward(backend.ip, backend.port), 0);
+    }
 
     // DNAT this first packet to the chosen backend.
     let nat = plan_nat(
@@ -1232,12 +1255,20 @@ fn try_port_forward(
         target.port
     };
 
-    // Forward: rewrite the destination on subsequent packets of this flow.
-    let _ = CONNTRACK.insert(&fkey, &FlowState::forward(target.ip, target.port), 0);
+    // Reverse first, then forward — a partial-failure self-heal (M2, see
+    // try_load_balance): the forward entry (which makes the conntrack fast path
+    // in try_load_balance fire) is only created once the reverse entry exists, so
+    // a full-table failure leaves neither and the next packet retries both.
     // Reverse: the reply (internal host -> client) SNATs its source back to the
     // original destination (our public ip:port).
     let rkey = FlowKey::new(policy_id, target.ip, src_addr, target_port, src_port, proto);
-    let _ = CONNTRACK.insert(&rkey, &FlowState::reverse(dst_addr, dst_port), 0);
+    if CONNTRACK
+        .insert(&rkey, &FlowState::reverse(dst_addr, dst_port), 0)
+        .is_ok()
+    {
+        // Forward: rewrite the destination on subsequent packets of this flow.
+        let _ = CONNTRACK.insert(&fkey, &FlowState::forward(target.ip, target.port), 0);
+    }
     // Let that reply through a stateful, deny-by-default internal zone.
     let _ = FW_FLOWS.insert(&rkey, &1u8, 0);
 
