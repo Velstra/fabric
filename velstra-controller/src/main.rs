@@ -60,9 +60,11 @@ use velstra_proto::{
 };
 
 mod authz;
+mod evpn;
 mod topology;
 
 use authz::{Authz, caller_of};
+use evpn::EvpnLearned;
 
 /// A `permission_denied` status for a caller not authorized for `what`.
 fn deny(what: &str) -> Status {
@@ -163,6 +165,13 @@ struct ServeArgs {
     /// addressed by IP but the shared server cert only carries a DNS SAN.
     #[arg(long, requires = "node_id")]
     raft_tls_domain: Option<String>,
+
+    /// Path to a Wren routing-daemon control socket to subscribe to for EVPN
+    /// updates (roadmap B4a). When set, the controller runs a background task
+    /// that folds EVPN-learned type-2 MAC/IP routes into every host's derived
+    /// config. Unset ⇒ the feature is entirely inert.
+    #[arg(long)]
+    wren_socket: Option<PathBuf>,
 }
 
 /// Client TLS options for the admin/orchestrator CLIs (use an `https://`
@@ -317,6 +326,10 @@ struct Shared {
     /// controller. When set, the fabric is replicated: the leader serves writes,
     /// followers redirect, and `state.derived` is recomputed on every Raft apply.
     raft: Option<Arc<velstra_raft::RaftNode>>,
+    /// EVPN state learned from a Wren `monitor evpn` feed (roadmap B4a). Folded
+    /// into `state.derived` by `re_derive`. Empty (and unused) unless
+    /// `--wren-socket` is set.
+    evpn_learned: RwLock<EvpnLearned>,
     generation: AtomicU64,
     notify: watch::Sender<u64>,
 }
@@ -329,6 +342,7 @@ impl Shared {
             // In cluster mode the Raft state machine owns durability, not a file.
             topology_path: if raft.is_some() { None } else { topology_path },
             raft,
+            evpn_learned: RwLock::new(EvpnLearned::default()),
             generation: AtomicU64::new(0),
             notify: watch::channel(0).0,
         }
@@ -405,19 +419,23 @@ impl Shared {
 /// it reads (and persists) the local model; in cluster mode it reads the Raft
 /// state machine's applied topology (called from the Raft apply-notification task).
 async fn re_derive(shared: &Shared) -> Result<()> {
+    // Fold in any EVPN-learned routes (empty/None-equivalent when the feature is
+    // off, so the derived output is unchanged in that case).
+    let evpn = shared.evpn_learned.read().await;
     let derived = if let Some(raft) = &shared.raft {
         // Cluster mode: derive from the replicated, committed topology.
         let topo = raft.topology().await;
-        topology::derive_configs(&topo)?
+        topology::derive_configs(&topo, Some(&evpn))?
     } else {
         let topo = shared.topology.read().await;
-        let derived = topology::derive_configs(&topo)?;
+        let derived = topology::derive_configs(&topo, Some(&evpn))?;
         // Single-controller mode: persist the mutated model atomically.
         if let Some(path) = &shared.topology_path {
             topology::save_model(&topo, path).context("persisting topology")?;
         }
         derived
     };
+    drop(evpn);
     let mut state = shared.state.write().await;
     if state.derived != derived {
         state.derived = derived;
@@ -903,7 +921,11 @@ impl VelstraOrchestrator for OrchestratorSvc {
         }
         let vni = request.into_inner().vni;
         info!("RemoveNetwork({vni})");
-        let resp = propose(&self.shared, velstra_raft::TopoRequest::RemoveNetwork { vni }).await?;
+        let resp = propose(
+            &self.shared,
+            velstra_raft::TopoRequest::RemoveNetwork { vni },
+        )
+        .await?;
         if !resp.ok {
             return Err(Status::failed_precondition(resp.error.unwrap_or_default()));
         }
@@ -1008,7 +1030,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
         if client_tls.is_some() {
             info!("raft peer transport: TLS (mTLS between controllers)");
         } else {
-            warn!("raft peer transport: PLAINTEXT (no --tls-cert/--client-ca) — secure the network");
+            warn!(
+                "raft peer transport: PLAINTEXT (no --tls-cert/--client-ca) — secure the network"
+            );
         }
         let node = Arc::new(
             velstra_raft::RaftNode::start_with_opts(id, args.raft_dir.clone(), client_tls).await?,
@@ -1091,12 +1115,15 @@ async fn serve(args: ServeArgs) -> Result<()> {
                 Err(e) => warn!("initial config load failed: {e}"),
             }
         }
+        let evpn = shared.evpn_learned.read().await;
         state.derived = if let Some(raft) = &shared.raft {
-            topology::derive_configs(&raft.topology().await).context("deriving topology")?
+            topology::derive_configs(&raft.topology().await, Some(&evpn))
+                .context("deriving topology")?
         } else {
             let topo = shared.topology.read().await;
-            topology::derive_configs(&topo).context("deriving topology")?
+            topology::derive_configs(&topo, Some(&evpn)).context("deriving topology")?
         };
+        drop(evpn);
         shared.recompute(&mut state);
     }
 
@@ -1119,6 +1146,13 @@ async fn serve(args: ServeArgs) -> Result<()> {
             dir.clone(),
             Duration::from_secs(args.poll_interval.max(1)),
         ));
+    }
+
+    // EVPN bridge (roadmap B4a): subscribe to a Wren `monitor evpn` feed and
+    // fold learned type-2 routes into the derived configs. Opt-in via flag; when
+    // unset the controller behaves exactly as before.
+    if let Some(socket) = &args.wren_socket {
+        tokio::spawn(evpn::run_evpn_monitor(socket.clone(), shared.clone()));
     }
 
     // Admin + orchestrator server on its own (localhost-by-default) port. It

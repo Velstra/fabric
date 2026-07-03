@@ -265,6 +265,24 @@ pub struct TunnelCfg {
     pub out_iface: String,
 }
 
+/// One L2 forwarding entry (`[[mac_route]]`, B1): which remote VTEP hosts a
+/// given tenant destination MAC. Consulted before the L3 `[[tunnel]]` table, so
+/// a true L2 overlay bridges by MAC. The controller pushes one per remote MAC.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MacRouteCfg {
+    /// Tenant VXLAN Network Identifier (24-bit; also the firewall `policy_id`).
+    pub vni: u32,
+    /// Inner destination MAC this entry bridges (a tenant VM's hardware address).
+    pub mac: String,
+    /// Remote VTEP underlay IPv4 (outer destination address).
+    pub remote_vtep: String,
+    /// Next-hop MAC on the underlay toward the remote VTEP.
+    pub via_mac: String,
+    /// Underlay egress interface name.
+    pub out_iface: String,
+}
+
 /// A named tenant policy (`[[policy]]`): the same firewall fields as the
 /// top-level config, but with an explicit non-zero `id` that interfaces map to.
 #[derive(Debug, Deserialize)]
@@ -353,6 +371,9 @@ pub struct FileConfig {
     /// Phase 4 overlay forwarding entries. Spelled `[[tunnel]]` in TOML.
     #[serde(rename = "tunnel")]
     pub tunnels: Vec<TunnelCfg>,
+    /// B1 per-MAC L2 forwarding entries. Spelled `[[mac_route]]` in TOML.
+    #[serde(rename = "mac_route")]
+    pub mac_routes: Vec<MacRouteCfg>,
     /// Phase 4 ARP-suppression neighbours. Spelled `[[neighbor]]` in TOML.
     #[serde(rename = "neighbor")]
     pub neighbors: Vec<NeighborCfg>,
@@ -503,6 +524,23 @@ pub struct ResolvedTunnel {
     pub out_iface: String,
 }
 
+/// A resolved L2 forwarding entry (B1): the tenant segment, the inner
+/// destination MAC it matches exactly, and the remote endpoint it points at.
+/// The egress interface stays a name (resolved to an ifindex at load time).
+#[derive(Debug, Clone)]
+pub struct ResolvedMacRoute {
+    /// Tenant VNI this entry belongs to (matched exactly in the MAC-FDB).
+    pub vni: u32,
+    /// Inner destination MAC this entry bridges toward.
+    pub mac: [u8; 6],
+    /// Remote VTEP underlay IPv4 (outer destination address).
+    pub remote_vtep_ip: [u8; 4],
+    /// Next-hop MAC on the underlay toward the remote VTEP.
+    pub outer_dst_mac: [u8; 6],
+    /// Underlay egress interface name.
+    pub out_iface: String,
+}
+
 /// Fully-resolved, validated configuration ready to be written into BPF maps.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -521,6 +559,8 @@ pub struct RuntimeConfig {
     pub overlay: Option<ResolvedOverlay>,
     /// Overlay forwarding entries for the `OVERLAY_FDB` map (Phase 4).
     pub tunnels: Vec<ResolvedTunnel>,
+    /// Per-MAC L2 forwarding entries for the `MAC_FDB` map (B1).
+    pub mac_routes: Vec<ResolvedMacRoute>,
     /// ARP-suppression neighbours for the `ARP_TABLE` map (Phase 4).
     pub neighbors: Vec<ResolvedNeighbor>,
 }
@@ -543,6 +583,7 @@ impl RuntimeConfig {
             port_forwards: Vec::new(),
             overlay: None,
             tunnels: Vec::new(),
+            mac_routes: Vec::new(),
             neighbors: Vec::new(),
         }
     }
@@ -597,12 +638,13 @@ fn resolve_firewall(
                 "policy {id}: port rule on ICMP is invalid (ICMP has no ports); use `drop_icmp = true`"
             );
         }
-        let src = match &rule.src {
-            Some(cidr) => Some(parse_cidr_v4(cidr).map_err(|e| {
-                anyhow::anyhow!("policy {id}: invalid rule source {cidr:?}: {e}")
-            })?),
-            None => None,
-        };
+        let src =
+            match &rule.src {
+                Some(cidr) => Some(parse_cidr_v4(cidr).map_err(|e| {
+                    anyhow::anyhow!("policy {id}: invalid rule source {cidr:?}: {e}")
+                })?),
+                None => None,
+            };
         rules.push((
             PortKey::new(rule.proto.number(), rule.port),
             src,
@@ -819,6 +861,30 @@ impl FileConfig {
             });
         }
 
+        if !self.mac_routes.is_empty() && overlay.is_none() {
+            bail!("`[[mac_route]]` entries require an `[overlay]` section");
+        }
+        let mut mac_routes = Vec::with_capacity(self.mac_routes.len());
+        for mr in &self.mac_routes {
+            if mr.vni > 0xFF_FFFF {
+                bail!("mac_route vni {} exceeds 24 bits", mr.vni);
+            }
+            let mac = parse_mac(&mr.mac)
+                .map_err(|e| anyhow::anyhow!("invalid mac_route mac {:?}: {e}", mr.mac))?;
+            let remote_vtep: Ipv4Addr = mr.remote_vtep.parse().map_err(|_| {
+                anyhow::anyhow!("invalid mac_route remote_vtep {:?}", mr.remote_vtep)
+            })?;
+            let outer_dst_mac = parse_mac(&mr.via_mac)
+                .map_err(|e| anyhow::anyhow!("invalid mac_route via_mac {:?}: {e}", mr.via_mac))?;
+            mac_routes.push(ResolvedMacRoute {
+                vni: mr.vni,
+                mac,
+                remote_vtep_ip: remote_vtep.octets(),
+                outer_dst_mac,
+                out_iface: mr.out_iface.clone(),
+            });
+        }
+
         if !self.neighbors.is_empty() && overlay.is_none() {
             bail!("`[[neighbor]]` entries require an `[overlay]` section");
         }
@@ -847,6 +913,7 @@ impl FileConfig {
             port_forwards,
             overlay,
             tunnels,
+            mac_routes,
             neighbors,
         })
     }
@@ -887,14 +954,22 @@ impl fmt::Display for RuntimeConfig {
             }
             for (key, src, action, _log) in &policy.port_rules {
                 let from = match src {
-                    Some(c) => format!(" from {}/{}", c.octets.map(|o| o.to_string()).join("."), c.prefix),
+                    Some(c) => format!(
+                        " from {}/{}",
+                        c.octets.map(|o| o.to_string()).join("."),
+                        c.prefix
+                    ),
                     None => String::new(),
                 };
                 let proto = match key.proto {
                     ip_proto::TCP => "tcp",
                     ip_proto::UDP => "udp",
                     other => {
-                        writeln!(f, "      proto {other} port {} ->{from} {action:?}", key.port)?;
+                        writeln!(
+                            f,
+                            "      proto {other} port {} ->{from} {action:?}",
+                            key.port
+                        )?;
                         continue;
                     }
                 };
@@ -994,6 +1069,19 @@ impl fmt::Display for RuntimeConfig {
                 "  - vni {} {} -> vtep {r0}.{r1}.{r2}.{r3} via {a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{ff:02x} dev {}",
                 tunnel.vni, tunnel.inner_dst, tunnel.out_iface,
             )?;
+        }
+        if !self.mac_routes.is_empty() {
+            writeln!(f, "mac_routes     : {} entry(ies)", self.mac_routes.len())?;
+            for mr in &self.mac_routes {
+                let [r0, r1, r2, r3] = mr.remote_vtep_ip;
+                let [m0, m1, m2, m3, m4, m5] = mr.mac;
+                let [a, b, c, d, e, ff] = mr.outer_dst_mac;
+                writeln!(
+                    f,
+                    "  - vni {} {m0:02x}:{m1:02x}:{m2:02x}:{m3:02x}:{m4:02x}:{m5:02x} -> vtep {r0}.{r1}.{r2}.{r3} via {a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{ff:02x} dev {}",
+                    mr.vni, mr.out_iface,
+                )?;
+            }
         }
         if !self.neighbors.is_empty() {
             writeln!(

@@ -213,6 +213,51 @@ scenario_overlay_encap() {
   agent_stop
 }
 
+# B1 — per-MAC MAC-FDB forwarding. Programs a `[[mac_route]]` (and NO `[[tunnel]]`)
+# so the ONLY way a tenant frame can be encapsulated is by matching its inner
+# destination MAC in MAC_FDB. The inner dst IP is deliberately left out of any
+# OVERLAY_FDB entry, so a hit here proves the L2 MAC path resolves independently
+# of the L3 (inner-IP) FDB.
+scenario_overlay_mac_fdb() {
+  section "B1 — overlay per-MAC MAC-FDB encap"
+  ns_add omh  # host (VTEP)
+  ns_add omc  # tenant VM
+  ns_add omu  # remote underlay peer
+  veth_pair omh tap0 - omc tap0c 192.168.100.1/24
+  veth_pair omh uplink0 10.20.0.1/24 omu under0 10.20.0.2/24
+  local umac
+  umac="$(nse omu cat /sys/class/net/under0/address)"
+  # The tenant peer's MAC — the frame's inner dst MAC, and the MAC-FDB key.
+  local peer_mac="02:00:00:00:0b:02"
+  cat >"$WORKDIR/mac.toml" <<-EOF
+	default_action = "pass"
+	[overlay]
+	local_vtep = "10.20.0.1"
+	underlay_iface = "uplink0"
+	underlay_mtu = 1500
+	[[interface]]
+	name = "tap0"
+	policy = 0
+	vni = 5000
+	[[mac_route]]
+	vni = 5000
+	mac = "$peer_mac"
+	remote_vtep = "10.20.0.2"
+	via_mac = "$umac"
+	out_iface = "uplink0"
+	EOF
+  agent_start omh -- --iface tap0 --iface uplink0 --config "$WORKDIR/mac.toml" \
+    || { bad "agent start"; return; }
+  # Pre-seed the VM's neighbour so it emits an IP frame addressed to peer_mac at
+  # L2 (no ARP). There is NO tunnel for 192.168.100.2, so only the MAC-FDB can
+  # resolve it — the encap counter firing proves the L2 path works standalone.
+  nse omc ip neigh replace 192.168.100.2 lladdr "$peer_mac" dev tap0c
+  nse omc ping -c2 -W1 192.168.100.2 >/dev/null 2>&1 || true
+  settle
+  assert_ge "$LAST_LOG" overlay_encap 1 "tenant frame encapsulated via MAC-FDB (no L3 FDB entry)"
+  agent_stop
+}
+
 scenario_routing() {
   section "Phase 2 — routing redirect"
   ns_add rtc; ns_add rtr; ns_add rtb
@@ -266,7 +311,7 @@ scenario_lb() {
 # ---------------------------------------------------------------------------
 ALL=(
   fw_pass fw_default_drop fw_blocklist_v4 fw_icmp fw_port fw_blocklist_v6
-  egress_blocklist routing lb overlay_arp overlay_encap
+  egress_blocklist routing lb overlay_arp overlay_encap overlay_mac_fdb
 )
 
 main() {

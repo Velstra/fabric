@@ -26,14 +26,22 @@
 //! # ip = "192.168.100.10"   # optional; auto-allocated from the subnet if omitted
 //! ```
 
-use std::{collections::HashMap, net::Ipv4Addr, path::Path};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr},
+    path::Path,
+};
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use velstra_common::{parse_cidr_v4, parse_mac};
-use velstra_config::{ActionName, EncapName, file_config_to_proto};
+use velstra_config::{
+    ActionName, EncapName, FileConfig, MacRouteCfg, NeighborCfg, TunnelCfg, file_config_to_proto,
+};
 use velstra_orchestrator::{Host, Network, Topology};
 use velstra_proto::NodeConfig;
+
+use crate::evpn::EvpnLearned;
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -144,17 +152,102 @@ fn build(tf: &TopologyFile) -> Result<Topology> {
 /// Derive every host's `NodeConfig` from the topology, validating each (via
 /// `resolve`) before it can be served. Returns `node_id -> config` (version 0;
 /// the controller stamps a real version on serve).
-pub fn derive_configs(topo: &Topology) -> Result<HashMap<String, NodeConfig>> {
+///
+/// When `evpn` is `Some`, EVPN-learned type-2 MAC/IP routes are folded into each
+/// host's config on top of the topology-derived entries (roadmap B4a); pass
+/// `None` to derive from the topology alone.
+pub fn derive_configs(
+    topo: &Topology,
+    evpn: Option<&EvpnLearned>,
+) -> Result<HashMap<String, NodeConfig>> {
     let mut out = HashMap::new();
     for host in topo.hosts() {
-        let file = topo
+        let mut file = topo
             .derive(&host.id)
             .ok_or_else(|| anyhow!("host {:?} vanished mid-derive", host.id))?;
+        if let Some(evpn) = evpn {
+            append_evpn_entries(&mut file, host, topo, evpn);
+        }
         file.resolve()
             .with_context(|| format!("derived config for host {:?} is invalid", host.id))?;
         out.insert(host.id.clone(), file_config_to_proto(&file, 0));
     }
     Ok(out)
+}
+
+/// Fold EVPN-learned type-2 MAC/IP routes into `host`'s derived `file`, on top
+/// of (and after) the topology-derived overlay entries (roadmap B4a).
+///
+/// Every type-2 MAC (MAC-only **and** MAC/IP) becomes an L2 [`MacRouteCfg`] for
+/// the B1 MAC-FDB datapath, so the overlay bridges by destination MAC. Routes
+/// that additionally carry a bound IP are programmable through the v4
+/// `OVERLAY_FDB` + `ARP_TABLE` maps too: each such entry also emits an
+/// ARP-suppression [`NeighborCfg`] plus an L3 [`TunnelCfg`] with
+/// `inner_dst = ip/32`. So a MAC-only entry ⇒ one `MacRouteCfg`; a MAC/IP entry
+/// ⇒ `MacRouteCfg` + `NeighborCfg` + `TunnelCfg`. We deliberately defer:
+/// * type-3 flood VTEPs (`evpn.floods()`) — need the BUM datapath (B2), and
+///   have no `NodeConfig` representation yet (the agent's `VTEP_PEERS` trusted-
+///   decap set is derived from the emitted tunnels/MAC routes, so a flood-only
+///   VTEP has nowhere to land);
+/// * v6 VTEPs — the maps are v4-only today (`remote_vtep` an `Ipv4Addr`), and
+///   v6 inner IPs (`inner_dst` is a `Cidr4`), which drop the L3 tunnel/neighbor
+///   for that entry but keep its MAC route.
+///
+/// `via_mac`/`out_iface` mirror `Topology::derive` exactly (see `Host::underlay_mac`):
+/// the next-hop `via_mac` is the remote VTEP host's underlay MAC, and `out_iface`
+/// is this host's underlay iface. That means we can only program a VTEP that is a
+/// **known fabric host** (we borrow its underlay MAC); an unknown/external VTEP is
+/// held in [`EvpnLearned`] but not programmed (a routed underlay would resolve the
+/// gateway MAC — a later chunk).
+///
+/// EVPN-managed and orchestrator-managed VNIs are expected disjoint (the
+/// `EVPN_RESERVED_VNI_BASE` convention). Entries are appended after the
+/// topology-derived ones, so on a key collision the agent's last-write-wins map
+/// programming lets the EVPN entry win.
+fn append_evpn_entries(file: &mut FileConfig, host: &Host, topo: &Topology, evpn: &EvpnLearned) {
+    for (vni, mac, learned) in evpn.iter_macs() {
+        // v4-only datapath today: skip v6 VTEPs (these gates apply to the L2 MAC
+        // route as well as the L3 tunnel below).
+        let IpAddr::V4(vtep) = learned.vtep else {
+            continue;
+        };
+        // Never tunnel to ourselves.
+        if vtep == host.vtep_ip {
+            continue;
+        }
+        // Borrow the remote VTEP host's underlay MAC as the next hop (mirrors
+        // the topology derive). An external VTEP we don't know is held, not
+        // programmed.
+        let Some(remote) = topo.hosts().find(|h| h.vtep_ip == vtep) else {
+            continue;
+        };
+        // B1: every type-2 MAC (MAC-only AND MAC/IP) gets an L2 MAC-FDB entry so
+        // the datapath can bridge by destination MAC, independent of the L3 FDB.
+        file.mac_routes.push(MacRouteCfg {
+            vni,
+            mac: fmt_mac(mac),
+            remote_vtep: vtep.to_string(),
+            via_mac: fmt_mac(remote.underlay_mac),
+            out_iface: host.underlay_iface.clone(),
+        });
+        // A bound IP additionally gets L3 forwarding + ARP suppression. A
+        // MAC-only entry (or a v6 inner IP) stops here — it has only a MAC route.
+        let Some(IpAddr::V4(ip)) = learned.ip else {
+            continue;
+        };
+        file.neighbors.push(NeighborCfg {
+            vni,
+            ip: ip.to_string(),
+            mac: fmt_mac(mac),
+        });
+        file.tunnels.push(TunnelCfg {
+            vni,
+            inner_dst: format!("{ip}/32"),
+            remote_vtep: vtep.to_string(),
+            via_mac: fmt_mac(remote.underlay_mac),
+            out_iface: host.underlay_iface.clone(),
+        });
+    }
 }
 
 /// Read, parse, and build the live [`Topology`] model from a file (the seed /
@@ -268,7 +361,7 @@ mod tests {
         "#;
         let tf: TopologyFile = toml::from_str(toml).unwrap();
         let topo = build(&tf).unwrap();
-        let configs = derive_configs(&topo).unwrap();
+        let configs = derive_configs(&topo, None).unwrap();
 
         assert_eq!(configs.len(), 2);
         // h1's derived config: a local interface tapA and a tunnel toward h2.
@@ -315,9 +408,125 @@ mod tests {
         assert_eq!(reloaded.ports()[0].id, original.ports()[0].id);
         assert_eq!(reloaded.ports()[0].ip, original.ports()[0].ip);
         // And the derived config is byte-identical.
-        let a = derive_configs(&original).unwrap();
-        let b = derive_configs(&reloaded).unwrap();
+        let a = derive_configs(&original, None).unwrap();
+        let b = derive_configs(&reloaded, None).unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn folds_evpn_learned_type2_routes_into_derived_config() {
+        use crate::evpn::{EvpnLearned, EvpnMonitorEvent};
+
+        // h1 has a local port (participates); h2 is a known host (its vtep/MAC
+        // are the next hop) but has no port, so h1's *base* config has no
+        // tunnels/neighbors — anything below is purely EVPN-contributed.
+        let toml = r#"
+            [[host]]
+            id = "h1"
+            vtep = "10.10.0.1"
+            underlay_iface = "eth0"
+            underlay_mac = "02:00:00:00:00:11"
+            [[host]]
+            id = "h2"
+            vtep = "10.10.0.2"
+            underlay_iface = "eth0"
+            underlay_mac = "02:00:00:00:00:22"
+            [[network]]
+            vni = 5000
+            name = "blue"
+            subnet = "192.168.100.0/24"
+            [[port]]
+            network = 5000
+            host = "h1"
+            tap = "tapA"
+        "#;
+        let topo = build(&toml::from_str(toml).unwrap()).unwrap();
+
+        // Baseline (no EVPN): h1 has no overlay peers.
+        let base = derive_configs(&topo, None).unwrap();
+        assert!(base["h1"].tunnels.is_empty());
+        assert!(base["h1"].neighbors.is_empty());
+
+        // Learn: a type-2 MAC/IP behind h2's VTEP (programmable), plus a
+        // MAC-only entry (must NOT be programmed) on the reserved EVPN VNI.
+        let evpn_vni = velstra_orchestrator::EVPN_RESERVED_VNI_BASE;
+        let mut learned = EvpnLearned::default();
+        assert!(learned.apply(&EvpnMonitorEvent::MacUpdate {
+            vni: evpn_vni,
+            mac: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            ip: Some("192.168.100.50".parse().unwrap()),
+            vtep: "10.10.0.2".parse().unwrap(),
+        }));
+        assert!(learned.apply(&EvpnMonitorEvent::MacUpdate {
+            vni: evpn_vni,
+            mac: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
+            ip: None, // MAC-only: held, not programmed
+            vtep: "10.10.0.2".parse().unwrap(),
+        }));
+
+        let cfg = derive_configs(&topo, Some(&learned)).unwrap();
+        let h1 = &cfg["h1"];
+
+        // Exactly the one MAC/IP entry became a tunnel + neighbor (MAC-only skipped
+        // for the L3 path).
+        assert_eq!(h1.tunnels.len(), 1);
+        assert_eq!(h1.neighbors.len(), 1);
+
+        let t = &h1.tunnels[0];
+        assert_eq!(t.vni, evpn_vni);
+        assert_eq!(t.inner_dst, "192.168.100.50/32");
+        assert_eq!(t.remote_vtep, "10.10.0.2");
+        // via_mac mirrors the topology convention: the remote VTEP host's MAC.
+        assert_eq!(t.via_mac, "02:00:00:00:00:22");
+        assert_eq!(t.out_iface, "eth0");
+
+        let n = &h1.neighbors[0];
+        assert_eq!(n.vni, evpn_vni);
+        assert_eq!(n.ip, "192.168.100.50");
+        assert_eq!(n.mac, "aa:bb:cc:dd:ee:ff");
+
+        // B1: BOTH type-2 MACs (MAC/IP + MAC-only) yield a MAC-FDB route. Order is
+        // map-iteration dependent, so look each up by its MAC.
+        assert_eq!(h1.mac_routes.len(), 2);
+        let mac_ip = h1
+            .mac_routes
+            .iter()
+            .find(|m| m.mac == "aa:bb:cc:dd:ee:ff")
+            .expect("MAC/IP entry has a mac route");
+        assert_eq!(mac_ip.vni, evpn_vni);
+        assert_eq!(mac_ip.remote_vtep, "10.10.0.2");
+        assert_eq!(mac_ip.via_mac, "02:00:00:00:00:22");
+        assert_eq!(mac_ip.out_iface, "eth0");
+
+        let mac_only = h1
+            .mac_routes
+            .iter()
+            .find(|m| m.mac == "11:22:33:44:55:66")
+            .expect("MAC-only entry has a mac route");
+        assert_eq!(mac_only.vni, evpn_vni);
+        assert_eq!(mac_only.remote_vtep, "10.10.0.2");
+        assert_eq!(mac_only.via_mac, "02:00:00:00:00:22");
+        assert_eq!(mac_only.out_iface, "eth0");
+
+        // The MAC-only entry contributed *exactly* its one mac route: no tunnel,
+        // no neighbor references it.
+        assert!(
+            !h1.tunnels
+                .iter()
+                .any(|t| t.inner_dst.starts_with("0.0.0.0"))
+        );
+        assert!(
+            !h1.neighbors.iter().any(|n| n.mac == "11:22:33:44:55:66"),
+            "MAC-only entry must not produce a neighbor"
+        );
+        assert_eq!(
+            h1.mac_routes
+                .iter()
+                .filter(|m| m.mac == "11:22:33:44:55:66")
+                .count(),
+            1,
+            "MAC-only entry produces exactly one mac route"
+        );
     }
 
     #[test]

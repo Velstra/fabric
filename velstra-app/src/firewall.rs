@@ -19,13 +19,13 @@ use aya::{
 use clap::ValueEnum;
 use log::warn;
 use velstra_common::{
-    ArpEntry, ArpKey, Backend, Cidr4, Counter, GlobalConfig, OverlayConfig, PolicyId, PortFwd,
-    RouteEntry, ScopedAddr, ScopedAddr6, ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue,
-    TunnelEndpoint, TunnelKey, parse_mac, port_rule_value,
+    ArpEntry, ArpKey, Backend, Cidr4, Counter, GlobalConfig, MacFdbKey, OverlayConfig, PolicyId,
+    PortFwd, RouteEntry, ScopedAddr, ScopedAddr6, ScopedPortKey, ScopedSrcPortKey, ServiceKey,
+    ServiceValue, TunnelEndpoint, TunnelKey, parse_mac, port_rule_value,
 };
 use velstra_config::{
-    PolicyConfig, ResolvedInterface, ResolvedNeighbor, ResolvedOverlay, ResolvedPortForward,
-    ResolvedRoute, ResolvedService, ResolvedTunnel, RuntimeConfig,
+    PolicyConfig, ResolvedInterface, ResolvedMacRoute, ResolvedNeighbor, ResolvedOverlay,
+    ResolvedPortForward, ResolvedRoute, ResolvedService, ResolvedTunnel, RuntimeConfig,
 };
 
 /// How to attach the XDP program to the interface.
@@ -544,14 +544,29 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
         }
     }
     {
+        // B1 MAC-FDB is a HashMap keyed by `(vni, inner dst MAC)`; drop the old
+        // set, mirroring the OVERLAY_FDB reconcile above.
+        let mut mac_fdb: HashMap<_, MacFdbKey, TunnelEndpoint> = HashMap::try_from(
+            ebpf.map_mut("MAC_FDB")
+                .ok_or_else(|| anyhow!("MAC_FDB map missing"))?,
+        )?;
+        for mr in &old.mac_routes {
+            let _ = mac_fdb.remove(&MacFdbKey::new(mr.vni, mr.mac));
+        }
+    }
+    {
         // Trusted-VTEP set (C2): drop the old peers; program_overlay re-adds every
         // still-current one, so a peer shared by another live tunnel survives.
+        // Both tunnels and MAC routes contribute trusted decap peers.
         let mut peers: HashMap<_, [u8; 4], u8> = HashMap::try_from(
             ebpf.map_mut("VTEP_PEERS")
                 .ok_or_else(|| anyhow!("VTEP_PEERS map missing"))?,
         )?;
         for tunnel in &old.tunnels {
             let _ = peers.remove(&tunnel.remote_vtep_ip);
+        }
+        for mr in &old.mac_routes {
+            let _ = peers.remove(&mr.remote_vtep_ip);
         }
     }
     {
@@ -579,7 +594,13 @@ fn apply_config(ebpf: &mut Ebpf, cfg: &RuntimeConfig, old: Option<&RuntimeConfig
     program_services(ebpf, &cfg.services)?;
     program_port_forwards(ebpf, &cfg.port_forwards)?;
     program_masquerade(ebpf, &cfg.interfaces)?;
-    program_overlay(ebpf, cfg.overlay.as_ref(), &cfg.tunnels, &cfg.neighbors)?;
+    program_overlay(
+        ebpf,
+        cfg.overlay.as_ref(),
+        &cfg.tunnels,
+        &cfg.mac_routes,
+        &cfg.neighbors,
+    )?;
 
     Ok(())
 }
@@ -781,16 +802,18 @@ fn program_masquerade(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Resu
     let prepared: Vec<(u32, [u8; 4])> = interfaces
         .iter()
         .filter(|i| i.masquerade)
-        .filter_map(|i| match (if_nametoindex(&i.name), read_iface_ipv4(&i.name)) {
-            (Ok(ifindex), Ok(ip)) => Some((ifindex, ip)),
-            _ => {
-                warn!(
-                    "masquerade interface {} has no IPv4 yet; deferring its SNAT",
-                    i.name
-                );
-                None
-            }
-        })
+        .filter_map(
+            |i| match (if_nametoindex(&i.name), read_iface_ipv4(&i.name)) {
+                (Ok(ifindex), Ok(ip)) => Some((ifindex, ip)),
+                _ => {
+                    warn!(
+                        "masquerade interface {} has no IPv4 yet; deferring its SNAT",
+                        i.name
+                    );
+                    None
+                }
+            },
+        )
         .collect();
     if prepared.is_empty() {
         return Ok(());
@@ -841,9 +864,11 @@ fn read_iface_ipv4(iface: &str) -> Result<[u8; 4]> {
 }
 
 /// Program the Phase 4 overlay maps: `OVERLAY_CONFIG` (this host's VTEP, a single
-/// entry) and `OVERLAY_FDB` (`(vni, inner dst)` → remote endpoint). Each tunnel's
-/// underlay egress ifindex is also mirrored into `TX_PORTS` so the data plane can
-/// redirect after encapsulating.
+/// entry), `OVERLAY_FDB` (`(vni, inner dst)` → remote endpoint), and the B1
+/// `MAC_FDB` (`(vni, inner dst MAC)` → remote endpoint, consulted first for L2
+/// bridging). Each tunnel's and MAC route's underlay egress ifindex is also
+/// mirrored into `TX_PORTS` so the data plane can redirect after encapsulating,
+/// and each remote VTEP is added to the trusted-decap `VTEP_PEERS` set.
 ///
 /// Slot `0` of `OVERLAY_CONFIG` is **always** written — with the resolved config
 /// or, when the overlay is absent, with the disabled default — so a live
@@ -852,6 +877,7 @@ fn program_overlay(
     ebpf: &mut Ebpf,
     overlay: Option<&ResolvedOverlay>,
     tunnels: &[ResolvedTunnel],
+    mac_routes: &[ResolvedMacRoute],
     neighbors: &[ResolvedNeighbor],
 ) -> Result<()> {
     // Resolve the host config (MAC + port) before borrowing any map.
@@ -894,7 +920,7 @@ fn program_overlay(
         }
     }
 
-    if tunnels.is_empty() {
+    if tunnels.is_empty() && mac_routes.is_empty() {
         return Ok(());
     }
 
@@ -928,6 +954,25 @@ fn program_overlay(
         })
         .collect();
 
+    // B1: resolve every MAC route's egress ifindex the same way. Each becomes an
+    // exact-match MAC-FDB key `(vni, inner dst MAC)` → endpoint.
+    let prepared_mac: Vec<(MacFdbKey, TunnelEndpoint)> = mac_routes
+        .iter()
+        .filter_map(|m| match if_nametoindex(&m.out_iface) {
+            Ok(ifindex) => Some((
+                MacFdbKey::new(m.vni, m.mac),
+                TunnelEndpoint::new(ifindex, m.remote_vtep_ip, m.outer_dst_mac),
+            )),
+            Err(_) => {
+                log::debug!(
+                    "mac_route egress {} not present yet; deferring its MAC-FDB entry",
+                    m.out_iface
+                );
+                None
+            }
+        })
+        .collect();
+
     {
         let mut fdb: LpmTrie<_, TunnelKey, TunnelEndpoint> = LpmTrie::try_from(
             ebpf.map_mut("OVERLAY_FDB")
@@ -940,10 +985,25 @@ fn program_overlay(
     }
 
     {
+        // B1 MAC-FDB: consulted before OVERLAY_FDB so a true L2 overlay bridges
+        // by destination MAC.
+        let mut mac_fdb: HashMap<_, MacFdbKey, TunnelEndpoint> = HashMap::try_from(
+            ebpf.map_mut("MAC_FDB")
+                .ok_or_else(|| anyhow!("MAC_FDB map missing"))?,
+        )?;
+        for (key, endpoint) in &prepared_mac {
+            mac_fdb
+                .insert(key, endpoint, 0)
+                .context("inserting MAC-FDB entry")?;
+        }
+    }
+
+    {
         // Trusted-VTEP set (C2): every distinct remote VTEP we tunnel with is an
         // authorized decap source. remove_stale dropped the old set first, and we
         // re-add every current peer here, so a still-valid VTEP survives a
-        // reconfigure (mirrors the OVERLAY_FDB reconcile).
+        // reconfigure (mirrors the OVERLAY_FDB reconcile). MAC routes reach the
+        // same remote VTEPs, so their VTEPs must be trusted decap peers too.
         let mut peers: HashMap<_, [u8; 4], u8> = HashMap::try_from(
             ebpf.map_mut("VTEP_PEERS")
                 .ok_or_else(|| anyhow!("VTEP_PEERS map missing"))?,
@@ -952,6 +1012,11 @@ fn program_overlay(
             peers
                 .insert(t.remote_vtep_ip, 1, 0)
                 .context("inserting trusted VTEP peer")?;
+        }
+        for m in mac_routes {
+            peers
+                .insert(m.remote_vtep_ip, 1, 0)
+                .context("inserting trusted VTEP peer (mac route)")?;
         }
     }
 
@@ -963,6 +1028,11 @@ fn program_overlay(
         tx_ports
             .set(endpoint.out_ifindex, endpoint.out_ifindex, None, 0)
             .context("registering overlay redirect device")?;
+    }
+    for (_, endpoint) in &prepared_mac {
+        tx_ports
+            .set(endpoint.out_ifindex, endpoint.out_ifindex, None, 0)
+            .context("registering overlay redirect device (mac route)")?;
     }
 
     Ok(())

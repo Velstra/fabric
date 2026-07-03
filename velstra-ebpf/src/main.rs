@@ -63,7 +63,7 @@ use velstra_common::{
     ARP_REPLY, ARP_REQUEST, Action, ArpEntry, ArpKey, Backend, ConfigFlags, Counter, ETHERTYPE_ARP,
     ETHERTYPE_IPV4, ETHERTYPE_IPV6, FlowKey, FlowState, ForwardOutcome, GlobalConfig, Nat,
     OVERLAY_OUTER_LEN, OverlayConfig, PacketMeta, PolicyId, PortFwd, Rewrite, RouteEntry,
-    ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, ScopedAddr, ScopedAddr6, ScopedPortKey,
+    ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, MacFdbKey, ScopedAddr, ScopedAddr6, ScopedPortKey,
     ScopedSrcPortKey, ServiceKey, ServiceValue, TunnelEndpoint, TunnelKey,
     build_encap, decide, icmp, icmp_checksum, ip_proto, is_overlay_dport, lpm_key_addr,
     plan_arp_reply, plan_forward, plan_icmp_unreachable, plan_nat, plan_tcp_rst, port_rule_action,
@@ -175,6 +175,12 @@ static ARP_TABLE: HashMap<ArpKey, ArpEntry> = HashMap::with_max_entries(8192, 0)
 /// the packet falls through to normal switching/routing.
 #[map]
 static OVERLAY_FDB: LpmTrie<TunnelKey, TunnelEndpoint> = LpmTrie::with_max_entries(8192, 0);
+
+/// B1 per-MAC forwarding DB: exact-match `(vni, inner dst MAC)` → remote
+/// [`TunnelEndpoint`]. Consulted before the L3 `OVERLAY_FDB` so a true L2
+/// overlay bridges by destination MAC; a miss falls through to the L3 path.
+#[map]
+static MAC_FDB: HashMap<MacFdbKey, TunnelEndpoint> = HashMap::with_max_entries(8192, 0);
 
 /// Phase 4 **trusted VTEP set** (C2): the outer source IPv4 (network order) of
 /// every remote peer VTEP this host tunnels with. A UDP datagram on the tunnel
@@ -993,15 +999,24 @@ fn try_encap(
     if !ocfg.is_enabled() || vni == 0 {
         return Ok(None);
     }
-    // Longest-prefix match on `(vni, inner dst)`: one entry can cover a whole
-    // remote subnet. A miss means the destination is local.
-    let key = Key::new(
-        TunnelKey::FULL_PREFIX,
-        TunnelKey::new(vni, lpm_key_addr(dst_addr)),
-    );
-    let ep = match OVERLAY_FDB.get(&key) {
+    // B1: a true L2 overlay bridges by the inner destination MAC. Try the MAC
+    // FDB first; on a miss fall through to the L3 (inner-IP) FDB unchanged. Read
+    // the inner dst MAC now, before any `bpf_xdp_adjust_head` grows the head.
+    let inner_dst_mac = unsafe { *ptr_at::<[u8; 6]>(ctx, O_ETH_DST)? };
+    let ep = match unsafe { MAC_FDB.get(&MacFdbKey::new(vni, inner_dst_mac)) } {
         Some(ep) => *ep,
-        None => return Ok(None),
+        None => {
+            // Longest-prefix match on `(vni, inner dst)`: one entry can cover a
+            // whole remote subnet. A miss means the destination is local.
+            let key = Key::new(
+                TunnelKey::FULL_PREFIX,
+                TunnelKey::new(vni, lpm_key_addr(dst_addr)),
+            );
+            match OVERLAY_FDB.get(&key) {
+                Some(ep) => *ep,
+                None => return Ok(None),
+            }
+        }
     };
 
     // Entropy for the outer UDP source port: hash the inner flow so the underlay
