@@ -61,13 +61,14 @@ use network_types::{
 };
 use velstra_common::{
     ARP_REPLY, ARP_REQUEST, Action, ArpEntry, ArpKey, Backend, ConfigFlags, Counter, ETHERTYPE_ARP,
-    ETHERTYPE_IPV4, ETHERTYPE_IPV6, FlowKey, FlowState, ForwardOutcome, GlobalConfig, Nat,
-    OVERLAY_OUTER_LEN, OverlayConfig, PacketMeta, PolicyId, PortFwd, Rewrite, RouteEntry,
-    ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, MacFdbKey, ScopedAddr, ScopedAddr6, ScopedPortKey,
-    ScopedSrcPortKey, ServiceKey, ServiceValue, TunnelEndpoint, TunnelKey,
-    build_encap, decide, icmp, icmp_checksum, ip_proto, is_overlay_dport, lpm_key_addr,
-    plan_arp_reply, plan_forward, plan_icmp_unreachable, plan_nat, plan_tcp_rst, port_rule_action,
-    port_rule_logs, select_backend, session_hash, tcp_flags,
+    ETHERTYPE_IPV4, ETHERTYPE_IPV6, FlowKey, FlowState, ForwardOutcome, GlobalConfig,
+    ICMPV6_NEIGHBOR_SOLICIT, ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, LocalMac, LocalMacKey,
+    MacFdbKey, ND_NA_MSG_LEN, Nat, NdKey, OVERLAY_OUTER_LEN, OverlayConfig, PacketMeta, PolicyId,
+    PortFwd, Rewrite,
+    RouteEntry, ScopedAddr, ScopedAddr6, ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue,
+    TunnelEndpoint, TunnelKey, build_encap, decide, icmp, icmp_checksum, ip_proto, is_overlay_dport,
+    lpm_key_addr, plan_arp_reply, plan_forward, plan_icmp_unreachable, plan_na_reply, plan_nat,
+    plan_tcp_rst, port_rule_action, port_rule_logs, select_backend, session_hash, tcp_flags,
 };
 
 /// Maps an ingress interface index to its policy id, so one XDP program can
@@ -168,6 +169,13 @@ static OVERLAY_CONFIG: Array<OverlayConfig> = Array::with_max_entries(1, 0);
 #[map]
 static ARP_TABLE: HashMap<ArpKey, ArpEntry> = HashMap::with_max_entries(8192, 0);
 
+/// B3 IPv6 Neighbor-Discovery suppression table: `(vni, tenant IPv6)` → the MAC
+/// that answers for it (the value shape is the same [`ArpEntry`] the ARP table
+/// uses). Pushed by the controller; lets the host reply to a tenant's Neighbor
+/// Solicitation locally instead of flooding the overlay.
+#[map]
+static ND_TABLE: HashMap<NdKey, ArpEntry> = HashMap::with_max_entries(8192, 0);
+
 /// Phase 4 overlay forwarding database: an **LPM trie** keyed by [`TunnelKey`]
 /// (`vni` exact + inner-destination prefix) → the remote [`TunnelEndpoint`].
 /// Longest-prefix matching lets one entry cover a whole remote subnet. Pushed by
@@ -181,6 +189,15 @@ static OVERLAY_FDB: LpmTrie<TunnelKey, TunnelEndpoint> = LpmTrie::with_max_entri
 /// overlay bridges by destination MAC; a miss falls through to the L3 path.
 #[map]
 static MAC_FDB: HashMap<MacFdbKey, TunnelEndpoint> = HashMap::with_max_entries(8192, 0);
+
+/// B4b **local-MAC learning** table: `(vni, tenant source MAC)` → the tenant's
+/// [`LocalMac`] (its bound IPv4). Populated **by the data plane itself** on the
+/// firewall-allowed path for tenant ports (`vni != 0`), so the co-located agent
+/// can read it out and advertise each local tenant MAC/IP to the Wren routing
+/// daemon (which re-advertises them as type-2 EVPN routes to remote VTEPs). An
+/// LRU map so it self-evicts silent MACs without any user-space pruning.
+#[map]
+static LOCAL_MACS: LruHashMap<LocalMacKey, LocalMac> = LruHashMap::with_max_entries(8192, 0);
 
 /// Phase 4 **trusted VTEP set** (C2): the outer source IPv4 (network order) of
 /// every remote peer VTEP this host tunnels with. A UDP datagram on the tunnel
@@ -494,6 +511,14 @@ const O_TCP_CSUM: usize = O_L4 + 16; //     50: TCP checksum
 const O_TCP_URG: usize = O_L4 + 18; //      52: TCP urgent pointer
 const O_UDP_CSUM: usize = O_L4 + 6; //      40: UDP checksum
 
+// Constant byte offsets for the B3 IPv6 Neighbor-Discovery suppression writes
+// (Ethernet + fixed 40-byte IPv6 header). The ICMPv6 Neighbor Advertisement is
+// written over the solicitation body in place.
+const O_IP6_PLEN: usize = O_IP + 4; //      18: IPv6 payload length
+const O_IP6_SRC: usize = O_IP + 8; //       22: IPv6 source address
+const O_IP6_DST: usize = O_IP + 24; //      38: IPv6 destination address
+const O_ND_MSG: usize = EthHdr::LEN + Ipv6Hdr::LEN; // 54: ICMPv6 message start
+
 /// Write a [`Nat`] rewrite's IPv4 address/port and repaired IPv4 checksum at
 /// their constant offsets. `reverse` selects the **source** fields (SNAT) over
 /// the **destination** fields (DNAT). The L4 checksum is written separately by
@@ -756,6 +781,26 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
 
     let log = cfg.has_flag(ConfigFlags::LOG);
 
+    // B4b: learn this tenant's source MAC → IPv4 on the firewall-allowed path so
+    // the agent can advertise it to the local routing daemon (EVPN type-2). Only
+    // on a tenant segment (`vni != 0`); the overlay/underlay port (`vni == 0`) is
+    // never learned, and decapped tunnel traffic already returned via `try_decap`
+    // above, so it can't reach here either. IPv4 only — `src_addr` is the parsed
+    // v4 source (v6 learning is out of scope for now). Verifier-simple: one
+    // constant-offset read at `O_ETH_SRC` (== 6, freshly bounds-checked by
+    // `ptr_at`) followed by a single LRU map insert — no loops, no data-dependent
+    // offsets. Refresh-on-every-frame is fine: the LRU keeps active MACs and ages
+    // out silent ones.
+    if vni != 0
+        && let Ok(src_mac) = unsafe { ptr_at::<[u8; 6]>(ctx, O_ETH_SRC) }
+    {
+        let _ = LOCAL_MACS.insert(
+            &LocalMacKey::new(vni, unsafe { *src_mac }),
+            &LocalMac::new(src_addr),
+            0,
+        );
+    }
+
     // Phase 4: overlay encapsulation. If this tenant's (vni == policy) inner
     // destination lives on another host, wrap the frame in a VXLAN/Geneve tunnel
     // and redirect it onto the underlay. A miss means "local" — fall through to
@@ -828,6 +873,15 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
     // payload length @4..6 (big-endian), next-header @6, addresses @8 and @24.
     let payload_len = u16::from_be_bytes([hdr[4], hdr[5]]);
     let next_hdr = hdr[6];
+
+    // B3: on a tenant port, a Neighbor Solicitation for a known address is
+    // answered locally (ND suppression). A miss / non-NS falls through to the
+    // firewall below, so ICMPv6 is still filtered and policed as before.
+    if next_hdr == ip_proto::ICMPV6 {
+        if let Some(action) = try_nd(ctx)? {
+            return Ok(action);
+        }
+    }
     let src_addr: [u8; 16] = [
         hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15], hdr[16], hdr[17],
         hdr[18], hdr[19], hdr[20], hdr[21], hdr[22], hdr[23],
@@ -940,6 +994,99 @@ fn try_arp(ctx: &XdpContext) -> Result<u32, ()> {
     }
     bump(Counter::ArpSuppressed);
     Ok(xdp_action::XDP_TX)
+}
+
+/// B3 **IPv6 Neighbor-Discovery suppression**: the IPv6 mirror of [`try_arp`].
+/// Answer a tenant's ICMPv6 Neighbor Solicitation locally from `ND_TABLE`
+/// (pushed by the controller) with a synthesised Neighbor Advertisement bounced
+/// back out the same interface (`XDP_TX`), so the solicitation never floods the
+/// overlay.
+///
+/// Returns `Ok(Some(XDP_TX))` when a Neighbor Advertisement was synthesised, and
+/// `Ok(None)` for anything not suppressible here (overlay off, non-tenant port,
+/// not an NS, an unknown target, or too small) so the caller falls through to
+/// the normal IPv6 firewall path.
+///
+/// **Size discipline:** the NA needs a 32-byte ICMPv6 message (24-byte NA header
+/// + an 8-byte Target-Link-Layer-Address option). A solicited NS from a real
+/// host always carries a Source-Link-Layer-Address option, so its ICMPv6 payload
+/// is already ≥ 32 bytes — we therefore answer **in place** only when the IPv6
+/// payload length is ≥ 32, overwriting that region with the 32-byte NA and never
+/// growing the packet (no `bpf_xdp_adjust_tail`), which keeps the write
+/// verifier-simple. A shorter NS (no SLLA option) is passed through untouched.
+#[inline(always)]
+fn try_nd(ctx: &XdpContext) -> Result<Option<u32>, ()> {
+    if !overlay_config().is_enabled() {
+        return Ok(None);
+    }
+    let ifindex = ctx.ingress_ifindex() as u32;
+    let vni = unsafe { IFACE_VNI.get(&ifindex) }.copied().unwrap_or(0);
+    if vni == 0 {
+        return Ok(None);
+    }
+
+    // The fixed 40-byte IPv6 header: payload length @4..6, next-header @6, the
+    // soliciting host's source address @8..24.
+    let hdr: *const [u8; Ipv6Hdr::LEN] = unsafe { ptr_at(ctx, EthHdr::LEN)? };
+    let hdr = unsafe { *hdr };
+    if hdr[6] != ip_proto::ICMPV6 {
+        return Ok(None);
+    }
+    // Only answer in place when the NS body (with its SLLA option) is ≥ 32 bytes,
+    // so the 32-byte NA fits exactly where it was — see the size note above.
+    let payload_len = u16::from_be_bytes([hdr[4], hdr[5]]);
+    if (payload_len as usize) < ND_NA_MSG_LEN {
+        return Ok(None);
+    }
+    let ns_src_ip: [u8; 16] = [
+        hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15], hdr[16], hdr[17],
+        hdr[18], hdr[19], hdr[20], hdr[21], hdr[22], hdr[23],
+    ];
+
+    // The ICMPv6 message begins right after the fixed IPv6 header. We need the
+    // type (@0) and, for an NS, the target address (@8..24 — a 4-byte ICMPv6
+    // header + 4 reserved bytes, then the 16-byte target).
+    let icmp6: *const [u8; 24] = unsafe { ptr_at(ctx, EthHdr::LEN + Ipv6Hdr::LEN)? };
+    let icmp6 = unsafe { *icmp6 };
+    if icmp6[0] != ICMPV6_NEIGHBOR_SOLICIT {
+        return Ok(None);
+    }
+    let target: [u8; 16] = [
+        icmp6[8], icmp6[9], icmp6[10], icmp6[11], icmp6[12], icmp6[13], icmp6[14], icmp6[15],
+        icmp6[16], icmp6[17], icmp6[18], icmp6[19], icmp6[20], icmp6[21], icmp6[22], icmp6[23],
+    ];
+
+    // Only answer addresses the controller told us about; else let it flood.
+    let entry = match unsafe { ND_TABLE.get(&NdKey::new(vni, target)) } {
+        Some(entry) => *entry,
+        None => return Ok(None),
+    };
+
+    // The requester's Ethernet source becomes the NA's L2 destination.
+    let eth_src: *const [u8; 6] = unsafe { ptr_at(ctx, O_ETH_SRC)? };
+    let ns_src_mac = unsafe { *eth_src };
+    let reply = plan_na_reply(target, entry.mac, ns_src_mac, ns_src_ip);
+
+    // Rewrite the solicitation into its advertisement in place, then bounce it
+    // (XDP_TX). All writes go through one freshly bounds-checked pointer at
+    // constant offsets. `payload_len ≥ 32` guarantees the frame covers @54..86.
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    if data + O_ND_MSG + ND_NA_MSG_LEN > data_end {
+        return Err(());
+    }
+    unsafe {
+        *((data + O_ETH_DST) as *mut [u8; 6]) = reply.eth_dst;
+        *((data + O_ETH_SRC) as *mut [u8; 6]) = reply.eth_src;
+        // Pin the IPv6 payload length to the 32-byte NA so a longer NS body can't
+        // leave trailing bytes outside the (checksummed) advertisement.
+        *((data + O_IP6_PLEN) as *mut [u8; 2]) = (ND_NA_MSG_LEN as u16).to_be_bytes();
+        *((data + O_IP6_SRC) as *mut [u8; 16]) = reply.ipv6_src;
+        *((data + O_IP6_DST) as *mut [u8; 16]) = reply.ipv6_dst;
+        *((data + O_ND_MSG) as *mut [u8; ND_NA_MSG_LEN]) = reply.na_msg;
+    }
+    bump(Counter::NdSuppressed);
+    Ok(Some(xdp_action::XDP_TX))
 }
 
 /// Read this host's [`OverlayConfig`] from the single-entry array map, falling

@@ -22,7 +22,11 @@
 //! action = "drop"
 //! ```
 
-use std::{fmt, net::Ipv4Addr, path::Path};
+use std::{
+    fmt,
+    net::{Ipv4Addr, Ipv6Addr},
+    path::Path,
+};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -248,6 +252,21 @@ pub struct NeighborCfg {
     pub mac: String,
 }
 
+/// A tenant IPv6 neighbour (`[[nd_neighbor]]`): the MAC that answers for a
+/// tenant IPv6, so the host can suppress (locally answer) IPv6 Neighbor
+/// Discovery for it instead of flooding the overlay. The IPv6 mirror of
+/// [`NeighborCfg`]; the controller pushes one per known tenant IPv6 address.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Nd6Cfg {
+    /// Tenant VNI this address lives on.
+    pub vni: u32,
+    /// The tenant IPv6 address.
+    pub ip: String,
+    /// Its hardware (MAC) address.
+    pub mac: String,
+}
+
 /// One overlay forwarding entry (`[[tunnel]]`): which remote VTEP hosts a given
 /// tenant IP. The controller pushes one per remote tenant address.
 #[derive(Debug, Deserialize)]
@@ -377,6 +396,9 @@ pub struct FileConfig {
     /// Phase 4 ARP-suppression neighbours. Spelled `[[neighbor]]` in TOML.
     #[serde(rename = "neighbor")]
     pub neighbors: Vec<NeighborCfg>,
+    /// B3 IPv6 ND-suppression neighbours. Spelled `[[nd_neighbor]]` in TOML.
+    #[serde(rename = "nd_neighbor")]
+    pub nd_neighbors: Vec<Nd6Cfg>,
 }
 
 /// A resolved load-balancer service: a service key and its (validated) backends.
@@ -492,6 +514,19 @@ pub struct ResolvedNeighbor {
     pub mac: [u8; 6],
 }
 
+/// A resolved IPv6 ND-suppression neighbour (B3): a tenant IPv6 and the MAC that
+/// answers for it (for the `ND_TABLE` map). The IPv6 mirror of
+/// [`ResolvedNeighbor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedNd6 {
+    /// Tenant VNI the address lives on.
+    pub vni: u32,
+    /// The tenant IPv6 address (network-order octets).
+    pub ip: [u8; 16],
+    /// The MAC that answers for it.
+    pub mac: [u8; 6],
+}
+
 /// A resolved interface assignment: which firewall policy *and* which overlay
 /// segment (VNI) an interface's traffic belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -563,6 +598,8 @@ pub struct RuntimeConfig {
     pub mac_routes: Vec<ResolvedMacRoute>,
     /// ARP-suppression neighbours for the `ARP_TABLE` map (Phase 4).
     pub neighbors: Vec<ResolvedNeighbor>,
+    /// IPv6 ND-suppression neighbours for the `ND_TABLE` map (B3).
+    pub nd_neighbors: Vec<ResolvedNd6>,
 }
 
 impl RuntimeConfig {
@@ -585,6 +622,7 @@ impl RuntimeConfig {
             tunnels: Vec::new(),
             mac_routes: Vec::new(),
             neighbors: Vec::new(),
+            nd_neighbors: Vec::new(),
         }
     }
 }
@@ -905,6 +943,26 @@ impl FileConfig {
             });
         }
 
+        if !self.nd_neighbors.is_empty() && overlay.is_none() {
+            bail!("`[[nd_neighbor]]` entries require an `[overlay]` section");
+        }
+        let mut nd_neighbors = Vec::with_capacity(self.nd_neighbors.len());
+        for n in &self.nd_neighbors {
+            if n.vni > 0xFF_FFFF {
+                bail!("nd_neighbor vni {} exceeds 24 bits", n.vni);
+            }
+            let ip: Ipv6Addr =
+                n.ip.parse()
+                    .map_err(|_| anyhow::anyhow!("invalid nd_neighbor ip {:?}", n.ip))?;
+            let mac = parse_mac(&n.mac)
+                .map_err(|e| anyhow::anyhow!("invalid nd_neighbor mac {:?}: {e}", n.mac))?;
+            nd_neighbors.push(ResolvedNd6 {
+                vni: n.vni,
+                ip: ip.octets(),
+                mac,
+            });
+        }
+
         Ok(RuntimeConfig {
             policies,
             interfaces,
@@ -915,6 +973,7 @@ impl FileConfig {
             tunnels,
             mac_routes,
             neighbors,
+            nd_neighbors,
         })
     }
 }
@@ -1095,6 +1154,22 @@ impl fmt::Display for RuntimeConfig {
                 writeln!(
                     f,
                     "  - vni {} {i0}.{i1}.{i2}.{i3} is at {a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{ff:02x}",
+                    n.vni,
+                )?;
+            }
+        }
+        if !self.nd_neighbors.is_empty() {
+            writeln!(
+                f,
+                "nd_neighbors   : {} (ipv6 nd suppression)",
+                self.nd_neighbors.len()
+            )?;
+            for n in &self.nd_neighbors {
+                let ip = Ipv6Addr::from(n.ip);
+                let [a, b, c, d, e, ff] = n.mac;
+                writeln!(
+                    f,
+                    "  - vni {} {ip} is at {a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{ff:02x}",
                     n.vni,
                 )?;
             }

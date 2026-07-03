@@ -36,7 +36,8 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use velstra_common::{parse_cidr_v4, parse_mac};
 use velstra_config::{
-    ActionName, EncapName, FileConfig, MacRouteCfg, NeighborCfg, TunnelCfg, file_config_to_proto,
+    ActionName, EncapName, FileConfig, MacRouteCfg, Nd6Cfg, NeighborCfg, TunnelCfg,
+    file_config_to_proto,
 };
 use velstra_orchestrator::{Host, Network, Topology};
 use velstra_proto::NodeConfig;
@@ -183,15 +184,18 @@ pub fn derive_configs(
 /// that additionally carry a bound IP are programmable through the v4
 /// `OVERLAY_FDB` + `ARP_TABLE` maps too: each such entry also emits an
 /// ARP-suppression [`NeighborCfg`] plus an L3 [`TunnelCfg`] with
-/// `inner_dst = ip/32`. So a MAC-only entry ⇒ one `MacRouteCfg`; a MAC/IP entry
-/// ⇒ `MacRouteCfg` + `NeighborCfg` + `TunnelCfg`. We deliberately defer:
+/// `inner_dst = ip/32`. A **v6** bound IP instead emits a B3 IPv6
+/// ND-suppression [`Nd6Cfg`] (the L3 `OVERLAY_FDB` stays v4-only). So a MAC-only
+/// entry yields one `MacRouteCfg`; a v4 MAC/IP entry yields `MacRouteCfg` +
+/// `NeighborCfg` + `TunnelCfg`; a v6 MAC/IP entry yields `MacRouteCfg` +
+/// `Nd6Cfg`. We deliberately defer:
 /// * type-3 flood VTEPs (`evpn.floods()`) — need the BUM datapath (B2), and
 ///   have no `NodeConfig` representation yet (the agent's `VTEP_PEERS` trusted-
 ///   decap set is derived from the emitted tunnels/MAC routes, so a flood-only
 ///   VTEP has nowhere to land);
 /// * v6 VTEPs — the maps are v4-only today (`remote_vtep` an `Ipv4Addr`), and
-///   v6 inner IPs (`inner_dst` is a `Cidr4`), which drop the L3 tunnel/neighbor
-///   for that entry but keep its MAC route.
+///   v6 inner IPs in the L3 `OVERLAY_FDB` (`inner_dst` is a `Cidr4`), which drop
+///   the L3 tunnel for a v6 entry but keep its MAC route and ND neighbour.
 ///
 /// `via_mac`/`out_iface` mirror `Topology::derive` exactly (see `Host::underlay_mac`):
 /// the next-hop `via_mac` is the remote VTEP host's underlay MAC, and `out_iface`
@@ -230,23 +234,35 @@ fn append_evpn_entries(file: &mut FileConfig, host: &Host, topo: &Topology, evpn
             via_mac: fmt_mac(remote.underlay_mac),
             out_iface: host.underlay_iface.clone(),
         });
-        // A bound IP additionally gets L3 forwarding + ARP suppression. A
-        // MAC-only entry (or a v6 inner IP) stops here — it has only a MAC route.
-        let Some(IpAddr::V4(ip)) = learned.ip else {
-            continue;
-        };
-        file.neighbors.push(NeighborCfg {
-            vni,
-            ip: ip.to_string(),
-            mac: fmt_mac(mac),
-        });
-        file.tunnels.push(TunnelCfg {
-            vni,
-            inner_dst: format!("{ip}/32"),
-            remote_vtep: vtep.to_string(),
-            via_mac: fmt_mac(remote.underlay_mac),
-            out_iface: host.underlay_iface.clone(),
-        });
+        // A bound IP additionally gets neighbour suppression. A v4 IP also gets
+        // L3 `OVERLAY_FDB` forwarding; a v6 IP is programmable as an `ND_TABLE`
+        // entry (B3) but the L3 FDB stays v4-only, so it emits only the ND
+        // neighbour. A MAC-only entry stops above with just its MAC route.
+        match learned.ip {
+            Some(IpAddr::V4(ip)) => {
+                file.neighbors.push(NeighborCfg {
+                    vni,
+                    ip: ip.to_string(),
+                    mac: fmt_mac(mac),
+                });
+                file.tunnels.push(TunnelCfg {
+                    vni,
+                    inner_dst: format!("{ip}/32"),
+                    remote_vtep: vtep.to_string(),
+                    via_mac: fmt_mac(remote.underlay_mac),
+                    out_iface: host.underlay_iface.clone(),
+                });
+            }
+            // B3: a learned v6 bound IP becomes an IPv6 ND-suppression neighbour.
+            Some(IpAddr::V6(ip6)) => {
+                file.nd_neighbors.push(Nd6Cfg {
+                    vni,
+                    ip: ip6.to_string(),
+                    mac: fmt_mac(mac),
+                });
+            }
+            None => {}
+        }
     }
 }
 
@@ -463,14 +479,38 @@ mod tests {
             ip: None, // MAC-only: held, not programmed
             vtep: "10.10.0.2".parse().unwrap(),
         }));
+        // B3: a type-2 MAC/**IPv6** behind h2 — programmable as an ND neighbour
+        // (but NOT as a v4 tunnel/neighbor, since the L3 FDB stays v4-only).
+        assert!(learned.apply(&EvpnMonitorEvent::MacUpdate {
+            vni: evpn_vni,
+            mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x06],
+            ip: Some("2001:db8::50".parse().unwrap()),
+            vtep: "10.10.0.2".parse().unwrap(),
+        }));
 
         let cfg = derive_configs(&topo, Some(&learned)).unwrap();
         let h1 = &cfg["h1"];
 
-        // Exactly the one MAC/IP entry became a tunnel + neighbor (MAC-only skipped
-        // for the L3 path).
+        // Exactly the one v4 MAC/IP entry became a tunnel + neighbor (MAC-only and
+        // the v6 entry are both skipped for the v4 L3 path).
         assert_eq!(h1.tunnels.len(), 1);
         assert_eq!(h1.neighbors.len(), 1);
+
+        // B3: the v6 MAC/IP entry became exactly one ND neighbour (correct
+        // vni/ip/mac) and NO v4 tunnel or neighbor.
+        assert_eq!(h1.nd_neighbors.len(), 1);
+        let nd = &h1.nd_neighbors[0];
+        assert_eq!(nd.vni, evpn_vni);
+        assert_eq!(nd.ip, "2001:db8::50");
+        assert_eq!(nd.mac, "de:ad:be:ef:00:06");
+        assert!(
+            !h1.neighbors.iter().any(|n| n.mac == "de:ad:be:ef:00:06"),
+            "v6 entry must not produce a v4 ARP neighbor"
+        );
+        assert!(
+            !h1.tunnels.iter().any(|t| t.inner_dst.contains(':')),
+            "v6 entry must not produce a v4 L3 tunnel"
+        );
 
         let t = &h1.tunnels[0];
         assert_eq!(t.vni, evpn_vni);
@@ -485,9 +525,9 @@ mod tests {
         assert_eq!(n.ip, "192.168.100.50");
         assert_eq!(n.mac, "aa:bb:cc:dd:ee:ff");
 
-        // B1: BOTH type-2 MACs (MAC/IP + MAC-only) yield a MAC-FDB route. Order is
-        // map-iteration dependent, so look each up by its MAC.
-        assert_eq!(h1.mac_routes.len(), 2);
+        // B1: EVERY type-2 MAC (v4 MAC/IP + MAC-only + v6 MAC/IP) yields a MAC-FDB
+        // route. Order is map-iteration dependent, so look each up by its MAC.
+        assert_eq!(h1.mac_routes.len(), 3);
         let mac_ip = h1
             .mac_routes
             .iter()

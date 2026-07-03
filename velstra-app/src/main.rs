@@ -14,6 +14,7 @@
 
 mod controller_client;
 mod firewall;
+mod wren;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -126,6 +127,14 @@ struct RunArgs {
     /// Seconds between live statistics dumps. `0` disables periodic dumps.
     #[arg(long, default_value_t = 5)]
     stats_interval: u64,
+
+    /// Path to the co-located Wren routing daemon's control socket. When set, the
+    /// agent reads locally-learned tenant MAC/IPs out of the data plane every few
+    /// seconds and advertises each to Wren (`evpn advertise <vni> <mac> <ip>`),
+    /// which re-advertises them as type-2 EVPN routes to remote VTEPs (roadmap
+    /// B4b). Unset ⇒ the whole learn-and-advertise task is inert.
+    #[arg(long)]
+    wren_socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -283,6 +292,26 @@ async fn run(args: RunArgs) -> Result<()> {
             tls.clone(),
             initial_version,
         ));
+    }
+
+    // B4b: local MAC learning → EVPN advertise. When a local Wren control socket
+    // is given, take the `LOCAL_MACS` map handle and run a task that advertises
+    // each locally-learned tenant MAC/IP to Wren. Opt-in and best-effort.
+    if let Some(socket) = args.wren_socket.clone() {
+        match firewall.lock().await.take_local_macs() {
+            Ok(map) => {
+                info!(
+                    "local-MAC learning: advertising to wren socket {}",
+                    socket.display()
+                );
+                tokio::spawn(wren::learn_and_advertise(
+                    map,
+                    socket,
+                    Duration::from_secs(2),
+                ));
+            }
+            Err(e) => warn!("could not start local-MAC learning: {e:#}"),
+        }
     }
 
     // In controller mode, also report statistics back periodically.

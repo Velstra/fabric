@@ -134,11 +134,14 @@ pub enum Counter {
     /// A tunnel packet was dropped before decap because it was not addressed to
     /// our VTEP or not sourced from a known peer VTEP (overlay decap auth, C2).
     OverlayDropUntrusted = 25,
+    /// Answered locally from the ND table (overlay IPv6 Neighbor-Discovery
+    /// suppression, B3 — the IPv6 mirror of [`Counter::ArpSuppressed`]).
+    NdSuppressed = 26,
 }
 
 impl Counter {
     /// Number of distinct counters — the `max_entries` of the `STATS` map.
-    pub const COUNT: u32 = 26;
+    pub const COUNT: u32 = 27;
 
     /// The array index of this counter.
     #[inline]
@@ -176,6 +179,7 @@ impl Counter {
             23 => Counter::EgressMasqueraded,
             24 => Counter::Rejected,
             25 => Counter::OverlayDropUntrusted,
+            26 => Counter::NdSuppressed,
             _ => return None,
         };
         Some(counter)
@@ -218,6 +222,7 @@ impl Counter {
             Counter::EgressMasqueraded => "egress_masqueraded",
             Counter::Rejected => "rejected",
             Counter::OverlayDropUntrusted => "overlay_drop_untrusted",
+            Counter::NdSuppressed => "nd_suppressed",
         }
     }
 }

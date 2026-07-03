@@ -10,10 +10,10 @@ mod config;
 mod proto_convert;
 
 pub use config::{
-    ActionName, BackendCfg, EncapName, FileConfig, ForwardMode, InterfaceFile, MacRouteCfg,
+    ActionName, BackendCfg, EncapName, FileConfig, ForwardMode, InterfaceFile, MacRouteCfg, Nd6Cfg,
     NeighborCfg, OverlayCfg, PolicyConfig, PolicyFile, PortForwardCfg, PortRule, ProtoName,
-    ResolvedInterface, ResolvedMacRoute, ResolvedNeighbor, ResolvedOverlay, ResolvedPortForward,
-    ResolvedRoute, ResolvedService, ResolvedTunnel, RouteCfg, RuntimeConfig, ServiceCfg, TunnelCfg,
-    load_file,
+    ResolvedInterface, ResolvedMacRoute, ResolvedNd6, ResolvedNeighbor, ResolvedOverlay,
+    ResolvedPortForward, ResolvedRoute, ResolvedService, ResolvedTunnel, RouteCfg, RuntimeConfig,
+    ServiceCfg, TunnelCfg, load_file,
 };
 pub use proto_convert::{file_config_from_proto, file_config_to_proto, runtime_from_proto};

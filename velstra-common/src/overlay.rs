@@ -252,6 +252,63 @@ impl MacFdbKey {
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for MacFdbKey {}
 
+/// B4b **local-MAC learning** key: a tenant VNI plus a **source** MAC the data
+/// plane observed on a tenant port, matched exactly (the key of the `LOCAL_MACS`
+/// LRU map). Mirrors [`MacFdbKey`]'s 12-byte layout — a `u32` VNI, a 6-byte MAC
+/// and explicit trailing padding — so the kernel and userspace agree
+/// byte-for-byte across the map boundary.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct LocalMacKey {
+    /// Tenant VNI the source MAC was learned on, matched exactly.
+    pub vni: u32,
+    /// The learned tenant source MAC.
+    pub mac: [u8; 6],
+    /// Explicit padding, always zero.
+    pub _pad: [u8; 2],
+}
+
+impl LocalMacKey {
+    /// Build a key for `(vni, mac)`.
+    #[inline]
+    pub const fn new(vni: u32, mac: [u8; 6]) -> Self {
+        Self {
+            vni,
+            mac,
+            _pad: [0; 2],
+        }
+    }
+}
+
+// SAFETY: `#[repr(C)]`, a `u32` + byte arrays, padding explicitly zeroed.
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for LocalMacKey {}
+
+/// B4b **local-MAC learning** value: the tenant IPv4 last seen bound to the keyed
+/// source MAC. The agent reads these out and advertises each `(vni, mac, ip)` to
+/// the co-located Wren routing daemon (which re-advertises them as type-2 EVPN
+/// routes). 8 bytes, explicit padding zeroed so the layout is deterministic.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LocalMac {
+    /// The learned tenant IPv4, network-order octets.
+    pub ip: [u8; 4],
+    /// Explicit padding, always zero.
+    pub _pad: [u8; 4],
+}
+
+impl LocalMac {
+    /// Build a value binding `ip` to a learned source MAC.
+    #[inline]
+    pub const fn new(ip: [u8; 4]) -> Self {
+        Self { ip, _pad: [0; 4] }
+    }
+}
+
+// SAFETY: `#[repr(C)]`, a 4-byte array + explicit padding, no uninit bytes.
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for LocalMac {}
+
 /// Derive the outer UDP **source** port from a flow-entropy hash.
 ///
 /// Per RFC 7348 the source port carries entropy so the underlay's ECMP/LAG
@@ -475,6 +532,174 @@ pub const fn plan_arp_reply(
     }
 }
 
+// === IPv6 Neighbor-Discovery suppression (B3) ==============================
+//
+// The IPv6 mirror of ARP suppression. A tenant VM sends an ICMPv6 Neighbor
+// Solicitation (NS, type 135) to resolve a peer's link-layer address; flooding
+// that to every VTEP scales as poorly as ARP does. So — exactly as [`try_arp`]
+// does for IPv4 — the host answers **locally** with a synthesised Neighbor
+// Advertisement (NA, type 136) from `ND_TABLE`, pushed by the controller, and
+// the solicitation never reaches the overlay.
+//
+// [`try_arp`]: (the eBPF data-plane function)
+
+/// ICMPv6 type for a Neighbor Solicitation (RFC 4861 §4.3).
+pub const ICMPV6_NEIGHBOR_SOLICIT: u8 = 135;
+/// ICMPv6 type for a Neighbor Advertisement (RFC 4861 §4.4).
+pub const ICMPV6_NEIGHBOR_ADVERT: u8 = 136;
+
+/// Length of the synthesised NA ICMPv6 message: the 24-byte NA header (type,
+/// code, checksum, 4-byte flags, 16-byte target) plus an 8-byte Target
+/// Link-Layer Address option (type, length, 6-byte MAC).
+pub const ND_NA_MSG_LEN: usize = 32;
+
+/// NA flags word (RFC 4861 §4.4): Solicited (`S`, `0x4000_0000`) + Override
+/// (`O`, `0x2000_0000`). The Router (`R`) bit is **not** set — we answer for
+/// tenant hosts, not routers.
+const ND_NA_FLAGS: u32 = 0x6000_0000;
+
+/// ICMPv6 NDP option type for a Target Link-Layer Address (RFC 4861 §4.6.1).
+const ND_OPT_TARGET_LLA: u8 = 2;
+
+/// Key into `ND_TABLE`: which tenant segment (`vni`) and which target IPv6 a
+/// Neighbor Solicitation is asking about. Exact match — one entry per tenant
+/// address. `4 + 16 = 20` bytes, 4-aligned with no implicit padding (the
+/// [`ArpEntry`] value is reused unchanged).
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct NdKey {
+    /// Tenant VNI the requesting port belongs to.
+    pub vni: u32,
+    /// Target IPv6 being resolved, network-order octets.
+    pub ip: [u8; 16],
+}
+
+impl NdKey {
+    /// Build a key for `(vni, ip)`.
+    #[inline]
+    pub const fn new(vni: u32, ip: [u8; 16]) -> Self {
+        Self { vni, ip }
+    }
+}
+
+// SAFETY: `#[repr(C)]`, a `u32` and a 16-byte array — 20 bytes, no padding.
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for NdKey {}
+
+/// The field values that turn an ICMPv6 Neighbor **Solicitation** into the
+/// Neighbor **Advertisement** to unicast back out the same interface
+/// (`XDP_TX`), produced by [`plan_na_reply`]. Pure data; the data plane writes
+/// these at constant offsets in place.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NaReply {
+    /// New Ethernet destination (the soliciting host's MAC).
+    pub eth_dst: [u8; 6],
+    /// New Ethernet source (the answered MAC).
+    pub eth_src: [u8; 6],
+    /// New IPv6 source (the solicited target address).
+    pub ipv6_src: [u8; 16],
+    /// New IPv6 destination (the soliciting host's address — unicast reply).
+    pub ipv6_dst: [u8; 16],
+    /// The complete 32-byte ICMPv6 Neighbor Advertisement message, checksum
+    /// filled in, ready to write over the NS body at a constant offset.
+    pub na_msg: [u8; ND_NA_MSG_LEN],
+}
+
+/// Internet checksum (RFC 4443 §2.3) over an ICMPv6 message, prefixed by the
+/// IPv6 **pseudo-header**: source (16) + destination (16) + upper-layer length
+/// (`u32` big-endian) + 3 zero bytes + next-header (58). The `icmpv6_msg` slice
+/// must carry its own checksum field zeroed; the returned folded complement is
+/// what goes in that field.
+#[inline]
+pub fn icmpv6_checksum(src: [u8; 16], dst: [u8; 16], icmpv6_msg: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+
+    // Pseudo-header addresses.
+    let mut i = 0;
+    while i + 1 < src.len() {
+        sum += u16::from_be_bytes([src[i], src[i + 1]]) as u32;
+        i += 2;
+    }
+    let mut i = 0;
+    while i + 1 < dst.len() {
+        sum += u16::from_be_bytes([dst[i], dst[i + 1]]) as u32;
+        i += 2;
+    }
+    // Upper-layer length (u32), then [0, 0, 0, next-header]: only the length and
+    // the next-header byte are non-zero.
+    let len = icmpv6_msg.len() as u32;
+    sum += (len >> 16) & 0xffff;
+    sum += len & 0xffff;
+    sum += crate::packet::ip_proto::ICMPV6 as u32;
+
+    // The ICMPv6 message itself (checksum field zeroed by the caller).
+    let mut i = 0;
+    while i + 1 < icmpv6_msg.len() {
+        sum += u16::from_be_bytes([icmpv6_msg[i], icmpv6_msg[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < icmpv6_msg.len() {
+        sum += (icmpv6_msg[i] as u32) << 8;
+    }
+
+    // Two folds reduce any u32 to 16 bits without a data-dependent loop (the
+    // verifier rejects the `while sum >> 16 != 0` form), matching the crate's
+    // other checksum code.
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
+    !(sum as u16)
+}
+
+/// Build the [`NaReply`] that answers a Neighbor Solicitation for `target` with
+/// `answer_mac`. Pure and unit-testable; mirrors a standard NDP responder: the
+/// solicited target becomes the NA's source, the reply unicasts straight back
+/// to the soliciting host.
+///
+/// * `target` — the solicited target IPv6 (becomes the NA IPv6 source).
+/// * `answer_mac` — the MAC that answers (NA Ethernet source + TLLA option).
+/// * `ns_src_mac` — the soliciting host's MAC (becomes the NA Ethernet dst).
+/// * `ns_src_ip` — the soliciting host's IPv6 (becomes the NA IPv6 dst).
+///
+/// ```
+/// use velstra_common::{plan_na_reply, ICMPV6_NEIGHBOR_ADVERT};
+/// let tgt = [0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+/// let ns_src = [0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+/// let r = plan_na_reply(tgt, [0x02, 0, 0, 0, 0, 0x14], [0x02, 0, 0, 0, 0, 0x0a], ns_src);
+/// assert_eq!(r.na_msg[0], ICMPV6_NEIGHBOR_ADVERT);
+/// assert_eq!(r.ipv6_src, tgt);       // NA is sourced from the target
+/// assert_eq!(r.ipv6_dst, ns_src);    // unicast back to the requester
+/// ```
+#[inline]
+pub fn plan_na_reply(
+    target: [u8; 16],
+    answer_mac: [u8; 6],
+    ns_src_mac: [u8; 6],
+    ns_src_ip: [u8; 16],
+) -> NaReply {
+    let mut msg = [0u8; ND_NA_MSG_LEN];
+    msg[0] = ICMPV6_NEIGHBOR_ADVERT; // type 136
+    // msg[1] code = 0, msg[2..4] checksum filled below.
+    msg[4..8].copy_from_slice(&ND_NA_FLAGS.to_be_bytes());
+    msg[8..24].copy_from_slice(&target);
+    // Target Link-Layer Address option: type 2, length 1 (in 8-octet units).
+    msg[24] = ND_OPT_TARGET_LLA;
+    msg[25] = 1;
+    msg[26..32].copy_from_slice(&answer_mac);
+
+    let ipv6_src = target;
+    let ipv6_dst = ns_src_ip;
+    let csum = icmpv6_checksum(ipv6_src, ipv6_dst, &msg);
+    msg[2..4].copy_from_slice(&csum.to_be_bytes());
+
+    NaReply {
+        eth_dst: ns_src_mac,
+        eth_src: answer_mac,
+        ipv6_src,
+        ipv6_dst,
+        na_msg: msg,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,6 +743,29 @@ mod tests {
         // Different vni or mac is a different key.
         assert_ne!(k, MacFdbKey::new(8, mac));
         assert_ne!(k, MacFdbKey::new(7, [0x02, 0, 0, 0, 0, 0x0b]));
+    }
+
+    #[test]
+    fn local_mac_layout_pad_and_equality() {
+        // 4 (vni) + 6 (mac) + 2 (pad) = 12; value is 4 (ip) + 4 (pad) = 8.
+        assert_eq!(core::mem::size_of::<LocalMacKey>(), 12);
+        assert_eq!(core::mem::size_of::<LocalMac>(), 8);
+
+        // `new` zeroes the padding, so equal (vni, mac) hash/compare identically.
+        let mac = [0x02, 0, 0, 0, 0, 0x0a];
+        let k = LocalMacKey::new(9, mac);
+        assert_eq!(k._pad, [0, 0]);
+        assert_eq!(k, LocalMacKey::new(9, mac));
+        // A different vni or a different MAC is a different key.
+        assert_ne!(k, LocalMacKey::new(10, mac));
+        assert_ne!(k, LocalMacKey::new(9, [0x02, 0, 0, 0, 0, 0x0b]));
+
+        // The value carries the bound IPv4 with zeroed padding.
+        let v = LocalMac::new([192, 168, 1, 5]);
+        assert_eq!(v._pad, [0, 0, 0, 0]);
+        assert_eq!(v.ip, [192, 168, 1, 5]);
+        assert_eq!(v, LocalMac::new([192, 168, 1, 5]));
+        assert_ne!(v, LocalMac::new([192, 168, 1, 6]));
     }
 
     #[test]
@@ -566,6 +814,122 @@ mod tests {
         assert_eq!(r.spa, [10, 0, 0, 20]); // the queried IP
         assert_eq!(r.tha, req_sha);
         assert_eq!(r.tpa, [10, 0, 0, 10]); // the requester's IP
+    }
+
+    #[test]
+    fn nd_key_layout_and_equality() {
+        // 4 (vni) + 16 (ip) = 20 bytes, 4-aligned, no padding. The value type is
+        // the reused `ArpEntry` (same 8-byte shape as ARP).
+        assert_eq!(core::mem::size_of::<NdKey>(), 20);
+        let ip = [0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let k = NdKey::new(7, ip);
+        assert_eq!(k, NdKey::new(7, ip));
+        // A different vni or a different address is a different key.
+        assert_ne!(k, NdKey::new(8, ip));
+        let mut other = ip;
+        other[15] = 3;
+        assert_ne!(k, NdKey::new(7, other));
+    }
+
+    /// Re-sum an ICMPv6 message *including* its in-place checksum field over the
+    /// pseudo-header; a valid message folds to zero.
+    fn icmpv6_validate(src: [u8; 16], dst: [u8; 16], msg: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+        for chunk in [&src[..], &dst[..]] {
+            let mut i = 0;
+            while i + 1 < chunk.len() {
+                sum += u16::from_be_bytes([chunk[i], chunk[i + 1]]) as u32;
+                i += 2;
+            }
+        }
+        let len = msg.len() as u32;
+        sum += (len >> 16) & 0xffff;
+        sum += len & 0xffff;
+        sum += ip_proto::ICMPV6 as u32;
+        let mut i = 0;
+        while i + 1 < msg.len() {
+            sum += u16::from_be_bytes([msg[i], msg[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < msg.len() {
+            sum += (msg[i] as u32) << 8;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    #[test]
+    fn na_reply_fields_flags_and_option() {
+        let target = [0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let ns_src_ip = [0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let ns_src_mac = [0x02, 0, 0, 0, 0, 0x0a];
+        let answer = [0x02, 0, 0, 0, 0, 0x14];
+        let r = plan_na_reply(target, answer, ns_src_mac, ns_src_ip);
+
+        // Addresses: reply is sourced from the target, unicast back to the asker.
+        assert_eq!(r.eth_dst, ns_src_mac);
+        assert_eq!(r.eth_src, answer);
+        assert_eq!(r.ipv6_src, target);
+        assert_eq!(r.ipv6_dst, ns_src_ip);
+
+        // NA message: type 136, code 0, Solicited+Override flags (R clear).
+        assert_eq!(r.na_msg[0], ICMPV6_NEIGHBOR_ADVERT);
+        assert_eq!(r.na_msg[1], 0);
+        assert_eq!(&r.na_msg[4..8], &0x6000_0000u32.to_be_bytes());
+        // Target address echoed into the NA body.
+        assert_eq!(&r.na_msg[8..24], &target);
+        // Target Link-Layer Address option: type 2, length 1, the answered MAC.
+        assert_eq!(r.na_msg[24], 2);
+        assert_eq!(r.na_msg[25], 1);
+        assert_eq!(&r.na_msg[26..32], &answer);
+    }
+
+    #[test]
+    fn na_checksum_validates_and_covers_the_body() {
+        let target = [0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x02];
+        let ns_src_ip = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x99];
+        let answer = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+        let r = plan_na_reply(target, answer, [0x02, 0, 0, 0, 0, 0x0a], ns_src_ip);
+
+        // The synthesised NA, fed back through the pseudo-header sum with its
+        // checksum field in place, folds to zero (i.e. is a valid checksum).
+        assert_eq!(
+            icmpv6_validate(r.ipv6_src, r.ipv6_dst, &r.na_msg),
+            0,
+            "ICMPv6 NA checksum invalid"
+        );
+
+        // The checksum genuinely covers the message: zeroing the checksum field
+        // and flipping a TLLA byte changes the recomputed value.
+        let mut zeroed = r.na_msg;
+        zeroed[2] = 0;
+        zeroed[3] = 0;
+        let base = icmpv6_checksum(r.ipv6_src, r.ipv6_dst, &zeroed);
+        let mut flipped = zeroed;
+        flipped[30] ^= 0xff;
+        assert_ne!(icmpv6_checksum(r.ipv6_src, r.ipv6_dst, &flipped), base);
+    }
+
+    #[test]
+    fn na_checksum_depends_on_the_addresses() {
+        // Two NAs that differ only in the destination (pseudo-header) address
+        // must differ in checksum — proving the pseudo-header is folded in.
+        let target = [0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let a = plan_na_reply(
+            target,
+            [0x02, 0, 0, 0, 0, 0x14],
+            [0; 6],
+            [0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        );
+        let b = plan_na_reply(
+            target,
+            [0x02, 0, 0, 0, 0, 0x14],
+            [0; 6],
+            [0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9],
+        );
+        assert_ne!(a.na_msg[2..4], b.na_msg[2..4]);
     }
 
     #[test]
