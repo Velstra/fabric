@@ -19,6 +19,7 @@ use std::{
     io::Read,
     net::Ipv4Addr,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -130,6 +131,11 @@ fn cmd_add(conf: &NetConf) -> Result<Option<CniResult>> {
     )))
 }
 
+/// How long controller-mode ADD waits for the agent to attach its XDP firewall
+/// to the new pod veth before failing closed (M3). Generous relative to the
+/// agent's config poll interval so a busy agent still completes in time.
+const XDP_ENFORCE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Controller-integrated ADD: the controller allocates the IP/MAC and, on the
 /// next derive, pushes this node's agent an interface binding for `host_veth`.
 fn cmd_add_controller(
@@ -169,6 +175,18 @@ fn cmd_add_controller(
         let _ = controller::remove_port(&conf.controllers, &tls, &port.id);
         return Err(e.context("setting up pod networking"));
     }
+
+    // Close the fail-open window (M3): the pod veth is now up and addressed, but
+    // the agent has not necessarily attached the XDP firewall to it yet. Block
+    // until it has — kubelet only starts the pod's containers once ADD returns —
+    // and fail *closed* (tear the pod networking down, release the port) if the
+    // firewall never attaches, rather than admitting an unenforced pod.
+    if let Err(e) = net::wait_for_xdp(host_veth, XDP_ENFORCE_TIMEOUT) {
+        let _ = net::teardown(host_veth);
+        let _ = controller::remove_port(&conf.controllers, &tls, &port.id);
+        return Err(e.context("waiting for the firewall to attach to the pod interface"));
+    }
+
     // Remember the port id so DEL (which only gets the container id) can find it.
     record_port(Path::new(DEFAULT_STATE_ROOT), container_id, &port.id)?;
 
