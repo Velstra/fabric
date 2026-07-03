@@ -371,7 +371,11 @@ mod tests {
         // checksum in place; a valid header folds to zero.
         let mut ip = icmp_unreach_ip_header(in_dst, in_src);
         ip[10..12].copy_from_slice(&plan.ip_checksum.to_be_bytes());
-        assert_eq!(ones_complement(&ip), 0, "ICMP-unreachable IP checksum invalid");
+        assert_eq!(
+            ones_complement(&ip),
+            0,
+            "ICMP-unreachable IP checksum invalid"
+        );
         // Header carries protocol ICMP and total length 56.
         assert_eq!(ip[9], crate::packet::ip_proto::ICMP);
         assert_eq!(u16::from_be_bytes([ip[2], ip[3]]), ICMP_UNREACH_TOTAL_LEN);

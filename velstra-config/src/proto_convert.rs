@@ -10,8 +10,9 @@ use anyhow::Result;
 use velstra_proto as proto;
 
 use crate::config::{
-    ActionName, BackendCfg, EncapName, FileConfig, ForwardMode, InterfaceFile, NeighborCfg,
-    OverlayCfg, PolicyFile, PortRule, ProtoName, RouteCfg, RuntimeConfig, ServiceCfg, TunnelCfg,
+    ActionName, BackendCfg, EncapName, FileConfig, ForwardMode, InterfaceFile, MacRouteCfg,
+    NeighborCfg, OverlayCfg, PolicyFile, PortRule, ProtoName, RouteCfg, RuntimeConfig, ServiceCfg,
+    TunnelCfg,
 };
 
 fn port_rule_to_proto(r: &PortRule) -> proto::PortRule {
@@ -182,6 +183,17 @@ pub fn file_config_to_proto(cfg: &FileConfig, version: u64) -> proto::NodeConfig
                 out_iface: t.out_iface.clone(),
             })
             .collect(),
+        mac_routes: cfg
+            .mac_routes
+            .iter()
+            .map(|m| proto::MacRoute {
+                vni: m.vni,
+                mac: m.mac.clone(),
+                remote_vtep: m.remote_vtep.clone(),
+                via_mac: m.via_mac.clone(),
+                out_iface: m.out_iface.clone(),
+            })
+            .collect(),
         neighbors: cfg
             .neighbors
             .iter()
@@ -306,6 +318,17 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
                 out_iface: t.out_iface.clone(),
             })
             .collect(),
+        mac_routes: cfg
+            .mac_routes
+            .iter()
+            .map(|m| MacRouteCfg {
+                vni: m.vni,
+                mac: m.mac.clone(),
+                remote_vtep: m.remote_vtep.clone(),
+                via_mac: m.via_mac.clone(),
+                out_iface: m.out_iface.clone(),
+            })
+            .collect(),
         neighbors: cfg
             .neighbors
             .iter()
@@ -423,6 +446,13 @@ mod tests {
             remote_vtep = "10.10.0.2"
             via_mac = "02:00:00:00:00:02"
             out_iface = "eth0"
+
+            [[mac_route]]
+            vni = 100
+            mac = "02:00:00:00:0b:07"
+            remote_vtep = "10.10.0.2"
+            via_mac = "02:00:00:00:00:02"
+            out_iface = "eth0"
         "#;
         let original: FileConfig = toml::from_str(toml).unwrap();
         let back = file_config_from_proto(&file_config_to_proto(&original, 4));
@@ -438,6 +468,16 @@ mod tests {
         assert_eq!(a.tunnels[0].inner_dst, b.tunnels[0].inner_dst);
         assert_eq!(a.tunnels[0].remote_vtep_ip, b.tunnels[0].remote_vtep_ip);
         assert_eq!(a.tunnels[0].outer_dst_mac, b.tunnels[0].outer_dst_mac);
+        // B1: MAC-FDB entries survive the wire round-trip too.
+        assert_eq!(a.mac_routes.len(), b.mac_routes.len());
+        assert_eq!(a.mac_routes[0].vni, b.mac_routes[0].vni);
+        assert_eq!(a.mac_routes[0].mac, b.mac_routes[0].mac);
+        assert_eq!(a.mac_routes[0].mac, [0x02, 0, 0, 0, 0x0b, 0x07]);
+        assert_eq!(
+            a.mac_routes[0].remote_vtep_ip,
+            b.mac_routes[0].remote_vtep_ip
+        );
+        assert_eq!(a.mac_routes[0].outer_dst_mac, b.mac_routes[0].outer_dst_mac);
     }
 
     #[test]

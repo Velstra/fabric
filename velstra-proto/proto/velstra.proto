@@ -187,6 +187,7 @@ message NodeConfig {
   Overlay overlay = 12;             // Phase 4 VXLAN/Geneve endpoint (optional)
   repeated Tunnel tunnels = 13;     // Phase 4 overlay forwarding entries
   repeated Neighbor neighbors = 14; // Phase 4 ARP-suppression neighbours
+  repeated MacRoute mac_routes = 15; // B1 per-MAC L2 forwarding entries
 }
 
 // Encapsulation format for the overlay.
@@ -216,6 +217,16 @@ message Neighbor {
 message Tunnel {
   uint32 vni = 1;          // tenant VNI (24-bit; also the policy id)
   string inner_dst = 2;    // inner destination IPv4 this entry matches
+  string remote_vtep = 3;  // remote VTEP underlay IPv4 (outer destination)
+  string via_mac = 4;      // next-hop MAC on the underlay
+  string out_iface = 5;    // underlay egress interface
+}
+
+// One L2 forwarding entry (B1): bridge a tenant destination MAC to a remote
+// VTEP. The MAC-FDB is consulted before the L3 Tunnel table.
+message MacRoute {
+  uint32 vni = 1;          // tenant VNI the destination MAC lives on
+  string mac = 2;          // inner destination MAC to bridge toward
   string remote_vtep = 3;  // remote VTEP underlay IPv4 (outer destination)
   string via_mac = 4;      // next-hop MAC on the underlay
   string out_iface = 5;    // underlay egress interface

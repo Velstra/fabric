@@ -221,6 +221,37 @@ impl TunnelEndpoint {
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for TunnelEndpoint {}
 
+/// B1 MAC-FDB key: a tenant VNI plus an inner destination MAC, matched
+/// exactly (a `HashMap` key, unlike the LPM `TunnelKey`). Explicit trailing
+/// padding keeps the layout deterministic across the kernel/userspace boundary
+/// (mirrors `TunnelEndpoint::_pad`).
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct MacFdbKey {
+    /// Tenant VNI the destination MAC lives on, matched exactly.
+    pub vni: u32,
+    /// Inner destination MAC to bridge toward.
+    pub mac: [u8; 6],
+    /// Explicit padding, always zero.
+    pub _pad: [u8; 2],
+}
+
+impl MacFdbKey {
+    /// Build a key for `(vni, mac)`.
+    #[inline]
+    pub const fn new(vni: u32, mac: [u8; 6]) -> Self {
+        Self {
+            vni,
+            mac,
+            _pad: [0; 2],
+        }
+    }
+}
+
+// SAFETY: `#[repr(C)]`, a `u32` + byte arrays, padding explicitly zeroed.
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for MacFdbKey {}
+
 /// Derive the outer UDP **source** port from a flow-entropy hash.
 ///
 /// Per RFC 7348 the source port carries entropy so the underlay's ECMP/LAG
@@ -472,6 +503,21 @@ mod tests {
         assert_eq!(core::mem::size_of::<TunnelKey>(), 8);
         assert_eq!(core::mem::size_of::<TunnelEndpoint>(), 16);
         assert_eq!(OVERLAY_OUTER_LEN, 50);
+    }
+
+    #[test]
+    fn mac_fdb_key_layout_and_equality() {
+        // 4 (vni) + 6 (mac) + 2 (pad) = 12; explicit pad keeps it deterministic.
+        assert_eq!(core::mem::size_of::<MacFdbKey>(), 12);
+        let mac = [0x02, 0, 0, 0, 0, 0x0a];
+        let k = MacFdbKey::new(7, mac);
+        // `new` always zeroes the padding, so two equal (vni, mac) hash/compare
+        // identically — a stable map key.
+        assert_eq!(k._pad, [0, 0]);
+        assert_eq!(k, MacFdbKey::new(7, mac));
+        // Different vni or mac is a different key.
+        assert_ne!(k, MacFdbKey::new(8, mac));
+        assert_ne!(k, MacFdbKey::new(7, [0x02, 0, 0, 0, 0, 0x0b]));
     }
 
     #[test]
