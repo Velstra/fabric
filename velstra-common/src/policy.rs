@@ -131,11 +131,14 @@ pub enum Counter {
     EgressMasqueraded = 23,
     /// Actively rejected — a TCP RST or ICMP unreachable was sent (Phase 3).
     Rejected = 24,
+    /// A tunnel packet was dropped before decap because it was not addressed to
+    /// our VTEP or not sourced from a known peer VTEP (overlay decap auth, C2).
+    OverlayDropUntrusted = 25,
 }
 
 impl Counter {
     /// Number of distinct counters — the `max_entries` of the `STATS` map.
-    pub const COUNT: u32 = 25;
+    pub const COUNT: u32 = 26;
 
     /// The array index of this counter.
     #[inline]
@@ -172,6 +175,7 @@ impl Counter {
             22 => Counter::EgressDropped,
             23 => Counter::EgressMasqueraded,
             24 => Counter::Rejected,
+            25 => Counter::OverlayDropUntrusted,
             _ => return None,
         };
         Some(counter)
@@ -213,6 +217,7 @@ impl Counter {
             Counter::EgressDropped => "egress_dropped",
             Counter::EgressMasqueraded => "egress_masqueraded",
             Counter::Rejected => "rejected",
+            Counter::OverlayDropUntrusted => "overlay_drop_untrusted",
         }
     }
 }

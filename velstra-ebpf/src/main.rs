@@ -174,6 +174,16 @@ static ARP_TABLE: HashMap<ArpKey, ArpEntry> = HashMap::with_max_entries(8192, 0)
 #[map]
 static OVERLAY_FDB: LpmTrie<TunnelKey, TunnelEndpoint> = LpmTrie::with_max_entries(8192, 0);
 
+/// Phase 4 **trusted VTEP set** (C2): the outer source IPv4 (network order) of
+/// every remote peer VTEP this host tunnels with. A UDP datagram on the tunnel
+/// port is only decapsulated when its outer source is in this set **and** its
+/// outer destination is our own VTEP — otherwise a tenant VM on a tap, or any
+/// host on the underlay, could forge an encapsulated frame under an arbitrary
+/// VNI and have it injected past the firewall. Pushed by the control plane
+/// alongside `OVERLAY_FDB` (one entry per distinct remote VTEP).
+#[map]
+static VTEP_PEERS: HashMap<[u8; 4], u8> = HashMap::with_max_entries(8192, 0);
+
 /// Per-CPU statistics, one slot per [`Counter`] variant.
 #[map]
 static STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(Counter::COUNT, 0);
@@ -584,6 +594,17 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     // the inner frame (e.g. to a local tenant tap via the host bridge).
     let ocfg = overlay_config();
     if proto == ip_proto::UDP && is_overlay_dport(&ocfg, dst_port) {
+        // C2: authenticate the tunnel BEFORE stripping any header. Decap only a
+        // datagram that is (a) actually addressed to our own VTEP and (b) sourced
+        // from a known peer VTEP. Without this, a tenant VM on a tap or any host
+        // on the underlay could forge an encapsulated frame under an arbitrary
+        // VNI and have the kernel bridge inject its inner frame past the firewall
+        // — a full multi-tenant + firewall bypass.
+        let from_known_vtep = unsafe { VTEP_PEERS.get(&src_addr) }.is_some();
+        if dst_addr != ocfg.local_vtep_ip || !from_known_vtep {
+            bump(Counter::OverlayDropUntrusted);
+            return Ok(xdp_action::XDP_DROP);
+        }
         return try_decap(ctx, ihl_bytes);
     }
 
