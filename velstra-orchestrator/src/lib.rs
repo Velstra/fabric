@@ -58,6 +58,21 @@ pub struct Host {
     pub underlay_mtu: Option<u16>,
 }
 
+/// Map-ownership convention between the two writers of `OVERLAY_FDB` /
+/// `ARP_TABLE` (M5), fixed **before** an EVPN/FPM path exists so the ranges can
+/// never be retrofitted after callers depend on them:
+///
+/// * **Orchestrator ("controller-FDB")** — statically derived tunnel/neighbour
+///   entries — owns VNIs `1 .. EVPN_RESERVED_VNI_BASE`.
+/// * **Reserved** — VNIs `>= EVPN_RESERVED_VNI_BASE` (the top 64K of the 24-bit
+///   space) are reserved for a future EVPN/FPM control-plane that learns FDB/ARP
+///   entries dynamically. Reserving them now guarantees a learned entry can
+///   never collide with a controller-derived one on the same map key.
+///
+/// The orchestrator therefore refuses to define a network in the reserved range
+/// (see [`Topology::add_network`]).
+pub const EVPN_RESERVED_VNI_BASE: u32 = 0xFF_0000;
+
 /// A virtual network (a tenant L2 segment), identified by its VNI.
 #[derive(Debug, Clone)]
 pub struct Network {
@@ -123,16 +138,46 @@ impl Topology {
         self.hosts.insert(host.id.clone(), host);
     }
 
-    /// Define a network. Fails for a zero / over-24-bit VNI or a duplicate.
+    /// Define a network. Fails for a zero VNI, a VNI in the reserved EVPN range
+    /// (see [`EVPN_RESERVED_VNI_BASE`]), or a duplicate.
     pub fn add_network(&mut self, network: Network) -> Result<()> {
-        if network.vni == 0 || network.vni > 0xFF_FFFF {
-            bail!("network vni {} must be in 1..=0xFFFFFF", network.vni);
+        if network.vni == 0 {
+            bail!("network vni must be non-zero");
+        }
+        if network.vni >= EVPN_RESERVED_VNI_BASE {
+            bail!(
+                "network vni {:#x} is reserved for the EVPN/FPM control-plane path \
+                 (>= {:#x}); orchestrator-managed networks must use 1..{:#x}",
+                network.vni,
+                EVPN_RESERVED_VNI_BASE,
+                EVPN_RESERVED_VNI_BASE
+            );
         }
         if self.networks.contains_key(&network.vni) {
             bail!("network vni {} already exists", network.vni);
         }
         self.networks.insert(network.vni, network);
         Ok(())
+    }
+
+    /// Retire a host. Fails while any port is still bound to it, so a caller
+    /// must migrate or remove those ports first — otherwise `derive()` would keep
+    /// generating dead tunnels/ARP entries toward a gone VTEP. Returns whether
+    /// the host existed.
+    pub fn remove_host(&mut self, id: &str) -> Result<bool> {
+        if let Some(p) = self.ports.iter().find(|p| p.host == id) {
+            bail!("host {id:?} still has port {:?}; migrate or remove it first", p.id);
+        }
+        Ok(self.hosts.remove(id).is_some())
+    }
+
+    /// Decommission a network. Fails while any port is still on it. Returns
+    /// whether the network existed.
+    pub fn remove_network(&mut self, vni: u32) -> Result<bool> {
+        if let Some(p) = self.ports.iter().find(|p| p.vni == vni) {
+            bail!("network {vni} still has port {:?}; remove it first", p.id);
+        }
+        Ok(self.networks.remove(&vni).is_some())
     }
 
     /// All hosts, in no particular order.
@@ -164,6 +209,13 @@ impl Topology {
         }
         if !self.hosts.contains_key(host) {
             bail!("unknown host {host:?}");
+        }
+        // A (host, tap) pair maps to exactly one host interface. Two ports bound
+        // to the same tap would resolve to the same ifindex on the agent, where
+        // the second silently overwrites the first's IFACE_POLICY/IFACE_VNI — one
+        // port left unfirewalled/mis-VNI'd with no error. Reject it here.
+        if self.ports.iter().any(|p| p.host == host && p.tap == tap) {
+            bail!("tap {tap:?} on host {host:?} is already bound to another port");
         }
         let ip = match requested_ip {
             Some(ip) => {
@@ -205,6 +257,15 @@ impl Topology {
     pub fn migrate_port(&mut self, id: &str, new_host: &str, new_tap: &str) -> Result<Port> {
         if !self.hosts.contains_key(new_host) {
             bail!("unknown host {new_host:?}");
+        }
+        // The destination tap must be free (ignoring this port itself), for the
+        // same ifindex-collision reason as create_port.
+        if self
+            .ports
+            .iter()
+            .any(|p| p.id != id && p.host == new_host && p.tap == new_tap)
+        {
+            bail!("tap {new_tap:?} on host {new_host:?} is already bound to another port");
         }
         let port = self
             .ports
@@ -514,6 +575,35 @@ mod tests {
     }
 
     #[test]
+    fn rejects_duplicate_tap_binding() {
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_network(network(100, "blue", "192.168.50.0/24")).unwrap();
+        t.create_port(100, "h1", "tap0", None).unwrap();
+        // Same (host, tap) → rejected, even on a different IP/allocation.
+        assert!(t.create_port(100, "h1", "tap0", None).is_err());
+        // A different tap on the same host is fine.
+        assert!(t.create_port(100, "h1", "tap1", None).is_ok());
+    }
+
+    #[test]
+    fn remove_host_and_network_require_no_ports() {
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_network(network(100, "blue", "192.168.50.0/24")).unwrap();
+        let p = t.create_port(100, "h1", "tap0", None).unwrap();
+        // Both are blocked while the port exists.
+        assert!(t.remove_host("h1").is_err());
+        assert!(t.remove_network(100).is_err());
+        // After removing the port, both succeed and report existence.
+        assert!(t.remove_port(&p.id));
+        assert!(t.remove_network(100).unwrap());
+        assert!(t.remove_host("h1").unwrap());
+        // Removing again reports "did not exist".
+        assert!(!t.remove_host("h1").unwrap());
+    }
+
+    #[test]
     fn ipam_allocates_sequentially_and_skips_taken() {
         let mut t = Topology::new();
         t.add_host(host("h1", "10.0.0.1", 1));
@@ -583,6 +673,26 @@ mod tests {
             .unwrap();
         assert!(t.create_port(100, "ghost", "tap0", None).is_err()); // no host
         assert!(t.add_network(network(0, "bad", "10.0.0.0/24")).is_err()); // vni 0
+    }
+
+    #[test]
+    fn rejects_networks_in_the_reserved_evpn_vni_range() {
+        let mut t = Topology::new();
+        // The reserved base itself and anything above it are refused so a future
+        // EVPN/FPM learning path owns them exclusively (M5 map-ownership).
+        assert!(
+            t.add_network(network(EVPN_RESERVED_VNI_BASE, "evpn", "10.1.0.0/24"))
+                .is_err()
+        );
+        assert!(
+            t.add_network(network(EVPN_RESERVED_VNI_BASE + 42, "evpn2", "10.2.0.0/24"))
+                .is_err()
+        );
+        // The last orchestrator-owned VNI just below the reserved base is fine.
+        assert!(
+            t.add_network(network(EVPN_RESERVED_VNI_BASE - 1, "ok", "10.3.0.0/24"))
+                .is_ok()
+        );
     }
 
     #[test]
