@@ -13,7 +13,10 @@ use openraft::{
         InstallSnapshotResponse, VoteRequest, VoteResponse,
     },
 };
-use tonic::{Request, Response, Status, transport::Channel};
+use tonic::{
+    Request, Response, Status,
+    transport::{Channel, ClientTlsConfig},
+};
 
 use crate::store::{NodeId, TypeConfig};
 
@@ -88,9 +91,22 @@ pub fn service(raft: Raft<TypeConfig>) -> RaftServiceServer {
 
 // --- Client side ------------------------------------------------------------
 
-/// Creates a [`Network`] client per peer on demand.
-#[derive(Clone)]
-pub struct NetworkFactory;
+/// Creates a [`Network`] client per peer on demand. Carries the optional client
+/// TLS config so peer connections use the **same** TLS/mTLS as the agent/admin
+/// channels instead of plaintext (C5).
+#[derive(Clone, Default)]
+pub struct NetworkFactory {
+    tls: Option<ClientTlsConfig>,
+}
+
+impl NetworkFactory {
+    /// A factory that dials peers with `tls` (mTLS when the config carries a
+    /// client identity); `None` keeps the legacy plaintext transport (dev /
+    /// single-node / trusted network).
+    pub fn new(tls: Option<ClientTlsConfig>) -> Self {
+        Self { tls }
+    }
+}
 
 impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
     type Network = Network;
@@ -99,6 +115,7 @@ impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
         Network {
             target,
             addr: node.addr.clone(),
+            tls: self.tls.clone(),
             channel: None,
         }
     }
@@ -108,6 +125,7 @@ impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
 pub struct Network {
     target: NodeId,
     addr: String,
+    tls: Option<ClientTlsConfig>,
     channel: Option<Channel>,
 }
 
@@ -119,12 +137,15 @@ impl Network {
         E: std::error::Error,
     {
         if self.channel.is_none() {
-            let endpoint = format!("http://{}", self.addr);
-            let channel = Channel::from_shared(endpoint)
-                .map_err(unreachable)?
-                .connect()
-                .await
-                .map_err(unreachable)?;
+            // Match the scheme to the transport: https when TLS is configured so
+            // AppendEntries/Vote/InstallSnapshot can't be injected in the clear.
+            let scheme = if self.tls.is_some() { "https" } else { "http" };
+            let endpoint = format!("{scheme}://{}", self.addr);
+            let mut ep = Channel::from_shared(endpoint).map_err(unreachable)?;
+            if let Some(tls) = &self.tls {
+                ep = ep.tls_config(tls.clone()).map_err(unreachable)?;
+            }
+            let channel = ep.connect().await.map_err(unreachable)?;
             self.channel = Some(channel);
         }
         Ok(RaftServiceClient::new(self.channel.clone().unwrap()))

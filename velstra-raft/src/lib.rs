@@ -16,8 +16,9 @@
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow};
-use openraft::{BasicNode, Config, Raft, ServerState};
+use openraft::{BasicNode, Config, Raft, ServerState, SnapshotPolicy};
 use tokio::sync::watch;
+use tonic::transport::ClientTlsConfig;
 use velstra_orchestrator::Topology;
 
 pub mod network;
@@ -45,6 +46,13 @@ fn raft_config() -> Result<Arc<Config>> {
         heartbeat_interval: 250,
         election_timeout_min: 500,
         election_timeout_max: 1000,
+        // The Raft log is in-memory only; durability comes exclusively from
+        // persisted snapshots. openraft's default policy snapshots every 5000
+        // committed logs, so a fabric with fewer mutations than that since the
+        // last snapshot would lose its ENTIRE topology on a full-cluster restart.
+        // Snapshot far more eagerly, and also on graceful shutdown (see
+        // RaftNode::shutdown), so `--raft-dir` actually protects the topology.
+        snapshot_policy: SnapshotPolicy::LogsSinceLast(100),
         ..Default::default()
     }
     .validate()?;
@@ -64,6 +72,18 @@ impl RaftNode {
     /// durability across a full restart: every controller reloads the last
     /// snapshot — the committed fabric — instead of coming up empty.
     pub async fn start_with_dir(id: NodeId, dir: Option<PathBuf>) -> Result<Self> {
+        Self::start_with_opts(id, dir, None).await
+    }
+
+    /// Like [`RaftNode::start_with_dir`], but dialing peers with `client_tls`
+    /// (the same TLS/mTLS material as the agent/admin channels) so the Raft peer
+    /// transport is encrypted+authenticated rather than plaintext (C5). `None`
+    /// keeps the plaintext transport for dev / single-node / trusted networks.
+    pub async fn start_with_opts(
+        id: NodeId,
+        dir: Option<PathBuf>,
+        client_tls: Option<ClientTlsConfig>,
+    ) -> Result<Self> {
         let loaded = match &dir {
             Some(d) => {
                 std::fs::create_dir_all(d)
@@ -77,7 +97,8 @@ impl RaftNode {
         let last_purged = loaded.as_ref().and_then(|s| s.meta.last_log_id);
         let log = LogStore::new(last_purged);
         let sm = StateMachineStore::new(dir, loaded)?;
-        let raft = Raft::new(id, raft_config()?, NetworkFactory, log, sm.clone()).await?;
+        let raft =
+            Raft::new(id, raft_config()?, NetworkFactory::new(client_tls), log, sm.clone()).await?;
         Ok(Self { raft, sm, id })
     }
 
@@ -144,8 +165,14 @@ impl RaftNode {
         self.sm.subscribe()
     }
 
-    /// Gracefully stop the Raft instance.
+    /// Gracefully stop the Raft instance. Triggers a final snapshot first (best
+    /// effort) so the committed topology is persisted before exit rather than
+    /// relying on the periodic snapshot policy having fired recently.
     pub async fn shutdown(&self) -> Result<()> {
+        // Only the leader can build a snapshot; on followers/errors this is a
+        // no-op we intentionally ignore, since their state is reconstructed from
+        // the leader on restart.
+        let _ = self.raft.trigger().snapshot().await;
         self.raft
             .shutdown()
             .await

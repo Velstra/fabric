@@ -50,7 +50,8 @@ use velstra_orchestrator::Topology;
 use velstra_proto::{
     Ack, Action, CreatePortRequest, Encap, HostSpec, ListNodesRequest, ListNodesResponse,
     ListPortsRequest, ListPortsResponse, MigratePortRequest, NetworkSpec, NodeConfig, NodeRequest,
-    NodeSummary, PortInfo, RemovePortRequest, SetConfigRequest, StatsReport,
+    NodeSummary, PortInfo, RemoveHostRequest, RemoveNetworkRequest, RemovePortRequest,
+    SetConfigRequest, StatsReport,
     velstra_admin_client::VelstraAdminClient,
     velstra_admin_server::{VelstraAdmin, VelstraAdminServer},
     velstra_control_server::{VelstraControl, VelstraControlServer},
@@ -58,7 +59,15 @@ use velstra_proto::{
     velstra_orchestrator_server::{VelstraOrchestrator, VelstraOrchestratorServer},
 };
 
+mod authz;
 mod topology;
+
+use authz::{Authz, caller_of};
+
+/// A `permission_denied` status for a caller not authorized for `what`.
+fn deny(what: &str) -> Status {
+    Status::permission_denied(format!("not authorized to {what}"))
+}
 
 /// Velstra controller — serve config to a fleet, or administer it.
 #[derive(Debug, Parser)]
@@ -113,6 +122,14 @@ struct ServeArgs {
     #[arg(long, requires = "tls_cert")]
     client_ca: Option<PathBuf>,
 
+    /// Certificate CN allowed to perform ANY fabric write on the admin/
+    /// orchestrator channel (operators / CI), repeatable. With mTLS enabled
+    /// (`--client-ca`) authorization is enforced: an admin CN may write any
+    /// host, any other client may only mutate the host whose id equals its own
+    /// CN, and fleet-wide writes (networks, port migration) are admin-only.
+    #[arg(long = "admin-cn")]
+    admin_cn: Vec<String>,
+
     // --- Cluster mode (Track D, embedded Raft) ------------------------------
     /// This controller's Raft node id. Presence enables **cluster mode**: the
     /// fabric is replicated across controllers and the file/`--topology`
@@ -140,6 +157,12 @@ struct ServeArgs {
     /// surviving peer, or losing the fabric on a full-cluster restart).
     #[arg(long, requires = "node_id")]
     raft_dir: Option<PathBuf>,
+
+    /// Server-name to validate against a peer's certificate when dialing the
+    /// Raft peer transport over TLS (cluster mode). Needed when peers are
+    /// addressed by IP but the shared server cert only carries a DNS SAN.
+    #[arg(long, requires = "node_id")]
+    raft_tls_domain: Option<String>,
 }
 
 /// Client TLS options for the admin/orchestrator CLIs (use an `https://`
@@ -536,6 +559,7 @@ impl VelstraControl for ControlSvc {
 
 struct AdminSvc {
     shared: Arc<Shared>,
+    authz: Authz,
 }
 
 #[tonic::async_trait]
@@ -544,7 +568,12 @@ impl VelstraAdmin for AdminSvc {
         &self,
         request: Request<SetConfigRequest>,
     ) -> Result<Response<Ack>, Status> {
+        let caller = caller_of(&request);
         let req = request.into_inner();
+        // A per-node config override is a write scoped to that node.
+        if !self.authz.allow_host(&caller, &req.node_id) {
+            return Err(deny(&format!("set config for node {:?}", req.node_id)));
+        }
         let Some(config) = req.config else {
             return Err(Status::invalid_argument("missing config"));
         };
@@ -560,7 +589,11 @@ impl VelstraAdmin for AdminSvc {
     }
 
     async fn delete_config(&self, request: Request<NodeRequest>) -> Result<Response<Ack>, Status> {
+        let caller = caller_of(&request);
         let node = request.into_inner().node_id;
+        if !self.authz.allow_host(&caller, &node) {
+            return Err(deny(&format!("delete config for node {node:?}")));
+        }
         info!("admin DeleteConfig({node:?})");
         let mut state = self.shared.state.write().await;
         let existed = state.overrides.remove(&node).is_some();
@@ -606,6 +639,7 @@ impl VelstraAdmin for AdminSvc {
 
 struct OrchestratorSvc {
     shared: Arc<Shared>,
+    authz: Authz,
 }
 
 fn fmt_mac(mac: [u8; 6]) -> String {
@@ -699,7 +733,14 @@ fn port_to_info(p: &velstra_orchestrator::Port) -> PortInfo {
 #[tonic::async_trait]
 impl VelstraOrchestrator for OrchestratorSvc {
     async fn add_host(&self, request: Request<HostSpec>) -> Result<Response<Ack>, Status> {
+        let caller = caller_of(&request);
         let spec = request.into_inner();
+        // Registering/updating a host is a write scoped to that host id — this
+        // is the VTEP-impersonation vector (idempotent AddHost), so a node may
+        // only (re)register itself.
+        if !self.authz.allow_host(&caller, &spec.id) {
+            return Err(deny(&format!("add/update host {:?}", spec.id)));
+        }
         info!("AddHost({:?})", spec.id);
         let resp = propose(
             &self.shared,
@@ -713,6 +754,10 @@ impl VelstraOrchestrator for OrchestratorSvc {
     }
 
     async fn add_network(&self, request: Request<NetworkSpec>) -> Result<Response<Ack>, Status> {
+        let caller = caller_of(&request);
+        if !self.authz.allow_admin(&caller) {
+            return Err(deny("define networks (admin only)"));
+        }
         let spec = request.into_inner();
         info!("AddNetwork(vni {} {:?})", spec.vni, spec.name);
         let resp = propose(
@@ -730,7 +775,13 @@ impl VelstraOrchestrator for OrchestratorSvc {
         &self,
         request: Request<CreatePortRequest>,
     ) -> Result<Response<PortInfo>, Status> {
+        let caller = caller_of(&request);
         let req = request.into_inner();
+        // Creating a port lands a tap on a specific host — a node may only place
+        // ports on itself.
+        if !self.authz.allow_host(&caller, &req.host) {
+            return Err(deny(&format!("create ports on host {:?}", req.host)));
+        }
         info!("CreatePort(vni {} on {:?})", req.network, req.host);
         let resp = propose(
             &self.shared,
@@ -755,7 +806,13 @@ impl VelstraOrchestrator for OrchestratorSvc {
         &self,
         request: Request<RemovePortRequest>,
     ) -> Result<Response<Ack>, Status> {
+        let caller = caller_of(&request);
         let id = request.into_inner().id;
+        // A port id doesn't name its owning host here, so removing one is
+        // admin-only rather than node-scoped.
+        if !self.authz.allow_admin(&caller) {
+            return Err(deny("remove ports (admin only)"));
+        }
         info!("RemovePort({id:?})");
         let resp = propose(&self.shared, velstra_raft::TopoRequest::RemovePort { id }).await?;
         Ok(Response::new(Ack { ok: resp.ok }))
@@ -765,6 +822,11 @@ impl VelstraOrchestrator for OrchestratorSvc {
         &self,
         request: Request<MigratePortRequest>,
     ) -> Result<Response<PortInfo>, Status> {
+        let caller = caller_of(&request);
+        // Migration moves a port between hosts (two owners), so it is admin-only.
+        if !self.authz.allow_admin(&caller) {
+            return Err(deny("migrate ports (admin only)"));
+        }
         let req = request.into_inner();
         info!("MigratePort({:?} -> {:?})", req.id, req.host);
         let resp = propose(
@@ -809,6 +871,40 @@ impl VelstraOrchestrator for OrchestratorSvc {
         };
         Ok(Response::new(ListPortsResponse { ports }))
     }
+
+    async fn remove_host(
+        &self,
+        request: Request<RemoveHostRequest>,
+    ) -> Result<Response<Ack>, Status> {
+        let caller = caller_of(&request);
+        let id = request.into_inner().id;
+        if !self.authz.allow_host(&caller, &id) {
+            return Err(deny(&format!("remove host {id:?}")));
+        }
+        info!("RemoveHost({id:?})");
+        let resp = propose(&self.shared, velstra_raft::TopoRequest::RemoveHost { id }).await?;
+        if !resp.ok {
+            return Err(Status::failed_precondition(resp.error.unwrap_or_default()));
+        }
+        Ok(Response::new(Ack { ok: true }))
+    }
+
+    async fn remove_network(
+        &self,
+        request: Request<RemoveNetworkRequest>,
+    ) -> Result<Response<Ack>, Status> {
+        let caller = caller_of(&request);
+        if !self.authz.allow_admin(&caller) {
+            return Err(deny("remove networks (admin only)"));
+        }
+        let vni = request.into_inner().vni;
+        info!("RemoveNetwork({vni})");
+        let resp = propose(&self.shared, velstra_raft::TopoRequest::RemoveNetwork { vni }).await?;
+        if !resp.ok {
+            return Err(Status::failed_precondition(resp.error.unwrap_or_default()));
+        }
+        Ok(Response::new(Ack { ok: true }))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -845,6 +941,36 @@ fn server_tls(args: &ServeArgs) -> Result<Option<ServerTlsConfig>> {
     Ok(Some(tls))
 }
 
+/// Build the client TLS config used to dial Raft peers, from the same cert
+/// material as the agent/admin channels. TLS is enabled exactly when a server
+/// cert+key are configured (so securing the agent channel secures Raft too);
+/// mTLS is added when a `--client-ca` is present (all controllers share that CA
+/// in this model, so it doubles as the peer-verification CA). Returns `None`
+/// (plaintext, legacy) when no cert is configured — dev / single-node.
+fn raft_client_tls(args: &ServeArgs) -> Result<Option<ClientTlsConfig>> {
+    let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) else {
+        return Ok(None);
+    };
+    let Some(ca) = &args.client_ca else {
+        // A server cert with no shared CA can't authenticate peers to each
+        // other; require --client-ca to turn on Raft TLS rather than trusting
+        // the system roots for internal peers.
+        return Ok(None);
+    };
+    let ca = std::fs::read(ca).with_context(|| format!("reading {}", ca.display()))?;
+    let identity = Identity::from_pem(
+        std::fs::read(cert).with_context(|| format!("reading {}", cert.display()))?,
+        std::fs::read(key).with_context(|| format!("reading {}", key.display()))?,
+    );
+    let mut tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(ca))
+        .identity(identity);
+    if let Some(domain) = &args.raft_tls_domain {
+        tls = tls.domain_name(domain);
+    }
+    Ok(Some(tls))
+}
+
 /// Parse `--peer id=host:port` entries into a member map; default to a
 /// single-node cluster of `self_id` at `self_addr` if none are given.
 fn parse_peers(peers: &[String], self_id: u64, self_addr: &str) -> Result<BTreeMap<u64, String>> {
@@ -871,8 +997,18 @@ async fn serve(args: ServeArgs) -> Result<()> {
 
     // Cluster mode: start the embedded Raft node and its peer service.
     let raft = if let Some(id) = args.node_id {
-        let node =
-            Arc::new(velstra_raft::RaftNode::start_with_dir(id, args.raft_dir.clone()).await?);
+        // Peer transport TLS/mTLS from the same certs as the agent/admin
+        // channels — never plaintext when the deployment is secured (C5).
+        let client_tls = raft_client_tls(&args)?;
+        let server_tls = server_tls(&args)?;
+        if client_tls.is_some() {
+            info!("raft peer transport: TLS (mTLS between controllers)");
+        } else {
+            warn!("raft peer transport: PLAINTEXT (no --tls-cert/--client-ca) — secure the network");
+        }
+        let node = Arc::new(
+            velstra_raft::RaftNode::start_with_opts(id, args.raft_dir.clone(), client_tls).await?,
+        );
         if let Some(dir) = &args.raft_dir {
             info!("raft snapshots persisted under {}", dir.display());
         }
@@ -883,7 +1019,17 @@ async fn serve(args: ServeArgs) -> Result<()> {
         let svc = node.service();
         tokio::spawn(async move {
             info!("raft peer service listening on {raft_addr}");
-            if let Err(e) = Server::builder().add_service(svc).serve(raft_addr).await {
+            let mut builder = Server::builder();
+            if let Some(tls) = server_tls {
+                match builder.tls_config(tls) {
+                    Ok(b) => builder = b,
+                    Err(e) => {
+                        warn!("raft server TLS config failed: {e}");
+                        return;
+                    }
+                }
+            }
+            if let Err(e) = builder.add_service(svc).serve(raft_addr).await {
                 warn!("raft server stopped: {e}");
             }
         });
@@ -980,6 +1126,18 @@ async fn serve(args: ServeArgs) -> Result<()> {
         .parse()
         .with_context(|| format!("invalid admin address {:?}", args.admin_listen))?;
     let admin_tls = server_tls(&args)?;
+    // Authorize writes by client-cert identity when the admin channel enforces
+    // mTLS (a --client-ca is set). Without it we can't identify the caller, so
+    // the localhost-only default stays open (single-operator, back-compat).
+    let authz = if args.client_ca.is_some() {
+        info!(
+            "admin/orchestrator authorization: ENFORCED ({} admin CN(s); nodes scoped to own host)",
+            args.admin_cn.len()
+        );
+        Authz::new(args.admin_cn.clone(), true)
+    } else {
+        Authz::disabled()
+    };
     let admin_shared = shared.clone();
     tokio::spawn(async move {
         info!("admin/orchestrator API listening on {admin_addr}");
@@ -996,9 +1154,11 @@ async fn serve(args: ServeArgs) -> Result<()> {
         if let Err(e) = builder
             .add_service(VelstraAdminServer::new(AdminSvc {
                 shared: admin_shared.clone(),
+                authz: authz.clone(),
             }))
             .add_service(VelstraOrchestratorServer::new(OrchestratorSvc {
                 shared: admin_shared,
+                authz,
             }))
             .serve(admin_addr)
             .await
