@@ -10,7 +10,7 @@ use anyhow::Result;
 use velstra_proto as proto;
 
 use crate::config::{
-    ActionName, BackendCfg, EncapName, FileConfig, ForwardMode, InterfaceFile, MacRouteCfg,
+    ActionName, BackendCfg, EncapName, FileConfig, ForwardMode, InterfaceFile, MacRouteCfg, Nd6Cfg,
     NeighborCfg, OverlayCfg, PolicyFile, PortRule, ProtoName, RouteCfg, RuntimeConfig, ServiceCfg,
     TunnelCfg,
 };
@@ -203,6 +203,15 @@ pub fn file_config_to_proto(cfg: &FileConfig, version: u64) -> proto::NodeConfig
                 mac: n.mac.clone(),
             })
             .collect(),
+        nd_neighbors: cfg
+            .nd_neighbors
+            .iter()
+            .map(|n| proto::Nd6 {
+                vni: n.vni,
+                ip: n.ip.clone(),
+                mac: n.mac.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -338,6 +347,15 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
                 mac: n.mac.clone(),
             })
             .collect(),
+        nd_neighbors: cfg
+            .nd_neighbors
+            .iter()
+            .map(|n| Nd6Cfg {
+                vni: n.vni,
+                ip: n.ip.clone(),
+                mac: n.mac.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -453,6 +471,16 @@ mod tests {
             remote_vtep = "10.10.0.2"
             via_mac = "02:00:00:00:00:02"
             out_iface = "eth0"
+
+            [[neighbor]]
+            vni = 100
+            ip = "192.168.50.7"
+            mac = "02:00:00:00:0b:07"
+
+            [[nd_neighbor]]
+            vni = 100
+            ip = "2001:db8::7"
+            mac = "02:00:00:00:0b:08"
         "#;
         let original: FileConfig = toml::from_str(toml).unwrap();
         let back = file_config_from_proto(&file_config_to_proto(&original, 4));
@@ -478,6 +506,21 @@ mod tests {
             b.mac_routes[0].remote_vtep_ip
         );
         assert_eq!(a.mac_routes[0].outer_dst_mac, b.mac_routes[0].outer_dst_mac);
+        // ARP + B3 IPv6 ND suppression neighbours both survive the wire round-trip.
+        assert_eq!(a.neighbors.len(), b.neighbors.len());
+        assert_eq!(a.neighbors[0].ip, b.neighbors[0].ip);
+        assert_eq!(a.nd_neighbors.len(), b.nd_neighbors.len());
+        assert_eq!(a.nd_neighbors[0].vni, b.nd_neighbors[0].vni);
+        assert_eq!(a.nd_neighbors[0].ip, b.nd_neighbors[0].ip);
+        assert_eq!(
+            a.nd_neighbors[0].ip,
+            "2001:db8::7"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets()
+        );
+        assert_eq!(a.nd_neighbors[0].mac, b.nd_neighbors[0].mac);
+        assert_eq!(a.nd_neighbors[0].mac, [0x02, 0, 0, 0, 0x0b, 0x08]);
     }
 
     #[test]

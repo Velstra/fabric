@@ -53,8 +53,10 @@ pub use lb::{
 pub use mac::{MacError, parse_mac};
 pub use overlay::{
     ARP_REPLY, ARP_REQUEST, ArpEntry, ArpKey, ArpReply, ETHERTYPE_ARP, Encap, GENEVE_PORT,
-    MacFdbKey, OVERLAY_OUTER_LEN, OverlayConfig, TunnelEndpoint, TunnelKey, VXLAN_PORT,
-    build_encap, decode_vni, encap_kind, is_overlay_dport, overlay_src_port, plan_arp_reply,
+    ICMPV6_NEIGHBOR_ADVERT, ICMPV6_NEIGHBOR_SOLICIT, LocalMac, LocalMacKey, MacFdbKey,
+    ND_NA_MSG_LEN, NaReply, NdKey, OVERLAY_OUTER_LEN, OverlayConfig, TunnelEndpoint, TunnelKey,
+    VXLAN_PORT, build_encap, decode_vni, encap_kind, icmpv6_checksum, is_overlay_dport,
+    overlay_src_port, plan_arp_reply, plan_na_reply,
 };
 pub use packet::{
     ETHERTYPE_IPV4, ETHERTYPE_IPV6, PacketMeta, PolicyId, PortKey, ScopedAddr, ScopedAddr6,

@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use aya::{
     Ebpf,
     maps::{
-        Array, DevMap, HashMap, PerCpuArray,
+        Array, DevMap, HashMap, MapData, PerCpuArray,
         lpm_trie::{Key, LpmTrie},
     },
     programs::{
@@ -19,13 +19,15 @@ use aya::{
 use clap::ValueEnum;
 use log::warn;
 use velstra_common::{
-    ArpEntry, ArpKey, Backend, Cidr4, Counter, GlobalConfig, MacFdbKey, OverlayConfig, PolicyId,
-    PortFwd, RouteEntry, ScopedAddr, ScopedAddr6, ScopedPortKey, ScopedSrcPortKey, ServiceKey,
-    ServiceValue, TunnelEndpoint, TunnelKey, parse_mac, port_rule_value,
+    ArpEntry, ArpKey, Backend, Cidr4, Counter, GlobalConfig, LocalMac, LocalMacKey, MacFdbKey,
+    NdKey, OverlayConfig, PolicyId, PortFwd, RouteEntry, ScopedAddr, ScopedAddr6, ScopedPortKey,
+    ScopedSrcPortKey, ServiceKey, ServiceValue, TunnelEndpoint, TunnelKey, parse_mac,
+    port_rule_value,
 };
 use velstra_config::{
-    PolicyConfig, ResolvedInterface, ResolvedMacRoute, ResolvedNeighbor, ResolvedOverlay,
-    ResolvedPortForward, ResolvedRoute, ResolvedService, ResolvedTunnel, RuntimeConfig,
+    PolicyConfig, ResolvedInterface, ResolvedMacRoute, ResolvedNd6, ResolvedNeighbor,
+    ResolvedOverlay, ResolvedPortForward, ResolvedRoute, ResolvedService, ResolvedTunnel,
+    RuntimeConfig,
 };
 
 /// How to attach the XDP program to the interface.
@@ -353,6 +355,24 @@ impl Firewall {
         }
         Ok(Stats { rows })
     }
+
+    /// Take ownership of the `LOCAL_MACS` map handle out of the loaded eBPF
+    /// object, for the B4b learn-and-advertise background task.
+    ///
+    /// The XDP program is already loaded and its map references are resolved, so
+    /// moving the userspace handle out of the `Ebpf` collection is safe — the
+    /// kernel map lives on (the returned handle owns its fd), the data plane keeps
+    /// populating it, and nothing else in the control plane touches `LOCAL_MACS`.
+    /// The background task reads through the returned handle; when it is dropped
+    /// the map is freed. (aya reads an LRU hash map through the same userspace
+    /// `HashMap` type as a regular hash map.)
+    pub fn take_local_macs(&mut self) -> Result<HashMap<MapData, LocalMacKey, LocalMac>> {
+        let map = self
+            .ebpf
+            .take_map("LOCAL_MACS")
+            .ok_or_else(|| anyhow!("LOCAL_MACS map missing"))?;
+        HashMap::try_from(map).context("LOCAL_MACS as a HashMap")
+    }
 }
 
 /// Raise the locked-memory rlimit so map allocation succeeds on older kernels
@@ -578,6 +598,15 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
             let _ = arp.remove(&ArpKey::new(n.vni, n.ip));
         }
     }
+    {
+        let mut nd: HashMap<_, NdKey, ArpEntry> = HashMap::try_from(
+            ebpf.map_mut("ND_TABLE")
+                .ok_or_else(|| anyhow!("ND_TABLE map missing"))?,
+        )?;
+        for n in &old.nd_neighbors {
+            let _ = nd.remove(&NdKey::new(n.vni, n.ip));
+        }
+    }
     Ok(())
 }
 
@@ -600,6 +629,7 @@ fn apply_config(ebpf: &mut Ebpf, cfg: &RuntimeConfig, old: Option<&RuntimeConfig
         &cfg.tunnels,
         &cfg.mac_routes,
         &cfg.neighbors,
+        &cfg.nd_neighbors,
     )?;
 
     Ok(())
@@ -879,6 +909,7 @@ fn program_overlay(
     tunnels: &[ResolvedTunnel],
     mac_routes: &[ResolvedMacRoute],
     neighbors: &[ResolvedNeighbor],
+    nd_neighbors: &[ResolvedNd6],
 ) -> Result<()> {
     // Resolve the host config (MAC + port) before borrowing any map.
     let config = match overlay {
@@ -917,6 +948,19 @@ fn program_overlay(
         for n in neighbors {
             arp.insert(ArpKey::new(n.vni, n.ip), ArpEntry::new(n.mac), 0)
                 .context("inserting ARP neighbour")?;
+        }
+    }
+
+    // B3 IPv6 ND-suppression table: `(vni, tenant IPv6)` → MAC (same value shape
+    // as ARP). The IPv6 mirror of the ARP table above.
+    if !nd_neighbors.is_empty() {
+        let mut nd: HashMap<_, NdKey, ArpEntry> = HashMap::try_from(
+            ebpf.map_mut("ND_TABLE")
+                .ok_or_else(|| anyhow!("ND_TABLE map missing"))?,
+        )?;
+        for n in nd_neighbors {
+            nd.insert(NdKey::new(n.vni, n.ip), ArpEntry::new(n.mac), 0)
+                .context("inserting ND neighbour")?;
         }
     }
 

@@ -188,6 +188,7 @@ message NodeConfig {
   repeated Tunnel tunnels = 13;     // Phase 4 overlay forwarding entries
   repeated Neighbor neighbors = 14; // Phase 4 ARP-suppression neighbours
   repeated MacRoute mac_routes = 15; // B1 per-MAC L2 forwarding entries
+  repeated Nd6 nd_neighbors = 16;   // B3 IPv6 ND-suppression neighbours
 }
 
 // Encapsulation format for the overlay.
@@ -210,6 +211,14 @@ message Overlay {
 message Neighbor {
   uint32 vni = 1;   // tenant segment the address lives on
   string ip = 2;    // tenant IPv4
+  string mac = 3;   // the MAC that answers for it
+}
+
+// A tenant IPv6 address → MAC, for local IPv6 Neighbor-Discovery suppression
+// (no overlay flood). The IPv6 mirror of Neighbor.
+message Nd6 {
+  uint32 vni = 1;   // tenant segment the address lives on
+  string ip = 2;    // tenant IPv6
   string mac = 3;   // the MAC that answers for it
 }
 
