@@ -36,7 +36,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use velstra_common::{parse_cidr_v4, parse_mac};
 use velstra_config::{
-    ActionName, EncapName, FileConfig, MacRouteCfg, Nd6Cfg, NeighborCfg, TunnelCfg,
+    ActionName, EncapName, FileConfig, FloodVtepCfg, MacRouteCfg, Nd6Cfg, NeighborCfg, TunnelCfg,
     file_config_to_proto,
 };
 use velstra_orchestrator::{Host, Network, Topology};
@@ -188,11 +188,12 @@ pub fn derive_configs(
 /// ND-suppression [`Nd6Cfg`] (the L3 `OVERLAY_FDB` stays v4-only). So a MAC-only
 /// entry yields one `MacRouteCfg`; a v4 MAC/IP entry yields `MacRouteCfg` +
 /// `NeighborCfg` + `TunnelCfg`; a v6 MAC/IP entry yields `MacRouteCfg` +
-/// `Nd6Cfg`. We deliberately defer:
-/// * type-3 flood VTEPs (`evpn.floods()`) — need the BUM datapath (B2), and
-///   have no `NodeConfig` representation yet (the agent's `VTEP_PEERS` trusted-
-///   decap set is derived from the emitted tunnels/MAC routes, so a flood-only
-///   VTEP has nowhere to land);
+/// `Nd6Cfg`.
+///
+/// **Type-3 IMET flood VTEPs** (`evpn.floods()`) are now folded too (roadmap
+/// B2): each v4 flood VTEP that is a known fabric host becomes a `FloodVtepCfg`
+/// programming that VNI's `FLOOD_LIST` head-end replication set, and the agent
+/// derives its `VTEP_PEERS` trusted-decap entry from it. We still defer:
 /// * v6 VTEPs — the maps are v4-only today (`remote_vtep` an `Ipv4Addr`), and
 ///   v6 inner IPs in the L3 `OVERLAY_FDB` (`inner_dst` is a `Cidr4`), which drop
 ///   the L3 tunnel for a v6 entry but keep its MAC route and ND neighbour.
@@ -262,6 +263,32 @@ fn append_evpn_entries(file: &mut FileConfig, host: &Host, topo: &Topology, evpn
                 });
             }
             None => {}
+        }
+    }
+
+    // B2: fold type-3 IMET flood VTEPs into this host's per-VNI flood set. Each
+    // remote v4 flood VTEP that is a known fabric host becomes a `FloodVtepCfg`,
+    // mirroring the same next-hop convention as the MAC/tunnel entries above:
+    // `via_mac` is the remote VTEP host's underlay MAC, `out_iface` this host's
+    // underlay iface. Skip self, skip v6, and skip an unknown/external VTEP we
+    // can't borrow a next-hop MAC for (a routed underlay is a later chunk).
+    for (&vni, vtep_set) in evpn.floods() {
+        for vtep in vtep_set {
+            let IpAddr::V4(vtep) = vtep else {
+                continue;
+            };
+            if *vtep == host.vtep_ip {
+                continue;
+            }
+            let Some(remote) = topo.hosts().find(|h| h.vtep_ip == *vtep) else {
+                continue;
+            };
+            file.flood_vteps.push(FloodVtepCfg {
+                vni,
+                remote_vtep: vtep.to_string(),
+                via_mac: fmt_mac(remote.underlay_mac),
+                out_iface: host.underlay_iface.clone(),
+            });
         }
     }
 }
@@ -487,6 +514,17 @@ mod tests {
             ip: Some("2001:db8::50".parse().unwrap()),
             vtep: "10.10.0.2".parse().unwrap(),
         }));
+        // B2: a type-3 IMET flood VTEP behind h2 (a known fabric host) — folds
+        // into h1's per-VNI flood set. An unknown/external VTEP flood is held,
+        // not programmed (no fabric host to borrow a next-hop MAC from).
+        assert!(learned.apply(&EvpnMonitorEvent::FloodUpdate {
+            vni: evpn_vni,
+            vtep: "10.10.0.2".parse().unwrap(),
+        }));
+        assert!(learned.apply(&EvpnMonitorEvent::FloodUpdate {
+            vni: evpn_vni,
+            vtep: "203.0.113.9".parse().unwrap(),
+        }));
 
         let cfg = derive_configs(&topo, Some(&learned)).unwrap();
         let h1 = &cfg["h1"];
@@ -567,6 +605,16 @@ mod tests {
             1,
             "MAC-only entry produces exactly one mac route"
         );
+
+        // B2: the type-3 flood VTEP behind the known host h2 became exactly one
+        // flood_vtep row (next-hop convention mirrors the tunnel/mac routes); the
+        // unknown external VTEP (203.0.113.9) was held, not programmed.
+        assert_eq!(h1.flood_vteps.len(), 1);
+        let fv = &h1.flood_vteps[0];
+        assert_eq!(fv.vni, evpn_vni);
+        assert_eq!(fv.remote_vtep, "10.10.0.2");
+        assert_eq!(fv.via_mac, "02:00:00:00:00:22");
+        assert_eq!(fv.out_iface, "eth0");
     }
 
     #[test]

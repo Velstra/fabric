@@ -221,6 +221,64 @@ impl TunnelEndpoint {
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for TunnelEndpoint {}
 
+/// Maximum number of remote VTEPs a single VNI's flood set (`FLOOD_LIST`) can
+/// hold. The B2 BUM head-end replication datapath iterates this set with a
+/// **constant** upper bound so the eBPF verifier can bound the loop; picking a
+/// fixed cap (rather than a variable-length list) is what makes that possible.
+/// 16 covers a comfortable fan-out for a small/medium fabric; larger fabrics
+/// would move to a multicast underlay instead of head-end replication.
+pub const MAX_FLOOD_VTEPS: usize = 16;
+
+/// B2 per-VNI **flood set**: the remote VTEPs a broadcast/unknown-unicast/
+/// multicast (BUM) frame on a tenant segment must be head-end replicated to.
+/// Keyed in `FLOOD_LIST` by a bare `u32` VNI.
+///
+/// A **fixed-size** array (not a variable list) so the datapath can walk it with
+/// a compile-time-bounded loop the verifier accepts; `count` says how many of
+/// the [`MAX_FLOOD_VTEPS`] slots are valid (the rest are zeroed). Each valid slot
+/// reuses [`TunnelEndpoint`] — the very same `(out_ifindex, remote_vtep_ip,
+/// outer_dst_mac)` triple the unicast FDB uses — so [`build_encap`] can encap a
+/// copy toward each one with no new arithmetic.
+///
+/// `#[repr(C)]`: a `u32` count (offset 0) followed by `[TunnelEndpoint; 16]`
+/// (each 16-byte, 4-aligned), so the whole struct is 4-aligned with no implicit
+/// padding — `4 + 16*16 = 260` bytes, identical across the kernel/userspace
+/// boundary.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FloodSet {
+    /// Number of valid entries in [`Self::vteps`] (`0..=MAX_FLOOD_VTEPS`).
+    pub count: u32,
+    /// The flood endpoints. Only the first `count` are meaningful; the rest are
+    /// zeroed so the layout is deterministic.
+    pub vteps: [TunnelEndpoint; MAX_FLOOD_VTEPS],
+}
+
+impl FloodSet {
+    /// Build a flood set from a slice of endpoints. Truncates to
+    /// [`MAX_FLOOD_VTEPS`] if the slice is longer, and zero-pads the unused
+    /// slots so two equal sets compare byte-for-byte.
+    pub fn new(vteps: &[TunnelEndpoint]) -> Self {
+        let mut arr = [TunnelEndpoint::new(0, [0; 4], [0; 6]); MAX_FLOOD_VTEPS];
+        let count = if vteps.len() > MAX_FLOOD_VTEPS {
+            MAX_FLOOD_VTEPS
+        } else {
+            vteps.len()
+        };
+        arr[..count].copy_from_slice(&vteps[..count]);
+        Self {
+            count: count as u32,
+            vteps: arr,
+        }
+    }
+}
+
+// SAFETY: `#[repr(C)]`, a `u32` + a fixed array of `Pod` `TunnelEndpoint`s;
+// every byte is initialised (unused slots are explicitly zeroed) and there is no
+// implicit padding.
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for FloodSet {}
+
 /// B1 MAC-FDB key: a tenant VNI plus an inner destination MAC, matched
 /// exactly (a `HashMap` key, unlike the LPM `TunnelKey`). Explicit trailing
 /// padding keeps the layout deterministic across the kernel/userspace boundary
@@ -766,6 +824,39 @@ mod tests {
         assert_eq!(v.ip, [192, 168, 1, 5]);
         assert_eq!(v, LocalMac::new([192, 168, 1, 5]));
         assert_ne!(v, LocalMac::new([192, 168, 1, 6]));
+    }
+
+    #[test]
+    fn flood_set_layout_count_and_truncation() {
+        // 4 (count) + 16 * 16 (TunnelEndpoint) = 260 bytes, 4-aligned, no padding.
+        assert_eq!(core::mem::size_of::<FloodSet>(), 4 + MAX_FLOOD_VTEPS * 16);
+        assert_eq!(core::mem::size_of::<FloodSet>(), 260);
+        assert_eq!(core::mem::align_of::<FloodSet>(), 4);
+
+        // Empty set: count 0, every slot zeroed.
+        let empty = FloodSet::new(&[]);
+        assert_eq!(empty.count, 0);
+        assert_eq!(empty.vteps[0], TunnelEndpoint::new(0, [0; 4], [0; 6]));
+
+        // A short set keeps its entries and zero-pads the rest.
+        let a = TunnelEndpoint::new(7, [10, 0, 0, 2], NEXTHOP_MAC);
+        let b = TunnelEndpoint::new(9, [10, 0, 0, 3], LOCAL_MAC);
+        let two = FloodSet::new(&[a, b]);
+        assert_eq!(two.count, 2);
+        assert_eq!(two.vteps[0], a);
+        assert_eq!(two.vteps[1], b);
+        assert_eq!(two.vteps[2], TunnelEndpoint::new(0, [0; 4], [0; 6]));
+        // Equal inputs produce byte-identical sets (padding is deterministic).
+        assert_eq!(two, FloodSet::new(&[a, b]));
+
+        // Over-long input truncates to MAX_FLOOD_VTEPS without panicking.
+        let many: Vec<TunnelEndpoint> = (0..MAX_FLOOD_VTEPS as u32 + 5)
+            .map(|i| TunnelEndpoint::new(i, [10, 0, 0, i as u8], NEXTHOP_MAC))
+            .collect();
+        let capped = FloodSet::new(&many);
+        assert_eq!(capped.count as usize, MAX_FLOOD_VTEPS);
+        assert_eq!(capped.vteps[0], many[0]);
+        assert_eq!(capped.vteps[MAX_FLOOD_VTEPS - 1], many[MAX_FLOOD_VTEPS - 1]);
     }
 
     #[test]

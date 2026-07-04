@@ -302,6 +302,25 @@ pub struct MacRouteCfg {
     pub out_iface: String,
 }
 
+/// One BUM head-end replication entry (`[[flood_vtep]]`, B2): a remote VTEP that
+/// broadcast/unknown-unicast/multicast traffic on `vni` must be flooded to. One
+/// row per (vni, remote_vtep); the agent groups all rows sharing a `vni` into a
+/// single per-VNI flood set. Fields mirror [`MacRouteCfg`] exactly (they resolve
+/// to the same `TunnelEndpoint` triple), minus the per-destination MAC — the
+/// flood is by VNI, not by inner MAC.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FloodVtepCfg {
+    /// Tenant VXLAN Network Identifier (24-bit) whose BUM traffic floods here.
+    pub vni: u32,
+    /// Remote VTEP underlay IPv4 (outer destination address).
+    pub remote_vtep: String,
+    /// Next-hop MAC on the underlay toward the remote VTEP.
+    pub via_mac: String,
+    /// Underlay egress interface name.
+    pub out_iface: String,
+}
+
 /// A named tenant policy (`[[policy]]`): the same firewall fields as the
 /// top-level config, but with an explicit non-zero `id` that interfaces map to.
 #[derive(Debug, Deserialize)]
@@ -399,6 +418,10 @@ pub struct FileConfig {
     /// B3 IPv6 ND-suppression neighbours. Spelled `[[nd_neighbor]]` in TOML.
     #[serde(rename = "nd_neighbor")]
     pub nd_neighbors: Vec<Nd6Cfg>,
+    /// B2 BUM head-end replication flood entries. Spelled `[[flood_vtep]]` in
+    /// TOML.
+    #[serde(rename = "flood_vtep")]
+    pub flood_vteps: Vec<FloodVtepCfg>,
 }
 
 /// A resolved load-balancer service: a service key and its (validated) backends.
@@ -576,6 +599,23 @@ pub struct ResolvedMacRoute {
     pub out_iface: String,
 }
 
+/// A resolved BUM head-end replication entry (B2): the tenant segment and the
+/// remote endpoint a broadcast/unknown-unicast/multicast frame on it must be
+/// flooded to. The agent groups every entry sharing a `vni` into one `FloodSet`
+/// for the `FLOOD_LIST` map. The egress interface stays a name (resolved to an
+/// ifindex at load time, like [`ResolvedMacRoute`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedFloodVtep {
+    /// Tenant VNI whose BUM traffic floods to this endpoint.
+    pub vni: u32,
+    /// Remote VTEP underlay IPv4 (outer destination address).
+    pub remote_vtep_ip: [u8; 4],
+    /// Next-hop MAC on the underlay toward the remote VTEP.
+    pub outer_dst_mac: [u8; 6],
+    /// Underlay egress interface name.
+    pub out_iface: String,
+}
+
 /// Fully-resolved, validated configuration ready to be written into BPF maps.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -600,6 +640,9 @@ pub struct RuntimeConfig {
     pub neighbors: Vec<ResolvedNeighbor>,
     /// IPv6 ND-suppression neighbours for the `ND_TABLE` map (B3).
     pub nd_neighbors: Vec<ResolvedNd6>,
+    /// BUM head-end replication flood entries for the `FLOOD_LIST` map (B2). The
+    /// agent groups these by `vni` into one `FloodSet` per segment.
+    pub flood_vteps: Vec<ResolvedFloodVtep>,
 }
 
 impl RuntimeConfig {
@@ -623,6 +666,7 @@ impl RuntimeConfig {
             mac_routes: Vec::new(),
             neighbors: Vec::new(),
             nd_neighbors: Vec::new(),
+            flood_vteps: Vec::new(),
         }
     }
 }
@@ -963,6 +1007,27 @@ impl FileConfig {
             });
         }
 
+        if !self.flood_vteps.is_empty() && overlay.is_none() {
+            bail!("`[[flood_vtep]]` entries require an `[overlay]` section");
+        }
+        let mut flood_vteps = Vec::with_capacity(self.flood_vteps.len());
+        for fv in &self.flood_vteps {
+            if fv.vni > 0xFF_FFFF {
+                bail!("flood_vtep vni {} exceeds 24 bits", fv.vni);
+            }
+            let remote_vtep: Ipv4Addr = fv.remote_vtep.parse().map_err(|_| {
+                anyhow::anyhow!("invalid flood_vtep remote_vtep {:?}", fv.remote_vtep)
+            })?;
+            let outer_dst_mac = parse_mac(&fv.via_mac)
+                .map_err(|e| anyhow::anyhow!("invalid flood_vtep via_mac {:?}: {e}", fv.via_mac))?;
+            flood_vteps.push(ResolvedFloodVtep {
+                vni: fv.vni,
+                remote_vtep_ip: remote_vtep.octets(),
+                outer_dst_mac,
+                out_iface: fv.out_iface.clone(),
+            });
+        }
+
         Ok(RuntimeConfig {
             policies,
             interfaces,
@@ -974,6 +1039,7 @@ impl FileConfig {
             mac_routes,
             neighbors,
             nd_neighbors,
+            flood_vteps,
         })
     }
 }
@@ -1171,6 +1237,22 @@ impl fmt::Display for RuntimeConfig {
                     f,
                     "  - vni {} {ip} is at {a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{ff:02x}",
                     n.vni,
+                )?;
+            }
+        }
+        if !self.flood_vteps.is_empty() {
+            writeln!(
+                f,
+                "flood_vteps    : {} (bum head-end replication)",
+                self.flood_vteps.len()
+            )?;
+            for fv in &self.flood_vteps {
+                let [r0, r1, r2, r3] = fv.remote_vtep_ip;
+                let [a, b, c, d, e, ff] = fv.outer_dst_mac;
+                writeln!(
+                    f,
+                    "  - vni {} flood -> vtep {r0}.{r1}.{r2}.{r3} via {a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{ff:02x} dev {}",
+                    fv.vni, fv.out_iface,
                 )?;
             }
         }
