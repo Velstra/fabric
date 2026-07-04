@@ -10,9 +10,9 @@ use anyhow::Result;
 use velstra_proto as proto;
 
 use crate::config::{
-    ActionName, BackendCfg, EncapName, FileConfig, ForwardMode, InterfaceFile, MacRouteCfg, Nd6Cfg,
-    NeighborCfg, OverlayCfg, PolicyFile, PortRule, ProtoName, RouteCfg, RuntimeConfig, ServiceCfg,
-    TunnelCfg,
+    ActionName, BackendCfg, EncapName, FileConfig, FloodVtepCfg, ForwardMode, InterfaceFile,
+    MacRouteCfg, Nd6Cfg, NeighborCfg, OverlayCfg, PolicyFile, PortRule, ProtoName, RouteCfg,
+    RuntimeConfig, ServiceCfg, TunnelCfg,
 };
 
 fn port_rule_to_proto(r: &PortRule) -> proto::PortRule {
@@ -212,6 +212,16 @@ pub fn file_config_to_proto(cfg: &FileConfig, version: u64) -> proto::NodeConfig
                 mac: n.mac.clone(),
             })
             .collect(),
+        flood_vteps: cfg
+            .flood_vteps
+            .iter()
+            .map(|fv| proto::FloodVtep {
+                vni: fv.vni,
+                remote_vtep: fv.remote_vtep.clone(),
+                via_mac: fv.via_mac.clone(),
+                out_iface: fv.out_iface.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -356,6 +366,16 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
                 mac: n.mac.clone(),
             })
             .collect(),
+        flood_vteps: cfg
+            .flood_vteps
+            .iter()
+            .map(|fv| FloodVtepCfg {
+                vni: fv.vni,
+                remote_vtep: fv.remote_vtep.clone(),
+                via_mac: fv.via_mac.clone(),
+                out_iface: fv.out_iface.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -481,6 +501,12 @@ mod tests {
             vni = 100
             ip = "2001:db8::7"
             mac = "02:00:00:00:0b:08"
+
+            [[flood_vtep]]
+            vni = 100
+            remote_vtep = "10.10.0.2"
+            via_mac = "02:00:00:00:00:02"
+            out_iface = "eth0"
         "#;
         let original: FileConfig = toml::from_str(toml).unwrap();
         let back = file_config_from_proto(&file_config_to_proto(&original, 4));
@@ -521,6 +547,20 @@ mod tests {
         );
         assert_eq!(a.nd_neighbors[0].mac, b.nd_neighbors[0].mac);
         assert_eq!(a.nd_neighbors[0].mac, [0x02, 0, 0, 0, 0x0b, 0x08]);
+        // B2: BUM flood entries survive the wire round-trip too.
+        assert_eq!(a.flood_vteps.len(), b.flood_vteps.len());
+        assert_eq!(a.flood_vteps[0].vni, b.flood_vteps[0].vni);
+        assert_eq!(a.flood_vteps[0].vni, 100);
+        assert_eq!(
+            a.flood_vteps[0].remote_vtep_ip,
+            b.flood_vteps[0].remote_vtep_ip
+        );
+        assert_eq!(a.flood_vteps[0].remote_vtep_ip, [10, 10, 0, 2]);
+        assert_eq!(
+            a.flood_vteps[0].outer_dst_mac,
+            b.flood_vteps[0].outer_dst_mac
+        );
+        assert_eq!(a.flood_vteps[0].outer_dst_mac, [0x02, 0, 0, 0, 0, 0x02]);
     }
 
     #[test]

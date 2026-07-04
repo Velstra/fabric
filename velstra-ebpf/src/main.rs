@@ -48,7 +48,9 @@
 //! kernel and the tests can never disagree.
 
 use aya_ebpf::{
-    bindings::{BPF_F_PSEUDO_HDR, TC_ACT_OK, TC_ACT_SHOT, xdp_action},
+    bindings::{
+        BPF_F_PSEUDO_HDR, TC_ACT_OK, TC_ACT_SHOT, bpf_adj_room_mode::BPF_ADJ_ROOM_MAC, xdp_action,
+    },
     helpers::bpf_xdp_adjust_head,
     macros::{classifier, map, xdp},
     maps::{Array, DevMap, HashMap, LpmTrie, LruHashMap, PerCpuArray, lpm_trie::Key},
@@ -61,14 +63,14 @@ use network_types::{
 };
 use velstra_common::{
     ARP_REPLY, ARP_REQUEST, Action, ArpEntry, ArpKey, Backend, ConfigFlags, Counter, ETHERTYPE_ARP,
-    ETHERTYPE_IPV4, ETHERTYPE_IPV6, FlowKey, FlowState, ForwardOutcome, GlobalConfig,
-    ICMPV6_NEIGHBOR_SOLICIT, ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, LocalMac, LocalMacKey,
-    MacFdbKey, ND_NA_MSG_LEN, Nat, NdKey, OVERLAY_OUTER_LEN, OverlayConfig, PacketMeta, PolicyId,
-    PortFwd, Rewrite,
-    RouteEntry, ScopedAddr, ScopedAddr6, ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue,
-    TunnelEndpoint, TunnelKey, build_encap, decide, icmp, icmp_checksum, ip_proto, is_overlay_dport,
-    lpm_key_addr, plan_arp_reply, plan_forward, plan_icmp_unreachable, plan_na_reply, plan_nat,
-    plan_tcp_rst, port_rule_action, port_rule_logs, select_backend, session_hash, tcp_flags,
+    ETHERTYPE_IPV4, ETHERTYPE_IPV6, FloodSet, FlowKey, FlowState, ForwardOutcome, GlobalConfig,
+    ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, ICMPV6_NEIGHBOR_SOLICIT, LocalMac, LocalMacKey,
+    MAX_FLOOD_VTEPS, MacFdbKey, ND_NA_MSG_LEN, Nat, NdKey, OVERLAY_OUTER_LEN, OverlayConfig,
+    PacketMeta, PolicyId, PortFwd, Rewrite, RouteEntry, ScopedAddr, ScopedAddr6, ScopedPortKey,
+    ScopedSrcPortKey, ServiceKey, ServiceValue, TunnelEndpoint, TunnelKey, build_encap, decide,
+    icmp, icmp_checksum, ip_proto, is_overlay_dport, lpm_key_addr, plan_arp_reply, plan_forward,
+    plan_icmp_unreachable, plan_na_reply, plan_nat, plan_tcp_rst, port_rule_action, port_rule_logs,
+    select_backend, session_hash, tcp_flags,
 };
 
 /// Maps an ingress interface index to its policy id, so one XDP program can
@@ -190,6 +192,16 @@ static OVERLAY_FDB: LpmTrie<TunnelKey, TunnelEndpoint> = LpmTrie::with_max_entri
 #[map]
 static MAC_FDB: HashMap<MacFdbKey, TunnelEndpoint> = HashMap::with_max_entries(8192, 0);
 
+/// B2 per-VNI **flood set**: `vni` → the [`FloodSet`] of remote VTEPs a
+/// broadcast/unknown-unicast/multicast (BUM) frame on that segment must be
+/// head-end replicated to. Consulted by the TC ingress `velstra_bum` classifier
+/// (XDP can only emit one action per packet, so BUM replication lives at the TC
+/// layer where `bpf_clone_redirect` can fan a frame out to N underlay copies).
+/// A miss or an empty set means "no remote flood targets" — the frame is left
+/// for local delivery only. Pushed by the control plane (`program_overlay`).
+#[map]
+static FLOOD_LIST: HashMap<u32, FloodSet> = HashMap::with_max_entries(4096, 0);
+
 /// B4b **local-MAC learning** table: `(vni, tenant source MAC)` → the tenant's
 /// [`LocalMac`] (its bound IPv4). Populated **by the data plane itself** on the
 /// firewall-allowed path for tenant ports (`vni != 0`), so the co-located agent
@@ -239,6 +251,181 @@ pub fn velstra_egress(ctx: TcContext) -> i32 {
         Ok(action) => action,
         Err(()) => TC_ACT_OK as i32,
     }
+}
+
+// ===========================================================================
+// B2 — BUM head-end replication (TC ingress classifier)
+// ===========================================================================
+//
+// WHY A NEW TC-INGRESS HOOK (and not the XDP path or `velstra_egress`):
+//
+// A tenant that sends a broadcast/unknown-unicast/multicast (BUM) frame needs
+// ONE VXLAN-encapsulated copy delivered to EACH remote VTEP in its VNI's flood
+// set. XDP is 1-packet-in → 1-action-out: it physically cannot fan one frame
+// into N copies. The kernel's only clone primitive on the packet path is
+// `bpf_clone_redirect`, which is a **TC**-layer helper (`TcContext`), so
+// replication has to live at TC.
+//
+// A tenant frame from the VM traverses, in order: XDP ingress (`velstra` →
+// `try_encap`) → TC ingress → the bridge/stack. `try_encap` already consumes
+// KNOWN unicast (a MAC_FDB / OVERLAY_FDB hit encapsulates + `XDP_REDIRECT`s the
+// single copy, so it never reaches TC). Only BUM and truly-local frames fall
+// through XDP to TC ingress — exactly the frames this hook must replicate. So
+// the clean seam is a NEW `clsact` **ingress** classifier on the tenant tap
+// (`velstra_bum`): it sees the BUM frame, `clone_redirect`s N encapsulated
+// copies onto the underlay, and returns `TC_ACT_OK` so the original is still
+// delivered locally. (`velstra_egress` is the wrong seam — it is TC *egress*,
+// the delivery-*to*-the-VM direction, and it filters, it does not replicate.)
+//
+// REPLICATION APPROACH (grow-once + full re-store per clone):
+//
+//   1. Grow skb headroom **once** with `adjust_room(+OVERLAY_OUTER_LEN,
+//      BPF_ADJ_ROOM_MAC, 0)` on the first copy.
+//   2. For each flood VTEP, `build_encap` (the same pure builder XDP uses)
+//      produces the full 50-byte outer stack **with that VTEP's already-correct
+//      IPv4 checksum**, so we simply `store()` the whole header at offset 0 —
+//      no per-field `l3_csum_replace` patching is needed (simpler and clearer
+//      than diffing the dst IP/MAC between iterations, and the checksum is never
+//      wrong).
+//   3. `clone_redirect(ep.out_ifindex, 0)` sends that copy; the ORIGINAL skb is
+//      untouched by the clone.
+//   4. After the loop, `adjust_room(-OVERLAY_OUTER_LEN, …)` removes the outer
+//      stack again so the original continues to local delivery unmodified.
+//
+// The loop bound is the CONSTANT `MAX_FLOOD_VTEPS` with an early `break` at
+// `flood.count`, so the verifier can bound it; `flood.vteps.get(i)` avoids any
+// panic/bounds-check path.
+//
+// !!! LOAD-VERIFICATION CAVEAT (B2 TODO(load-iterate)) !!!
+// This datapath is COMPILE-verified only; it has NOT been kernel-load / verifier
+// validated in this environment (that needs root + a live tap/underlay). The
+// user will iterate it under load. Specifically unverified:
+//   * exact `BPF_ADJ_ROOM_MAC` byte-insertion semantics (does the +room open at
+//     offset 0 for a fresh outer L2, and does the store land where intended?);
+//   * whether the verifier accepts `store` after `adjust_room` without a
+//     `pull_data`/re-check of `data`..`data_end`;
+//   * `clone_redirect` interaction with the subsequent room-shrink on the
+//     original;
+//   * outer UDP entropy (kept coarse below — a BUM frame carries no L4 flow).
+// If the verifier rejects a step, that step is where to iterate; the control
+// plane (FLOOD_LIST, VTEP_PEERS, TX_PORTS, attach) is already complete.
+
+/// TC **ingress** entry point for B2 BUM head-end replication. Attached on
+/// tenant taps (`clsact` ingress). Delegates to [`try_bum`]; any parse/helper
+/// failure fails open (`TC_ACT_OK`) so a BUM frame is never black-holed here —
+/// worst case it just isn't replicated.
+#[classifier]
+pub fn velstra_bum(ctx: TcContext) -> i32 {
+    match try_bum(&ctx) {
+        Ok(action) => action,
+        Err(()) => TC_ACT_OK as i32,
+    }
+}
+
+/// Head-end replicate a tenant BUM frame to every remote VTEP in its VNI's
+/// flood set. See the module-level block above for the design and the
+/// load-verification caveat. Always returns `TC_ACT_OK` — the clones are extra
+/// copies; the original frame is left for normal local delivery.
+#[inline(always)]
+fn try_bum(ctx: &TcContext) -> Result<i32, ()> {
+    // Overlay must be active for any encapsulation to make sense.
+    let ocfg = overlay_config();
+    if !ocfg.is_enabled() {
+        return Ok(TC_ACT_OK as i32);
+    }
+
+    // Ingress VNI is the tap's segment — the same `IFACE_VNI` map the XDP encap
+    // path keys on. A non-tenant port (vni 0) never floods.
+    let ifindex = unsafe { (*ctx.skb.skb).ifindex };
+    let vni = unsafe { IFACE_VNI.get(&ifindex) }.copied().unwrap_or(0);
+    if vni == 0 {
+        return Ok(TC_ACT_OK as i32);
+    }
+
+    // Classify BUM by the inner destination MAC (frame offset 0):
+    //   * broadcast  (ff:ff:ff:ff:ff:ff) — has bit 0 of octet 0 set, so it is
+    //     caught by the multicast test;
+    //   * multicast  (octet0 & 1 == 1);
+    //   * unknown-unicast — a MAC_FDB miss for this (vni, dst MAC).
+    // A KNOWN unicast (MAC_FDB hit) is not BUM and was already handled by XDP
+    // `try_encap`; leave it alone.
+    let dst_mac = unsafe { *ptr_at_tc::<[u8; 6]>(ctx, O_ETH_DST)? };
+    let is_multicast = dst_mac[0] & 1 == 1;
+    let is_bum = is_multicast || unsafe { MAC_FDB.get(&MacFdbKey::new(vni, dst_mac)) }.is_none();
+    if !is_bum {
+        return Ok(TC_ACT_OK as i32);
+    }
+
+    // The flood set for this segment. A miss or an empty set ⇒ nothing to do.
+    // Hold a *reference* into the map value — the whole `FloodSet` is 260 bytes,
+    // far too large to copy onto the 512-byte BPF stack; we index it in place and
+    // copy out only one 16-byte `TunnelEndpoint` per iteration.
+    let flood = match unsafe { FLOOD_LIST.get(&vni) } {
+        Some(f) => f,
+        None => return Ok(TC_ACT_OK as i32),
+    };
+    let count = flood.count;
+    if count == 0 {
+        return Ok(TC_ACT_OK as i32);
+    }
+
+    // The inner frame length (whole L2 frame becomes the tunnel payload), read
+    // BEFORE any room grow. Drop-silently (leave for local delivery) if encap
+    // would exceed the underlay MTU — mirrors the XDP encap MTU guard.
+    let inner_len = (ctx.data_end() - ctx.data()) as u16;
+    if inner_len > ocfg.max_inner_len() {
+        return Ok(TC_ACT_OK as i32);
+    }
+    // Coarse outer-UDP entropy: a BUM frame carries no single L4 flow to hash,
+    // so we spread only by (vni, dst MAC). Refine at load-iterate if underlay
+    // ECMP distribution matters for flood traffic.
+    let entropy = vni ^ ((dst_mac[4] as u32) << 8) ^ (dst_mac[5] as u32);
+
+    let mut grown = false;
+    let mut i: usize = 0;
+    while i < MAX_FLOOD_VTEPS {
+        if i as u32 >= count {
+            break;
+        }
+        // `.get` (not `[]`) keeps the verifier off any panic/bounds path.
+        let ep = match flood.vteps.get(i) {
+            Some(e) => *e,
+            None => break,
+        };
+
+        // Build this VTEP's full outer stack (correct checksum included).
+        let encap = build_encap(&ocfg, &ep, vni, inner_len, entropy);
+
+        // Grow the headroom exactly once, on the first copy.
+        if !grown {
+            if ctx
+                .adjust_room(OVERLAY_OUTER_LEN as i32, BPF_ADJ_ROOM_MAC, 0)
+                .is_err()
+            {
+                // Could not make room — abandon replication, deliver locally.
+                return Ok(TC_ACT_OK as i32);
+            }
+            grown = true;
+        }
+
+        // Overwrite the outer stack for this VTEP, then clone+redirect the copy
+        // onto the underlay. `store`/`clone_redirect` are skb helpers (handle a
+        // non-linear skb), so no direct-pointer bounds dance is needed.
+        if ctx.store(0, &encap.headers, 0).is_ok() && ctx.clone_redirect(ep.out_ifindex, 0).is_ok()
+        {
+            bump(Counter::BumReplicated);
+        }
+
+        i += 1;
+    }
+
+    // Remove the outer stack we prepended so the ORIGINAL frame is delivered
+    // locally unchanged (clone_redirect did not consume it).
+    if grown {
+        let _ = ctx.adjust_room(-(OVERLAY_OUTER_LEN as i32), BPF_ADJ_ROOM_MAC, 0);
+    }
+
+    Ok(TC_ACT_OK as i32)
 }
 
 /// Increment a per-CPU counter by one. Infallible and lock-free.
@@ -1332,7 +1519,14 @@ fn try_load_balance(
     } else {
         backend.port
     };
-    let rkey = FlowKey::new(policy_id, backend.ip, src_addr, backend_port, src_port, proto);
+    let rkey = FlowKey::new(
+        policy_id,
+        backend.ip,
+        src_addr,
+        backend_port,
+        src_port,
+        proto,
+    );
     if CONNTRACK
         .insert(&rkey, &FlowState::reverse(dst_addr, dst_port), 0)
         .is_ok()

@@ -19,15 +19,15 @@ use aya::{
 use clap::ValueEnum;
 use log::warn;
 use velstra_common::{
-    ArpEntry, ArpKey, Backend, Cidr4, Counter, GlobalConfig, LocalMac, LocalMacKey, MacFdbKey,
-    NdKey, OverlayConfig, PolicyId, PortFwd, RouteEntry, ScopedAddr, ScopedAddr6, ScopedPortKey,
-    ScopedSrcPortKey, ServiceKey, ServiceValue, TunnelEndpoint, TunnelKey, parse_mac,
-    port_rule_value,
+    ArpEntry, ArpKey, Backend, Cidr4, Counter, FloodSet, GlobalConfig, LocalMac, LocalMacKey,
+    MacFdbKey, NdKey, OverlayConfig, PolicyId, PortFwd, RouteEntry, ScopedAddr, ScopedAddr6,
+    ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue, TunnelEndpoint, TunnelKey,
+    parse_mac, port_rule_value,
 };
 use velstra_config::{
-    PolicyConfig, ResolvedInterface, ResolvedMacRoute, ResolvedNd6, ResolvedNeighbor,
-    ResolvedOverlay, ResolvedPortForward, ResolvedRoute, ResolvedService, ResolvedTunnel,
-    RuntimeConfig,
+    PolicyConfig, ResolvedFloodVtep, ResolvedInterface, ResolvedMacRoute, ResolvedNd6,
+    ResolvedNeighbor, ResolvedOverlay, ResolvedPortForward, ResolvedRoute, ResolvedService,
+    ResolvedTunnel, RuntimeConfig,
 };
 
 /// How to attach the XDP program to the interface.
@@ -140,6 +140,26 @@ impl Firewall {
         }
         if !egress_ifaces.is_empty() {
             attach_egress(&mut ebpf, &egress_ifaces)?;
+        }
+
+        // B2: attach the BUM head-end replication classifier at TC **ingress**
+        // on the tenant taps (config interfaces on a real overlay segment,
+        // `vni != 0`, that are present). Best-effort: `velstra_bum` is a
+        // compile-verified-only datapath pending kernel-load iteration, so a
+        // load/verifier failure is logged and swallowed rather than taking the
+        // agent down — the flood-set maps are already programmed either way.
+        if cfg.overlay.is_some() {
+            let bum_ifaces: Vec<String> = cfg
+                .interfaces
+                .iter()
+                .filter(|i| i.vni != 0 && if_nametoindex(&i.name).is_ok())
+                .map(|i| i.name.clone())
+                .collect();
+            if !bum_ifaces.is_empty()
+                && let Err(e) = attach_bum_ingress(&mut ebpf, &bum_ifaces)
+            {
+                warn!("B2 BUM replication attach failed (load-iterate pending): {e:#}");
+            }
         }
 
         Ok(Self {
@@ -575,6 +595,18 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
         }
     }
     {
+        // B2 flood set: drop every VNI that had a flood set; program_overlay
+        // rebuilds each still-current one from the fresh config. Keyed by a bare
+        // VNI, so removing by the old flood entries' distinct VNIs clears it.
+        let mut flood: HashMap<_, u32, FloodSet> = HashMap::try_from(
+            ebpf.map_mut("FLOOD_LIST")
+                .ok_or_else(|| anyhow!("FLOOD_LIST map missing"))?,
+        )?;
+        for fv in &old.flood_vteps {
+            let _ = flood.remove(&fv.vni);
+        }
+    }
+    {
         // Trusted-VTEP set (C2): drop the old peers; program_overlay re-adds every
         // still-current one, so a peer shared by another live tunnel survives.
         // Both tunnels and MAC routes contribute trusted decap peers.
@@ -587,6 +619,11 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
         }
         for mr in &old.mac_routes {
             let _ = peers.remove(&mr.remote_vtep_ip);
+        }
+        // Flood VTEPs are trusted decap peers too (they receive our encapped BUM
+        // copies and send their own back).
+        for fv in &old.flood_vteps {
+            let _ = peers.remove(&fv.remote_vtep_ip);
         }
     }
     {
@@ -630,6 +667,7 @@ fn apply_config(ebpf: &mut Ebpf, cfg: &RuntimeConfig, old: Option<&RuntimeConfig
         &cfg.mac_routes,
         &cfg.neighbors,
         &cfg.nd_neighbors,
+        &cfg.flood_vteps,
     )?;
 
     Ok(())
@@ -894,15 +932,18 @@ fn read_iface_ipv4(iface: &str) -> Result<[u8; 4]> {
 }
 
 /// Program the Phase 4 overlay maps: `OVERLAY_CONFIG` (this host's VTEP, a single
-/// entry), `OVERLAY_FDB` (`(vni, inner dst)` → remote endpoint), and the B1
+/// entry), `OVERLAY_FDB` (`(vni, inner dst)` → remote endpoint), the B1
 /// `MAC_FDB` (`(vni, inner dst MAC)` → remote endpoint, consulted first for L2
-/// bridging). Each tunnel's and MAC route's underlay egress ifindex is also
-/// mirrored into `TX_PORTS` so the data plane can redirect after encapsulating,
-/// and each remote VTEP is added to the trusted-decap `VTEP_PEERS` set.
+/// bridging), and the B2 `FLOOD_LIST` (`vni` → the [`FloodSet`] of remote VTEPs
+/// a BUM frame on that segment head-end replicates to). Each tunnel's, MAC
+/// route's and flood VTEP's underlay egress ifindex is also mirrored into
+/// `TX_PORTS` so the data plane can redirect after encapsulating, and each
+/// remote VTEP is added to the trusted-decap `VTEP_PEERS` set.
 ///
 /// Slot `0` of `OVERLAY_CONFIG` is **always** written — with the resolved config
 /// or, when the overlay is absent, with the disabled default — so a live
 /// reconfigure that drops the overlay correctly turns encap/decap off.
+#[allow(clippy::too_many_arguments)]
 fn program_overlay(
     ebpf: &mut Ebpf,
     overlay: Option<&ResolvedOverlay>,
@@ -910,6 +951,7 @@ fn program_overlay(
     mac_routes: &[ResolvedMacRoute],
     neighbors: &[ResolvedNeighbor],
     nd_neighbors: &[ResolvedNd6],
+    flood_vteps: &[ResolvedFloodVtep],
 ) -> Result<()> {
     // Resolve the host config (MAC + port) before borrowing any map.
     let config = match overlay {
@@ -964,7 +1006,7 @@ fn program_overlay(
         }
     }
 
-    if tunnels.is_empty() && mac_routes.is_empty() {
+    if tunnels.is_empty() && mac_routes.is_empty() && flood_vteps.is_empty() {
         return Ok(());
     }
 
@@ -1017,6 +1059,31 @@ fn program_overlay(
         })
         .collect();
 
+    // B2: group flood VTEPs by VNI into one FloodSet per segment. Resolve each
+    // entry's egress ifindex the same way (deferring an absent one), collecting
+    // endpoints per VNI in config order. `flood_groups` feeds both FLOOD_LIST
+    // and (via each endpoint's ifindex) TX_PORTS. A plain `Vec` of pairs keeps
+    // insertion order and avoids clashing with the `aya` `HashMap` alias in
+    // scope here.
+    let mut flood_groups: Vec<(u32, Vec<TunnelEndpoint>)> = Vec::new();
+    for fv in flood_vteps {
+        let ifindex = match if_nametoindex(&fv.out_iface) {
+            Ok(i) => i,
+            Err(_) => {
+                log::debug!(
+                    "flood_vtep egress {} not present yet; deferring its flood entry",
+                    fv.out_iface
+                );
+                continue;
+            }
+        };
+        let ep = TunnelEndpoint::new(ifindex, fv.remote_vtep_ip, fv.outer_dst_mac);
+        match flood_groups.iter_mut().find(|(v, _)| *v == fv.vni) {
+            Some((_, eps)) => eps.push(ep),
+            None => flood_groups.push((fv.vni, vec![ep])),
+        }
+    }
+
     {
         let mut fdb: LpmTrie<_, TunnelKey, TunnelEndpoint> = LpmTrie::try_from(
             ebpf.map_mut("OVERLAY_FDB")
@@ -1043,6 +1110,20 @@ fn program_overlay(
     }
 
     {
+        // B2 FLOOD_LIST: one FloodSet per VNI, walked by the TC ingress
+        // `velstra_bum` classifier to head-end replicate BUM frames.
+        let mut flood: HashMap<_, u32, FloodSet> = HashMap::try_from(
+            ebpf.map_mut("FLOOD_LIST")
+                .ok_or_else(|| anyhow!("FLOOD_LIST map missing"))?,
+        )?;
+        for (vni, eps) in &flood_groups {
+            flood
+                .insert(vni, FloodSet::new(eps), 0)
+                .with_context(|| format!("inserting flood set for vni {vni}"))?;
+        }
+    }
+
+    {
         // Trusted-VTEP set (C2): every distinct remote VTEP we tunnel with is an
         // authorized decap source. remove_stale dropped the old set first, and we
         // re-add every current peer here, so a still-valid VTEP survives a
@@ -1062,6 +1143,13 @@ fn program_overlay(
                 .insert(m.remote_vtep_ip, 1, 0)
                 .context("inserting trusted VTEP peer (mac route)")?;
         }
+        // B2: flood VTEPs receive our encapped BUM copies (and send their own
+        // back), so they are trusted decap peers as well.
+        for fv in flood_vteps {
+            peers
+                .insert(fv.remote_vtep_ip, 1, 0)
+                .context("inserting trusted VTEP peer (flood vtep)")?;
+        }
     }
 
     let mut tx_ports: DevMap<_> = DevMap::try_from(
@@ -1077,6 +1165,15 @@ fn program_overlay(
         tx_ports
             .set(endpoint.out_ifindex, endpoint.out_ifindex, None, 0)
             .context("registering overlay redirect device (mac route)")?;
+    }
+    // B2: the TC `velstra_bum` classifier `clone_redirect`s each BUM copy onto a
+    // flood VTEP's underlay ifindex, so those ifindexes must be in the devmap too.
+    for (_, eps) in &flood_groups {
+        for endpoint in eps {
+            tx_ports
+                .set(endpoint.out_ifindex, endpoint.out_ifindex, None, 0)
+                .context("registering overlay redirect device (flood vtep)")?;
+        }
     }
 
     Ok(())
@@ -1209,6 +1306,34 @@ fn attach_egress(ebpf: &mut Ebpf, ifaces: &[String]) -> Result<()> {
             .attach(iface, TcAttachType::Egress)
             .with_context(|| format!("attaching TC egress program to {iface}"))?;
         log::info!("attached egress firewall to {iface}");
+    }
+    Ok(())
+}
+
+/// Load the B2 `velstra_bum` TC classifier and attach it at **ingress** on each
+/// tenant tap, so a BUM (broadcast/unknown-unicast/multicast) frame from the VM
+/// is head-end replicated to the VNI's flood set. Requires a `clsact` qdisc,
+/// created first (idempotent, like [`attach_egress`]).
+///
+/// B2 datapath note: the `velstra_bum` program is COMPILE-verified only and
+/// awaits kernel-load iteration, so this attach is called **best-effort** by the
+/// caller (a verifier rejection must not take the agent down); the flood-set
+/// control plane (`FLOOD_LIST`/`VTEP_PEERS`/`TX_PORTS`) is programmed regardless.
+fn attach_bum_ingress(ebpf: &mut Ebpf, ifaces: &[String]) -> Result<()> {
+    let program: &mut SchedClassifier = ebpf
+        .program_mut("velstra_bum")
+        .ok_or_else(|| anyhow!("eBPF object has no `velstra_bum` program"))?
+        .try_into()?;
+    program
+        .load()
+        .context("loading TC BUM-replication program into the kernel")?;
+    for iface in ifaces {
+        // Idempotent: a pre-existing clsact qdisc is fine.
+        let _ = qdisc_add_clsact(iface);
+        program
+            .attach(iface, TcAttachType::Ingress)
+            .with_context(|| format!("attaching TC BUM-replication program to {iface}"))?;
+        log::info!("attached BUM head-end replication (ingress) to {iface}");
     }
     Ok(())
 }

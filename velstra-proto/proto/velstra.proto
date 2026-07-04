@@ -189,6 +189,7 @@ message NodeConfig {
   repeated Neighbor neighbors = 14; // Phase 4 ARP-suppression neighbours
   repeated MacRoute mac_routes = 15; // B1 per-MAC L2 forwarding entries
   repeated Nd6 nd_neighbors = 16;   // B3 IPv6 ND-suppression neighbours
+  repeated FloodVtep flood_vteps = 17; // B2 per-VNI BUM head-end flood entries
 }
 
 // Encapsulation format for the overlay.
@@ -239,6 +240,17 @@ message MacRoute {
   string remote_vtep = 3;  // remote VTEP underlay IPv4 (outer destination)
   string via_mac = 4;      // next-hop MAC on the underlay
   string out_iface = 5;    // underlay egress interface
+}
+
+// One BUM head-end replication entry (B2): a remote VTEP that a
+// broadcast/unknown-unicast/multicast frame on `vni` must be flooded to. The
+// agent groups all rows sharing a `vni` into one per-VNI flood set. One row per
+// (vni, remote_vtep); the fields mirror MacRoute/Tunnel exactly.
+message FloodVtep {
+  uint32 vni = 1;          // tenant VNI whose BUM traffic floods to this VTEP
+  string remote_vtep = 2;  // remote VTEP underlay IPv4 (outer destination)
+  string via_mac = 3;      // next-hop MAC on the underlay
+  string out_iface = 4;    // underlay egress interface
 }
 
 // A named tenant policy (the top-level fields above are policy 0).
