@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use aya::{
     Ebpf,
     maps::{
-        Array, DevMap, HashMap, MapData, PerCpuArray,
+        Array, DevMap, HashMap, MapData, PerCpuArray, ProgramArray,
         lpm_trie::{Key, LpmTrie},
     },
     programs::{
@@ -109,6 +109,39 @@ impl Firewall {
 
         spawn_log_forwarder(&mut ebpf);
         apply_config(&mut ebpf, cfg, None)?;
+
+        // Load the tail-call target (`velstra_forward`) and register it in the
+        // `VELSTRA_PROGS` program array, so the main program's
+        // `tail_call(PROG_FORWARD)` resolves. It is loaded but never attached to
+        // an interface — it only ever runs via the tail call out of `velstra`.
+        // Done before the `velstra` mutable borrow below so the borrows don't
+        // overlap, and before attach so the first packet already tail-calls.
+        {
+            let flow: &mut Xdp = ebpf
+                .program_mut("velstra_forward")
+                .ok_or_else(|| anyhow!("eBPF object has no `velstra_forward` program"))?
+                .try_into()?;
+            flow.load()
+                .context("loading XDP forward program into the kernel")?;
+        }
+        // Clone the program fd to an owned handle so the immutable borrow on
+        // `ebpf` ends before the map is borrowed mutably below.
+        let flow_fd = {
+            let flow: &Xdp = ebpf
+                .program("velstra_forward")
+                .ok_or_else(|| anyhow!("eBPF object has no `velstra_forward` program"))?
+                .try_into()?;
+            flow.fd()?.try_clone()?
+        };
+        {
+            let mut prog_array = ProgramArray::try_from(
+                ebpf.map_mut("VELSTRA_PROGS")
+                    .ok_or_else(|| anyhow!("VELSTRA_PROGS map missing"))?,
+            )?;
+            prog_array
+                .set(0, &flow_fd, 0)
+                .context("registering velstra_forward in VELSTRA_PROGS")?;
+        }
 
         let program: &mut Xdp = ebpf
             .program_mut("velstra")

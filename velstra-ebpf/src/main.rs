@@ -53,7 +53,7 @@ use aya_ebpf::{
     },
     helpers::bpf_xdp_adjust_head,
     macros::{classifier, map, xdp},
-    maps::{Array, DevMap, HashMap, LpmTrie, LruHashMap, PerCpuArray, lpm_trie::Key},
+    maps::{Array, DevMap, HashMap, LpmTrie, LruHashMap, PerCpuArray, ProgramArray, lpm_trie::Key},
     programs::{TcContext, XdpContext},
 };
 use aya_log_ebpf::info;
@@ -224,6 +224,59 @@ static VTEP_PEERS: HashMap<[u8; 4], u8> = HashMap::with_max_entries(8192, 0);
 /// Per-CPU statistics, one slot per [`Counter`] variant.
 #[map]
 static STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(Counter::COUNT, 0);
+
+/// Everything the tail-called [`velstra_forward`] program needs from
+/// [`try_velstra`]'s post-firewall state. A tail call replaces the running
+/// program without passing arguments and does **not** carry the stack, so the
+/// main program stashes this in the per-CPU [`SCRATCH`] slot and the forward
+/// program reads it straight back.
+///
+/// Field order is large→small so the natural `#[repr(C)]` layout has **no
+/// implicit padding**: `port_forward` (8B) then the two `[u8; 4]`s, then the
+/// `u16`s (offsets 16..24), then the three `u32`s on 4-byte offsets (24, 28, 32),
+/// then the four `u8`s filling 36..40. The value is copied in and out wholesale,
+/// so no padding byte is ever read uninitialised.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ForwardScratch {
+    /// The resolved port-forward target (its `0.0.0.0` sentinel means "none";
+    /// only consulted when `has_port_forward != 0`).
+    port_forward: PortFwd,
+    src_addr: [u8; 4],
+    dst_addr: [u8; 4],
+    checksum: u16,
+    src_port: u16,
+    dst_port: u16,
+    /// The IPv4 header length in bytes; stored as `u16`, used back as `usize`.
+    ihl_bytes: u16,
+    policy_id: PolicyId,
+    vni: u32,
+    /// The firewall verdict's counter index ([`Counter::index`]); reconstructed
+    /// with [`Counter::from_u32`] for the fall-through `bump`, so the exact
+    /// counter `try_velstra` would have bumped is preserved.
+    fw_counter: u32,
+    proto: u8,
+    ttl: u8,
+    /// A `bool` as `u8` (a plain `bool` across the scratch copy is avoided).
+    has_port_forward: u8,
+    /// A `bool` as `u8`.
+    log: u8,
+}
+
+/// Per-CPU scratch carrying [`try_velstra`]'s post-firewall state across the tail
+/// call into [`velstra_forward`] — a tail call cannot pass the stack, so this
+/// single-slot per-CPU array is the hand-off. Per-CPU means no cross-CPU race:
+/// the fill and the read run on the same CPU within one packet's processing.
+#[map]
+static SCRATCH: PerCpuArray<ForwardScratch> = PerCpuArray::with_max_entries(1, 0);
+
+/// Tail-call jump table. Slot [`PROG_FORWARD`] holds [`velstra_forward`]; the
+/// control plane populates it at load time (see `firewall.rs`).
+#[map]
+static VELSTRA_PROGS: ProgramArray = ProgramArray::with_max_entries(1, 0);
+
+/// Index of [`velstra_forward`] in [`VELSTRA_PROGS`].
+const PROG_FORWARD: u32 = 0;
 
 /// XDP entry point. Kept tiny: it delegates to [`try_velstra`] and turns a
 /// parse failure into a safe `XDP_PASS` (fail-open) rather than aborting.
@@ -872,7 +925,18 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     let rule = lookup_port_rule(policy_id, proto, dst_port, lpm_key_addr(src_addr));
     // A configured port-forward for this destination port implicitly opens the
     // firewall (the DNAT + reply SNAT are done below / in the conntrack path).
-    let port_forward = lookup_port_forward(policy_id, proto, dst_port);
+    // Collapse the port-forward lookup into plain scalars *immediately*: a `bool`
+    // and an owned `PortFwd` (its `ip == 0.0.0.0` sentinel is never a real DNAT
+    // target). Carrying the `Option<PortFwd>` across the long live range to the
+    // consumers below let LLVM keep the underlying `Option<&PortFwd>` map-value
+    // pointer niche alive and, under this function's register pressure, lower the
+    // niche transition to a bitwise-OR on that pointer — which the verifier
+    // rejects ("R1 bitwise operator |= on pointer prohibited"). Reducing it to
+    // scalars here means no map-value pointer is ever live at a merge point, and
+    // it adds no BPF sub-program frame (which would blow the 512-byte stack).
+    let pf_lookup = lookup_port_forward(policy_id, proto, dst_port);
+    let has_port_forward = pf_lookup.is_some();
+    let port_forward = pf_lookup.unwrap_or(PortFwd::new([0; 4], 0));
 
     let verdict = decide(&meta, &cfg, blocklisted, rule.map(port_rule_action));
     // Per-rule logging: this rule's own log bit, and the effective flag combining
@@ -894,7 +958,7 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
         (Action::Drop, Counter::DroppedBlocklist)
     } else if established {
         (Action::Pass, Counter::EstablishedAllowed)
-    } else if port_forward.is_some() {
+    } else if has_port_forward {
         // The blocklist still wins (checked first); otherwise a port-forward
         // destination port is allowed inbound.
         (Action::Pass, Counter::PassedRule)
@@ -988,12 +1052,86 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
         );
     }
 
+    // Hand the forwarding transforms (encap / DNAT / LB / route) to a tail-called
+    // program so they run with a fresh 512-byte stack — the main program is at the
+    // BPF stack ceiling, leaving no room to grow the datapath (e.g. SRv6). Carry
+    // the post-firewall state through a per-CPU scratch slot; a tail call cannot
+    // pass the stack. Behaviour is identical to running the phases inline.
+    let scratch = ForwardScratch {
+        port_forward,
+        src_addr,
+        dst_addr,
+        checksum,
+        src_port,
+        dst_port,
+        ihl_bytes: ihl_bytes as u16,
+        policy_id,
+        vni,
+        fw_counter: fw_counter.index(),
+        proto,
+        ttl,
+        has_port_forward: has_port_forward as u8,
+        log: log as u8,
+    };
+    if let Some(dst) = SCRATCH.get_ptr_mut(0) {
+        // SAFETY: `get_ptr_mut` returned a valid pointer into this CPU's slot;
+        // per-CPU maps are not shared, so nothing else races this write.
+        unsafe { *dst = scratch };
+    }
+    // `tail_call` does not return on success — control jumps into `velstra_forward`
+    // and never comes back (this aya build types it as returning `()`, not a
+    // `Result`). It falls through to the lines below only if the slot is
+    // unpopulated: a load-time misconfiguration, since userspace always sets it.
+    // Degrade safely by honouring the firewall PASS without overlay/LB/route.
+    unsafe {
+        VELSTRA_PROGS.tail_call(ctx, PROG_FORWARD);
+    }
+    bump(fw_counter);
+    Ok(xdp_action::XDP_PASS)
+}
+
+/// Tail-call target for the IPv4 forwarding transforms — Phase 4 overlay encap,
+/// Phase 3a port-forward DNAT, Phase 3 load-balancer DNAT/SNAT, and Phase 2
+/// routing. Split out of [`try_velstra`] so it runs with a fresh 512-byte BPF
+/// stack: the main program (parse + decap-auth + firewall + MAC-learn) already
+/// sits at the stack ceiling, leaving no headroom to grow the datapath. Behaviour
+/// is byte-for-byte identical to running these phases inline; only the stack
+/// frame is fresh. All inputs arrive via the per-CPU [`SCRATCH`] slot the main
+/// program filled immediately before tail-calling.
+#[xdp]
+pub fn velstra_forward(ctx: XdpContext) -> u32 {
+    match try_velstra_forward(&ctx) {
+        Ok(action) => action,
+        // Preserve the pre-split fail-open behaviour exactly. When these phases
+        // ran inline in `try_velstra`, a helper `?` bounds failure propagated to
+        // the `velstra` entry wrapper, which counts it and PASSes (a firewall must
+        // never black-hole traffic over its own parse error). Keep that verdict
+        // here rather than aborting.
+        Err(()) => {
+            bump(Counter::Malformed);
+            xdp_action::XDP_PASS
+        }
+    }
+}
+
+fn try_velstra_forward(ctx: &XdpContext) -> Result<u32, ()> {
+    let s = match SCRATCH.get_ptr(0) {
+        // SAFETY: a valid pointer into this CPU's private scratch slot, just
+        // written by `try_velstra` before the tail call.
+        Some(p) => unsafe { *p },
+        // Only reachable if the per-CPU scratch map is absent (it never is).
+        None => return Ok(xdp_action::XDP_PASS),
+    };
+    let ihl_bytes = s.ihl_bytes as usize;
+    let ocfg = overlay_config();
+    let log = s.log != 0;
+
     // Phase 4: overlay encapsulation. If this tenant's (vni == policy) inner
     // destination lives on another host, wrap the frame in a VXLAN/Geneve tunnel
     // and redirect it onto the underlay. A miss means "local" — fall through to
     // ordinary switching/routing.
     if let Some(action) = try_encap(
-        ctx, &ocfg, vni, src_addr, dst_addr, src_port, dst_port, proto, log,
+        ctx, &ocfg, s.vni, s.src_addr, s.dst_addr, s.src_port, s.dst_port, s.proto, log,
     )? {
         return Ok(action);
     }
@@ -1002,10 +1140,18 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     // rewritten to its internal host here; established flows and the reply path
     // are handled by the conntrack path in try_load_balance below (shared
     // CONNTRACK map), so this only fires once per connection.
-    if let Some(target) = port_forward {
+    if s.has_port_forward != 0 {
         if let Some(action) = try_port_forward(
-            ctx, ihl_bytes, policy_id, src_addr, dst_addr, src_port, dst_port, proto, checksum,
-            target,
+            ctx,
+            ihl_bytes,
+            s.policy_id,
+            s.src_addr,
+            s.dst_addr,
+            s.src_port,
+            s.dst_port,
+            s.proto,
+            s.checksum,
+            s.port_forward,
         )? {
             return Ok(action);
         }
@@ -1014,7 +1160,8 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     // Phase 3: load balancer / DNAT. A matching service rewrites the packet to a
     // backend and we PASS it for the kernel to route there.
     if let Some(action) = try_load_balance(
-        ctx, ihl_bytes, policy_id, src_addr, dst_addr, src_port, dst_port, proto, checksum, log,
+        ctx, ihl_bytes, s.policy_id, s.src_addr, s.dst_addr, s.src_port, s.dst_port, s.proto,
+        s.checksum, log,
     )? {
         return Ok(action);
     }
@@ -1023,10 +1170,10 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     let route = ROUTES
         .get(Key::new(
             ScopedAddr::FULL_PREFIX,
-            ScopedAddr::new(policy_id, lpm_key_addr(dst_addr)),
+            ScopedAddr::new(s.policy_id, lpm_key_addr(s.dst_addr)),
         ))
         .copied();
-    match plan_forward(ttl, checksum, proto, route) {
+    match plan_forward(s.ttl, s.checksum, s.proto, route) {
         ForwardOutcome::Pass => {}
         ForwardOutcome::TtlExceeded => {
             bump(Counter::ForwardTtlExceeded);
@@ -1035,8 +1182,10 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
         ForwardOutcome::Redirect(rewrite) => return forward(ctx, rewrite, log),
     }
 
-    // Nothing took over: honour the firewall's pass decision.
-    bump(fw_counter);
+    // Nothing took over: honour the firewall's pass decision. Reconstruct the
+    // exact counter `try_velstra` resolved from its firewall verdict; the sentinel
+    // fallback is unreachable (the stored value is always a real `Counter`).
+    bump(Counter::from_u32(s.fw_counter).unwrap_or(Counter::PassedRule));
     Ok(xdp_action::XDP_PASS)
 }
 
@@ -1864,7 +2013,6 @@ fn forward(ctx: &XdpContext, rewrite: Rewrite, log: bool) -> Result<u32, ()> {
 
 /// Look up an explicit `(policy, proto, dst_port)` rule, decoding the stored
 /// `u32` into an [`Action`].
-#[inline(always)]
 /// Look up the packed `PORT_RULES` value for `(policy, proto, dst_port)` and the
 /// packet's `src` address ([`lpm_key_addr`] form). The trie matches the fixed
 /// `(policy, proto, dport)` head exactly and the source longest-prefix, so a rule
@@ -1872,20 +2020,41 @@ fn forward(ctx: &XdpContext, rewrite: Rewrite, log: bool) -> Result<u32, ()> {
 /// as `0` to match only source-less (`/0`) rules. The low byte of the value is the
 /// [`Action`] (`port_rule_action`); bit 8 is the per-rule log flag
 /// (`port_rule_logs`). Returns `None` when no rule matches.
+///
+#[inline(always)]
 fn lookup_port_rule(policy_id: PolicyId, proto: u8, dst_port: u16, src: u32) -> Option<u32> {
-    let value = PORT_RULES.get(Key::new(
+    match PORT_RULES.get(Key::new(
         ScopedSrcPortKey::FULL_PREFIX,
         ScopedSrcPortKey::new(policy_id, proto, dst_port, src),
-    ))?;
-    Some(*value)
+    )) {
+        Some(value) => Some(*value),
+        None => None,
+    }
 }
 
 /// The DNAT target for an inbound `(policy, proto, dport)`, if a port-forward is
 /// configured for it. SAFETY as in [`lookup_port_rule`] — copied out at once.
+///
+/// The explicit `match ... Some(v) => Some(*v)` (instead of `.copied()`) forces
+/// the map value to be loaded out of `PORT_FORWARDS` into an owned `PortFwd`
+/// here, so the raw `Option<&PortFwd>` map-value pointer dies at this `match`.
+/// The caller (`try_velstra`) must then *immediately* collapse the returned
+/// `Option<PortFwd>` into plain scalars (`unwrap_or` + a `bool`) rather than
+/// carrying the `Option` across its long live range — see the note there. That
+/// combination stops LLVM, under the register pressure `try_velstra` carries
+/// after the added `MAC_FDB`/`LOCAL_MACS` map work, from keeping the pointer
+/// niche live and lowering the `Option<&PortFwd>` -> `Option<PortFwd>` niche
+/// transition to a bitwise-OR on the map-value pointer, which the kernel
+/// verifier rejects ("R1 bitwise operator |= on pointer prohibited"). This must
+/// stay `#[inline(always)]`: a separate BPF sub-program frame would push the
+/// combined bpf-to-bpf stack past the 512-byte `MAX_BPF_STACK` ceiling.
 #[inline(always)]
 fn lookup_port_forward(policy_id: PolicyId, proto: u8, dst_port: u16) -> Option<PortFwd> {
     let key = ScopedPortKey::new(policy_id, proto, dst_port);
-    (unsafe { PORT_FORWARDS.get(key) }).copied()
+    match unsafe { PORT_FORWARDS.get(key) } {
+        Some(v) => Some(*v),
+        None => None,
+    }
 }
 
 #[cfg(not(test))]
