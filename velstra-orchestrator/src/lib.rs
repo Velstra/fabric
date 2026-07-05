@@ -224,6 +224,9 @@ enum IpAllocOwner {
     Reserved,
     /// The subnet's gateway, auto-reserved when the subnet is added.
     Gateway,
+    /// Held by a floating IP (B6) — the floating IP's id. Keeps a floating
+    /// address out of the port-allocation pool while it exists.
+    Floating(String),
 }
 
 /// A workload's virtual NIC, attached to a [`Network`] and bound to a [`Host`].
@@ -324,6 +327,45 @@ impl SecurityGroup {
     }
 }
 
+/// A 1:1 association of a [`FloatingIp`] to a port's fixed address (roadmap B6).
+/// The datapath will DNAT inbound traffic destined to the floating address onto
+/// `fixed_addr` and SNAT the return path; that enforcement is **deferred** to the
+/// maintainer's eBPF work — this layer only models the mapping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FloatingAssociation {
+    /// The port whose fixed address the floating IP maps to.
+    pub port_id: String,
+    /// The port's fixed address the floating IP is bound to — validated to be one
+    /// the port actually holds (its [`Port::ip`] or an IPAM-bound [`PortAddr`]).
+    pub fixed_addr: IpAddr,
+}
+
+/// A first-class floating / secondary address (roadmap B6): an address allocated
+/// from a designated floating/external [`Subnet`] via the shared IPAM, with an
+/// optional 1:1 association to a port's fixed address. Held on the [`Topology`]
+/// keyed by [`id`](Self::id) and tagged with the floating subnet's
+/// [`vni`](Self::vni), mirroring how B5 security groups and D2 subnets live on
+/// the topology rather than being embedded in another object.
+///
+/// While allocated, the address is reserved in its subnet's IPAM under an
+/// [`IpAllocOwner::Floating`] owner, so it can never be handed to a port. When
+/// associated, the datapath DNAT/SNATs between the floating address and the
+/// port's fixed address — see [`FloatingAssociation`] (deferred to eBPF).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FloatingIp {
+    /// Stable, fabric-unique floating-IP id (`fip-{vni}-{addr}`).
+    pub id: String,
+    /// The floating subnet's network (VNI) — the tag this floating IP carries.
+    pub vni: u32,
+    /// The floating/external subnet the address was allocated from.
+    pub subnet_id: String,
+    /// The allocated floating address.
+    pub addr: IpAddr,
+    /// The current 1:1 association to a port's fixed address, or `None` when the
+    /// floating IP is allocated but unassociated.
+    pub association: Option<FloatingAssociation>,
+}
+
 /// The whole virtual fabric: networks, hosts, and the ports binding them.
 /// Holds no I/O — the controller owns persistence and distribution.
 #[derive(Debug, Default, Clone)]
@@ -340,6 +382,10 @@ pub struct Topology {
     /// record of which addresses are in use; the ordered [`BTreeMap`] makes
     /// "next free address" deterministic across replicas.
     ipam: HashMap<String, BTreeMap<u128, IpAllocOwner>>,
+    /// First-class floating / secondary IPs (B6), keyed by id. Each is tagged
+    /// with its floating subnet's VNI and holds an IPAM address under an
+    /// [`IpAllocOwner::Floating`] owner.
+    floating_ips: HashMap<String, FloatingIp>,
 }
 
 /// Derive a locally-administered, deterministic MAC for an inner IPv4: `02:00`
@@ -614,6 +660,13 @@ impl Topology {
             for allocs in self.ipam.values_mut() {
                 allocs.retain(|_, o| !matches!(o, IpAllocOwner::Port(p) if p == id));
             }
+            // Any floating IP associated to this port loses its association (the
+            // floating IP itself stays allocated, free to re-associate elsewhere).
+            for fip in self.floating_ips.values_mut() {
+                if fip.association.as_ref().is_some_and(|a| a.port_id == id) {
+                    fip.association = None;
+                }
+            }
         }
         removed
     }
@@ -822,6 +875,153 @@ impl Topology {
             (&a.subnet_id, ip_to_u128(a.addr)).cmp(&(&b.subnet_id, ip_to_u128(b.addr)))
         });
         out
+    }
+
+    // === B6: floating IPs ===================================================
+
+    /// Allocate a [`FloatingIp`] from a designated floating/external subnet via
+    /// IPAM — the lowest free address, or a specific `requested` one. The floating
+    /// IP starts unassociated. Deterministic and dup-free: the address is reserved
+    /// in the subnet's IPAM under an [`IpAllocOwner::Floating`] owner, so it can
+    /// never be handed to a port. Fails on an unknown subnet, an out-of-pool /
+    /// already-allocated request, or exhaustion.
+    pub fn allocate_floating_ip(
+        &mut self,
+        subnet_id: &str,
+        requested: Option<IpAddr>,
+    ) -> Result<FloatingIp> {
+        let vni = self
+            .subnets
+            .get(subnet_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown subnet {subnet_id:?}"))?
+            .vni;
+        // Reserve the address through the shared IPAM path (which enforces the
+        // pool / dup / exhaustion rules), then re-tag it as Floating-owned once the
+        // address — and hence the derived id — is known.
+        let addr = self.alloc_in(subnet_id, requested, IpAllocOwner::Reserved)?;
+        let id = format!("fip-{vni}-{addr}");
+        if self.floating_ips.contains_key(&id) {
+            // Undo the reservation so a failed allocate leaves no orphaned entry.
+            self.release(subnet_id, addr);
+            bail!("floating ip {id:?} already exists");
+        }
+        if let Some(allocs) = self.ipam.get_mut(subnet_id) {
+            allocs.insert(ip_to_u128(addr), IpAllocOwner::Floating(id.clone()));
+        }
+        let fip = FloatingIp {
+            id: id.clone(),
+            vni,
+            subnet_id: subnet_id.to_string(),
+            addr,
+            association: None,
+        };
+        self.floating_ips.insert(id, fip.clone());
+        Ok(fip)
+    }
+
+    /// Associate a floating IP to a port's fixed address (a 1:1 mapping). Fails on
+    /// an unknown floating IP or port, if the floating IP is already associated
+    /// (disassociate it first), if the port does not actually hold `fixed_addr`,
+    /// or if another floating IP already maps that fixed address.
+    pub fn associate_floating_ip(
+        &mut self,
+        fip_id: &str,
+        port_id: &str,
+        fixed_addr: IpAddr,
+    ) -> Result<FloatingIp> {
+        match self.floating_ips.get(fip_id) {
+            None => bail!("unknown floating ip {fip_id:?}"),
+            Some(f) if f.association.is_some() => {
+                bail!("floating ip {fip_id:?} is already associated; disassociate it first")
+            }
+            Some(_) => {}
+        }
+        if !self.port_holds_addr(port_id, fixed_addr) {
+            // Covers both an unknown port and a port that doesn't hold the address.
+            bail!("port {port_id:?} does not hold fixed address {fixed_addr}");
+        }
+        if let Some(other) = self.floating_ips.values().find(|f| {
+            f.id != fip_id
+                && f.association
+                    .as_ref()
+                    .is_some_and(|a| a.fixed_addr == fixed_addr)
+        }) {
+            bail!(
+                "fixed address {fixed_addr} is already mapped by floating ip {:?}",
+                other.id
+            );
+        }
+        let fip = self.floating_ips.get_mut(fip_id).unwrap();
+        fip.association = Some(FloatingAssociation {
+            port_id: port_id.to_string(),
+            fixed_addr,
+        });
+        Ok(fip.clone())
+    }
+
+    /// Clear a floating IP's association, leaving it allocated but unbound. Fails
+    /// only on an unknown floating IP; clearing an already-unassociated one is a
+    /// no-op. Returns the resulting [`FloatingIp`].
+    pub fn disassociate_floating_ip(&mut self, fip_id: &str) -> Result<FloatingIp> {
+        let fip = self
+            .floating_ips
+            .get_mut(fip_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown floating ip {fip_id:?}"))?;
+        fip.association = None;
+        Ok(fip.clone())
+    }
+
+    /// Release a floating IP, freeing its IPAM address back to the floating
+    /// subnet's pool. Blocked while it is still associated (disassociate first) —
+    /// mirroring how a bound security group blocks its own removal. Returns
+    /// whether the floating IP existed.
+    pub fn release_floating_ip(&mut self, fip_id: &str) -> Result<bool> {
+        let Some(fip) = self.floating_ips.get(fip_id) else {
+            return Ok(false);
+        };
+        if fip.association.is_some() {
+            bail!("floating ip {fip_id:?} is still associated; disassociate it first");
+        }
+        let subnet_id = fip.subnet_id.clone();
+        let addr = fip.addr;
+        self.floating_ips.remove(fip_id);
+        self.release(&subnet_id, addr);
+        Ok(true)
+    }
+
+    /// All floating IPs, in no particular order.
+    pub fn floating_ips(&self) -> impl Iterator<Item = &FloatingIp> {
+        self.floating_ips.values()
+    }
+
+    /// Look up a floating IP by id.
+    pub fn floating_ip(&self, id: &str) -> Option<&FloatingIp> {
+        self.floating_ips.get(id)
+    }
+
+    /// Every floating IP currently associated to a port, sorted by id for a
+    /// deterministic order.
+    pub fn port_floating_ips(&self, port_id: &str) -> Vec<&FloatingIp> {
+        let mut out: Vec<&FloatingIp> = self
+            .floating_ips
+            .values()
+            .filter(|f| f.association.as_ref().is_some_and(|a| a.port_id == port_id))
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
+    }
+
+    /// Whether a port holds `addr` as a fixed address — either its legacy inner
+    /// IPv4 ([`Port::ip`]) or an IPAM-bound [`PortAddr`]. Returns `false` for an
+    /// unknown port.
+    fn port_holds_addr(&self, port_id: &str, addr: IpAddr) -> bool {
+        let Some(port) = self.ports.iter().find(|p| p.id == port_id) else {
+            return false;
+        };
+        if IpAddr::V4(port.ip) == addr {
+            return true;
+        }
+        self.port_addrs(port_id).iter().any(|pa| pa.addr == addr)
     }
 
     /// Core IPAM allocation, shared by [`allocate`](Self::allocate) and
@@ -1050,6 +1250,10 @@ pub struct FabricSnapshot {
     /// pre-D2 snapshots.
     #[serde(default)]
     pub ip_allocations: Vec<IpAllocRec>,
+    /// All floating IPs (B6). `#[serde(default)]` so pre-B6 snapshots restore
+    /// with no floating IPs.
+    #[serde(default)]
+    pub floating_ips: Vec<FloatingIpRec>,
 }
 
 /// Serializable mirror of a [`Host`].
@@ -1111,6 +1315,7 @@ pub enum IpAllocOwnerRec {
     Port(String),
     Reserved,
     Gateway,
+    Floating(String),
 }
 
 /// Serializable mirror of one IPAM allocation (D2): the subnet, the allocated
@@ -1121,6 +1326,28 @@ pub struct IpAllocRec {
     pub is_v6: bool,
     pub addr: [u8; 16],
     pub owner: IpAllocOwnerRec,
+}
+
+/// Serializable mirror of a [`FloatingIp`] (B6). The floating address and any
+/// associated fixed address are stored as an `is_v6` flag plus 16-byte encodings
+/// (a v4 address in the first four bytes), matching the byte-oriented style of
+/// [`SubnetRec`] / [`IpAllocRec`] so the record — and the association that must
+/// survive a Raft failover — round-trips losslessly and infallibly. The fixed
+/// address carries its own family flag, since it may differ from the floating
+/// address's family.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FloatingIpRec {
+    pub id: String,
+    pub vni: u32,
+    pub subnet_id: String,
+    pub is_v6: bool,
+    pub addr: [u8; 16],
+    /// The associated port id, or `None` when unassociated.
+    pub assoc_port: Option<String>,
+    /// The associated fixed address (present iff `assoc_port` is).
+    pub assoc_fixed: Option<[u8; 16]>,
+    /// The family of `assoc_fixed`.
+    pub assoc_fixed_is_v6: bool,
 }
 
 /// Serializable mirror of a [`Port`].
@@ -1231,8 +1458,33 @@ impl Topology {
                             IpAllocOwner::Port(p) => IpAllocOwnerRec::Port(p.clone()),
                             IpAllocOwner::Reserved => IpAllocOwnerRec::Reserved,
                             IpAllocOwner::Gateway => IpAllocOwnerRec::Gateway,
+                            IpAllocOwner::Floating(f) => IpAllocOwnerRec::Floating(f.clone()),
                         },
                     })
+                })
+                .collect(),
+            floating_ips: self
+                .floating_ips
+                .values()
+                .map(|f| {
+                    let (assoc_port, assoc_fixed, assoc_fixed_is_v6) = match &f.association {
+                        Some(a) => (
+                            Some(a.port_id.clone()),
+                            Some(ip_to_bytes16(a.fixed_addr)),
+                            a.fixed_addr.is_ipv6(),
+                        ),
+                        None => (None, None, false),
+                    };
+                    FloatingIpRec {
+                        id: f.id.clone(),
+                        vni: f.vni,
+                        subnet_id: f.subnet_id.clone(),
+                        is_v6: f.addr.is_ipv6(),
+                        addr: ip_to_bytes16(f.addr),
+                        assoc_port,
+                        assoc_fixed,
+                        assoc_fixed_is_v6,
+                    }
                 })
                 .collect(),
         }
@@ -1336,11 +1588,34 @@ impl Topology {
                 IpAllocOwnerRec::Port(p) => IpAllocOwner::Port(p.clone()),
                 IpAllocOwnerRec::Reserved => IpAllocOwner::Reserved,
                 IpAllocOwnerRec::Gateway => IpAllocOwner::Gateway,
+                IpAllocOwnerRec::Floating(f) => IpAllocOwner::Floating(f.clone()),
             };
             t.ipam
                 .entry(a.subnet_id.clone())
                 .or_default()
                 .insert(key, owner);
+        }
+        // Floating IPs (B6) are restored verbatim — their address is already in
+        // the IPAM set above under a Floating owner, and the association is
+        // reconstructed from the record so it survives a failover.
+        for f in &snap.floating_ips {
+            let association = match (&f.assoc_port, f.assoc_fixed) {
+                (Some(port_id), Some(fixed)) => Some(FloatingAssociation {
+                    port_id: port_id.clone(),
+                    fixed_addr: bytes16_to_ip(fixed, f.assoc_fixed_is_v6),
+                }),
+                _ => None,
+            };
+            t.floating_ips.insert(
+                f.id.clone(),
+                FloatingIp {
+                    id: f.id.clone(),
+                    vni: f.vni,
+                    subnet_id: f.subnet_id.clone(),
+                    addr: bytes16_to_ip(f.addr, f.is_v6),
+                    association,
+                },
+            );
         }
         t
     }
@@ -2166,5 +2441,268 @@ mod tests {
             restored.clone().allocate("s4", None).unwrap(),
             ip("192.168.50.11")
         );
+    }
+
+    // === B6: floating IPs ===================================================
+
+    #[test]
+    fn floating_ip_allocation_is_ipam_backed_deterministic_and_exhaustible() {
+        let mut t = Topology::new();
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+        // A /29 external subnet with a gateway at .1 → usable pool .1..=.6 minus
+        // the gateway = five free addresses (.2..=.6).
+        let mut ext = v4_subnet("ext", 100, "203.0.113.0/29");
+        ext.gateway = Some(ip("203.0.113.1"));
+        t.add_subnet(ext).unwrap();
+
+        // Lowest free address first (.2; the gateway .1 is reserved), tagged with
+        // the floating subnet's vni and its derived id.
+        let f1 = t.allocate_floating_ip("ext", None).unwrap();
+        assert_eq!(f1.addr, ip("203.0.113.2"));
+        assert_eq!(f1.vni, 100);
+        assert_eq!(f1.subnet_id, "ext");
+        assert_eq!(f1.id, "fip-100-203.0.113.2");
+        assert!(f1.association.is_none());
+
+        // A specific request is honoured, then excluded from future hand-outs.
+        let f2 = t
+            .allocate_floating_ip("ext", Some(ip("203.0.113.5")))
+            .unwrap();
+        assert_eq!(f2.addr, ip("203.0.113.5"));
+        let f3 = t.allocate_floating_ip("ext", None).unwrap();
+        assert_eq!(f3.addr, ip("203.0.113.3")); // skips the taken .2 and .5
+
+        // The floating address is reserved in IPAM — a port can't be handed it,
+        // and re-requesting it as a floating IP fails.
+        assert!(t.allocate("ext", Some(ip("203.0.113.2"))).is_err());
+        assert!(
+            t.allocate_floating_ip("ext", Some(ip("203.0.113.5")))
+                .is_err()
+        );
+        // An unknown subnet is an error.
+        assert!(t.allocate_floating_ip("ghost", None).is_err());
+
+        // Drain the rest of the pool (.4, .6) then exhaust.
+        t.allocate_floating_ip("ext", None).unwrap(); // .4
+        t.allocate_floating_ip("ext", None).unwrap(); // .6
+        assert!(t.allocate_floating_ip("ext", None).is_err()); // exhausted
+
+        // Lookups.
+        assert!(t.floating_ip(&f1.id).is_some());
+        assert!(t.floating_ip("fip-100-203.0.113.99").is_none());
+        assert_eq!(t.floating_ips().count(), 5);
+    }
+
+    #[test]
+    fn associate_and_disassociate_validate_and_map_one_to_one() {
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+        let mut ext = v4_subnet("ext", 100, "203.0.113.0/29");
+        ext.gateway = Some(ip("203.0.113.1"));
+        t.add_subnet(ext).unwrap();
+
+        // A port holding the legacy fixed IP .10.
+        let p = t
+            .create_port(
+                100,
+                "h1",
+                "tap0",
+                Some("192.168.50.10".parse().unwrap()),
+                None,
+            )
+            .unwrap();
+        let f = t.allocate_floating_ip("ext", None).unwrap(); // .2
+
+        // Associating to an address the port does not hold fails; so do an unknown
+        // floating IP and an unknown port.
+        assert!(
+            t.associate_floating_ip(&f.id, &p.id, ip("192.168.50.99"))
+                .is_err()
+        );
+        assert!(
+            t.associate_floating_ip("nope", &p.id, ip("192.168.50.10"))
+                .is_err()
+        );
+        assert!(
+            t.associate_floating_ip(&f.id, "ghost", ip("192.168.50.10"))
+                .is_err()
+        );
+
+        // Associate to the port's fixed address (1:1).
+        let assoc = t
+            .associate_floating_ip(&f.id, &p.id, ip("192.168.50.10"))
+            .unwrap();
+        let a = assoc.association.unwrap();
+        assert_eq!(a.port_id, p.id);
+        assert_eq!(a.fixed_addr, ip("192.168.50.10"));
+
+        // Re-associating an already-associated floating IP fails (must clear it).
+        assert!(
+            t.associate_floating_ip(&f.id, &p.id, ip("192.168.50.10"))
+                .is_err()
+        );
+        // A second floating IP can't map the same fixed address (1:1).
+        let f2 = t.allocate_floating_ip("ext", None).unwrap();
+        assert!(
+            t.associate_floating_ip(&f2.id, &p.id, ip("192.168.50.10"))
+                .is_err()
+        );
+
+        // port_floating_ips reflects the mapping.
+        let mapped = t.port_floating_ips(&p.id);
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].id, f.id);
+
+        // Disassociate → the mapping clears; the floating IP stays allocated.
+        let cleared = t.disassociate_floating_ip(&f.id).unwrap();
+        assert!(cleared.association.is_none());
+        assert!(t.port_floating_ips(&p.id).is_empty());
+        assert!(t.floating_ip(&f.id).is_some());
+        // Disassociating an unknown floating IP errors; a repeat is a no-op.
+        assert!(t.disassociate_floating_ip("nope").is_err());
+        assert!(t.disassociate_floating_ip(&f.id).is_ok());
+    }
+
+    #[test]
+    fn floating_ip_maps_an_ipam_bound_fixed_address() {
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+        t.add_subnet(v4_subnet("tenant", 100, "192.168.50.0/24"))
+            .unwrap();
+        t.add_subnet(v4_subnet("ext", 100, "203.0.113.0/29"))
+            .unwrap();
+
+        let p = t.create_port(100, "h1", "tap0", None, None).unwrap();
+        let bound = t.bind_port_subnet(&p.id, "tenant", None).unwrap(); // .1
+        let f = t.allocate_floating_ip("ext", None).unwrap();
+
+        // A floating IP can map an IPAM-bound fixed address the port holds (not
+        // just the legacy Port::ip).
+        let assoc = t.associate_floating_ip(&f.id, &p.id, bound.addr).unwrap();
+        assert_eq!(assoc.association.unwrap().fixed_addr, bound.addr);
+    }
+
+    #[test]
+    fn release_floating_ip_blocked_while_associated_then_frees_ipam() {
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+        t.add_subnet(v4_subnet("ext", 100, "203.0.113.0/29"))
+            .unwrap();
+        let p = t
+            .create_port(
+                100,
+                "h1",
+                "tap0",
+                Some("192.168.50.10".parse().unwrap()),
+                None,
+            )
+            .unwrap();
+        let f = t.allocate_floating_ip("ext", None).unwrap(); // .1
+        t.associate_floating_ip(&f.id, &p.id, ip("192.168.50.10"))
+            .unwrap();
+
+        // Associated → release refused.
+        assert!(t.release_floating_ip(&f.id).is_err());
+        // Disassociate, then release frees the IPAM address for re-allocation.
+        t.disassociate_floating_ip(&f.id).unwrap();
+        assert!(t.release_floating_ip(&f.id).unwrap());
+        assert!(t.floating_ip(&f.id).is_none());
+        assert_eq!(t.allocate("ext", Some(f.addr)).unwrap(), f.addr);
+        // Releasing a non-existent floating IP reports "did not exist".
+        assert!(!t.release_floating_ip("nope").unwrap());
+    }
+
+    #[test]
+    fn remove_port_disassociates_its_floating_ips() {
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+        t.add_subnet(v4_subnet("ext", 100, "203.0.113.0/29"))
+            .unwrap();
+        let p = t
+            .create_port(
+                100,
+                "h1",
+                "tap0",
+                Some("192.168.50.10".parse().unwrap()),
+                None,
+            )
+            .unwrap();
+        let f = t.allocate_floating_ip("ext", None).unwrap();
+        t.associate_floating_ip(&f.id, &p.id, ip("192.168.50.10"))
+            .unwrap();
+        assert_eq!(t.port_floating_ips(&p.id).len(), 1);
+
+        // Removing the port clears the association but leaves the floating IP
+        // allocated (so it can be re-associated to another port).
+        assert!(t.remove_port(&p.id));
+        assert!(t.floating_ip(&f.id).unwrap().association.is_none());
+        assert!(t.port_floating_ips(&p.id).is_empty());
+        // The now-free floating IP can be released.
+        assert!(t.release_floating_ip(&f.id).unwrap());
+    }
+
+    #[test]
+    fn floating_ips_survive_a_snapshot_roundtrip() {
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+        t.add_subnet(v4_subnet("ext", 100, "203.0.113.0/29"))
+            .unwrap();
+        let p = t
+            .create_port(
+                100,
+                "h1",
+                "tap0",
+                Some("192.168.50.10".parse().unwrap()),
+                None,
+            )
+            .unwrap();
+        // One associated floating IP and one free-standing one.
+        let f_assoc = t.allocate_floating_ip("ext", None).unwrap(); // .1
+        t.associate_floating_ip(&f_assoc.id, &p.id, ip("192.168.50.10"))
+            .unwrap();
+        let f_free = t.allocate_floating_ip("ext", None).unwrap(); // .2
+
+        let restored = Topology::from_snapshot(&t.to_snapshot());
+
+        // Both floating IPs came back verbatim, association included.
+        assert_eq!(
+            restored.floating_ip(&f_assoc.id),
+            t.floating_ip(&f_assoc.id)
+        );
+        let ra = restored.floating_ip(&f_assoc.id).unwrap();
+        assert_eq!(ra.vni, 100);
+        let a = ra.association.as_ref().unwrap();
+        assert_eq!(a.port_id, p.id);
+        assert_eq!(a.fixed_addr, ip("192.168.50.10"));
+        assert!(
+            restored
+                .floating_ip(&f_free.id)
+                .unwrap()
+                .association
+                .is_none()
+        );
+
+        // The used-address set is preserved: neither floating address can be
+        // re-handed-out after the failover.
+        assert!(
+            restored
+                .clone()
+                .allocate("ext", Some(f_assoc.addr))
+                .is_err()
+        );
+        assert!(restored.clone().allocate("ext", Some(f_free.addr)).is_err());
+        // And port_floating_ips still resolves the association post-restore.
+        assert_eq!(restored.port_floating_ips(&p.id).len(), 1);
     }
 }
