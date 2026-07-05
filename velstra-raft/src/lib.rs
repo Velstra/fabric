@@ -27,7 +27,8 @@ pub mod store;
 use network::NetworkFactory;
 pub use network::{RaftServiceServer, service};
 pub use store::{
-    HostSpec, NetworkSpec, NodeId, PortRecord, TopoRequest, TopoResponse, TypeConfig, apply,
+    HostSpec, NetworkSpec, NodeId, PortRecord, SecurityGroupSpec, TopoRequest, TopoResponse,
+    TypeConfig, apply,
 };
 use store::{LogStore, StateMachineStore};
 
@@ -294,6 +295,50 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             assert!(ok, "node {} never received the replicated port", node.id);
+        }
+
+        // B5: register a security group on the leader and bind the port to it.
+        let port_id = port.port.expect("create returns a port").id;
+        assert!(
+            leader
+                .propose(TopoRequest::AddSecurityGroup(SecurityGroupSpec {
+                    name: "web".into(),
+                    default_action: ActionName::Drop,
+                    drop_icmp: false,
+                    stateful: true,
+                    blocklist: vec![],
+                    rules: vec![],
+                }))
+                .await
+                .unwrap()
+                .ok
+        );
+        assert!(
+            leader
+                .propose(TopoRequest::SetPortSecurityGroup {
+                    port_id: port_id.clone(),
+                    group: Some("web".into()),
+                })
+                .await
+                .unwrap()
+                .ok
+        );
+        let pid = velstra_orchestrator::security_group_policy_id("web");
+
+        // The group and the port's binding must replicate to every member.
+        for node in &nodes {
+            let mut ok = false;
+            for _ in 0..50 {
+                let topo = node.topology().await;
+                let has_group = topo.security_group("web").is_some();
+                let bound = topo.ports().first().map(|p| p.policy) == Some(Some(pid));
+                if has_group && bound {
+                    ok = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(ok, "node {} never received the replicated security group", node.id);
         }
     }
 

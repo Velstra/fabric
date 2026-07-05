@@ -26,8 +26,8 @@ use openraft::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, watch};
 use velstra_common::{parse_cidr_v4, parse_mac};
-use velstra_config::{ActionName, EncapName};
-use velstra_orchestrator::{Host, Network, Topology};
+use velstra_config::{ActionName, EncapName, PortRule};
+use velstra_orchestrator::{Host, Network, SecurityGroup, Topology};
 
 pub type NodeId = u64;
 
@@ -66,6 +66,19 @@ pub struct NetworkSpec {
     pub drop_icmp: bool,
 }
 
+/// A serializable security-group description carried in
+/// [`TopoRequest::AddSecurityGroup`] (B5). Mirrors [`NetworkSpec`]: a plain,
+/// wire-friendly form validated when applied to the topology (on every replica).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityGroupSpec {
+    pub name: String,
+    pub default_action: ActionName,
+    pub drop_icmp: bool,
+    pub stateful: bool,
+    pub blocklist: Vec<String>,
+    pub rules: Vec<PortRule>,
+}
+
 /// A fabric mutation — the unit of replication. Every committed request is
 /// applied, in log order, to every replica's [`Topology`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +107,17 @@ pub enum TopoRequest {
     },
     RemoveNetwork {
         vni: u32,
+    },
+    /// Register a named security group (B5).
+    AddSecurityGroup(SecurityGroupSpec),
+    /// Remove a security group by name (fails while any port binds it).
+    RemoveSecurityGroup {
+        name: String,
+    },
+    /// Bind a port to a security group by name, or clear it (`group = None`).
+    SetPortSecurityGroup {
+        port_id: String,
+        group: Option<String>,
     },
 }
 
@@ -164,6 +188,17 @@ fn network_from_spec(s: &NetworkSpec) -> Result<Network> {
     })
 }
 
+fn sg_from_spec(s: &SecurityGroupSpec) -> SecurityGroup {
+    SecurityGroup {
+        name: s.name.clone(),
+        default_action: s.default_action,
+        drop_icmp: s.drop_icmp,
+        stateful: s.stateful,
+        blocklist: s.blocklist.clone(),
+        rules: s.rules.clone(),
+    }
+}
+
 /// Apply one request to the fabric, producing its response. Pure given the
 /// current `topo`, so it is deterministic across replicas. Exposed so the
 /// controller can run the *same* mutation logic in its non-Raft single-node mode.
@@ -212,6 +247,25 @@ pub fn apply(topo: &mut Topology, req: &TopoRequest) -> TopoResponse {
         }
         TopoRequest::MigratePort { id, host, tap } => {
             let p = topo.migrate_port(id, host, tap)?;
+            Ok(Some(PortRecord {
+                id: p.id,
+                vni: p.vni,
+                host: p.host,
+                ip: p.ip.to_string(),
+                mac: fmt_mac(p.mac),
+                tap: p.tap,
+            }))
+        }
+        TopoRequest::AddSecurityGroup(s) => {
+            topo.add_security_group(sg_from_spec(s))?;
+            Ok(None)
+        }
+        TopoRequest::RemoveSecurityGroup { name } => {
+            topo.remove_security_group(name)?;
+            Ok(None)
+        }
+        TopoRequest::SetPortSecurityGroup { port_id, group } => {
+            let p = topo.set_port_security_group(port_id, group.as_deref())?;
             Ok(Some(PortRecord {
                 id: p.id,
                 vni: p.vni,
@@ -693,5 +747,107 @@ mod tests {
             )
             .ok
         );
+    }
+
+    #[test]
+    fn apply_security_group_add_bind_and_remove_roundtrip() {
+        use velstra_config::ProtoName;
+
+        let mut t = Topology::new();
+        assert!(apply(&mut t, &TopoRequest::AddHost(host_spec("h1", "10.0.0.1"))).ok);
+        assert!(
+            apply(
+                &mut t,
+                &TopoRequest::AddNetwork(NetworkSpec {
+                    vni: 5000,
+                    name: "blue".into(),
+                    subnet: "192.168.100.0/24".into(),
+                    default_action: ActionName::Pass,
+                    drop_icmp: false,
+                })
+            )
+            .ok
+        );
+        let port = apply(
+            &mut t,
+            &TopoRequest::CreatePort {
+                vni: 5000,
+                host: "h1".into(),
+                tap: "tapA".into(),
+                ip: None,
+                policy: None,
+            },
+        )
+        .port
+        .expect("create returns a port");
+
+        // Add a "web" group (default-drop, allow tcp/80).
+        assert!(
+            apply(
+                &mut t,
+                &TopoRequest::AddSecurityGroup(SecurityGroupSpec {
+                    name: "web".into(),
+                    default_action: ActionName::Drop,
+                    drop_icmp: false,
+                    stateful: true,
+                    blocklist: vec![],
+                    rules: vec![PortRule {
+                        proto: ProtoName::Tcp,
+                        port: 80,
+                        action: ActionName::Pass,
+                        log: false,
+                        src: None,
+                    }],
+                })
+            )
+            .ok
+        );
+        // A duplicate name is a failed response, not a panic.
+        assert!(
+            !apply(
+                &mut t,
+                &TopoRequest::AddSecurityGroup(SecurityGroupSpec {
+                    name: "web".into(),
+                    default_action: ActionName::Drop,
+                    drop_icmp: false,
+                    stateful: false,
+                    blocklist: vec![],
+                    rules: vec![],
+                })
+            )
+            .ok
+        );
+
+        // Bind the port → its policy becomes the group's deterministic id, and
+        // the derived config for h1 resolves with the group's rules.
+        let bound = apply(
+            &mut t,
+            &TopoRequest::SetPortSecurityGroup {
+                port_id: port.id.clone(),
+                group: Some("web".into()),
+            },
+        );
+        assert!(bound.ok, "bind failed: {:?}", bound.error);
+        let pid = velstra_orchestrator::security_group_policy_id("web");
+        let rt = t.derive("h1").unwrap().resolve().expect("derived config resolves");
+        assert!(rt.policies.iter().any(|p| p.id == pid));
+        assert_eq!(
+            rt.interfaces.iter().find(|i| i.name == "tapA").unwrap().policy,
+            pid
+        );
+
+        // Removing a bound group fails; clearing the binding then allows removal.
+        assert!(!apply(&mut t, &TopoRequest::RemoveSecurityGroup { name: "web".into() }).ok);
+        assert!(
+            apply(
+                &mut t,
+                &TopoRequest::SetPortSecurityGroup {
+                    port_id: port.id,
+                    group: None,
+                },
+            )
+            .ok
+        );
+        assert!(apply(&mut t, &TopoRequest::RemoveSecurityGroup { name: "web".into() }).ok);
     }
 }

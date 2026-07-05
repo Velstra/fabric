@@ -45,12 +45,16 @@ use tonic::{
         Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Server, ServerTlsConfig,
     },
 };
-use velstra_config::{ActionName, EncapName, FileConfig, file_config_to_proto};
+use velstra_config::{
+    ActionName, EncapName, FileConfig, PortRule as ConfigPortRule, ProtoName, file_config_to_proto,
+};
 use velstra_orchestrator::Topology;
 use velstra_proto::{
-    Ack, Action, CreatePortRequest, Encap, HostSpec, ListNodesRequest, ListNodesResponse,
-    ListPortsRequest, ListPortsResponse, MigratePortRequest, NetworkSpec, NodeConfig, NodeRequest,
-    NodeSummary, PortInfo, RemoveHostRequest, RemoveNetworkRequest, RemovePortRequest,
+    Ack, Action, BindPortSecurityGroupRequest, CreatePortRequest, Encap, HostSpec,
+    ListNodesRequest, ListNodesResponse, ListPortsRequest, ListPortsResponse, ListSecurityGroupsRequest,
+    ListSecurityGroupsResponse, MigratePortRequest, NetworkSpec, NodeConfig, NodeRequest,
+    NodeSummary, PortInfo, PortRule, Proto, RemoveHostRequest, RemoveNetworkRequest,
+    RemovePortRequest, RemoveSecurityGroupRequest, SecurityGroupInfo, SecurityGroupSpec,
     SetConfigRequest, StatsReport,
     velstra_admin_client::VelstraAdminClient,
     velstra_admin_server::{VelstraAdmin, VelstraAdminServer},
@@ -277,6 +281,45 @@ enum OrchAction {
     },
     /// List all ports in the fabric.
     ListPorts,
+    /// Register a named security group (B5). Rules are given as repeated
+    /// `--allow proto:port` / `--deny proto:port` (e.g. `--allow tcp:80`).
+    AddSecurityGroup {
+        #[arg(long)]
+        name: String,
+        /// Default action for unmatched traffic: `pass` (default) or `drop`.
+        #[arg(long, default_value = "pass")]
+        default_action: String,
+        #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
+        drop_icmp: bool,
+        #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
+        stateful: bool,
+        /// Allow a `proto:port` (e.g. `tcp:80`), repeatable.
+        #[arg(long = "allow")]
+        allow: Vec<String>,
+        /// Deny a `proto:port` (e.g. `tcp:22`), repeatable.
+        #[arg(long = "deny")]
+        deny: Vec<String>,
+        /// Source CIDR to blocklist, repeatable.
+        #[arg(long = "block")]
+        block: Vec<String>,
+    },
+    /// Remove a security group by name.
+    RemoveSecurityGroup {
+        #[arg(long)]
+        name: String,
+    },
+    /// List all security groups in the fabric.
+    ListSecurityGroups,
+    /// Bind a port to a security group (`--group`), or clear it (`--clear`).
+    BindPort {
+        #[arg(long)]
+        port: String,
+        #[arg(long)]
+        group: Option<String>,
+        /// Clear the binding (revert to the VNI default); overrides `--group`.
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -699,6 +742,84 @@ fn raft_network_spec(s: NetworkSpec) -> velstra_raft::NetworkSpec {
     }
 }
 
+fn action_from_proto(a: Action) -> ActionName {
+    match a {
+        Action::Drop => ActionName::Drop,
+        Action::Pass => ActionName::Pass,
+    }
+}
+
+// The proto Action enum has no Reject variant, so a config Reject narrows to
+// Drop on the wire — mirroring `velstra_config::proto_convert`.
+fn action_to_proto(a: ActionName) -> Action {
+    match a {
+        ActionName::Pass => Action::Pass,
+        ActionName::Drop | ActionName::Reject => Action::Drop,
+    }
+}
+
+fn proto_from_proto(p: Proto) -> ProtoName {
+    match p {
+        Proto::Tcp => ProtoName::Tcp,
+        Proto::Udp => ProtoName::Udp,
+        Proto::Icmp => ProtoName::Icmp,
+    }
+}
+
+fn proto_to_proto(p: ProtoName) -> Proto {
+    match p {
+        ProtoName::Tcp => Proto::Tcp,
+        ProtoName::Udp => Proto::Udp,
+        ProtoName::Icmp => Proto::Icmp,
+    }
+}
+
+fn config_rule_from_proto(r: &PortRule) -> ConfigPortRule {
+    ConfigPortRule {
+        proto: proto_from_proto(r.proto()),
+        port: r.port as u16,
+        action: action_from_proto(r.action()),
+        log: r.log,
+        src: (!r.src.is_empty()).then(|| r.src.clone()),
+    }
+}
+
+fn proto_rule_from_config(r: &ConfigPortRule) -> PortRule {
+    PortRule {
+        proto: proto_to_proto(r.proto) as i32,
+        port: r.port as u32,
+        action: action_to_proto(r.action) as i32,
+        log: r.log,
+        src: r.src.clone().unwrap_or_default(),
+    }
+}
+
+// Convert a gRPC security-group spec into the replicated raft form (validation
+// happens when applied to the topology, on every replica). Mirrors
+// `raft_network_spec`.
+fn raft_security_group_spec(s: SecurityGroupSpec) -> velstra_raft::SecurityGroupSpec {
+    velstra_raft::SecurityGroupSpec {
+        name: s.name.clone(),
+        default_action: action_from_proto(s.default_action()),
+        drop_icmp: s.drop_icmp,
+        stateful: s.stateful,
+        blocklist: s.blocklist.clone(),
+        rules: s.rules.iter().map(config_rule_from_proto).collect(),
+    }
+}
+
+fn sg_to_info(g: &velstra_orchestrator::SecurityGroup) -> SecurityGroupInfo {
+    SecurityGroupInfo {
+        name: g.name.clone(),
+        policy_id: g.policy_id(),
+        default_action: action_to_proto(g.default_action) as i32,
+        drop_icmp: g.drop_icmp,
+        stateful: g.stateful,
+        blocklist: g.blocklist.clone(),
+        rules: g.rules.iter().map(proto_rule_from_config).collect(),
+    }
+}
+
 fn port_record_to_info(p: velstra_raft::PortRecord) -> PortInfo {
     PortInfo {
         id: p.id,
@@ -930,6 +1051,100 @@ impl VelstraOrchestrator for OrchestratorSvc {
             return Err(Status::failed_precondition(resp.error.unwrap_or_default()));
         }
         Ok(Response::new(Ack { ok: true }))
+    }
+
+    async fn add_security_group(
+        &self,
+        request: Request<SecurityGroupSpec>,
+    ) -> Result<Response<Ack>, Status> {
+        let caller = caller_of(&request);
+        if !self.authz.allow_admin(&caller) {
+            return Err(deny("define security groups (admin only)"));
+        }
+        let spec = request.into_inner();
+        info!("AddSecurityGroup({:?})", spec.name);
+        let resp = propose(
+            &self.shared,
+            velstra_raft::TopoRequest::AddSecurityGroup(raft_security_group_spec(spec)),
+        )
+        .await?;
+        if !resp.ok {
+            return Err(Status::invalid_argument(resp.error.unwrap_or_default()));
+        }
+        Ok(Response::new(Ack { ok: true }))
+    }
+
+    async fn remove_security_group(
+        &self,
+        request: Request<RemoveSecurityGroupRequest>,
+    ) -> Result<Response<Ack>, Status> {
+        let caller = caller_of(&request);
+        if !self.authz.allow_admin(&caller) {
+            return Err(deny("remove security groups (admin only)"));
+        }
+        let name = request.into_inner().name;
+        info!("RemoveSecurityGroup({name:?})");
+        let resp = propose(
+            &self.shared,
+            velstra_raft::TopoRequest::RemoveSecurityGroup { name },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(Status::failed_precondition(resp.error.unwrap_or_default()));
+        }
+        Ok(Response::new(Ack { ok: true }))
+    }
+
+    async fn bind_port_security_group(
+        &self,
+        request: Request<BindPortSecurityGroupRequest>,
+    ) -> Result<Response<PortInfo>, Status> {
+        let caller = caller_of(&request);
+        // A port id doesn't name its owning host here, so binding is admin-only
+        // (same rationale as RemovePort).
+        if !self.authz.allow_admin(&caller) {
+            return Err(deny("bind ports to security groups (admin only)"));
+        }
+        let req = request.into_inner();
+        info!("BindPortSecurityGroup({:?} -> {:?})", req.port_id, req.group);
+        let resp = propose(
+            &self.shared,
+            velstra_raft::TopoRequest::SetPortSecurityGroup {
+                port_id: req.port_id,
+                group: req.group,
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(Status::invalid_argument(resp.error.unwrap_or_default()));
+        }
+        let port = resp
+            .port
+            .ok_or_else(|| Status::internal("bind_port_security_group returned no port"))?;
+        Ok(Response::new(port_record_to_info(port)))
+    }
+
+    async fn list_security_groups(
+        &self,
+        _request: Request<ListSecurityGroupsRequest>,
+    ) -> Result<Response<ListSecurityGroupsResponse>, Status> {
+        // Read from the Raft state machine in cluster mode, else the local model.
+        let groups = if let Some(raft) = &self.shared.raft {
+            raft.topology()
+                .await
+                .security_groups()
+                .map(sg_to_info)
+                .collect()
+        } else {
+            self.shared
+                .topology
+                .read()
+                .await
+                .security_groups()
+                .map(sg_to_info)
+                .collect()
+        };
+        Ok(Response::new(ListSecurityGroupsResponse { groups }))
     }
 }
 
@@ -1409,6 +1624,97 @@ async fn orch(args: OrchArgs) -> Result<()> {
                 );
             }
         }
+        OrchAction::AddSecurityGroup {
+            name,
+            default_action,
+            drop_icmp,
+            stateful,
+            allow,
+            deny,
+            block,
+        } => {
+            let default_action = match default_action.as_str() {
+                "pass" => Action::Pass,
+                "drop" => Action::Drop,
+                other => bail!("unknown default_action {other:?} (use pass or drop)"),
+            };
+            let mut rules = Vec::new();
+            for spec in &allow {
+                rules.push(parse_cli_rule(spec, Action::Pass)?);
+            }
+            for spec in &deny {
+                rules.push(parse_cli_rule(spec, Action::Drop)?);
+            }
+            client
+                .add_security_group(SecurityGroupSpec {
+                    name: name.clone(),
+                    default_action: default_action as i32,
+                    drop_icmp,
+                    stateful,
+                    blocklist: block,
+                    rules,
+                })
+                .await?;
+            println!("added security group {name:?}");
+        }
+        OrchAction::RemoveSecurityGroup { name } => {
+            let ack = client
+                .remove_security_group(RemoveSecurityGroupRequest { name: name.clone() })
+                .await?
+                .into_inner();
+            println!(
+                "{} security group {name:?}",
+                if ack.ok { "removed" } else { "no such" }
+            );
+        }
+        OrchAction::ListSecurityGroups => {
+            let resp = client
+                .list_security_groups(ListSecurityGroupsRequest {})
+                .await?
+                .into_inner();
+            println!("{:<24} {:>12}  rules", "name", "policy_id");
+            for g in resp.groups {
+                println!("{:<24} {:>12}  {}", g.name, g.policy_id, g.rules.len());
+            }
+        }
+        OrchAction::BindPort { port, group, clear } => {
+            let group = if clear { None } else { group };
+            let info = client
+                .bind_port_security_group(BindPortSecurityGroupRequest {
+                    port_id: port.clone(),
+                    group: group.clone(),
+                })
+                .await?
+                .into_inner();
+            match group {
+                Some(g) => println!("bound port {:?} to security group {g:?}", info.id),
+                None => println!("cleared security group on port {:?}", info.id),
+            }
+        }
     }
     Ok(())
+}
+
+/// Parse a CLI rule spec `proto:port` (e.g. `tcp:80`) into a proto [`PortRule`]
+/// with the given action.
+fn parse_cli_rule(spec: &str, action: Action) -> Result<PortRule> {
+    let (proto, port) = spec
+        .split_once(':')
+        .ok_or_else(|| anyhow!("rule {spec:?} must be proto:port (e.g. tcp:80)"))?;
+    let proto = match proto {
+        "tcp" => Proto::Tcp,
+        "udp" => Proto::Udp,
+        "icmp" => Proto::Icmp,
+        other => bail!("unknown proto {other:?} in rule {spec:?} (use tcp/udp/icmp)"),
+    };
+    let port: u16 = port
+        .parse()
+        .with_context(|| format!("bad port in rule {spec:?}"))?;
+    Ok(PortRule {
+        proto: proto as i32,
+        port: port as u32,
+        action: action as i32,
+        log: false,
+        src: String::new(),
+    })
 }
