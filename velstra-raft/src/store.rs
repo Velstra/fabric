@@ -8,6 +8,7 @@ use std::{
     collections::BTreeMap,
     fmt::Debug,
     io::Cursor,
+    net::IpAddr,
     ops::RangeBounds,
     path::{Path, PathBuf},
     sync::{
@@ -16,7 +17,7 @@ use std::{
     },
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use openraft::{
     BasicNode, Entry, EntryPayload, LogId, LogState, OptionalSend, RaftLogReader,
     RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError, StorageIOError, StoredMembership,
@@ -25,9 +26,11 @@ use openraft::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, watch};
-use velstra_common::{parse_cidr_v4, parse_mac};
+use velstra_common::{parse_cidr_v4, parse_cidr_v6, parse_mac};
 use velstra_config::{ActionName, EncapName, PortRule};
-use velstra_orchestrator::{Host, Network, SecurityGroup, Topology};
+use velstra_orchestrator::{
+    AllocRange, FloatingIp, Host, Network, SecurityGroup, Subnet, SubnetCidr, Topology,
+};
 
 pub type NodeId = u64;
 
@@ -79,6 +82,33 @@ pub struct SecurityGroupSpec {
     pub rules: Vec<PortRule>,
 }
 
+/// A serializable subnet description carried in [`TopoRequest::AddSubnet`] (D2).
+/// Wire-friendly strings validated when applied to the topology (on every
+/// replica). An empty `gateway`/`pool_*` is represented as `None`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubnetSpec {
+    pub id: String,
+    pub vni: u32,
+    /// CIDR, IPv4 (`192.168.50.0/24`) or IPv6 (`2001:db8::/64`).
+    pub cidr: String,
+    pub gateway: Option<String>,
+    pub pool_start: Option<String>,
+    pub pool_end: Option<String>,
+    pub enable_dhcp: bool,
+}
+
+/// A serializable view of a floating IP (the result of allocate/associate/
+/// disassociate, B6). `assoc_*` are `None` when the floating IP is unassociated.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FloatingIpRecord {
+    pub id: String,
+    pub vni: u32,
+    pub subnet_id: String,
+    pub addr: String,
+    pub assoc_port: Option<String>,
+    pub assoc_fixed: Option<String>,
+}
+
 /// A fabric mutation — the unit of replication. Every committed request is
 /// applied, in log order, to every replica's [`Topology`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +149,55 @@ pub enum TopoRequest {
         port_id: String,
         group: Option<String>,
     },
+    // --- Subnets + IPAM (D2) ------------------------------------------------
+    /// Define a first-class subnet under a network.
+    AddSubnet(SubnetSpec),
+    /// Remove a subnet by id (fails while any address is still allocated).
+    RemoveSubnet {
+        id: String,
+    },
+    /// Bind a port to a subnet, allocating (or requesting `ip`) an address.
+    BindPortSubnet {
+        port_id: String,
+        subnet_id: String,
+        ip: Option<String>,
+    },
+    /// Release one of a port's bound addresses back to its subnet's pool.
+    UnbindPortAddress {
+        port_id: String,
+        subnet_id: String,
+        addr: String,
+    },
+    /// Allocate a standalone address from a subnet's pool (or a requested one).
+    AllocateAddress {
+        subnet_id: String,
+        ip: Option<String>,
+    },
+    /// Release a standalone address back to a subnet's pool.
+    ReleaseAddress {
+        subnet_id: String,
+        addr: String,
+    },
+    // --- Floating IPs (B6) --------------------------------------------------
+    /// Allocate a floating IP from a floating subnet via IPAM.
+    AllocateFloatingIp {
+        subnet_id: String,
+        ip: Option<String>,
+    },
+    /// Associate a floating IP to a port's fixed address (1:1).
+    AssociateFloatingIp {
+        id: String,
+        port_id: String,
+        fixed_addr: String,
+    },
+    /// Clear a floating IP's association, leaving it allocated.
+    DisassociateFloatingIp {
+        id: String,
+    },
+    /// Release a floating IP (blocked while it is still associated).
+    ReleaseFloatingIp {
+        id: String,
+    },
 }
 
 /// A serializable view of an allocated port (the result of `CreatePort`).
@@ -137,23 +216,49 @@ pub struct PortRecord {
 pub struct TopoResponse {
     pub ok: bool,
     pub error: Option<String>,
-    /// The created port, for `CreatePort`.
+    /// The created/updated port, for `CreatePort`/`MigratePort`/`SetPortSecurityGroup`.
     pub port: Option<PortRecord>,
+    /// The allocated address, for `AllocateAddress`/`BindPortSubnet` (D2).
+    #[serde(default)]
+    pub addr: Option<String>,
+    /// The affected floating IP, for the B6 allocate/associate/disassociate ops.
+    #[serde(default)]
+    pub floating: Option<FloatingIpRecord>,
 }
 
 impl TopoResponse {
     fn ok() -> Self {
         Self {
             ok: true,
-            error: None,
-            port: None,
+            ..Default::default()
+        }
+    }
+    fn ok_port(port: PortRecord) -> Self {
+        Self {
+            ok: true,
+            port: Some(port),
+            ..Default::default()
+        }
+    }
+    fn ok_addr(addr: String) -> Self {
+        Self {
+            ok: true,
+            addr: Some(addr),
+            ..Default::default()
+        }
+    }
+    fn ok_floating(floating: FloatingIpRecord) -> Self {
+        Self {
+            ok: true,
+            floating: Some(floating),
+            ..Default::default()
         }
     }
     fn err(e: impl ToString) -> Self {
         Self {
             ok: false,
             error: Some(e.to_string()),
-            port: None,
+            ..Default::default()
         }
     }
 }
@@ -199,18 +304,84 @@ fn sg_from_spec(s: &SecurityGroupSpec) -> SecurityGroup {
     }
 }
 
+/// Parse an optional address string; `None` (auto-allocate) stays `None`.
+fn parse_opt_ip(s: &Option<String>) -> Result<Option<IpAddr>> {
+    match s {
+        Some(s) => Ok(Some(s.parse().map_err(|_| anyhow!("invalid ip {s:?}"))?)),
+        None => Ok(None),
+    }
+}
+
+fn subnet_from_spec(s: &SubnetSpec) -> Result<Subnet> {
+    // Detect the family by the CIDR text: a ':' means IPv6.
+    let cidr = if s.cidr.contains(':') {
+        SubnetCidr::V6(
+            parse_cidr_v6(&s.cidr).map_err(|e| anyhow!("invalid cidr {:?}: {e}", s.cidr))?,
+        )
+    } else {
+        SubnetCidr::V4(
+            parse_cidr_v4(&s.cidr).map_err(|e| anyhow!("invalid cidr {:?}: {e}", s.cidr))?,
+        )
+    };
+    let gateway = match &s.gateway {
+        Some(g) => Some(
+            g.parse::<IpAddr>()
+                .map_err(|_| anyhow!("invalid gateway {g:?}"))?,
+        ),
+        None => None,
+    };
+    let pool = match (&s.pool_start, &s.pool_end) {
+        (Some(a), Some(b)) => Some(AllocRange {
+            start: a.parse().map_err(|_| anyhow!("invalid pool start {a:?}"))?,
+            end: b.parse().map_err(|_| anyhow!("invalid pool end {b:?}"))?,
+        }),
+        (None, None) => None,
+        _ => bail!("subnet {:?}: pool requires both start and end", s.id),
+    };
+    Ok(Subnet {
+        id: s.id.clone(),
+        vni: s.vni,
+        cidr,
+        gateway,
+        pool,
+        enable_dhcp: s.enable_dhcp,
+    })
+}
+
+fn port_record(p: &velstra_orchestrator::Port) -> PortRecord {
+    PortRecord {
+        id: p.id.clone(),
+        vni: p.vni,
+        host: p.host.clone(),
+        ip: p.ip.to_string(),
+        mac: fmt_mac(p.mac),
+        tap: p.tap.clone(),
+    }
+}
+
+fn fip_record(f: &FloatingIp) -> FloatingIpRecord {
+    FloatingIpRecord {
+        id: f.id.clone(),
+        vni: f.vni,
+        subnet_id: f.subnet_id.clone(),
+        addr: f.addr.to_string(),
+        assoc_port: f.association.as_ref().map(|a| a.port_id.clone()),
+        assoc_fixed: f.association.as_ref().map(|a| a.fixed_addr.to_string()),
+    }
+}
+
 /// Apply one request to the fabric, producing its response. Pure given the
 /// current `topo`, so it is deterministic across replicas. Exposed so the
 /// controller can run the *same* mutation logic in its non-Raft single-node mode.
 pub fn apply(topo: &mut Topology, req: &TopoRequest) -> TopoResponse {
-    let outcome: Result<Option<PortRecord>> = (|| match req {
+    let outcome: Result<TopoResponse> = (|| match req {
         TopoRequest::AddHost(s) => {
             topo.add_host(host_from_spec(s)?);
-            Ok(None)
+            Ok(TopoResponse::ok())
         }
         TopoRequest::AddNetwork(s) => {
             topo.add_network(network_from_spec(s)?)?;
-            Ok(None)
+            Ok(TopoResponse::ok())
         }
         TopoRequest::CreatePort {
             vni,
@@ -224,66 +395,110 @@ pub fn apply(topo: &mut Topology, req: &TopoRequest) -> TopoResponse {
                 None => None,
             };
             let p = topo.create_port(*vni, host, tap, ip, *policy)?;
-            Ok(Some(PortRecord {
-                id: p.id,
-                vni: p.vni,
-                host: p.host,
-                ip: p.ip.to_string(),
-                mac: fmt_mac(p.mac),
-                tap: p.tap,
-            }))
+            Ok(TopoResponse::ok_port(port_record(&p)))
         }
         TopoRequest::RemovePort { id } => {
             topo.remove_port(id);
-            Ok(None)
+            Ok(TopoResponse::ok())
         }
         TopoRequest::RemoveHost { id } => {
             topo.remove_host(id)?;
-            Ok(None)
+            Ok(TopoResponse::ok())
         }
         TopoRequest::RemoveNetwork { vni } => {
             topo.remove_network(*vni)?;
-            Ok(None)
+            Ok(TopoResponse::ok())
         }
         TopoRequest::MigratePort { id, host, tap } => {
             let p = topo.migrate_port(id, host, tap)?;
-            Ok(Some(PortRecord {
-                id: p.id,
-                vni: p.vni,
-                host: p.host,
-                ip: p.ip.to_string(),
-                mac: fmt_mac(p.mac),
-                tap: p.tap,
-            }))
+            Ok(TopoResponse::ok_port(port_record(&p)))
         }
         TopoRequest::AddSecurityGroup(s) => {
             topo.add_security_group(sg_from_spec(s))?;
-            Ok(None)
+            Ok(TopoResponse::ok())
         }
         TopoRequest::RemoveSecurityGroup { name } => {
             topo.remove_security_group(name)?;
-            Ok(None)
+            Ok(TopoResponse::ok())
         }
         TopoRequest::SetPortSecurityGroup { port_id, group } => {
             let p = topo.set_port_security_group(port_id, group.as_deref())?;
-            Ok(Some(PortRecord {
-                id: p.id,
-                vni: p.vni,
-                host: p.host,
-                ip: p.ip.to_string(),
-                mac: fmt_mac(p.mac),
-                tap: p.tap,
-            }))
+            Ok(TopoResponse::ok_port(port_record(&p)))
+        }
+        // --- Subnets + IPAM (D2) --------------------------------------------
+        TopoRequest::AddSubnet(s) => {
+            topo.add_subnet(subnet_from_spec(s)?)?;
+            Ok(TopoResponse::ok())
+        }
+        TopoRequest::RemoveSubnet { id } => {
+            topo.remove_subnet(id)?;
+            Ok(TopoResponse::ok())
+        }
+        TopoRequest::BindPortSubnet {
+            port_id,
+            subnet_id,
+            ip,
+        } => {
+            let pa = topo.bind_port_subnet(port_id, subnet_id, parse_opt_ip(ip)?)?;
+            Ok(TopoResponse::ok_addr(pa.addr.to_string()))
+        }
+        TopoRequest::UnbindPortAddress {
+            port_id,
+            subnet_id,
+            addr,
+        } => {
+            let a = addr
+                .parse::<IpAddr>()
+                .map_err(|_| anyhow!("invalid addr {addr:?}"))?;
+            if topo.unbind_port_address(port_id, subnet_id, a) {
+                Ok(TopoResponse::ok())
+            } else {
+                bail!("address {addr} was not bound to port {port_id:?}")
+            }
+        }
+        TopoRequest::AllocateAddress { subnet_id, ip } => {
+            let a = topo.allocate(subnet_id, parse_opt_ip(ip)?)?;
+            Ok(TopoResponse::ok_addr(a.to_string()))
+        }
+        TopoRequest::ReleaseAddress { subnet_id, addr } => {
+            let a = addr
+                .parse::<IpAddr>()
+                .map_err(|_| anyhow!("invalid addr {addr:?}"))?;
+            if topo.release(subnet_id, a) {
+                Ok(TopoResponse::ok())
+            } else {
+                bail!("address {addr} was not allocated in subnet {subnet_id:?}")
+            }
+        }
+        // --- Floating IPs (B6) ----------------------------------------------
+        TopoRequest::AllocateFloatingIp { subnet_id, ip } => {
+            let f = topo.allocate_floating_ip(subnet_id, parse_opt_ip(ip)?)?;
+            Ok(TopoResponse::ok_floating(fip_record(&f)))
+        }
+        TopoRequest::AssociateFloatingIp {
+            id,
+            port_id,
+            fixed_addr,
+        } => {
+            let a = fixed_addr
+                .parse::<IpAddr>()
+                .map_err(|_| anyhow!("invalid fixed addr {fixed_addr:?}"))?;
+            let f = topo.associate_floating_ip(id, port_id, a)?;
+            Ok(TopoResponse::ok_floating(fip_record(&f)))
+        }
+        TopoRequest::DisassociateFloatingIp { id } => {
+            let f = topo.disassociate_floating_ip(id)?;
+            Ok(TopoResponse::ok_floating(fip_record(&f)))
+        }
+        TopoRequest::ReleaseFloatingIp { id } => {
+            if topo.release_floating_ip(id)? {
+                Ok(TopoResponse::ok())
+            } else {
+                bail!("no floating ip {id:?}")
+            }
         }
     })();
-    match outcome {
-        Ok(port) => TopoResponse {
-            ok: true,
-            error: None,
-            port,
-        },
-        Err(e) => TopoResponse::err(e),
-    }
+    outcome.unwrap_or_else(TopoResponse::err)
 }
 
 // --- Log store --------------------------------------------------------------
@@ -869,5 +1084,314 @@ mod tests {
             )
             .ok
         );
+    }
+
+    /// Seed a topology (one host + one network) via `apply`, returning it.
+    fn seeded() -> Topology {
+        let mut t = Topology::new();
+        assert!(apply(&mut t, &TopoRequest::AddHost(host_spec("h1", "10.0.0.1"))).ok);
+        assert!(
+            apply(
+                &mut t,
+                &TopoRequest::AddNetwork(NetworkSpec {
+                    vni: 5000,
+                    name: "blue".into(),
+                    subnet: "192.168.100.0/24".into(),
+                    default_action: ActionName::Pass,
+                    drop_icmp: false,
+                })
+            )
+            .ok
+        );
+        t
+    }
+
+    fn subnet_spec(id: &str, cidr: &str, gateway: Option<&str>) -> SubnetSpec {
+        SubnetSpec {
+            id: id.into(),
+            vni: 5000,
+            cidr: cidr.into(),
+            gateway: gateway.map(|g| g.into()),
+            pool_start: None,
+            pool_end: None,
+            enable_dhcp: false,
+        }
+    }
+
+    #[test]
+    fn apply_subnet_add_bind_allocate_and_remove_roundtrip() {
+        let mut t = seeded();
+
+        // Add a v4 and a v6 subnet (dual stack), each with a gateway.
+        assert!(
+            apply(
+                &mut t,
+                &TopoRequest::AddSubnet(subnet_spec(
+                    "s4",
+                    "192.168.100.0/24",
+                    Some("192.168.100.1")
+                ))
+            )
+            .ok
+        );
+        assert!(
+            apply(
+                &mut t,
+                &TopoRequest::AddSubnet(subnet_spec("s6", "2001:db8::/64", Some("2001:db8::1")))
+            )
+            .ok
+        );
+        // An unknown-VNI subnet fails (validated on apply, deterministically).
+        let bad = SubnetSpec {
+            vni: 999,
+            ..subnet_spec("bad", "10.9.0.0/24", None)
+        };
+        assert!(!apply(&mut t, &TopoRequest::AddSubnet(bad)).ok);
+        assert_eq!(t.subnets().count(), 2);
+
+        // A standalone allocation returns the address (gateway .1 reserved → .2).
+        let alloc = apply(
+            &mut t,
+            &TopoRequest::AllocateAddress {
+                subnet_id: "s4".into(),
+                ip: None,
+            },
+        );
+        assert!(alloc.ok);
+        assert_eq!(alloc.addr.as_deref(), Some("192.168.100.2"));
+        // Releasing it back succeeds; a double release fails.
+        assert!(
+            apply(
+                &mut t,
+                &TopoRequest::ReleaseAddress {
+                    subnet_id: "s4".into(),
+                    addr: "192.168.100.2".into()
+                }
+            )
+            .ok
+        );
+        assert!(
+            !apply(
+                &mut t,
+                &TopoRequest::ReleaseAddress {
+                    subnet_id: "s4".into(),
+                    addr: "192.168.100.2".into()
+                }
+            )
+            .ok
+        );
+
+        // Create a port and bind it dual-stack.
+        let port = apply(
+            &mut t,
+            &TopoRequest::CreatePort {
+                vni: 5000,
+                host: "h1".into(),
+                tap: "tapA".into(),
+                ip: None,
+                policy: None,
+            },
+        )
+        .port
+        .expect("create returns a port");
+        let b4 = apply(
+            &mut t,
+            &TopoRequest::BindPortSubnet {
+                port_id: port.id.clone(),
+                subnet_id: "s4".into(),
+                ip: None,
+            },
+        );
+        assert!(b4.ok);
+        assert_eq!(b4.addr.as_deref(), Some("192.168.100.2")); // .1 gw reserved, .2 free again
+        let b6 = apply(
+            &mut t,
+            &TopoRequest::BindPortSubnet {
+                port_id: port.id.clone(),
+                subnet_id: "s6".into(),
+                ip: None,
+            },
+        );
+        assert!(b6.ok);
+        assert_eq!(b6.addr.as_deref(), Some("2001:db8::2"));
+
+        // Unbinding the wrong address fails; the right one succeeds.
+        assert!(
+            !apply(
+                &mut t,
+                &TopoRequest::UnbindPortAddress {
+                    port_id: port.id.clone(),
+                    subnet_id: "s4".into(),
+                    addr: "192.168.100.9".into()
+                }
+            )
+            .ok
+        );
+        assert!(
+            apply(
+                &mut t,
+                &TopoRequest::UnbindPortAddress {
+                    port_id: port.id.clone(),
+                    subnet_id: "s4".into(),
+                    addr: "192.168.100.2".into()
+                }
+            )
+            .ok
+        );
+
+        // Removing a subnet with a live binding fails; after unbinding s6, it removes.
+        assert!(!apply(&mut t, &TopoRequest::RemoveSubnet { id: "s6".into() }).ok);
+        assert!(
+            apply(
+                &mut t,
+                &TopoRequest::UnbindPortAddress {
+                    port_id: port.id,
+                    subnet_id: "s6".into(),
+                    addr: "2001:db8::2".into()
+                }
+            )
+            .ok
+        );
+        assert!(apply(&mut t, &TopoRequest::RemoveSubnet { id: "s6".into() }).ok);
+
+        // The whole thing survives a snapshot round-trip (cluster durability).
+        let restored = Topology::from_snapshot(&t.to_snapshot());
+        assert_eq!(restored.subnets().count(), t.subnets().count());
+    }
+
+    #[test]
+    fn apply_floating_ip_allocate_associate_and_release_roundtrip() {
+        let mut t = seeded();
+        // A tenant subnet (for the port's fixed address) and an external/floating one.
+        assert!(
+            apply(
+                &mut t,
+                &TopoRequest::AddSubnet(subnet_spec("tenant", "192.168.100.0/24", None))
+            )
+            .ok
+        );
+        assert!(
+            apply(
+                &mut t,
+                &TopoRequest::AddSubnet(SubnetSpec {
+                    vni: 5000,
+                    ..subnet_spec("ext", "203.0.113.0/29", None)
+                })
+            )
+            .ok
+        );
+
+        let port = apply(
+            &mut t,
+            &TopoRequest::CreatePort {
+                vni: 5000,
+                host: "h1".into(),
+                tap: "tapA".into(),
+                ip: None,
+                policy: None,
+            },
+        )
+        .port
+        .expect("create returns a port");
+        let fixed = apply(
+            &mut t,
+            &TopoRequest::BindPortSubnet {
+                port_id: port.id.clone(),
+                subnet_id: "tenant".into(),
+                ip: None,
+            },
+        )
+        .addr
+        .expect("bind returns an address"); // .1
+
+        // Allocate a floating IP (returns the fip record, unassociated).
+        let alloc = apply(
+            &mut t,
+            &TopoRequest::AllocateFloatingIp {
+                subnet_id: "ext".into(),
+                ip: None,
+            },
+        );
+        assert!(alloc.ok);
+        let fip = alloc.floating.expect("allocate returns a floating ip");
+        assert_eq!(fip.addr, "203.0.113.1");
+        assert!(fip.assoc_port.is_none());
+
+        // Associating to a fixed address the port does not hold fails.
+        assert!(
+            !apply(
+                &mut t,
+                &TopoRequest::AssociateFloatingIp {
+                    id: fip.id.clone(),
+                    port_id: port.id.clone(),
+                    fixed_addr: "192.168.100.99".into()
+                }
+            )
+            .ok
+        );
+        // Associate to the port's real fixed address.
+        let assoc = apply(
+            &mut t,
+            &TopoRequest::AssociateFloatingIp {
+                id: fip.id.clone(),
+                port_id: port.id.clone(),
+                fixed_addr: fixed.clone(),
+            },
+        );
+        assert!(assoc.ok, "associate failed: {:?}", assoc.error);
+        let af = assoc.floating.unwrap();
+        assert_eq!(af.assoc_port.as_deref(), Some(port.id.as_str()));
+        assert_eq!(af.assoc_fixed.as_deref(), Some(fixed.as_str()));
+
+        // Release is blocked while associated; disassociate then release works.
+        assert!(
+            !apply(
+                &mut t,
+                &TopoRequest::ReleaseFloatingIp { id: fip.id.clone() }
+            )
+            .ok
+        );
+        let dis = apply(
+            &mut t,
+            &TopoRequest::DisassociateFloatingIp { id: fip.id.clone() },
+        );
+        assert!(dis.ok);
+        assert!(dis.floating.unwrap().assoc_port.is_none());
+        assert!(
+            apply(
+                &mut t,
+                &TopoRequest::ReleaseFloatingIp { id: fip.id.clone() }
+            )
+            .ok
+        );
+        // Releasing again reports failure (no such floating ip).
+        assert!(!apply(&mut t, &TopoRequest::ReleaseFloatingIp { id: fip.id }).ok);
+
+        // Re-allocate + associate, then confirm it survives a snapshot round-trip.
+        let f2 = apply(
+            &mut t,
+            &TopoRequest::AllocateFloatingIp {
+                subnet_id: "ext".into(),
+                ip: None,
+            },
+        )
+        .floating
+        .unwrap();
+        assert!(
+            apply(
+                &mut t,
+                &TopoRequest::AssociateFloatingIp {
+                    id: f2.id.clone(),
+                    port_id: port.id,
+                    fixed_addr: fixed
+                }
+            )
+            .ok
+        );
+        let restored = Topology::from_snapshot(&t.to_snapshot());
+        let rf = restored
+            .floating_ip(&f2.id)
+            .expect("floating ip survives failover");
+        assert!(rf.association.is_some());
     }
 }
