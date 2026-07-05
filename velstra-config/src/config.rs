@@ -60,7 +60,7 @@ impl From<ActionName> for Action {
 }
 
 /// A transport protocol name as written in TOML.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProtoName {
     Tcp,
@@ -81,7 +81,7 @@ impl ProtoName {
 }
 
 /// A single `(protocol, port) -> action` rule.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PortRule {
     /// Transport protocol.
