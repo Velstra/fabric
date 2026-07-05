@@ -26,12 +26,12 @@
 //! [`ARP_TABLE`]: velstra_common::ArpKey
 
 use std::{
-    collections::{HashMap, HashSet},
-    net::Ipv4Addr,
+    collections::{BTreeMap, HashMap, HashSet},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
 };
 
 use anyhow::{Result, bail};
-use velstra_common::{Cidr4, PolicyId};
+use velstra_common::{Cidr4, Cidr6, PolicyId, mask_v4, mask_v6};
 use velstra_config::{
     ActionName, EncapName, FileConfig, InterfaceFile, NeighborCfg, OverlayCfg, PolicyFile,
     PortRule, TunnelCfg,
@@ -87,6 +87,143 @@ pub struct Network {
     pub default_action: ActionName,
     /// Whether the network's policy drops ICMP.
     pub drop_icmp: bool,
+}
+
+/// A dual-stack CIDR: a subnet is either IPv4 or IPv6. Wraps the shared
+/// [`Cidr4`]/[`Cidr6`] so one [`Subnet`] type carries either family — a network
+/// can therefore hold both a v4 and a v6 subnet (dual stack).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubnetCidr {
+    /// An IPv4 subnet.
+    V4(Cidr4),
+    /// An IPv6 subnet.
+    V6(Cidr6),
+}
+
+impl SubnetCidr {
+    /// Whether this is an IPv6 subnet.
+    #[inline]
+    pub fn is_v6(&self) -> bool {
+        matches!(self, SubnetCidr::V6(_))
+    }
+
+    /// The prefix length in bits.
+    #[inline]
+    pub fn prefix(&self) -> u8 {
+        match self {
+            SubnetCidr::V4(c) => c.prefix,
+            SubnetCidr::V6(c) => c.prefix,
+        }
+    }
+
+    /// Whether `addr` falls within this CIDR. A family mismatch (a v6 address
+    /// against a v4 subnet, or vice versa) is never contained.
+    pub fn contains(&self, addr: IpAddr) -> bool {
+        match (self, addr) {
+            (SubnetCidr::V4(c), IpAddr::V4(a)) => mask_v4(a.octets(), c.prefix) == c.octets,
+            (SubnetCidr::V6(c), IpAddr::V6(a)) => mask_v6(a.octets(), c.prefix) == c.octets,
+            _ => false,
+        }
+    }
+
+    /// The network address as a numeric value (a v4 address in the low 32 bits).
+    fn base(&self) -> u128 {
+        match self {
+            SubnetCidr::V4(c) => u32::from_be_bytes(c.octets) as u128,
+            SubnetCidr::V6(c) => u128::from_be_bytes(c.octets),
+        }
+    }
+
+    /// The number of addresses the block spans (saturating at the whole space
+    /// for a `/0`).
+    fn span(&self) -> u128 {
+        let total = if self.is_v6() { 128 } else { 32 };
+        let host = total - self.prefix() as u32;
+        if host >= 128 {
+            u128::MAX
+        } else {
+            1u128 << host
+        }
+    }
+
+    /// The default `[lo, hi]` numeric allocation range when a subnet declares no
+    /// explicit pool. IPv4 skips the network and broadcast addresses; IPv6 skips
+    /// only the subnet-router anycast (the base). A range that yields no usable
+    /// host addresses returns `lo > hi` (an empty pool), so allocation reports
+    /// exhaustion rather than handing out a reserved address.
+    fn default_pool(&self) -> (u128, u128) {
+        let base = self.base();
+        let span = self.span();
+        if self.is_v6() {
+            (
+                base.saturating_add(1),
+                base.saturating_add(span.saturating_sub(1)),
+            )
+        } else if span < 3 {
+            (1, 0) // /31 and /32 have no usable host range: empty pool
+        } else {
+            (base + 1, base + span - 2)
+        }
+    }
+}
+
+/// An inclusive `[start, end]` address range within a [`Subnet`]'s CIDR — the
+/// pool IPAM hands addresses out of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllocRange {
+    /// First allocatable address (inclusive).
+    pub start: IpAddr,
+    /// Last allocatable address (inclusive).
+    pub end: IpAddr,
+}
+
+/// A first-class subnet under a [`Network`] (roadmap D2). A network is addressed
+/// by its VNI; a subnet is a concrete address space *within* it, so a network can
+/// hold several — e.g. a v4 and a v6 subnet for a dual-stack tenant, or multiple
+/// ranges. Subnets are held on the [`Topology`] (keyed by [`id`](Self::id) and
+/// tagged with their [`vni`](Self::vni)), mirroring how B5 security groups live
+/// on the topology rather than being embedded in another object — see
+/// [`Topology::add_subnet`] / [`Topology::network_subnets`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subnet {
+    /// Stable, fabric-unique subnet id.
+    pub id: String,
+    /// The network (VNI) this subnet belongs to.
+    pub vni: u32,
+    /// The subnet's CIDR (v4 or v6).
+    pub cidr: SubnetCidr,
+    /// Optional gateway address — must lie within [`cidr`](Self::cidr); reserved
+    /// from allocation (IPAM never hands it to a port).
+    pub gateway: Option<IpAddr>,
+    /// Optional explicit allocation pool; `None` derives one from the CIDR (first
+    /// usable .. last usable, skipping network/broadcast for v4).
+    pub pool: Option<AllocRange>,
+    /// Whether DHCP is enabled on this subnet. A pure model flag today — the
+    /// datapath that would serve leases is deferred to the maintainer's eBPF work.
+    pub enable_dhcp: bool,
+}
+
+/// An IPAM-allocated address bound to a [`Port`] from a [`Subnet`]. A port may
+/// hold several (typically one v4 and one v6 — a dual-stack NIC).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortAddr {
+    /// The subnet the address came from.
+    pub subnet_id: String,
+    /// The allocated address.
+    pub addr: IpAddr,
+}
+
+/// Who holds an IPAM allocation. The single source of truth for a subnet's used
+/// addresses (see [`Topology::allocate`]); persisted in the snapshot so a live
+/// address is never re-handed-out after a Raft failover or restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IpAllocOwner {
+    /// Bound to a port's NIC (the port id).
+    Port(String),
+    /// A standalone reservation made via [`Topology::allocate`].
+    Reserved,
+    /// The subnet's gateway, auto-reserved when the subnet is added.
+    Gateway,
 }
 
 /// A workload's virtual NIC, attached to a [`Network`] and bound to a [`Host`].
@@ -197,6 +334,12 @@ pub struct Topology {
     /// Named security groups (B5), keyed by name. A port references one by
     /// `policy_id` (stored in [`Port::policy`]).
     security_groups: HashMap<String, SecurityGroup>,
+    /// First-class subnets (D2), keyed by subnet id; each is tagged with its VNI.
+    subnets: HashMap<String, Subnet>,
+    /// IPAM allocations: subnet id -> (numeric address -> owner). The durable
+    /// record of which addresses are in use; the ordered [`BTreeMap`] makes
+    /// "next free address" deterministic across replicas.
+    ipam: HashMap<String, BTreeMap<u128, IpAllocOwner>>,
 }
 
 /// Derive a locally-administered, deterministic MAC for an inner IPv4: `02:00`
@@ -209,6 +352,58 @@ fn mac_for(ip: Ipv4Addr) -> [u8; 6] {
 fn fmt_mac(mac: [u8; 6]) -> String {
     let [a, b, c, d, e, f] = mac;
     format!("{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}")
+}
+
+/// An IP address as a numeric value (a v4 address in the low 32 bits), the key
+/// space IPAM allocates over.
+fn ip_to_u128(a: IpAddr) -> u128 {
+    match a {
+        IpAddr::V4(v) => u32::from(v) as u128,
+        IpAddr::V6(v) => u128::from(v),
+    }
+}
+
+/// Reconstruct an address from its numeric value, in the family the subnet fixes.
+fn u128_to_ip(n: u128, is_v6: bool) -> IpAddr {
+    if is_v6 {
+        IpAddr::V6(Ipv6Addr::from(n))
+    } else {
+        IpAddr::V4(Ipv4Addr::from(n as u32))
+    }
+}
+
+/// A family-agnostic 16-byte encoding of an address for the snapshot (a v4
+/// address occupies the first four bytes). Paired with an `is_v6` flag on the
+/// record so it round-trips losslessly and infallibly (no string parsing).
+fn ip_to_bytes16(a: IpAddr) -> [u8; 16] {
+    match a {
+        IpAddr::V4(v) => {
+            let mut b = [0u8; 16];
+            b[..4].copy_from_slice(&v.octets());
+            b
+        }
+        IpAddr::V6(v) => v.octets(),
+    }
+}
+
+/// Inverse of [`ip_to_bytes16`], given the family recorded alongside it.
+fn bytes16_to_ip(b: [u8; 16], is_v6: bool) -> IpAddr {
+    if is_v6 {
+        IpAddr::V6(Ipv6Addr::from(b))
+    } else {
+        let mut o = [0u8; 4];
+        o.copy_from_slice(&b[..4]);
+        IpAddr::V4(Ipv4Addr::from(o))
+    }
+}
+
+/// The effective `[lo, hi]` numeric allocation pool for a subnet: its explicit
+/// pool if set, else the CIDR-derived default.
+fn effective_pool(cidr: &SubnetCidr, pool: Option<AllocRange>) -> (u128, u128) {
+    match pool {
+        Some(r) => (ip_to_u128(r.start), ip_to_u128(r.end)),
+        None => cidr.default_pool(),
+    }
 }
 
 impl Topology {
@@ -263,6 +458,9 @@ impl Topology {
     pub fn remove_network(&mut self, vni: u32) -> Result<bool> {
         if let Some(p) = self.ports.iter().find(|p| p.vni == vni) {
             bail!("network {vni} still has port {:?}; remove it first", p.id);
+        }
+        if let Some(s) = self.subnets.values().find(|s| s.vni == vni) {
+            bail!("network {vni} still has subnet {:?}; remove it first", s.id);
         }
         Ok(self.networks.remove(&vni).is_some())
     }
@@ -406,11 +604,18 @@ impl Topology {
         Ok(port)
     }
 
-    /// Remove a port by id. Returns whether it existed.
+    /// Remove a port by id, releasing any IPAM addresses bound to it back to
+    /// their subnets' pools. Returns whether it existed.
     pub fn remove_port(&mut self, id: &str) -> bool {
         let before = self.ports.len();
         self.ports.retain(|p| p.id != id);
-        self.ports.len() != before
+        let removed = self.ports.len() != before;
+        if removed {
+            for allocs in self.ipam.values_mut() {
+                allocs.retain(|_, o| !matches!(o, IpAllocOwner::Port(p) if p == id));
+            }
+        }
+        removed
     }
 
     /// Move an existing port to `new_host`, binding it to `new_tap` there. The
@@ -440,6 +645,222 @@ impl Topology {
         port.host = new_host.to_string();
         port.tap = new_tap.to_string();
         Ok(port.clone())
+    }
+
+    // === D2: first-class subnets + IPAM =====================================
+
+    /// Define a [`Subnet`] under an existing network. Fails on an empty or
+    /// duplicate id, an unknown VNI, a gateway or pool endpoint outside the CIDR
+    /// (or of the wrong family), or an inverted pool (`start > end`). On success
+    /// the gateway (if any) is auto-reserved in IPAM so it is never handed out.
+    pub fn add_subnet(&mut self, subnet: Subnet) -> Result<()> {
+        if subnet.id.is_empty() {
+            bail!("subnet id must not be empty");
+        }
+        if self.subnets.contains_key(&subnet.id) {
+            bail!("subnet {:?} already exists", subnet.id);
+        }
+        if !self.networks.contains_key(&subnet.vni) {
+            bail!("unknown network vni {}", subnet.vni);
+        }
+        if let Some(gw) = subnet.gateway
+            && !subnet.cidr.contains(gw)
+        {
+            bail!(
+                "gateway {gw} is not in subnet {:?}'s CIDR (or wrong family)",
+                subnet.id
+            );
+        }
+        if let Some(pool) = subnet.pool {
+            if !subnet.cidr.contains(pool.start) || !subnet.cidr.contains(pool.end) {
+                bail!(
+                    "pool {}..{} is not within subnet {:?}'s CIDR (or wrong family)",
+                    pool.start,
+                    pool.end,
+                    subnet.id
+                );
+            }
+            if ip_to_u128(pool.start) > ip_to_u128(pool.end) {
+                bail!(
+                    "pool start {} is above end {} in subnet {:?}",
+                    pool.start,
+                    pool.end,
+                    subnet.id
+                );
+            }
+        }
+        let id = subnet.id.clone();
+        let gateway = subnet.gateway;
+        self.subnets.insert(id.clone(), subnet);
+        let allocs = self.ipam.entry(id).or_default();
+        if let Some(gw) = gateway {
+            allocs.insert(ip_to_u128(gw), IpAllocOwner::Gateway);
+        }
+        Ok(())
+    }
+
+    /// Remove a subnet by id. Fails while any address (a port binding or a
+    /// standalone reservation) is still allocated from it — the auto-reserved
+    /// gateway does not block removal and is cleaned up. Returns whether it
+    /// existed.
+    pub fn remove_subnet(&mut self, id: &str) -> Result<bool> {
+        if !self.subnets.contains_key(id) {
+            return Ok(false);
+        }
+        if let Some(allocs) = self.ipam.get(id)
+            && allocs.values().any(|o| !matches!(o, IpAllocOwner::Gateway))
+        {
+            bail!("subnet {id:?} still has allocated addresses; release them first");
+        }
+        self.subnets.remove(id);
+        self.ipam.remove(id);
+        Ok(true)
+    }
+
+    /// All subnets, in no particular order.
+    pub fn subnets(&self) -> impl Iterator<Item = &Subnet> {
+        self.subnets.values()
+    }
+
+    /// Look up a subnet by id.
+    pub fn subnet(&self, id: &str) -> Option<&Subnet> {
+        self.subnets.get(id)
+    }
+
+    /// The subnets belonging to a network (VNI) — the "a network has subnets"
+    /// view. In no particular order.
+    pub fn network_subnets(&self, vni: u32) -> impl Iterator<Item = &Subnet> {
+        self.subnets.values().filter(move |s| s.vni == vni)
+    }
+
+    /// Allocate an address from a subnet's pool (a standalone reservation), or a
+    /// specific `requested` one. Deterministic: with no request it returns the
+    /// lowest free address in the pool. Fails on an unknown subnet, a request
+    /// outside the CIDR/pool, an already-allocated request, or exhaustion.
+    pub fn allocate(&mut self, subnet_id: &str, requested: Option<IpAddr>) -> Result<IpAddr> {
+        self.alloc_in(subnet_id, requested, IpAllocOwner::Reserved)
+    }
+
+    /// Release an address back to a subnet's pool. Returns whether an allocation
+    /// was actually freed (an unknown subnet or unallocated address is `false`).
+    pub fn release(&mut self, subnet_id: &str, addr: IpAddr) -> bool {
+        self.ipam
+            .get_mut(subnet_id)
+            .map(|a| a.remove(&ip_to_u128(addr)).is_some())
+            .unwrap_or(false)
+    }
+
+    /// Bind a port to a subnet, giving it an IPAM-allocated address (or a
+    /// specific `requested` one, validated in-range and free). The subnet must
+    /// belong to the port's network. Returns the resulting [`PortAddr`]. Bind a
+    /// port to both a v4 and a v6 subnet to make it dual-stack.
+    pub fn bind_port_subnet(
+        &mut self,
+        port_id: &str,
+        subnet_id: &str,
+        requested: Option<IpAddr>,
+    ) -> Result<PortAddr> {
+        let port_vni = self
+            .ports
+            .iter()
+            .find(|p| p.id == port_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown port {port_id:?}"))?
+            .vni;
+        let subnet_vni = self
+            .subnets
+            .get(subnet_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown subnet {subnet_id:?}"))?
+            .vni;
+        if subnet_vni != port_vni {
+            bail!(
+                "subnet {subnet_id:?} is on network {subnet_vni}, but port {port_id:?} is on {port_vni}"
+            );
+        }
+        let addr = self.alloc_in(
+            subnet_id,
+            requested,
+            IpAllocOwner::Port(port_id.to_string()),
+        )?;
+        Ok(PortAddr {
+            subnet_id: subnet_id.to_string(),
+            addr,
+        })
+    }
+
+    /// Release one of a port's bound addresses. Returns whether that address was
+    /// actually bound to this port (a mismatched owner is left untouched).
+    pub fn unbind_port_address(&mut self, port_id: &str, subnet_id: &str, addr: IpAddr) -> bool {
+        let Some(allocs) = self.ipam.get_mut(subnet_id) else {
+            return false;
+        };
+        let key = ip_to_u128(addr);
+        if matches!(allocs.get(&key), Some(IpAllocOwner::Port(p)) if p == port_id) {
+            allocs.remove(&key);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Every IPAM address currently bound to a port, sorted by `(subnet id,
+    /// address)` for a deterministic order. A dual-stack port returns both its v4
+    /// and v6 address.
+    pub fn port_addrs(&self, port_id: &str) -> Vec<PortAddr> {
+        let mut out = Vec::new();
+        for (sid, allocs) in &self.ipam {
+            let is_v6 = self.subnets.get(sid).is_some_and(|s| s.cidr.is_v6());
+            for (key, owner) in allocs {
+                if matches!(owner, IpAllocOwner::Port(p) if p == port_id) {
+                    out.push(PortAddr {
+                        subnet_id: sid.clone(),
+                        addr: u128_to_ip(*key, is_v6),
+                    });
+                }
+            }
+        }
+        out.sort_by(|a, b| {
+            (&a.subnet_id, ip_to_u128(a.addr)).cmp(&(&b.subnet_id, ip_to_u128(b.addr)))
+        });
+        out
+    }
+
+    /// Core IPAM allocation, shared by [`allocate`](Self::allocate) and
+    /// [`bind_port_subnet`](Self::bind_port_subnet): reserve `requested` (or the
+    /// lowest free address in the pool) under `owner`.
+    fn alloc_in(
+        &mut self,
+        subnet_id: &str,
+        requested: Option<IpAddr>,
+        owner: IpAllocOwner,
+    ) -> Result<IpAddr> {
+        let subnet = self
+            .subnets
+            .get(subnet_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown subnet {subnet_id:?}"))?;
+        let cidr = subnet.cidr;
+        let is_v6 = cidr.is_v6();
+        let (lo, hi) = effective_pool(&cidr, subnet.pool);
+        let allocs = self.ipam.entry(subnet_id.to_string()).or_default();
+        let key = match requested {
+            Some(req) => {
+                if !cidr.contains(req) {
+                    bail!("address {req} is not in subnet {subnet_id:?} (or wrong family)");
+                }
+                let k = ip_to_u128(req);
+                if !(lo..=hi).contains(&k) {
+                    bail!("address {req} is outside subnet {subnet_id:?}'s allocation pool");
+                }
+                if allocs.contains_key(&k) {
+                    bail!("address {req} is already allocated in subnet {subnet_id:?}");
+                }
+                k
+            }
+            None => (lo..=hi)
+                .find(|k| !allocs.contains_key(k))
+                .ok_or_else(|| anyhow::anyhow!("subnet {subnet_id:?} has no free addresses"))?,
+        };
+        allocs.insert(key, owner);
+        Ok(u128_to_ip(key, is_v6))
     }
 
     fn subnet_contains(&self, vni: u32, ip: Ipv4Addr) -> bool {
@@ -620,6 +1041,15 @@ pub struct FabricSnapshot {
     /// B5 deserialize as an empty set (no groups).
     #[serde(default)]
     pub security_groups: Vec<SecurityGroupRec>,
+    /// All subnets (D2). `#[serde(default)]` so pre-D2 snapshots restore with no
+    /// subnets.
+    #[serde(default)]
+    pub subnets: Vec<SubnetRec>,
+    /// All IPAM allocations (D2) — the durable used-address set, so a live
+    /// address is never re-handed-out after a failover. `#[serde(default)]` for
+    /// pre-D2 snapshots.
+    #[serde(default)]
+    pub ip_allocations: Vec<IpAllocRec>,
 }
 
 /// Serializable mirror of a [`Host`].
@@ -656,6 +1086,41 @@ pub struct SecurityGroupRec {
     pub stateful: bool,
     pub blocklist: Vec<String>,
     pub rules: Vec<PortRule>,
+}
+
+/// Serializable mirror of a [`Subnet`] (D2). The CIDR, gateway, and pool are
+/// stored as an `is_v6` flag plus 16-byte address encodings (a v4 address in the
+/// first four bytes), so the record round-trips losslessly and infallibly — no
+/// string parsing on restore, matching the byte-oriented style of the other recs.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SubnetRec {
+    pub id: String,
+    pub vni: u32,
+    pub is_v6: bool,
+    pub cidr_octets: [u8; 16],
+    pub cidr_prefix: u8,
+    pub gateway: Option<[u8; 16]>,
+    pub pool_start: Option<[u8; 16]>,
+    pub pool_end: Option<[u8; 16]>,
+    pub enable_dhcp: bool,
+}
+
+/// The owner of a serialized IPAM allocation ([`IpAllocRec`]).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum IpAllocOwnerRec {
+    Port(String),
+    Reserved,
+    Gateway,
+}
+
+/// Serializable mirror of one IPAM allocation (D2): the subnet, the allocated
+/// address (16-byte encoded, family from `is_v6`), and its owner.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IpAllocRec {
+    pub subnet_id: String,
+    pub is_v6: bool,
+    pub addr: [u8; 16],
+    pub owner: IpAllocOwnerRec,
 }
 
 /// Serializable mirror of a [`Port`].
@@ -728,6 +1193,48 @@ impl Topology {
                     rules: g.rules.clone(),
                 })
                 .collect(),
+            subnets: self
+                .subnets
+                .values()
+                .map(|s| {
+                    let (cidr_octets, cidr_prefix) = match s.cidr {
+                        SubnetCidr::V4(c) => {
+                            let mut b = [0u8; 16];
+                            b[..4].copy_from_slice(&c.octets);
+                            (b, c.prefix)
+                        }
+                        SubnetCidr::V6(c) => (c.octets, c.prefix),
+                    };
+                    SubnetRec {
+                        id: s.id.clone(),
+                        vni: s.vni,
+                        is_v6: s.cidr.is_v6(),
+                        cidr_octets,
+                        cidr_prefix,
+                        gateway: s.gateway.map(ip_to_bytes16),
+                        pool_start: s.pool.map(|p| ip_to_bytes16(p.start)),
+                        pool_end: s.pool.map(|p| ip_to_bytes16(p.end)),
+                        enable_dhcp: s.enable_dhcp,
+                    }
+                })
+                .collect(),
+            ip_allocations: self
+                .ipam
+                .iter()
+                .flat_map(|(sid, allocs)| {
+                    let is_v6 = self.subnets.get(sid).is_some_and(|s| s.cidr.is_v6());
+                    allocs.iter().map(move |(key, owner)| IpAllocRec {
+                        subnet_id: sid.clone(),
+                        is_v6,
+                        addr: ip_to_bytes16(u128_to_ip(*key, is_v6)),
+                        owner: match owner {
+                            IpAllocOwner::Port(p) => IpAllocOwnerRec::Port(p.clone()),
+                            IpAllocOwner::Reserved => IpAllocOwnerRec::Reserved,
+                            IpAllocOwner::Gateway => IpAllocOwnerRec::Gateway,
+                        },
+                    })
+                })
+                .collect(),
         }
     }
 
@@ -787,6 +1294,53 @@ impl Topology {
                     rules: g.rules.clone(),
                 },
             );
+        }
+        for s in &snap.subnets {
+            let cidr = if s.is_v6 {
+                SubnetCidr::V6(Cidr6 {
+                    octets: s.cidr_octets,
+                    prefix: s.cidr_prefix,
+                })
+            } else {
+                let mut o = [0u8; 4];
+                o.copy_from_slice(&s.cidr_octets[..4]);
+                SubnetCidr::V4(Cidr4 {
+                    octets: o,
+                    prefix: s.cidr_prefix,
+                })
+            };
+            t.subnets.insert(
+                s.id.clone(),
+                Subnet {
+                    id: s.id.clone(),
+                    vni: s.vni,
+                    cidr,
+                    gateway: s.gateway.map(|b| bytes16_to_ip(b, s.is_v6)),
+                    pool: match (s.pool_start, s.pool_end) {
+                        (Some(start), Some(end)) => Some(AllocRange {
+                            start: bytes16_to_ip(start, s.is_v6),
+                            end: bytes16_to_ip(end, s.is_v6),
+                        }),
+                        _ => None,
+                    },
+                    enable_dhcp: s.enable_dhcp,
+                },
+            );
+        }
+        // IPAM is restored verbatim (not re-derived) so allocations survive a
+        // failover exactly as they were — including the auto-reserved gateway,
+        // which is therefore not re-inserted here.
+        for a in &snap.ip_allocations {
+            let key = ip_to_u128(bytes16_to_ip(a.addr, a.is_v6));
+            let owner = match &a.owner {
+                IpAllocOwnerRec::Port(p) => IpAllocOwner::Port(p.clone()),
+                IpAllocOwnerRec::Reserved => IpAllocOwner::Reserved,
+                IpAllocOwnerRec::Gateway => IpAllocOwner::Gateway,
+            };
+            t.ipam
+                .entry(a.subnet_id.clone())
+                .or_default()
+                .insert(key, owner);
         }
         t
     }
@@ -1341,6 +1895,276 @@ mod tests {
         assert_eq!(
             format!("{:?}", t.derive("h1")),
             format!("{:?}", restored.derive("h1"))
+        );
+    }
+
+    // === D2: first-class subnets + IPAM =====================================
+
+    use velstra_common::parse_cidr_v6;
+
+    fn v4_subnet(id: &str, vni: u32, cidr: &str) -> Subnet {
+        Subnet {
+            id: id.to_string(),
+            vni,
+            cidr: SubnetCidr::V4(parse_cidr_v4(cidr).unwrap()),
+            gateway: None,
+            pool: None,
+            enable_dhcp: false,
+        }
+    }
+
+    fn v6_subnet(id: &str, vni: u32, cidr: &str) -> Subnet {
+        Subnet {
+            id: id.to_string(),
+            vni,
+            cidr: SubnetCidr::V6(parse_cidr_v6(cidr).unwrap()),
+            gateway: None,
+            pool: None,
+            enable_dhcp: false,
+        }
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn add_subnet_validates_id_network_gateway_and_pool() {
+        let mut t = Topology::new();
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+
+        // Empty id, unknown network, duplicate id.
+        assert!(t.add_subnet(v4_subnet("", 100, "10.0.0.0/24")).is_err());
+        assert!(
+            t.add_subnet(v4_subnet("s-ghost", 999, "10.0.0.0/24"))
+                .is_err()
+        );
+        t.add_subnet(v4_subnet("s1", 100, "192.168.50.0/24"))
+            .unwrap();
+        assert!(
+            t.add_subnet(v4_subnet("s1", 100, "192.168.50.0/24"))
+                .is_err()
+        );
+
+        // Gateway outside the CIDR (and wrong-family gateway) are rejected.
+        let mut bad_gw = v4_subnet("s2", 100, "192.168.60.0/24");
+        bad_gw.gateway = Some(ip("10.9.9.1"));
+        assert!(t.add_subnet(bad_gw).is_err());
+        let mut wrong_family = v4_subnet("s3", 100, "192.168.60.0/24");
+        wrong_family.gateway = Some(ip("2001:db8::1"));
+        assert!(t.add_subnet(wrong_family).is_err());
+
+        // Inverted / out-of-CIDR pools are rejected.
+        let mut inverted = v4_subnet("s4", 100, "192.168.60.0/24");
+        inverted.pool = Some(AllocRange {
+            start: ip("192.168.60.100"),
+            end: ip("192.168.60.10"),
+        });
+        assert!(t.add_subnet(inverted).is_err());
+        let mut out_of_cidr = v4_subnet("s5", 100, "192.168.60.0/24");
+        out_of_cidr.pool = Some(AllocRange {
+            start: ip("192.168.60.10"),
+            end: ip("192.168.99.10"),
+        });
+        assert!(t.add_subnet(out_of_cidr).is_err());
+
+        // Listing and per-network views.
+        assert!(t.subnet("s1").is_some());
+        assert_eq!(t.subnets().count(), 1);
+        assert_eq!(t.network_subnets(100).count(), 1);
+        assert_eq!(t.network_subnets(999).count(), 0);
+    }
+
+    #[test]
+    fn ipam_allocates_deterministically_skips_gateway_and_reports_exhaustion() {
+        let mut t = Topology::new();
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+        // A /29 with a gateway at .1: usable pool is .1..=.6 minus the gateway.
+        let mut s = v4_subnet("s1", 100, "192.168.50.0/29");
+        s.gateway = Some(ip("192.168.50.1"));
+        t.add_subnet(s).unwrap();
+
+        // The gateway (.1) is reserved, so the first hand-out is .2, then .3…
+        assert_eq!(t.allocate("s1", None).unwrap(), ip("192.168.50.2"));
+        assert_eq!(t.allocate("s1", None).unwrap(), ip("192.168.50.3"));
+
+        // A specific request is honoured, then excluded.
+        assert_eq!(
+            t.allocate("s1", Some(ip("192.168.50.5"))).unwrap(),
+            ip("192.168.50.5")
+        );
+        // Re-requesting an allocated address fails; so does the gateway and an
+        // address outside the pool / subnet.
+        assert!(t.allocate("s1", Some(ip("192.168.50.5"))).is_err());
+        assert!(t.allocate("s1", Some(ip("192.168.50.1"))).is_err()); // gateway
+        assert!(t.allocate("s1", Some(ip("192.168.50.7"))).is_err()); // broadcast (out of pool)
+        assert!(t.allocate("s1", Some(ip("10.0.0.9"))).is_err()); // out of subnet
+
+        // Drain the rest of the pool (.4, .6) then exhaust.
+        assert_eq!(t.allocate("s1", None).unwrap(), ip("192.168.50.4"));
+        assert_eq!(t.allocate("s1", None).unwrap(), ip("192.168.50.6"));
+        assert!(t.allocate("s1", None).is_err()); // exhausted
+
+        // Releasing frees the address for re-allocation; a no-op release is false.
+        assert!(t.release("s1", ip("192.168.50.4")));
+        assert!(!t.release("s1", ip("192.168.50.4")));
+        assert_eq!(t.allocate("s1", None).unwrap(), ip("192.168.50.4"));
+    }
+
+    #[test]
+    fn port_binds_dual_stack_addresses_from_v4_and_v6_subnets() {
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+        let mut s4 = v4_subnet("s4", 100, "192.168.50.0/24");
+        s4.gateway = Some(ip("192.168.50.1"));
+        let mut s6 = v6_subnet("s6", 100, "2001:db8::/64");
+        s6.gateway = Some(ip("2001:db8::1"));
+        t.add_subnet(s4).unwrap();
+        t.add_subnet(s6).unwrap();
+
+        let p = t.create_port(100, "h1", "tap0", None, None).unwrap();
+
+        // Bind a v4 and a v6 address → a dual-stack port.
+        let a4 = t.bind_port_subnet(&p.id, "s4", None).unwrap();
+        let a6 = t.bind_port_subnet(&p.id, "s6", None).unwrap();
+        assert_eq!(a4.addr, ip("192.168.50.2")); // .1 gateway reserved
+        assert_eq!(a6.addr, ip("2001:db8::2")); // ::1 gateway reserved
+        assert!(a4.addr.is_ipv4() && a6.addr.is_ipv6());
+
+        // port_addrs returns both, deterministically sorted by (subnet, addr).
+        let addrs = t.port_addrs(&p.id);
+        assert_eq!(addrs.len(), 2);
+        assert_eq!(addrs[0], a4); // "s4" < "s6"
+        assert_eq!(addrs[1], a6);
+
+        // Binding requires the subnet be on the port's network.
+        t.add_network(network(200, "red", "10.1.0.0/24")).unwrap();
+        t.add_subnet(v4_subnet("s-other", 200, "10.1.0.0/24"))
+            .unwrap();
+        assert!(t.bind_port_subnet(&p.id, "s-other", None).is_err());
+        // Unknown port / subnet are errors.
+        assert!(t.bind_port_subnet("nope", "s4", None).is_err());
+        assert!(t.bind_port_subnet(&p.id, "ghost", None).is_err());
+    }
+
+    #[test]
+    fn unbind_and_remove_port_release_ipam_addresses() {
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+        t.add_subnet(v4_subnet("s4", 100, "192.168.50.0/24"))
+            .unwrap();
+        let p = t.create_port(100, "h1", "tap0", None, None).unwrap();
+        let a = t.bind_port_subnet(&p.id, "s4", None).unwrap();
+
+        // Unbind only succeeds for the owning port; a wrong owner is a no-op.
+        assert!(!t.unbind_port_address("someone-else", "s4", a.addr));
+        assert!(t.unbind_port_address(&p.id, "s4", a.addr));
+        assert!(t.port_addrs(&p.id).is_empty());
+        // The address is free again after unbind.
+        assert_eq!(t.allocate("s4", Some(a.addr)).unwrap(), a.addr);
+        t.release("s4", a.addr);
+
+        // Removing the port releases everything it held.
+        let a2 = t.bind_port_subnet(&p.id, "s4", None).unwrap();
+        assert!(!t.port_addrs(&p.id).is_empty());
+        assert!(t.remove_port(&p.id));
+        assert!(t.port_addrs(&p.id).is_empty());
+        assert_eq!(t.allocate("s4", Some(a2.addr)).unwrap(), a2.addr); // freed
+    }
+
+    #[test]
+    fn remove_subnet_blocked_while_allocated_gateway_does_not_block() {
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+        let mut s = v4_subnet("s4", 100, "192.168.50.0/24");
+        s.gateway = Some(ip("192.168.50.1"));
+        t.add_subnet(s).unwrap();
+
+        // A gateway-only subnet still removes (the reservation doesn't block).
+        assert!(t.subnet("s4").is_some());
+        // Allocate → removal blocked.
+        let addr = t.allocate("s4", None).unwrap();
+        assert!(t.remove_subnet("s4").is_err());
+        // Release → removal succeeds and reports existence.
+        t.release("s4", addr);
+        assert!(t.remove_subnet("s4").unwrap());
+        // Removing a non-existent subnet reports "did not exist".
+        assert!(!t.remove_subnet("s4").unwrap());
+    }
+
+    #[test]
+    fn remove_network_blocked_while_a_subnet_references_it() {
+        let mut t = Topology::new();
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+        t.add_subnet(v4_subnet("s4", 100, "192.168.50.0/24"))
+            .unwrap();
+        // The subnet keeps the network alive.
+        assert!(t.remove_network(100).is_err());
+        assert!(t.remove_subnet("s4").unwrap());
+        assert!(t.remove_network(100).unwrap());
+    }
+
+    #[test]
+    fn subnets_and_ipam_survive_a_snapshot_roundtrip() {
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+        let mut s4 = v4_subnet("s4", 100, "192.168.50.0/24");
+        s4.gateway = Some(ip("192.168.50.1"));
+        s4.enable_dhcp = true;
+        s4.pool = Some(AllocRange {
+            start: ip("192.168.50.10"),
+            end: ip("192.168.50.20"),
+        });
+        let mut s6 = v6_subnet("s6", 100, "2001:db8::/64");
+        s6.gateway = Some(ip("2001:db8::1"));
+        t.add_subnet(s4.clone()).unwrap();
+        t.add_subnet(s6).unwrap();
+
+        let p = t.create_port(100, "h1", "tap0", None, None).unwrap();
+        let a4 = t.bind_port_subnet(&p.id, "s4", None).unwrap(); // .10 (pool start)
+        let a6 = t.bind_port_subnet(&p.id, "s6", None).unwrap(); // ::2
+        let reserved = t.allocate("s4", Some(ip("192.168.50.15"))).unwrap();
+        assert_eq!(a4.addr, ip("192.168.50.10"));
+
+        let restored = Topology::from_snapshot(&t.to_snapshot());
+
+        // Subnet came back verbatim (CIDR, gateway, pool, dhcp flag).
+        assert_eq!(restored.subnet("s4"), t.subnet("s4"));
+        assert_eq!(restored.subnet("s4").unwrap(), &s4);
+        assert!(restored.subnet("s6").unwrap().cidr.is_v6());
+
+        // The port's dual-stack bindings survived.
+        let addrs = restored.port_addrs(&p.id);
+        assert!(
+            addrs
+                .iter()
+                .any(|x| x.addr == a4.addr && x.subnet_id == "s4")
+        );
+        assert!(
+            addrs
+                .iter()
+                .any(|x| x.addr == a6.addr && x.subnet_id == "s6")
+        );
+
+        // The used-address set is preserved: none of the live addresses (gateway,
+        // port bindings, standalone reservation) can be re-handed-out, so the next
+        // free v4 address is .11 (pool = .10..=.20, .10 and .15 taken).
+        assert!(restored.clone().allocate("s4", Some(a4.addr)).is_err());
+        assert!(restored.clone().allocate("s4", Some(reserved)).is_err());
+        assert_eq!(
+            restored.clone().allocate("s4", None).unwrap(),
+            ip("192.168.50.11")
         );
     }
 }
