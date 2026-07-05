@@ -1160,8 +1160,16 @@ fn try_velstra_forward(ctx: &XdpContext) -> Result<u32, ()> {
     // Phase 3: load balancer / DNAT. A matching service rewrites the packet to a
     // backend and we PASS it for the kernel to route there.
     if let Some(action) = try_load_balance(
-        ctx, ihl_bytes, s.policy_id, s.src_addr, s.dst_addr, s.src_port, s.dst_port, s.proto,
-        s.checksum, log,
+        ctx,
+        ihl_bytes,
+        s.policy_id,
+        s.src_addr,
+        s.dst_addr,
+        s.src_port,
+        s.dst_port,
+        s.proto,
+        s.checksum,
+        log,
     )? {
         return Ok(action);
     }

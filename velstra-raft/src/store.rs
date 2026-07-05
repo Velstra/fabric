@@ -829,15 +829,29 @@ mod tests {
         );
         assert!(bound.ok, "bind failed: {:?}", bound.error);
         let pid = velstra_orchestrator::security_group_policy_id("web");
-        let rt = t.derive("h1").unwrap().resolve().expect("derived config resolves");
+        let rt = t
+            .derive("h1")
+            .unwrap()
+            .resolve()
+            .expect("derived config resolves");
         assert!(rt.policies.iter().any(|p| p.id == pid));
         assert_eq!(
-            rt.interfaces.iter().find(|i| i.name == "tapA").unwrap().policy,
+            rt.interfaces
+                .iter()
+                .find(|i| i.name == "tapA")
+                .unwrap()
+                .policy,
             pid
         );
 
         // Removing a bound group fails; clearing the binding then allows removal.
-        assert!(!apply(&mut t, &TopoRequest::RemoveSecurityGroup { name: "web".into() }).ok);
+        assert!(
+            !apply(
+                &mut t,
+                &TopoRequest::RemoveSecurityGroup { name: "web".into() }
+            )
+            .ok
+        );
         assert!(
             apply(
                 &mut t,
@@ -848,6 +862,12 @@ mod tests {
             )
             .ok
         );
-        assert!(apply(&mut t, &TopoRequest::RemoveSecurityGroup { name: "web".into() }).ok);
+        assert!(
+            apply(
+                &mut t,
+                &TopoRequest::RemoveSecurityGroup { name: "web".into() }
+            )
+            .ok
+        );
     }
 }
