@@ -26,3 +26,11 @@ x509-parser = "0.16"
 toml = { workspace = true, features = ["display"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "signal", "fs", "net", "io-util"] }
 tokio-stream = { workspace = true }
+# REST/JSON northbound gateway (roadmap D1). axum 0.7 shares hyper 1 / http 1
+# with the tonic gRPC stack already in the tree, so no duplicate HTTP runtime.
+axum = { version = "0.7", default-features = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# HTTP client for the REST integration tests (plain HTTP, no TLS backend).
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
