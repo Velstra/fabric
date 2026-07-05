@@ -56,6 +56,16 @@ service VelstraOrchestrator {
   rpc RemoveHost(RemoveHostRequest) returns (Ack);
   // Decommission a network. Fails while any port is still on it.
   rpc RemoveNetwork(RemoveNetworkRequest) returns (Ack);
+  // Register a named security group (B5): a reusable firewall rule set assigned
+  // a deterministic policy id. Fails on a duplicate name.
+  rpc AddSecurityGroup(SecurityGroupSpec) returns (Ack);
+  // Remove a security group by name. Fails while any port is still bound to it.
+  rpc RemoveSecurityGroup(RemoveSecurityGroupRequest) returns (Ack);
+  // List all security groups in the fabric (with their derived policy ids).
+  rpc ListSecurityGroups(ListSecurityGroupsRequest) returns (ListSecurityGroupsResponse);
+  // Bind a port to a security group by name, or clear its binding (revert to
+  // the VNI-as-policy default). Returns the updated port.
+  rpc BindPortSecurityGroup(BindPortSecurityGroupRequest) returns (PortInfo);
 }
 
 message HostSpec {
@@ -117,6 +127,47 @@ message ListPortsRequest {}
 
 message ListPortsResponse {
   repeated PortInfo ports = 1;
+}
+
+// A named security group (B5): the same firewall shape as a Policy, addressed by
+// name. Its policy id is derived deterministically from the name by the
+// controller (not carried here). Reuses the PortRule message for its rules.
+message SecurityGroupSpec {
+  string name = 1;
+  Action default_action = 2;
+  bool drop_icmp = 3;
+  bool stateful = 4;
+  repeated string blocklist = 5;
+  repeated PortRule rules = 6;
+}
+
+message RemoveSecurityGroupRequest {
+  string name = 1;
+}
+
+message ListSecurityGroupsRequest {}
+
+// A security group as reported by ListSecurityGroups: its spec plus the
+// deterministic policy id the controller assigned it.
+message SecurityGroupInfo {
+  string name = 1;
+  uint32 policy_id = 2;
+  Action default_action = 3;
+  bool drop_icmp = 4;
+  bool stateful = 5;
+  repeated string blocklist = 6;
+  repeated PortRule rules = 7;
+}
+
+message ListSecurityGroupsResponse {
+  repeated SecurityGroupInfo groups = 1;
+}
+
+message BindPortSecurityGroupRequest {
+  string port_id = 1;
+  // Security group name to bind. Absent ⇒ clear the binding (revert to the
+  // VNI-as-policy default). `optional` so "unset" and a name stay distinct.
+  optional string group = 2;
 }
 
 message SetConfigRequest {
