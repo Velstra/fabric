@@ -98,8 +98,14 @@ impl RaftNode {
         let last_purged = loaded.as_ref().and_then(|s| s.meta.last_log_id);
         let log = LogStore::new(last_purged);
         let sm = StateMachineStore::new(dir, loaded)?;
-        let raft =
-            Raft::new(id, raft_config()?, NetworkFactory::new(client_tls), log, sm.clone()).await?;
+        let raft = Raft::new(
+            id,
+            raft_config()?,
+            NetworkFactory::new(client_tls),
+            log,
+            sm.clone(),
+        )
+        .await?;
         Ok(Self { raft, sm, id })
     }
 
@@ -338,7 +344,11 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            assert!(ok, "node {} never received the replicated security group", node.id);
+            assert!(
+                ok,
+                "node {} never received the replicated security group",
+                node.id
+            );
         }
     }
 

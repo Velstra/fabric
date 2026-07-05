@@ -51,11 +51,11 @@ use velstra_config::{
 use velstra_orchestrator::Topology;
 use velstra_proto::{
     Ack, Action, BindPortSecurityGroupRequest, CreatePortRequest, Encap, HostSpec,
-    ListNodesRequest, ListNodesResponse, ListPortsRequest, ListPortsResponse, ListSecurityGroupsRequest,
-    ListSecurityGroupsResponse, MigratePortRequest, NetworkSpec, NodeConfig, NodeRequest,
-    NodeSummary, PortInfo, PortRule, Proto, RemoveHostRequest, RemoveNetworkRequest,
-    RemovePortRequest, RemoveSecurityGroupRequest, SecurityGroupInfo, SecurityGroupSpec,
-    SetConfigRequest, StatsReport,
+    ListNodesRequest, ListNodesResponse, ListPortsRequest, ListPortsResponse,
+    ListSecurityGroupsRequest, ListSecurityGroupsResponse, MigratePortRequest, NetworkSpec,
+    NodeConfig, NodeRequest, NodeSummary, PortInfo, PortRule, Proto, RemoveHostRequest,
+    RemoveNetworkRequest, RemovePortRequest, RemoveSecurityGroupRequest, SecurityGroupInfo,
+    SecurityGroupSpec, SetConfigRequest, StatsReport,
     velstra_admin_client::VelstraAdminClient,
     velstra_admin_server::{VelstraAdmin, VelstraAdminServer},
     velstra_control_server::{VelstraControl, VelstraControlServer},
@@ -1106,7 +1106,10 @@ impl VelstraOrchestrator for OrchestratorSvc {
             return Err(deny("bind ports to security groups (admin only)"));
         }
         let req = request.into_inner();
-        info!("BindPortSecurityGroup({:?} -> {:?})", req.port_id, req.group);
+        info!(
+            "BindPortSecurityGroup({:?} -> {:?})",
+            req.port_id, req.group
+        );
         let resp = propose(
             &self.shared,
             velstra_raft::TopoRequest::SetPortSecurityGroup {
