@@ -31,10 +31,10 @@ use std::{
 };
 
 use anyhow::{Result, bail};
-use velstra_common::Cidr4;
+use velstra_common::{Cidr4, PolicyId};
 use velstra_config::{
     ActionName, EncapName, FileConfig, InterfaceFile, NeighborCfg, OverlayCfg, PolicyFile,
-    TunnelCfg,
+    PortRule, TunnelCfg,
 };
 
 /// A physical host that terminates tunnels (a VTEP).
@@ -123,6 +123,70 @@ impl Port {
     }
 }
 
+/// Base of the policy-id band reserved for named [`SecurityGroup`]s (roadmap
+/// B5): `2^24`. It sits entirely **above** the 24-bit VNI space, and therefore
+/// above every network-derived policy id (which equals a ≤ 24-bit VNI) *and*
+/// above the [`EVPN_RESERVED_VNI_BASE`] VNI reservation. A security group's
+/// `policy_id` is derived by hashing its name into `[BASE, u32::MAX]`, so it can
+/// never collide with a VNI-derived policy id, is independent of creation order,
+/// and stays fixed across rule edits — the property that keeps a group's
+/// conntrack and firewall-map keys stable when only its rules change.
+pub const SECURITY_GROUP_POLICY_BASE: PolicyId = 1 << 24;
+
+/// Deterministically derive a security group's fabric `policy_id` from its name.
+///
+/// A 32-bit FNV-1a hash (small, stable, dependency-free) folded into the
+/// [`SECURITY_GROUP_POLICY_BASE`] band. Purely a function of the name: the same
+/// name always maps to the same id, on any host and across restarts, so two
+/// controllers derive identical map keys and editing a group's rules never moves
+/// its id.
+pub fn security_group_policy_id(name: &str) -> PolicyId {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in name.bytes() {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    let span = u32::MAX - SECURITY_GROUP_POLICY_BASE + 1;
+    SECURITY_GROUP_POLICY_BASE + (hash % span)
+}
+
+/// A named, reusable firewall rule set (roadmap B5) — a *security group*.
+///
+/// It carries exactly the same firewall shape as a `[[policy]]` block (a default
+/// action, the ICMP/stateful toggles, a source blocklist, and per-`(proto,
+/// port)` rules), but is addressed by **name** and assigned a deterministic
+/// fabric [`policy_id`](Self::policy_id). A [`Port`] binds to one via
+/// [`Topology::set_port_security_group`]; [`Topology::derive`] then emits the
+/// group as a `[[policy]]` block on every host that has a bound local port, so
+/// the data plane enforces its rules under the group's stable `policy_id`.
+///
+/// The rules reuse the existing [`velstra_config::PortRule`] schema — there is
+/// no second rule model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurityGroup {
+    /// Unique group name; also the sole input to its `policy_id`.
+    pub name: String,
+    /// Verdict for traffic matching no rule.
+    pub default_action: ActionName,
+    /// Drop all ICMP under this group.
+    pub drop_icmp: bool,
+    /// Track connections and allow established flows (stateful firewall).
+    pub stateful: bool,
+    /// Source-IP CIDR blocks to drop unconditionally.
+    pub blocklist: Vec<String>,
+    /// Per-`(proto, port)` rules (reuses [`velstra_config::PortRule`]).
+    pub rules: Vec<PortRule>,
+}
+
+impl SecurityGroup {
+    /// This group's deterministic fabric `policy_id` (a pure function of its
+    /// name — see [`security_group_policy_id`]).
+    #[inline]
+    pub fn policy_id(&self) -> PolicyId {
+        security_group_policy_id(&self.name)
+    }
+}
+
 /// The whole virtual fabric: networks, hosts, and the ports binding them.
 /// Holds no I/O — the controller owns persistence and distribution.
 #[derive(Debug, Default, Clone)]
@@ -130,6 +194,9 @@ pub struct Topology {
     networks: HashMap<u32, Network>,
     hosts: HashMap<String, Host>,
     ports: Vec<Port>,
+    /// Named security groups (B5), keyed by name. A port references one by
+    /// `policy_id` (stored in [`Port::policy`]).
+    security_groups: HashMap<String, SecurityGroup>,
 }
 
 /// Derive a locally-administered, deterministic MAC for an inner IPv4: `02:00`
@@ -183,7 +250,10 @@ impl Topology {
     /// the host existed.
     pub fn remove_host(&mut self, id: &str) -> Result<bool> {
         if let Some(p) = self.ports.iter().find(|p| p.host == id) {
-            bail!("host {id:?} still has port {:?}; migrate or remove it first", p.id);
+            bail!(
+                "host {id:?} still has port {:?}; migrate or remove it first",
+                p.id
+            );
         }
         Ok(self.hosts.remove(id).is_some())
     }
@@ -210,6 +280,82 @@ impl Topology {
     /// All ports.
     pub fn ports(&self) -> &[Port] {
         &self.ports
+    }
+
+    /// Register a named security group (B5). Fails on an empty name, a duplicate
+    /// name, or the (vanishingly rare) case of its derived `policy_id` colliding
+    /// with an already-registered group's — mirroring the "reject rather than
+    /// silently overwrite" stance of [`add_network`](Self::add_network).
+    pub fn add_security_group(&mut self, sg: SecurityGroup) -> Result<()> {
+        if sg.name.is_empty() {
+            bail!("security group name must not be empty");
+        }
+        if self.security_groups.contains_key(&sg.name) {
+            bail!("security group {:?} already exists", sg.name);
+        }
+        let pid = sg.policy_id();
+        if let Some(existing) = self.security_groups.values().find(|g| g.policy_id() == pid) {
+            bail!(
+                "security group {:?} hashes to the same policy_id {pid} as {:?}; rename one",
+                sg.name,
+                existing.name
+            );
+        }
+        self.security_groups.insert(sg.name.clone(), sg);
+        Ok(())
+    }
+
+    /// All security groups, in no particular order.
+    pub fn security_groups(&self) -> impl Iterator<Item = &SecurityGroup> {
+        self.security_groups.values()
+    }
+
+    /// Look up a security group by name.
+    pub fn security_group(&self, name: &str) -> Option<&SecurityGroup> {
+        self.security_groups.get(name)
+    }
+
+    /// Remove a security group by name. Fails while any port is still bound to it
+    /// (the caller must rebind or remove those ports first — otherwise `derive()`
+    /// would emit interfaces pointing at a policy with no rule set). Returns
+    /// whether the group existed.
+    pub fn remove_security_group(&mut self, name: &str) -> Result<bool> {
+        let Some(sg) = self.security_groups.get(name) else {
+            return Ok(false);
+        };
+        let pid = sg.policy_id();
+        if let Some(p) = self.ports.iter().find(|p| p.policy == Some(pid)) {
+            bail!(
+                "security group {name:?} still bound by port {:?}; rebind or remove it first",
+                p.id
+            );
+        }
+        self.security_groups.remove(name);
+        Ok(true)
+    }
+
+    /// Bind a port to a security group by name (`Some`), or clear its binding
+    /// back to the VNI-as-policy default (`None`). Setting a binding resolves the
+    /// group's deterministic `policy_id` into [`Port::policy`], so the port's
+    /// traffic is evaluated against that group's rules. Fails on an unknown port
+    /// or an unknown group.
+    pub fn set_port_security_group(&mut self, port_id: &str, group: Option<&str>) -> Result<Port> {
+        let policy = match group {
+            Some(name) => Some(
+                self.security_groups
+                    .get(name)
+                    .ok_or_else(|| anyhow::anyhow!("unknown security group {name:?}"))?
+                    .policy_id(),
+            ),
+            None => None,
+        };
+        let port = self
+            .ports
+            .iter_mut()
+            .find(|p| p.id == port_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown port {port_id:?}"))?;
+        port.policy = policy;
+        Ok(port.clone())
     }
 
     /// Create a port on `vni`/`host`, allocating an IP (the next free address in
@@ -391,6 +537,36 @@ impl Topology {
             });
         }
 
+        // Security groups (B5): every group a *local* port binds (its
+        // `effective_policy` is a security-group policy id, not the VNI) becomes
+        // a `[[policy]]` block carrying that group's rules, so the interface the
+        // port loop emits below resolves to a real rule set under the group's
+        // stable policy id. Collected and sorted by policy id for deterministic
+        // output; a group is emitted once no matter how many ports bind it.
+        let mut sg_pids: Vec<PolicyId> = self
+            .ports
+            .iter()
+            .filter(|p| p.host == host_id)
+            .filter_map(|p| p.policy)
+            .filter(|pid| !local_vnis.contains(pid))
+            .collect();
+        sg_pids.sort_unstable();
+        sg_pids.dedup();
+        for pid in sg_pids {
+            if let Some(sg) = self.security_groups.values().find(|g| g.policy_id() == pid) {
+                cfg.policies.push(PolicyFile {
+                    id: pid,
+                    name: Some(sg.name.clone()),
+                    default_action: sg.default_action,
+                    drop_icmp: sg.drop_icmp,
+                    log: false,
+                    stateful: sg.stateful,
+                    blocklist: sg.blocklist.clone(),
+                    port_rules: sg.rules.clone(),
+                });
+            }
+        }
+
         // Ports: local → interface; remote on a hosted VNI → tunnel + neighbour.
         for port in &self.ports {
             if port.host == host_id {
@@ -440,6 +616,10 @@ pub struct FabricSnapshot {
     pub networks: Vec<NetworkRec>,
     /// All ports.
     pub ports: Vec<PortRec>,
+    /// All security groups (B5). `#[serde(default)]` so snapshots written before
+    /// B5 deserialize as an empty set (no groups).
+    #[serde(default)]
+    pub security_groups: Vec<SecurityGroupRec>,
 }
 
 /// Serializable mirror of a [`Host`].
@@ -463,6 +643,19 @@ pub struct NetworkRec {
     pub subnet_prefix: u8,
     pub default_action: ActionName,
     pub drop_icmp: bool,
+}
+
+/// Serializable mirror of a [`SecurityGroup`] (B5). The `policy_id` is *not*
+/// stored — it is recomputed from `name` on restore, keeping the name the single
+/// source of truth for the id.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SecurityGroupRec {
+    pub name: String,
+    pub default_action: ActionName,
+    pub drop_icmp: bool,
+    pub stateful: bool,
+    pub blocklist: Vec<String>,
+    pub rules: Vec<PortRule>,
 }
 
 /// Serializable mirror of a [`Port`].
@@ -523,6 +716,18 @@ impl Topology {
                     tap: p.tap.clone(),
                 })
                 .collect(),
+            security_groups: self
+                .security_groups
+                .values()
+                .map(|g| SecurityGroupRec {
+                    name: g.name.clone(),
+                    default_action: g.default_action,
+                    drop_icmp: g.drop_icmp,
+                    stateful: g.stateful,
+                    blocklist: g.blocklist.clone(),
+                    rules: g.rules.clone(),
+                })
+                .collect(),
         }
     }
 
@@ -570,6 +775,19 @@ impl Topology {
                 tap: p.tap.clone(),
             });
         }
+        for g in &snap.security_groups {
+            t.security_groups.insert(
+                g.name.clone(),
+                SecurityGroup {
+                    name: g.name.clone(),
+                    default_action: g.default_action,
+                    drop_icmp: g.drop_icmp,
+                    stateful: g.stateful,
+                    blocklist: g.blocklist.clone(),
+                    rules: g.rules.clone(),
+                },
+            );
+        }
         t
     }
 }
@@ -606,7 +824,8 @@ mod tests {
     fn rejects_duplicate_tap_binding() {
         let mut t = Topology::new();
         t.add_host(host("h1", "10.0.0.1", 1));
-        t.add_network(network(100, "blue", "192.168.50.0/24")).unwrap();
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
         t.create_port(100, "h1", "tap0", None, None).unwrap();
         // Same (host, tap) → rejected, even on a different IP/allocation.
         assert!(t.create_port(100, "h1", "tap0", None, None).is_err());
@@ -618,7 +837,8 @@ mod tests {
     fn remove_host_and_network_require_no_ports() {
         let mut t = Topology::new();
         t.add_host(host("h1", "10.0.0.1", 1));
-        t.add_network(network(100, "blue", "192.168.50.0/24")).unwrap();
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
         let p = t.create_port(100, "h1", "tap0", None, None).unwrap();
         // Both are blocked while the port exists.
         assert!(t.remove_host("h1").is_err());
@@ -899,8 +1119,15 @@ mod tests {
 
         let cfg = t.derive("h1").unwrap();
         let iface = cfg.interfaces.iter().find(|i| i.name == "tapSG").unwrap();
-        assert_eq!(iface.policy, 42, "interface firewall policy == security group");
-        assert_eq!(iface.vni, Some(5000), "…while staying on VNI 5000's segment");
+        assert_eq!(
+            iface.policy, 42,
+            "interface firewall policy == security group"
+        );
+        assert_eq!(
+            iface.vni,
+            Some(5000),
+            "…while staying on VNI 5000's segment"
+        );
 
         // The default (policy = None) still collapses to the VNI.
         let d = t.create_port(5000, "h1", "tapDef", None, None).unwrap();
@@ -910,5 +1137,210 @@ mod tests {
         let restored = Topology::from_snapshot(&t.to_snapshot());
         let rp = restored.ports().iter().find(|q| q.id == p.id).unwrap();
         assert_eq!(rp.policy, Some(42));
+    }
+
+    // === B5: security groups ================================================
+
+    /// A `[[port_rule]]`-shaped rule for tests.
+    fn rule(proto: velstra_config::ProtoName, port: u16, action: ActionName) -> PortRule {
+        PortRule {
+            proto,
+            port,
+            action,
+            log: false,
+            src: None,
+        }
+    }
+
+    fn sg(name: &str, rules: Vec<PortRule>) -> SecurityGroup {
+        SecurityGroup {
+            name: name.to_string(),
+            default_action: ActionName::Drop,
+            drop_icmp: false,
+            stateful: true,
+            blocklist: Vec::new(),
+            rules,
+        }
+    }
+
+    #[test]
+    fn security_group_policy_id_is_deterministic_ordered_and_in_band() {
+        use velstra_config::ProtoName;
+
+        // Same name → same id, every time and regardless of the rules it carries.
+        let a1 = security_group_policy_id("web");
+        let a2 = security_group_policy_id("web");
+        assert_eq!(a1, a2);
+        assert_eq!(
+            sg("web", vec![rule(ProtoName::Tcp, 80, ActionName::Pass)]).policy_id(),
+            sg("web", vec![]).policy_id(),
+            "id depends only on the name, not the rules — stable across edits"
+        );
+
+        // Different names → (almost surely) different ids.
+        assert_ne!(a1, security_group_policy_id("db"));
+
+        // Every id lands in the reserved band, so it can never collide with a
+        // VNI-derived policy id (all ≤ 24 bits, i.e. < the band base).
+        for name in ["web", "db", "", "a-very-long-security-group-name-42"] {
+            let pid = security_group_policy_id(name);
+            assert!(pid >= SECURITY_GROUP_POLICY_BASE);
+            assert!(pid > EVPN_RESERVED_VNI_BASE);
+            assert!(pid > 0xFF_FFFF, "must sit above the whole 24-bit VNI space");
+        }
+    }
+
+    #[test]
+    fn add_security_group_rejects_empty_and_duplicate_names() {
+        let mut t = Topology::new();
+        assert!(t.add_security_group(sg("", vec![])).is_err()); // empty name
+        t.add_security_group(sg("web", vec![])).unwrap();
+        assert!(t.add_security_group(sg("web", vec![])).is_err()); // duplicate
+        // A distinct name is accepted and both are retrievable.
+        t.add_security_group(sg("db", vec![])).unwrap();
+        assert!(t.security_group("web").is_some());
+        assert_eq!(t.security_groups().count(), 2);
+        assert!(t.security_group("missing").is_none());
+    }
+
+    #[test]
+    fn bind_and_unbind_port_resolves_security_group_policy_id() {
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+        t.add_security_group(sg("web", vec![])).unwrap();
+        let p = t.create_port(100, "h1", "tap0", None, None).unwrap();
+        assert_eq!(p.effective_policy(), 100); // defaults to the VNI
+
+        // Bind → the port's policy is the group's deterministic id.
+        let bound = t.set_port_security_group(&p.id, Some("web")).unwrap();
+        assert_eq!(bound.policy, Some(security_group_policy_id("web")));
+        assert_eq!(bound.effective_policy(), security_group_policy_id("web"));
+
+        // Unbind → back to the VNI default.
+        let cleared = t.set_port_security_group(&p.id, None).unwrap();
+        assert_eq!(cleared.policy, None);
+        assert_eq!(cleared.effective_policy(), 100);
+
+        // Unknown port / group are errors.
+        assert!(t.set_port_security_group("nope", Some("web")).is_err());
+        assert!(t.set_port_security_group(&p.id, Some("ghost")).is_err());
+    }
+
+    #[test]
+    fn derive_emits_bound_security_group_as_a_resolvable_policy() {
+        use velstra_common::ip_proto;
+        use velstra_config::ProtoName;
+
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.10.0.1", 0x11));
+        t.add_network(network(5000, "blue", "192.168.100.0/24"))
+            .unwrap();
+        // A "web" group: default-drop, allow tcp/80, block tcp/22.
+        t.add_security_group(sg(
+            "web",
+            vec![
+                rule(ProtoName::Tcp, 80, ActionName::Pass),
+                rule(ProtoName::Tcp, 22, ActionName::Drop),
+            ],
+        ))
+        .unwrap();
+
+        let p = t.create_port(5000, "h1", "tapW", None, None).unwrap();
+        t.set_port_security_group(&p.id, Some("web")).unwrap();
+        let pid = security_group_policy_id("web");
+
+        let cfg = t.derive("h1").unwrap();
+        // The derived config now RESOLVES — before B5 a decoupled port policy had
+        // no `[[policy]]` block and `resolve()` would reject the dangling id.
+        let rt = cfg
+            .resolve()
+            .expect("bound security group makes derive resolvable");
+
+        // The interface binds the group's policy id while staying on the VNI.
+        let iface = rt.interfaces.iter().find(|i| i.name == "tapW").unwrap();
+        assert_eq!(iface.policy, pid);
+        assert_eq!(iface.vni, 5000);
+
+        // A `[[policy]]` for the group carries its rules (stateful, tcp/80 pass,
+        // tcp/22 drop) — plus the network's own policy (id == vni).
+        let gp = rt.policies.iter().find(|pl| pl.id == pid).unwrap();
+        assert!(gp.global.has_flag(velstra_common::ConfigFlags::STATEFUL));
+        assert!(gp.port_rules.iter().any(|(k, _, a, _)| {
+            *k == velstra_common::PortKey::new(ip_proto::TCP, 80)
+                && *a == velstra_common::Action::Pass
+        }));
+        assert!(gp.port_rules.iter().any(|(k, _, a, _)| {
+            *k == velstra_common::PortKey::new(ip_proto::TCP, 22)
+                && *a == velstra_common::Action::Drop
+        }));
+        assert!(rt.policies.iter().any(|pl| pl.id == 5000));
+    }
+
+    #[test]
+    fn one_group_bound_by_many_ports_emits_a_single_policy_block() {
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.10.0.1", 0x11));
+        t.add_network(network(5000, "blue", "192.168.100.0/24"))
+            .unwrap();
+        t.add_security_group(sg("web", vec![])).unwrap();
+        for tap in ["tapA", "tapB", "tapC"] {
+            let p = t.create_port(5000, "h1", tap, None, None).unwrap();
+            t.set_port_security_group(&p.id, Some("web")).unwrap();
+        }
+        let pid = security_group_policy_id("web");
+        let rt = t.derive("h1").unwrap().resolve().unwrap();
+        assert_eq!(
+            rt.policies.iter().filter(|pl| pl.id == pid).count(),
+            1,
+            "the group is emitted exactly once, no matter how many ports bind it"
+        );
+    }
+
+    #[test]
+    fn remove_security_group_is_blocked_while_a_port_binds_it() {
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+        t.add_security_group(sg("web", vec![])).unwrap();
+        let p = t.create_port(100, "h1", "tap0", None, None).unwrap();
+        t.set_port_security_group(&p.id, Some("web")).unwrap();
+
+        // Bound → removal refused.
+        assert!(t.remove_security_group("web").is_err());
+        // Rebind away, then removal succeeds and reports existence.
+        t.set_port_security_group(&p.id, None).unwrap();
+        assert!(t.remove_security_group("web").unwrap());
+        // Removing a non-existent group reports "did not exist".
+        assert!(!t.remove_security_group("web").unwrap());
+    }
+
+    #[test]
+    fn security_groups_survive_a_snapshot_roundtrip() {
+        use velstra_config::ProtoName;
+
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.10.0.1", 0x11));
+        t.add_network(network(5000, "blue", "192.168.100.0/24"))
+            .unwrap();
+        let mut g = sg("web", vec![rule(ProtoName::Tcp, 443, ActionName::Pass)]);
+        g.blocklist = vec!["203.0.113.0/24".to_string()];
+        t.add_security_group(g.clone()).unwrap();
+        let p = t.create_port(5000, "h1", "tapW", None, None).unwrap();
+        t.set_port_security_group(&p.id, Some("web")).unwrap();
+
+        let restored = Topology::from_snapshot(&t.to_snapshot());
+        // The group came back verbatim…
+        assert_eq!(restored.security_group("web"), Some(&g));
+        // …the port's binding survived…
+        let rp = restored.ports().iter().find(|q| q.id == p.id).unwrap();
+        assert_eq!(rp.policy, Some(security_group_policy_id("web")));
+        // …and the derived config is byte-identical across the round-trip.
+        assert_eq!(
+            format!("{:?}", t.derive("h1")),
+            format!("{:?}", restored.derive("h1"))
+        );
     }
 }
