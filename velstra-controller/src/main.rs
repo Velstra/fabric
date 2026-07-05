@@ -69,6 +69,7 @@ use velstra_proto::{
 
 mod authz;
 mod evpn;
+mod rest;
 mod topology;
 
 use authz::{Authz, caller_of};
@@ -180,6 +181,27 @@ struct ServeArgs {
     /// config. Unset ⇒ the feature is entirely inert.
     #[arg(long)]
     wren_socket: Option<PathBuf>,
+
+    // --- REST/JSON northbound gateway (roadmap D1) --------------------------
+    /// REST/JSON northbound gateway listen address. Serves the same fabric
+    /// operations as the gRPC orchestrator over HTTP so both Velstra products
+    /// can drive the fabric without gRPC. Unset ⇒ the gateway is not started
+    /// (gRPC-only, back-compat).
+    #[arg(long)]
+    rest_listen: Option<String>,
+
+    /// Bearer token → caller identity for the REST gateway, as `CN=TOKEN`
+    /// (repeatable). A token authenticates as the mTLS CN it maps to; admin CNs
+    /// (`--admin-cn`) may perform any write, a node CN may write only its own
+    /// host, reads are open. None ⇒ the gateway is open (localhost / single-
+    /// operator default, mirroring the admin channel with no `--client-ca`).
+    #[arg(long = "rest-token", requires = "rest_listen")]
+    rest_tokens: Vec<String>,
+
+    /// File the REST gateway appends audit records to (newline-delimited JSON),
+    /// in addition to the in-memory ring exposed at `GET /v1/audit`.
+    #[arg(long, requires = "rest_listen")]
+    rest_audit_log: Option<PathBuf>,
 }
 
 /// Client TLS options for the admin/orchestrator CLIs (use an `https://`
@@ -1680,6 +1702,22 @@ fn parse_peers(peers: &[String], self_id: u64, self_addr: &str) -> Result<BTreeM
     Ok(members)
 }
 
+/// Parse `--rest-token CN=TOKEN` entries into a `token → CN` lookup map (the
+/// bearer-token stand-in for an mTLS client-cert CN on the REST gateway).
+fn parse_rest_tokens(specs: &[String]) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+    for spec in specs {
+        let (cn, token) = spec
+            .split_once('=')
+            .ok_or_else(|| anyhow!("--rest-token must be CN=TOKEN, got {spec:?}"))?;
+        if cn.is_empty() || token.is_empty() {
+            bail!("--rest-token {spec:?} has an empty CN or token");
+        }
+        map.insert(token.to_string(), cn.to_string());
+    }
+    Ok(map)
+}
+
 async fn serve(args: ServeArgs) -> Result<()> {
     if args.config_dir.is_none() && args.topology.is_none() && args.node_id.is_none() {
         bail!("provide --config-dir, --topology, or --node-id (cluster mode)");
@@ -1868,6 +1906,46 @@ async fn serve(args: ServeArgs) -> Result<()> {
             warn!("admin server stopped: {e}");
         }
     });
+
+    // REST/JSON northbound gateway (roadmap D1). Opt-in via --rest-listen; it
+    // drives the SAME controller path (propose-through-Raft / local Topology) as
+    // the gRPC orchestrator, with a bearer-token stand-in for the mTLS CN authz.
+    if let Some(rest_listen) = &args.rest_listen {
+        let rest_addr: std::net::SocketAddr = rest_listen
+            .parse()
+            .with_context(|| format!("invalid rest address {rest_listen:?}"))?;
+        let tokens = parse_rest_tokens(&args.rest_tokens)?;
+        let rest_authz = if tokens.is_empty() {
+            info!("REST gateway authorization: OPEN (no --rest-token configured)");
+            Authz::disabled()
+        } else {
+            info!(
+                "REST gateway authorization: ENFORCED ({} token(s); {} admin CN(s))",
+                tokens.len(),
+                args.admin_cn.len()
+            );
+            Authz::new(args.admin_cn.clone(), true)
+        };
+        let audit = Arc::new(rest::Audit::new(args.rest_audit_log.as_ref()));
+        let rest_state = Arc::new(rest::RestState {
+            shared: shared.clone(),
+            authz: rest_authz,
+            tokens,
+            audit,
+        });
+        let app = rest::router(rest_state);
+        tokio::spawn(async move {
+            match tokio::net::TcpListener::bind(rest_addr).await {
+                Ok(listener) => {
+                    info!("REST gateway listening on {rest_addr}");
+                    if let Err(e) = axum::serve(listener, app).await {
+                        warn!("REST gateway stopped: {e}");
+                    }
+                }
+                Err(e) => warn!("REST gateway bind {rest_addr} failed: {e}"),
+            }
+        });
+    }
 
     // Agent-facing server (optionally with TLS/mTLS).
     let addr = args
