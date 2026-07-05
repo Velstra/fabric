@@ -50,12 +50,16 @@ use velstra_config::{
 };
 use velstra_orchestrator::Topology;
 use velstra_proto::{
-    Ack, Action, BindPortSecurityGroupRequest, CreatePortRequest, Encap, HostSpec,
-    ListNodesRequest, ListNodesResponse, ListPortsRequest, ListPortsResponse,
-    ListSecurityGroupsRequest, ListSecurityGroupsResponse, MigratePortRequest, NetworkSpec,
-    NodeConfig, NodeRequest, NodeSummary, PortInfo, PortRule, Proto, RemoveHostRequest,
-    RemoveNetworkRequest, RemovePortRequest, RemoveSecurityGroupRequest, SecurityGroupInfo,
-    SecurityGroupSpec, SetConfigRequest, StatsReport,
+    Ack, Action, AllocateAddressRequest, AllocateAddressResponse, AllocateFloatingIpRequest,
+    AssociateFloatingIpRequest, BindPortSecurityGroupRequest, BindPortSubnetRequest,
+    CreatePortRequest, DisassociateFloatingIpRequest, Encap, FloatingIpInfo, HostSpec,
+    ListFloatingIpsRequest, ListFloatingIpsResponse, ListNodesRequest, ListNodesResponse,
+    ListPortsRequest, ListPortsResponse, ListSecurityGroupsRequest, ListSecurityGroupsResponse,
+    ListSubnetsRequest, ListSubnetsResponse, MigratePortRequest, NetworkSpec, NodeConfig,
+    NodeRequest, NodeSummary, PortAddrInfo, PortInfo, PortRule, Proto, ReleaseAddressRequest,
+    ReleaseFloatingIpRequest, RemoveHostRequest, RemoveNetworkRequest, RemovePortRequest,
+    RemoveSecurityGroupRequest, RemoveSubnetRequest, SecurityGroupInfo, SecurityGroupSpec,
+    SetConfigRequest, StatsReport, SubnetInfo, SubnetSpec, UnbindPortAddressRequest,
     velstra_admin_client::VelstraAdminClient,
     velstra_admin_server::{VelstraAdmin, VelstraAdminServer},
     velstra_control_server::{VelstraControl, VelstraControlServer},
@@ -320,6 +324,91 @@ enum OrchAction {
         #[arg(long)]
         clear: bool,
     },
+    /// Define a first-class subnet under a network (D2).
+    AddSubnet {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        vni: u32,
+        /// CIDR, IPv4 or IPv6 (e.g. `192.168.50.0/24` or `2001:db8::/64`).
+        #[arg(long)]
+        cidr: String,
+        #[arg(long)]
+        gateway: Option<String>,
+        #[arg(long)]
+        pool_start: Option<String>,
+        #[arg(long)]
+        pool_end: Option<String>,
+        #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
+        enable_dhcp: bool,
+    },
+    /// Remove a subnet by id.
+    RemoveSubnet {
+        #[arg(long)]
+        id: String,
+    },
+    /// List all subnets in the fabric.
+    ListSubnets,
+    /// Bind a port to a subnet, allocating (or requesting `--ip`) an address.
+    BindSubnet {
+        #[arg(long)]
+        port: String,
+        #[arg(long)]
+        subnet: String,
+        #[arg(long)]
+        ip: Option<String>,
+    },
+    /// Release one of a port's bound addresses back to its subnet's pool.
+    UnbindAddr {
+        #[arg(long)]
+        port: String,
+        #[arg(long)]
+        subnet: String,
+        #[arg(long)]
+        addr: String,
+    },
+    /// Allocate a standalone address from a subnet's pool (or a requested one).
+    AllocAddr {
+        #[arg(long)]
+        subnet: String,
+        #[arg(long)]
+        ip: Option<String>,
+    },
+    /// Release a standalone address back to a subnet's pool.
+    ReleaseAddr {
+        #[arg(long)]
+        subnet: String,
+        #[arg(long)]
+        addr: String,
+    },
+    /// Allocate a floating/secondary IP from a floating subnet (B6).
+    AllocFloatingIp {
+        #[arg(long)]
+        subnet: String,
+        #[arg(long)]
+        ip: Option<String>,
+    },
+    /// Associate a floating IP to a port's fixed address (1:1).
+    AssociateFloatingIp {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        port: String,
+        #[arg(long)]
+        fixed: String,
+    },
+    /// Clear a floating IP's association, leaving it allocated.
+    DisassociateFloatingIp {
+        #[arg(long)]
+        id: String,
+    },
+    /// Release a floating IP (blocked while it is still associated).
+    ReleaseFloatingIp {
+        #[arg(long)]
+        id: String,
+    },
+    /// List all floating IPs in the fabric.
+    ListFloatingIps,
 }
 
 #[derive(Debug, Subcommand)]
@@ -831,6 +920,74 @@ fn port_record_to_info(p: velstra_raft::PortRecord) -> PortInfo {
     }
 }
 
+// Convert a gRPC subnet spec into the replicated raft form (empty strings map to
+// `None`; validation happens when applied to the topology, on every replica).
+fn raft_subnet_spec(s: SubnetSpec) -> velstra_raft::SubnetSpec {
+    let opt = |v: String| (!v.is_empty()).then_some(v);
+    velstra_raft::SubnetSpec {
+        id: s.id,
+        vni: s.vni,
+        cidr: s.cidr,
+        gateway: opt(s.gateway),
+        pool_start: opt(s.pool_start),
+        pool_end: opt(s.pool_end),
+        enable_dhcp: s.enable_dhcp,
+    }
+}
+
+fn subnet_cidr_to_string(c: &velstra_orchestrator::SubnetCidr) -> String {
+    match c {
+        velstra_orchestrator::SubnetCidr::V4(c) => c.to_string(),
+        velstra_orchestrator::SubnetCidr::V6(c) => c.to_string(),
+    }
+}
+
+fn subnet_to_info(s: &velstra_orchestrator::Subnet) -> SubnetInfo {
+    let (pool_start, pool_end) = match s.pool {
+        Some(r) => (r.start.to_string(), r.end.to_string()),
+        None => (String::new(), String::new()),
+    };
+    SubnetInfo {
+        id: s.id.clone(),
+        vni: s.vni,
+        cidr: subnet_cidr_to_string(&s.cidr),
+        gateway: s.gateway.map(|g| g.to_string()).unwrap_or_default(),
+        pool_start,
+        pool_end,
+        enable_dhcp: s.enable_dhcp,
+    }
+}
+
+fn fip_to_info(f: &velstra_orchestrator::FloatingIp) -> FloatingIpInfo {
+    FloatingIpInfo {
+        id: f.id.clone(),
+        vni: f.vni,
+        subnet_id: f.subnet_id.clone(),
+        addr: f.addr.to_string(),
+        assoc_port: f
+            .association
+            .as_ref()
+            .map(|a| a.port_id.clone())
+            .unwrap_or_default(),
+        assoc_fixed: f
+            .association
+            .as_ref()
+            .map(|a| a.fixed_addr.to_string())
+            .unwrap_or_default(),
+    }
+}
+
+fn fip_record_to_info(r: velstra_raft::FloatingIpRecord) -> FloatingIpInfo {
+    FloatingIpInfo {
+        id: r.id,
+        vni: r.vni,
+        subnet_id: r.subnet_id,
+        addr: r.addr,
+        assoc_port: r.assoc_port.unwrap_or_default(),
+        assoc_fixed: r.assoc_fixed.unwrap_or_default(),
+    }
+}
+
 /// Apply a fabric mutation, in whichever mode the controller runs:
 /// - **cluster mode**: propose through Raft (leader only; a follower returns a
 ///   redirect to the current leader). The Raft apply-notification task re-derives.
@@ -1148,6 +1305,295 @@ impl VelstraOrchestrator for OrchestratorSvc {
                 .collect()
         };
         Ok(Response::new(ListSecurityGroupsResponse { groups }))
+    }
+
+    // --- Subnets + IPAM (D2) ------------------------------------------------
+
+    async fn add_subnet(&self, request: Request<SubnetSpec>) -> Result<Response<Ack>, Status> {
+        let caller = caller_of(&request);
+        if !self.authz.allow_admin(&caller) {
+            return Err(deny("define subnets (admin only)"));
+        }
+        let spec = request.into_inner();
+        info!("AddSubnet({:?} vni {})", spec.id, spec.vni);
+        let resp = propose(
+            &self.shared,
+            velstra_raft::TopoRequest::AddSubnet(raft_subnet_spec(spec)),
+        )
+        .await?;
+        if !resp.ok {
+            return Err(Status::invalid_argument(resp.error.unwrap_or_default()));
+        }
+        Ok(Response::new(Ack { ok: true }))
+    }
+
+    async fn remove_subnet(
+        &self,
+        request: Request<RemoveSubnetRequest>,
+    ) -> Result<Response<Ack>, Status> {
+        let caller = caller_of(&request);
+        if !self.authz.allow_admin(&caller) {
+            return Err(deny("remove subnets (admin only)"));
+        }
+        let id = request.into_inner().id;
+        info!("RemoveSubnet({id:?})");
+        let resp = propose(&self.shared, velstra_raft::TopoRequest::RemoveSubnet { id }).await?;
+        if !resp.ok {
+            return Err(Status::failed_precondition(resp.error.unwrap_or_default()));
+        }
+        Ok(Response::new(Ack { ok: true }))
+    }
+
+    async fn list_subnets(
+        &self,
+        _request: Request<ListSubnetsRequest>,
+    ) -> Result<Response<ListSubnetsResponse>, Status> {
+        let subnets = if let Some(raft) = &self.shared.raft {
+            raft.topology()
+                .await
+                .subnets()
+                .map(subnet_to_info)
+                .collect()
+        } else {
+            self.shared
+                .topology
+                .read()
+                .await
+                .subnets()
+                .map(subnet_to_info)
+                .collect()
+        };
+        Ok(Response::new(ListSubnetsResponse { subnets }))
+    }
+
+    async fn bind_port_subnet(
+        &self,
+        request: Request<BindPortSubnetRequest>,
+    ) -> Result<Response<PortAddrInfo>, Status> {
+        let caller = caller_of(&request);
+        if !self.authz.allow_admin(&caller) {
+            return Err(deny("bind ports to subnets (admin only)"));
+        }
+        let req = request.into_inner();
+        let subnet_id = req.subnet_id.clone();
+        info!("BindPortSubnet({:?} -> {:?})", req.port_id, subnet_id);
+        let resp = propose(
+            &self.shared,
+            velstra_raft::TopoRequest::BindPortSubnet {
+                port_id: req.port_id,
+                subnet_id: req.subnet_id,
+                ip: (!req.ip.is_empty()).then_some(req.ip),
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(Status::invalid_argument(resp.error.unwrap_or_default()));
+        }
+        let addr = resp
+            .addr
+            .ok_or_else(|| Status::internal("bind_port_subnet returned no address"))?;
+        Ok(Response::new(PortAddrInfo { subnet_id, addr }))
+    }
+
+    async fn unbind_port_address(
+        &self,
+        request: Request<UnbindPortAddressRequest>,
+    ) -> Result<Response<Ack>, Status> {
+        let caller = caller_of(&request);
+        if !self.authz.allow_admin(&caller) {
+            return Err(deny("unbind port addresses (admin only)"));
+        }
+        let req = request.into_inner();
+        info!("UnbindPortAddress({:?} {})", req.port_id, req.addr);
+        let resp = propose(
+            &self.shared,
+            velstra_raft::TopoRequest::UnbindPortAddress {
+                port_id: req.port_id,
+                subnet_id: req.subnet_id,
+                addr: req.addr,
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(Status::failed_precondition(resp.error.unwrap_or_default()));
+        }
+        Ok(Response::new(Ack { ok: true }))
+    }
+
+    async fn allocate_address(
+        &self,
+        request: Request<AllocateAddressRequest>,
+    ) -> Result<Response<AllocateAddressResponse>, Status> {
+        let caller = caller_of(&request);
+        if !self.authz.allow_admin(&caller) {
+            return Err(deny("allocate addresses (admin only)"));
+        }
+        let req = request.into_inner();
+        let subnet_id = req.subnet_id.clone();
+        info!("AllocateAddress({subnet_id:?})");
+        let resp = propose(
+            &self.shared,
+            velstra_raft::TopoRequest::AllocateAddress {
+                subnet_id: req.subnet_id,
+                ip: (!req.ip.is_empty()).then_some(req.ip),
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(Status::invalid_argument(resp.error.unwrap_or_default()));
+        }
+        let addr = resp
+            .addr
+            .ok_or_else(|| Status::internal("allocate_address returned no address"))?;
+        Ok(Response::new(AllocateAddressResponse { subnet_id, addr }))
+    }
+
+    async fn release_address(
+        &self,
+        request: Request<ReleaseAddressRequest>,
+    ) -> Result<Response<Ack>, Status> {
+        let caller = caller_of(&request);
+        if !self.authz.allow_admin(&caller) {
+            return Err(deny("release addresses (admin only)"));
+        }
+        let req = request.into_inner();
+        info!("ReleaseAddress({:?} {})", req.subnet_id, req.addr);
+        let resp = propose(
+            &self.shared,
+            velstra_raft::TopoRequest::ReleaseAddress {
+                subnet_id: req.subnet_id,
+                addr: req.addr,
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(Status::failed_precondition(resp.error.unwrap_or_default()));
+        }
+        Ok(Response::new(Ack { ok: true }))
+    }
+
+    // --- Floating IPs (B6) --------------------------------------------------
+
+    async fn allocate_floating_ip(
+        &self,
+        request: Request<AllocateFloatingIpRequest>,
+    ) -> Result<Response<FloatingIpInfo>, Status> {
+        let caller = caller_of(&request);
+        if !self.authz.allow_admin(&caller) {
+            return Err(deny("allocate floating ips (admin only)"));
+        }
+        let req = request.into_inner();
+        info!("AllocateFloatingIp({:?})", req.subnet_id);
+        let resp = propose(
+            &self.shared,
+            velstra_raft::TopoRequest::AllocateFloatingIp {
+                subnet_id: req.subnet_id,
+                ip: (!req.ip.is_empty()).then_some(req.ip),
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(Status::invalid_argument(resp.error.unwrap_or_default()));
+        }
+        let f = resp
+            .floating
+            .ok_or_else(|| Status::internal("allocate_floating_ip returned no floating ip"))?;
+        Ok(Response::new(fip_record_to_info(f)))
+    }
+
+    async fn associate_floating_ip(
+        &self,
+        request: Request<AssociateFloatingIpRequest>,
+    ) -> Result<Response<FloatingIpInfo>, Status> {
+        let caller = caller_of(&request);
+        if !self.authz.allow_admin(&caller) {
+            return Err(deny("associate floating ips (admin only)"));
+        }
+        let req = request.into_inner();
+        info!("AssociateFloatingIp({:?} -> {:?})", req.id, req.port_id);
+        let resp = propose(
+            &self.shared,
+            velstra_raft::TopoRequest::AssociateFloatingIp {
+                id: req.id,
+                port_id: req.port_id,
+                fixed_addr: req.fixed_addr,
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(Status::invalid_argument(resp.error.unwrap_or_default()));
+        }
+        let f = resp
+            .floating
+            .ok_or_else(|| Status::internal("associate_floating_ip returned no floating ip"))?;
+        Ok(Response::new(fip_record_to_info(f)))
+    }
+
+    async fn disassociate_floating_ip(
+        &self,
+        request: Request<DisassociateFloatingIpRequest>,
+    ) -> Result<Response<FloatingIpInfo>, Status> {
+        let caller = caller_of(&request);
+        if !self.authz.allow_admin(&caller) {
+            return Err(deny("disassociate floating ips (admin only)"));
+        }
+        let id = request.into_inner().id;
+        info!("DisassociateFloatingIp({id:?})");
+        let resp = propose(
+            &self.shared,
+            velstra_raft::TopoRequest::DisassociateFloatingIp { id },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(Status::invalid_argument(resp.error.unwrap_or_default()));
+        }
+        let f = resp
+            .floating
+            .ok_or_else(|| Status::internal("disassociate_floating_ip returned no floating ip"))?;
+        Ok(Response::new(fip_record_to_info(f)))
+    }
+
+    async fn release_floating_ip(
+        &self,
+        request: Request<ReleaseFloatingIpRequest>,
+    ) -> Result<Response<Ack>, Status> {
+        let caller = caller_of(&request);
+        if !self.authz.allow_admin(&caller) {
+            return Err(deny("release floating ips (admin only)"));
+        }
+        let id = request.into_inner().id;
+        info!("ReleaseFloatingIp({id:?})");
+        let resp = propose(
+            &self.shared,
+            velstra_raft::TopoRequest::ReleaseFloatingIp { id },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(Status::failed_precondition(resp.error.unwrap_or_default()));
+        }
+        Ok(Response::new(Ack { ok: true }))
+    }
+
+    async fn list_floating_ips(
+        &self,
+        _request: Request<ListFloatingIpsRequest>,
+    ) -> Result<Response<ListFloatingIpsResponse>, Status> {
+        let floating_ips = if let Some(raft) = &self.shared.raft {
+            raft.topology()
+                .await
+                .floating_ips()
+                .map(fip_to_info)
+                .collect()
+        } else {
+            self.shared
+                .topology
+                .read()
+                .await
+                .floating_ips()
+                .map(fip_to_info)
+                .collect()
+        };
+        Ok(Response::new(ListFloatingIpsResponse { floating_ips }))
     }
 }
 
@@ -1692,6 +2138,170 @@ async fn orch(args: OrchArgs) -> Result<()> {
             match group {
                 Some(g) => println!("bound port {:?} to security group {g:?}", info.id),
                 None => println!("cleared security group on port {:?}", info.id),
+            }
+        }
+        OrchAction::AddSubnet {
+            id,
+            vni,
+            cidr,
+            gateway,
+            pool_start,
+            pool_end,
+            enable_dhcp,
+        } => {
+            client
+                .add_subnet(SubnetSpec {
+                    id: id.clone(),
+                    vni,
+                    cidr,
+                    gateway: gateway.unwrap_or_default(),
+                    pool_start: pool_start.unwrap_or_default(),
+                    pool_end: pool_end.unwrap_or_default(),
+                    enable_dhcp,
+                })
+                .await?;
+            println!("added subnet {id:?}");
+        }
+        OrchAction::RemoveSubnet { id } => {
+            let ack = client
+                .remove_subnet(RemoveSubnetRequest { id: id.clone() })
+                .await?
+                .into_inner();
+            println!(
+                "{} subnet {id:?}",
+                if ack.ok { "removed" } else { "no such" }
+            );
+        }
+        OrchAction::ListSubnets => {
+            let resp = client
+                .list_subnets(ListSubnetsRequest {})
+                .await?
+                .into_inner();
+            println!(
+                "{:<16} {:>6}  {:<20} {:<16} dhcp",
+                "id", "vni", "cidr", "gateway"
+            );
+            for s in resp.subnets {
+                println!(
+                    "{:<16} {:>6}  {:<20} {:<16} {}",
+                    s.id, s.vni, s.cidr, s.gateway, s.enable_dhcp
+                );
+            }
+        }
+        OrchAction::BindSubnet { port, subnet, ip } => {
+            let info = client
+                .bind_port_subnet(BindPortSubnetRequest {
+                    port_id: port.clone(),
+                    subnet_id: subnet,
+                    ip: ip.unwrap_or_default(),
+                })
+                .await?
+                .into_inner();
+            println!(
+                "bound port {port:?} to subnet {:?} at {}",
+                info.subnet_id, info.addr
+            );
+        }
+        OrchAction::UnbindAddr { port, subnet, addr } => {
+            let ack = client
+                .unbind_port_address(UnbindPortAddressRequest {
+                    port_id: port.clone(),
+                    subnet_id: subnet,
+                    addr: addr.clone(),
+                })
+                .await?
+                .into_inner();
+            println!(
+                "{} address {addr} from port {port:?}",
+                if ack.ok { "unbound" } else { "did not unbind" }
+            );
+        }
+        OrchAction::AllocAddr { subnet, ip } => {
+            let resp = client
+                .allocate_address(AllocateAddressRequest {
+                    subnet_id: subnet,
+                    ip: ip.unwrap_or_default(),
+                })
+                .await?
+                .into_inner();
+            println!("allocated {} in subnet {:?}", resp.addr, resp.subnet_id);
+        }
+        OrchAction::ReleaseAddr { subnet, addr } => {
+            let ack = client
+                .release_address(ReleaseAddressRequest {
+                    subnet_id: subnet.clone(),
+                    addr: addr.clone(),
+                })
+                .await?
+                .into_inner();
+            println!(
+                "{} address {addr} in subnet {subnet:?}",
+                if ack.ok {
+                    "released"
+                } else {
+                    "did not release"
+                }
+            );
+        }
+        OrchAction::AllocFloatingIp { subnet, ip } => {
+            let info = client
+                .allocate_floating_ip(AllocateFloatingIpRequest {
+                    subnet_id: subnet,
+                    ip: ip.unwrap_or_default(),
+                })
+                .await?
+                .into_inner();
+            println!("allocated floating ip {} : {}", info.id, info.addr);
+        }
+        OrchAction::AssociateFloatingIp { id, port, fixed } => {
+            let info = client
+                .associate_floating_ip(AssociateFloatingIpRequest {
+                    id: id.clone(),
+                    port_id: port,
+                    fixed_addr: fixed,
+                })
+                .await?
+                .into_inner();
+            println!(
+                "associated floating ip {} -> {} ({})",
+                info.id, info.assoc_fixed, info.assoc_port
+            );
+        }
+        OrchAction::DisassociateFloatingIp { id } => {
+            let info = client
+                .disassociate_floating_ip(DisassociateFloatingIpRequest { id: id.clone() })
+                .await?
+                .into_inner();
+            println!("disassociated floating ip {}", info.id);
+        }
+        OrchAction::ReleaseFloatingIp { id } => {
+            let ack = client
+                .release_floating_ip(ReleaseFloatingIpRequest { id: id.clone() })
+                .await?
+                .into_inner();
+            println!(
+                "{} floating ip {id:?}",
+                if ack.ok {
+                    "released"
+                } else {
+                    "did not release"
+                }
+            );
+        }
+        OrchAction::ListFloatingIps => {
+            let resp = client
+                .list_floating_ips(ListFloatingIpsRequest {})
+                .await?
+                .into_inner();
+            println!(
+                "{:<24} {:>6}  {:<16} {:<22} fixed",
+                "id", "vni", "addr", "port"
+            );
+            for f in resp.floating_ips {
+                println!(
+                    "{:<24} {:>6}  {:<16} {:<22} {}",
+                    f.id, f.vni, f.addr, f.assoc_port, f.assoc_fixed
+                );
             }
         }
     }

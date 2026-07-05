@@ -66,6 +66,36 @@ service VelstraOrchestrator {
   // Bind a port to a security group by name, or clear its binding (revert to
   // the VNI-as-policy default). Returns the updated port.
   rpc BindPortSecurityGroup(BindPortSecurityGroupRequest) returns (PortInfo);
+
+  // --- Subnets + IPAM (D2) --------------------------------------------------
+  // Define a first-class subnet under a network. Fails on a duplicate id, an
+  // unknown VNI, or a gateway/pool outside the CIDR.
+  rpc AddSubnet(SubnetSpec) returns (Ack);
+  // Remove a subnet by id. Fails while any address is still allocated from it.
+  rpc RemoveSubnet(RemoveSubnetRequest) returns (Ack);
+  // List all subnets in the fabric.
+  rpc ListSubnets(ListSubnetsRequest) returns (ListSubnetsResponse);
+  // Bind a port to a subnet, giving it an IPAM-allocated (or requested) address.
+  // Returns the allocated address.
+  rpc BindPortSubnet(BindPortSubnetRequest) returns (PortAddrInfo);
+  // Release one of a port's bound addresses back to its subnet's pool.
+  rpc UnbindPortAddress(UnbindPortAddressRequest) returns (Ack);
+  // Allocate a standalone address from a subnet's pool (or a requested one).
+  rpc AllocateAddress(AllocateAddressRequest) returns (AllocateAddressResponse);
+  // Release a standalone address back to a subnet's pool.
+  rpc ReleaseAddress(ReleaseAddressRequest) returns (Ack);
+
+  // --- Floating IPs (B6) ----------------------------------------------------
+  // Allocate a floating/secondary IP from a floating subnet via IPAM.
+  rpc AllocateFloatingIp(AllocateFloatingIpRequest) returns (FloatingIpInfo);
+  // Associate a floating IP to a port's fixed address (1:1). Returns the fip.
+  rpc AssociateFloatingIp(AssociateFloatingIpRequest) returns (FloatingIpInfo);
+  // Clear a floating IP's association, leaving it allocated. Returns the fip.
+  rpc DisassociateFloatingIp(DisassociateFloatingIpRequest) returns (FloatingIpInfo);
+  // Release a floating IP. Blocked while it is still associated.
+  rpc ReleaseFloatingIp(ReleaseFloatingIpRequest) returns (Ack);
+  // List all floating IPs in the fabric.
+  rpc ListFloatingIps(ListFloatingIpsRequest) returns (ListFloatingIpsResponse);
 }
 
 message HostSpec {
@@ -168,6 +198,112 @@ message BindPortSecurityGroupRequest {
   // Security group name to bind. Absent ⇒ clear the binding (revert to the
   // VNI-as-policy default). `optional` so "unset" and a name stay distinct.
   optional string group = 2;
+}
+
+// --- Subnets + IPAM (D2) ----------------------------------------------------
+
+// A first-class subnet under a network (D2). The CIDR may be IPv4 or IPv6.
+// String addresses are validated when the request is applied to the topology.
+message SubnetSpec {
+  string id = 1;
+  uint32 vni = 2;
+  string cidr = 3;         // "192.168.50.0/24" or "2001:db8::/64"
+  string gateway = 4;      // empty = none (auto-reserved from IPAM if set)
+  string pool_start = 5;   // empty (with pool_end empty) = CIDR-derived pool
+  string pool_end = 6;     // empty (with pool_start empty) = CIDR-derived pool
+  bool enable_dhcp = 7;
+}
+
+message RemoveSubnetRequest {
+  string id = 1;
+}
+
+message ListSubnetsRequest {}
+
+// A subnet as reported by ListSubnets. Mirrors SubnetSpec (empty string ⇒ unset).
+message SubnetInfo {
+  string id = 1;
+  uint32 vni = 2;
+  string cidr = 3;
+  string gateway = 4;
+  string pool_start = 5;
+  string pool_end = 6;
+  bool enable_dhcp = 7;
+}
+
+message ListSubnetsResponse {
+  repeated SubnetInfo subnets = 1;
+}
+
+message BindPortSubnetRequest {
+  string port_id = 1;
+  string subnet_id = 2;
+  string ip = 3;  // empty = auto-allocate the lowest free address
+}
+
+// An IPAM address bound to a port (the result of BindPortSubnet).
+message PortAddrInfo {
+  string subnet_id = 1;
+  string addr = 2;
+}
+
+message UnbindPortAddressRequest {
+  string port_id = 1;
+  string subnet_id = 2;
+  string addr = 3;
+}
+
+message AllocateAddressRequest {
+  string subnet_id = 1;
+  string ip = 2;  // empty = auto-allocate the lowest free address
+}
+
+message AllocateAddressResponse {
+  string subnet_id = 1;
+  string addr = 2;
+}
+
+message ReleaseAddressRequest {
+  string subnet_id = 1;
+  string addr = 2;
+}
+
+// --- Floating IPs (B6) ------------------------------------------------------
+
+message AllocateFloatingIpRequest {
+  string subnet_id = 1;
+  string ip = 2;  // empty = auto-allocate the lowest free address
+}
+
+message AssociateFloatingIpRequest {
+  string id = 1;          // floating-ip id
+  string port_id = 2;
+  string fixed_addr = 3;  // a fixed address the port holds
+}
+
+message DisassociateFloatingIpRequest {
+  string id = 1;
+}
+
+message ReleaseFloatingIpRequest {
+  string id = 1;
+}
+
+message ListFloatingIpsRequest {}
+
+// A floating IP as reported by allocate/associate/list. Empty assoc_* ⇒
+// unassociated.
+message FloatingIpInfo {
+  string id = 1;
+  uint32 vni = 2;
+  string subnet_id = 3;
+  string addr = 4;
+  string assoc_port = 5;
+  string assoc_fixed = 6;
+}
+
+message ListFloatingIpsResponse {
+  repeated FloatingIpInfo floating_ips = 1;
 }
 
 message SetConfigRequest {

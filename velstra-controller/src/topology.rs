@@ -32,14 +32,16 @@ use std::{
     path::Path,
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use velstra_common::{parse_cidr_v4, parse_mac};
+use velstra_common::{parse_cidr_v4, parse_cidr_v6, parse_mac};
 use velstra_config::{
-    ActionName, EncapName, FileConfig, FloodVtepCfg, MacRouteCfg, Nd6Cfg, NeighborCfg, TunnelCfg,
-    file_config_to_proto,
+    ActionName, EncapName, FileConfig, FloodVtepCfg, MacRouteCfg, Nd6Cfg, NeighborCfg, PortRule,
+    TunnelCfg, file_config_to_proto,
 };
-use velstra_orchestrator::{Host, Network, Topology};
+use velstra_orchestrator::{
+    AllocRange, Host, Network, SecurityGroup, Subnet, SubnetCidr, Topology,
+};
 use velstra_proto::NodeConfig;
 
 use crate::evpn::EvpnLearned;
@@ -51,6 +53,18 @@ struct TopologyFile {
     hosts: Vec<HostFile>,
     #[serde(rename = "network", default)]
     networks: Vec<NetworkFile>,
+    /// First-class subnets (D2). Declarative subnet definitions only; runtime
+    /// IPAM allocations and port-subnet bindings are durable via the Raft
+    /// snapshot (cluster mode), not this file.
+    #[serde(rename = "subnet", default, skip_serializing_if = "Vec::is_empty")]
+    subnets: Vec<SubnetFile>,
+    /// Named security groups (B5). Ports reference one by name (see [`PortFile`]).
+    #[serde(
+        rename = "security_group",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    security_groups: Vec<SecurityGroupFile>,
     #[serde(rename = "port", default)]
     ports: Vec<PortFile>,
 }
@@ -86,6 +100,42 @@ struct NetworkFile {
     drop_icmp: bool,
 }
 
+/// A first-class subnet (D2). The CIDR may be IPv4 or IPv6; a network can hold
+/// several (e.g. a v4 and a v6 subnet for a dual-stack tenant).
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SubnetFile {
+    id: String,
+    vni: u32,
+    cidr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gateway: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pool_start: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pool_end: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    enable_dhcp: bool,
+}
+
+/// A named security group (B5): a reusable firewall rule set, spelled
+/// `[[security_group]]` with inline `[[security_group.rule]]`s.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SecurityGroupFile {
+    name: String,
+    #[serde(default)]
+    default_action: ActionName,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    drop_icmp: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    stateful: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    blocklist: Vec<String>,
+    #[serde(default, rename = "rule", skip_serializing_if = "Vec::is_empty")]
+    rules: Vec<PortRule>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PortFile {
@@ -95,9 +145,14 @@ struct PortFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ip: Option<String>,
     /// Security-group policy id, decoupled from the VNI (M4). Omitted ⇒ default
-    /// to the network VNI (single-tenant).
+    /// to the network VNI (single-tenant). Mutually redundant with
+    /// `security_group` (a name); the name form is preferred on serialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     policy: Option<u32>,
+    /// Bind this port to a named security group (B5). Takes precedence over
+    /// `policy`; resolved to the group's deterministic policy id at build time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    security_group: Option<String>,
 }
 
 /// Build the orchestrator [`Topology`] from a parsed file (validating addresses,
@@ -137,6 +192,21 @@ fn build(tf: &TopologyFile) -> Result<Topology> {
             drop_icmp: n.drop_icmp,
         })?;
     }
+    // Subnets (D2) reference a network by VNI, so add them after networks.
+    for s in &tf.subnets {
+        topo.add_subnet(subnet_from_file(s)?)?;
+    }
+    // Security groups (B5) must exist before ports can bind them by name.
+    for g in &tf.security_groups {
+        topo.add_security_group(SecurityGroup {
+            name: g.name.clone(),
+            default_action: g.default_action,
+            drop_icmp: g.drop_icmp,
+            stateful: g.stateful,
+            blocklist: g.blocklist.clone(),
+            rules: g.rules.clone(),
+        })?;
+    }
     for p in &tf.ports {
         let ip = match &p.ip {
             Some(s) => Some(
@@ -145,9 +215,66 @@ fn build(tf: &TopologyFile) -> Result<Topology> {
             ),
             None => None,
         };
-        topo.create_port(p.network, &p.host, &p.tap, ip, p.policy)?;
+        // A named security group sets the policy via its deterministic id, so
+        // create the port policy-less then bind by name; otherwise honour the
+        // raw M4 policy id (if any).
+        let policy = if p.security_group.is_some() {
+            None
+        } else {
+            p.policy
+        };
+        let created = topo.create_port(p.network, &p.host, &p.tap, ip, policy)?;
+        if let Some(group) = &p.security_group {
+            topo.set_port_security_group(&created.id, Some(group))?;
+        }
     }
     Ok(topo)
+}
+
+/// Build a [`Subnet`] from its file form (validating the CIDR family, gateway,
+/// and pool endpoints).
+fn subnet_from_file(s: &SubnetFile) -> Result<Subnet> {
+    let cidr = if s.cidr.contains(':') {
+        SubnetCidr::V6(
+            parse_cidr_v6(&s.cidr)
+                .map_err(|e| anyhow!("subnet {:?}: invalid cidr {:?}: {e}", s.id, s.cidr))?,
+        )
+    } else {
+        SubnetCidr::V4(
+            parse_cidr_v4(&s.cidr)
+                .map_err(|e| anyhow!("subnet {:?}: invalid cidr {:?}: {e}", s.id, s.cidr))?,
+        )
+    };
+    let gateway = match &s.gateway {
+        Some(g) => Some(
+            g.parse::<IpAddr>()
+                .with_context(|| format!("subnet {:?}: invalid gateway {g:?}", s.id))?,
+        ),
+        None => None,
+    };
+    let pool = match (&s.pool_start, &s.pool_end) {
+        (Some(a), Some(b)) => Some(AllocRange {
+            start: a
+                .parse::<IpAddr>()
+                .with_context(|| format!("subnet {:?}: invalid pool_start {a:?}", s.id))?,
+            end: b
+                .parse::<IpAddr>()
+                .with_context(|| format!("subnet {:?}: invalid pool_end {b:?}", s.id))?,
+        }),
+        (None, None) => None,
+        _ => bail!(
+            "subnet {:?}: pool requires both pool_start and pool_end",
+            s.id
+        ),
+    };
+    Ok(Subnet {
+        id: s.id.clone(),
+        vni: s.vni,
+        cidr,
+        gateway,
+        pool,
+        enable_dhcp: s.enable_dhcp,
+    })
 }
 
 /// Derive every host's `NodeConfig` from the topology, validating each (via
@@ -338,22 +465,76 @@ fn to_file(topo: &Topology) -> TopologyFile {
         .collect();
     networks.sort_by_key(|n| n.vni);
 
+    let mut subnets: Vec<SubnetFile> = topo.subnets().map(subnet_to_file).collect();
+    subnets.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let mut security_groups: Vec<SecurityGroupFile> = topo
+        .security_groups()
+        .map(|g| SecurityGroupFile {
+            name: g.name.clone(),
+            default_action: g.default_action,
+            drop_icmp: g.drop_icmp,
+            stateful: g.stateful,
+            blocklist: g.blocklist.clone(),
+            rules: g.rules.clone(),
+        })
+        .collect();
+    security_groups.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Reverse-map a port's policy id back to its security-group name (if it
+    // names one) so a bound port round-trips by name rather than raw id.
+    let pid_to_name: HashMap<u32, String> = topo
+        .security_groups()
+        .map(|g| (g.policy_id(), g.name.clone()))
+        .collect();
     let ports: Vec<PortFile> = topo
         .ports()
         .iter()
-        .map(|p| PortFile {
-            network: p.vni,
-            host: p.host.clone(),
-            tap: p.tap.clone(),
-            ip: Some(p.ip.to_string()),
-            policy: p.policy,
+        .map(|p| {
+            let security_group = p.policy.and_then(|pid| pid_to_name.get(&pid).cloned());
+            PortFile {
+                network: p.vni,
+                host: p.host.clone(),
+                tap: p.tap.clone(),
+                ip: Some(p.ip.to_string()),
+                // A group-bound port serialises by name; an unnamed raw policy
+                // keeps its numeric id.
+                policy: if security_group.is_some() {
+                    None
+                } else {
+                    p.policy
+                },
+                security_group,
+            }
         })
         .collect();
 
     TopologyFile {
         hosts,
         networks,
+        subnets,
+        security_groups,
         ports,
+    }
+}
+
+/// Serialise a live [`Subnet`] back into its file form.
+fn subnet_to_file(s: &Subnet) -> SubnetFile {
+    let (pool_start, pool_end) = match s.pool {
+        Some(r) => (Some(r.start.to_string()), Some(r.end.to_string())),
+        None => (None, None),
+    };
+    SubnetFile {
+        id: s.id.clone(),
+        vni: s.vni,
+        cidr: match s.cidr {
+            SubnetCidr::V4(c) => c.to_string(),
+            SubnetCidr::V6(c) => c.to_string(),
+        },
+        gateway: s.gateway.map(|g| g.to_string()),
+        pool_start,
+        pool_end,
+        enable_dhcp: s.enable_dhcp,
     }
 }
 
@@ -615,6 +796,109 @@ mod tests {
         assert_eq!(fv.remote_vtep, "10.10.0.2");
         assert_eq!(fv.via_mac, "02:00:00:00:00:22");
         assert_eq!(fv.out_iface, "eth0");
+    }
+
+    #[test]
+    fn parses_subnets_and_security_groups_and_binds_ports_by_name() {
+        let toml = r#"
+            [[host]]
+            id = "h1"
+            vtep = "10.10.0.1"
+            underlay_iface = "eth0"
+            underlay_mac = "02:00:00:00:00:11"
+
+            [[network]]
+            vni = 5000
+            name = "blue"
+            subnet = "192.168.100.0/24"
+
+            [[subnet]]
+            id = "s4"
+            vni = 5000
+            cidr = "192.168.100.0/24"
+            gateway = "192.168.100.1"
+
+            [[subnet]]
+            id = "s6"
+            vni = 5000
+            cidr = "2001:db8::/64"
+            pool_start = "2001:db8::100"
+            pool_end = "2001:db8::200"
+
+            [[security_group]]
+            name = "web"
+            default_action = "drop"
+            stateful = true
+            [[security_group.rule]]
+            proto = "tcp"
+            port = 80
+            action = "pass"
+
+            [[port]]
+            network = 5000
+            host = "h1"
+            tap = "tapA"
+            security_group = "web"
+        "#;
+        let tf: TopologyFile = toml::from_str(toml).unwrap();
+        let topo = build(&tf).unwrap();
+
+        // Both subnets landed, tagged with their VNI.
+        assert_eq!(topo.subnets().count(), 2);
+        assert!(topo.subnet("s6").unwrap().cidr.is_v6());
+        // The security group landed, and the port bound to it (its policy is the
+        // group's deterministic id).
+        assert_eq!(topo.security_groups().count(), 1);
+        let pid = velstra_orchestrator::security_group_policy_id("web");
+        assert_eq!(topo.ports()[0].policy, Some(pid));
+        // The derived config resolves (the bound group emits a [[policy]] block).
+        let cfg = derive_configs(&topo, None).unwrap();
+        assert!(cfg["h1"].policies.iter().any(|p| p.id == pid));
+    }
+
+    #[test]
+    fn subnets_and_group_bindings_survive_a_file_roundtrip() {
+        let toml = r#"
+            [[host]]
+            id = "h1"
+            vtep = "10.10.0.1"
+            underlay_iface = "eth0"
+            underlay_mac = "02:00:00:00:00:11"
+            [[network]]
+            vni = 5000
+            name = "blue"
+            subnet = "192.168.100.0/24"
+            [[subnet]]
+            id = "s4"
+            vni = 5000
+            cidr = "192.168.100.0/24"
+            gateway = "192.168.100.1"
+            [[security_group]]
+            name = "web"
+            default_action = "drop"
+            [[port]]
+            network = 5000
+            host = "h1"
+            tap = "tapA"
+            security_group = "web"
+        "#;
+        let original = build(&toml::from_str(toml).unwrap()).unwrap();
+
+        // Round-trip through the on-disk schema.
+        let serialised = toml::to_string_pretty(&to_file(&original)).unwrap();
+        let reloaded = build(&toml::from_str(&serialised).unwrap()).unwrap();
+
+        // Subnet, security group, and the port's group binding all survived; the
+        // port serialised by group *name* (not raw id) and re-bound identically.
+        assert_eq!(reloaded.subnets().count(), 1);
+        assert_eq!(reloaded.security_groups().count(), 1);
+        let pid = velstra_orchestrator::security_group_policy_id("web");
+        assert_eq!(reloaded.ports()[0].policy, Some(pid));
+        assert!(serialised.contains("security_group = \"web\""));
+        assert_eq!(
+            derive_configs(&original, None).unwrap(),
+            derive_configs(&reloaded, None).unwrap()
+        );
     }
 
     #[test]
