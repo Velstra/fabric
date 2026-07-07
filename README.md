@@ -17,7 +17,8 @@ data plane).
 > `XDP_REDIRECT` (Phase 2), a **stateful** L4 load balancer with connection
 > tracking and reverse NAT (Phase 3), and a **VXLAN/Geneve overlay** for
 > multi-host tenants (Phase 4). A **gRPC controller** distributes config to a
-> fleet of nodes with live updates. A Kubernetes CNI is on the [roadmap](#roadmap).
+> fleet of nodes with live updates, and a Kubernetes CNI plugin (`velstra-cni`)
+> brings the same data plane to pods.
 
 ## Why?
 
@@ -165,7 +166,7 @@ sudo -E ./target/release/velstra run --iface eth0 --egress --config rules.toml
 ```
 
 It's opt-in because an egress filter can drop traffic the ingress side never
-sees. *(IPv4 only for now; IPv6 and overlay-aware egress are on the roadmap.)*
+sees. *(The egress hook is IPv4-only and not overlay-aware.)*
 
 ### Multi-tenant policy (per interface)
 
@@ -308,8 +309,9 @@ controller-pushed `[[neighbor]]` IP→MAC entries) and bounces the reply with
 `XDP_TX` — the broadcast never leaves the host. An **MTU guard** drops a frame
 that would exceed `underlay_mtu - 36` (counter `overlay_too_big`) instead of
 emitting one the underlay silently black-holes, so size tenant MTUs to ≤ 1464
-(at the default 1500 underlay) or enable jumbo frames. *(IPv6 ND suppression and
-MSS-clamp/PMTU are on the roadmap.)*
+(at the default 1500 underlay) or enable jumbo frames. IPv6 Neighbor-Discovery
+suppression mirrors ARP suppression for IPv6 tenants; the overlay applies no
+MSS-clamp or PMTU handling.
 
 On egress from a tenant tap, a longest-prefix hit in the `OVERLAY_FDB` trie on
 `(vni, inner dst)` **encapsulates** (prepend a 50-byte outer
@@ -505,46 +507,54 @@ make e2e                        # or: sudo ./tests/e2e/run.sh [scenario...]
 For a guided manual walkthrough of all three phases (incl. routing & LB), follow
 [`docs/TESTING.md`](docs/TESTING.md).
 
-## Roadmap
+## Features
 
-* **Phase 1 — Firewall & filter (done):** stateless `XDP_DROP` filtering,
-  CIDR blocklist, per-port rules, ICMP filter, per-CPU stats.
-* **Phase 2 — Routing & switching (done):** L2/L3 forwarding via `XDP_REDIRECT`
-  with a longest-prefix-match FIB, MAC rewrite, TTL decrement + incremental
-  checksum, and an L2 switch mode.
-* **Phase 3 — Load balancing & NAT (done):** stateful L4 load balancing with
-  source-hash backend selection, connection tracking (LRU `CONNTRACK`), DNAT +
-  reverse SNAT, and incremental IPv4 + TCP/UDP checksum repair.
-* **Phase 4 — VXLAN/Geneve overlay (done):** multi-host tenants over a routed
-  underlay. `build_encap()` builds the outer stack (pure, unit-tested); the data
-  plane `bpf_xdp_adjust_head()`s to encap onto the underlay and decap inbound
-  tunnel packets. Overlay segment (VNI) decoupled from firewall policy; FDB is an
-  LPM trie (subnet per entry); controller pushes it over gRPC.
-* **Dual-stack (done):** the firewall (blocklist, ICMPv6, port rules, default)
-  is IPv4 + IPv6; routing/LB/overlay underlay stay IPv4.
-* **Egress firewall (done):** opt-in TC `clsact` hook (`--egress`) filters
-  leaving traffic by destination and records stateful flows for the return path,
+* **Firewall & filter.** Stateless `XDP_DROP` filtering with a CIDR blocklist,
+  per-port rules, an ICMP filter, and per-CPU stats. Dual-stack: the firewall
+  (blocklist, ICMPv6, port rules, default action) covers IPv4 and IPv6.
+* **Egress firewall.** An opt-in TC `clsact` hook (`--egress`) filters leaving
+  traffic by destination and records stateful flows for the return path,
   covering host-originated connections and the receive side of tenant taps.
-* **Orchestration (done):** a declarative fabric topology (hosts/networks/ports)
-  the controller turns into per-host config — IPAM, automatic tunnel + ARP
-  derivation, push (`velstra-orchestrator` + `--topology`). The leap from
-  hand-written per-host TOML to declared intent.
-* **Controller HA (done):** controllers form an embedded **Raft** cluster
+* **Routing & switching.** L2/L3 forwarding via `XDP_REDIRECT` with a
+  longest-prefix-match FIB, MAC rewrite, TTL decrement with incremental checksum
+  repair, and an L2 switch mode.
+* **Load balancing & NAT.** Stateful L4 load balancing with source-hash backend
+  selection, connection tracking (LRU `CONNTRACK`), DNAT with reverse SNAT, and
+  incremental IPv4 + TCP/UDP checksum repair.
+* **VXLAN/Geneve overlay.** Multi-host tenants over a routed underlay:
+  `build_encap()` builds the outer stack (pure, unit-tested) and the data plane
+  `bpf_xdp_adjust_head()`s to encapsulate onto the underlay and decapsulate
+  inbound tunnel packets. The overlay segment (VNI) is decoupled from firewall
+  policy; the FDB is an LPM trie (a subnet per entry); the controller pushes it
+  over gRPC. ARP and IPv6 Neighbor-Discovery suppression answer tenant lookups
+  locally.
+* **Security groups.** Named rule sets resolve to a deterministic per-port
+  policy id, with gRPC + Raft CRUD.
+* **Subnets & IPAM.** First-class subnets with address management.
+* **Floating IPs & secondary addresses.** First-class floating IPs and
+  secondary addresses on ports.
+* **Orchestration.** A declarative fabric topology (hosts/networks/ports) the
+  controller turns into per-host config — IPAM, automatic tunnel + ARP
+  derivation, and push (`velstra-orchestrator` + `--topology`). You declare
+  intent once instead of hand-writing per-host TOML.
+* **Controller HA.** Controllers form an embedded **Raft** cluster
   (`velstra-raft` over openraft) — the fabric is the replicated state machine,
-  the leader serves writes, followers replicate + serve reads, automatic
-  re-election. Snapshots persist to `--raft-dir` (survives a full-cluster
+  the leader serves writes, followers replicate and serve reads, with automatic
+  re-election. Snapshots persist to `--raft-dir` (surviving a full-cluster
   restart); agents take a repeatable `--controller` list and fail over to any
   reachable member. No external datastore, no message queue.
-* **Distribution (done):** a central **gRPC** (`tonic`) controller serves and
+* **Distribution.** A central **gRPC** (`tonic`) controller serves and
   live-updates per-node config across a fleet (file + runtime admin overrides),
   secured with **mTLS**; agents report stats back.
-* **Kubernetes CNI (in progress):** `velstra-cni` implements the CNI protocol
-  with pod veth/netns setup (see [`docs/TESTING.md`](docs/TESTING.md) §7). Two
-  modes: **standalone** (host-local IPAM) and **controller-integrated**, where
-  ADD calls the controller's `CreatePort` (Raft-replicated IP/MAC allocation) and
+* **REST/JSON northbound.** A versioned REST/JSON gateway on the controller
+  exposes the fabric API over HTTP alongside gRPC.
+* **Kubernetes CNI.** `velstra-cni` implements the CNI protocol with pod
+  veth/netns setup (see [`docs/TESTING.md`](docs/TESTING.md) §7) in two modes:
+  **standalone** (host-local IPAM) and **controller-integrated**, where ADD
+  calls the controller's `CreatePort` (Raft-replicated IP/MAC allocation) and
   the node's agent — on the pushed config — attaches the XDP firewall/LB to the
-  new pod veth. Next: the agent DaemonSet + manifests, and attaching to a
-  configured veth as it appears.
+  new pod veth. An agent DaemonSet installs the plugin and attaches to each pod
+  veth as it appears (see [`deploy/k8s/`](deploy/k8s)).
 
 ## License
 

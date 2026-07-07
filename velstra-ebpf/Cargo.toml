@@ -1,6 +1,6 @@
 [package]
 name = "velstra-ebpf"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 # GPL/MIT: this crate compiles to the in-kernel eBPF object, which must be
 # GPL-compatible to call GPL-only BPF helpers (see the LICENSE marker in main.rs).

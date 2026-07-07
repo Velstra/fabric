@@ -72,6 +72,14 @@ jobs:
                      examples/multitenant.toml examples/router.toml examples/overlay.toml; do
             ./target/release/velstra validate "$cfg"
           done
+      # NOTE: the `cargo build --release` step above is what gates the eBPF data
+      # plane — velstra-app's build.rs cross-compiles `velstra-ebpf` for the BPF
+      # target via aya-build, so a data-plane compile error fails this job (on
+      # PRs too). The datapath *end-to-end* suite (`tests/e2e/run.sh`), which
+      # loads the real XDP/TC programs, needs root + CAP_BPF and a recent kernel;
+      # it is intentionally NOT run here (hosted runners lack the privileges and
+      # would flake). Run it on a self-hosted/privileged runner or locally with
+      # `make e2e`.
       # Hand the freshly-built binaries to the `images` job so it doesn't repeat
       # the (slow) eBPF release build. Only on push — PRs don't publish.
       - name: Upload release binaries
