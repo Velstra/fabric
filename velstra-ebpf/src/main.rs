@@ -232,16 +232,21 @@ static STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(Counter::COUNT, 0
 /// program reads it straight back.
 ///
 /// Field order is large→small so the natural `#[repr(C)]` layout has **no
-/// implicit padding**: `port_forward` (8B) then the two `[u8; 4]`s, then the
-/// `u16`s (offsets 16..24), then the three `u32`s on 4-byte offsets (24, 28, 32),
-/// then the four `u8`s filling 36..40. The value is copied in and out wholesale,
-/// so no padding byte is ever read uninitialised.
+/// implicit padding**: the two `[u8; 4]`s (offsets 0..8), the four `u16`s
+/// (8..16), the three `u32`s on 4-byte offsets (16, 20, 24), then the four `u8`s
+/// filling 28..32. The value is copied in and out wholesale, so no padding byte
+/// is ever read uninitialised.
+///
+/// The port-forward **target** is deliberately NOT carried here: the main program
+/// only needs to know a forward *exists* (`has_port_forward`, to open the
+/// firewall), while `try_port_forward` — which runs in [`velstra_forward`] — looks
+/// the `PortFwd` up again from the same `(policy, proto, dport)`. Keeping a
+/// `PortFwd` (an `Option`) live in the main program is what made LLVM emit the
+/// fragile niche codegen the verifier rejected (`R3 !read_ok` on the None path);
+/// reducing the main program to a bool eliminates it and shrinks the slot.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ForwardScratch {
-    /// The resolved port-forward target (its `0.0.0.0` sentinel means "none";
-    /// only consulted when `has_port_forward != 0`).
-    port_forward: PortFwd,
     src_addr: [u8; 4],
     dst_addr: [u8; 4],
     checksum: u16,
@@ -924,19 +929,17 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
         .is_some();
     let rule = lookup_port_rule(policy_id, proto, dst_port, lpm_key_addr(src_addr));
     // A configured port-forward for this destination port implicitly opens the
-    // firewall (the DNAT + reply SNAT are done below / in the conntrack path).
-    // Collapse the port-forward lookup into plain scalars *immediately*: a `bool`
-    // and an owned `PortFwd` (its `ip == 0.0.0.0` sentinel is never a real DNAT
-    // target). Carrying the `Option<PortFwd>` across the long live range to the
-    // consumers below let LLVM keep the underlying `Option<&PortFwd>` map-value
-    // pointer niche alive and, under this function's register pressure, lower the
-    // niche transition to a bitwise-OR on that pointer — which the verifier
-    // rejects ("R1 bitwise operator |= on pointer prohibited"). Reducing it to
-    // scalars here means no map-value pointer is ever live at a merge point, and
-    // it adds no BPF sub-program frame (which would blow the 512-byte stack).
-    let pf_lookup = lookup_port_forward(policy_id, proto, dst_port);
-    let has_port_forward = pf_lookup.is_some();
-    let port_forward = pf_lookup.unwrap_or(PortFwd::new([0; 4], 0));
+    // firewall (the DNAT + reply SNAT run in `velstra_forward` / the conntrack
+    // path). The main program only needs to know one *exists* — a bare `bool`,
+    // never the `PortFwd` value. Materialising the `Option<PortFwd>` here and
+    // carrying it to the consumer kept a map-value pointer niche live across a
+    // merge point; under this function's register pressure LLVM lowered it to a
+    // bitwise-OR on that pointer ("R1 |= on pointer") and, after the tail-call
+    // split changed register allocation, to an uninitialised read on the None
+    // path ("R3 !read_ok"). `port_forward_exists` returns a plain bool from the
+    // map-lookup discriminant, so no map-value pointer is ever live here;
+    // `try_port_forward` re-looks-up the target with a fresh stack downstream.
+    let has_port_forward = port_forward_exists(policy_id, proto, dst_port);
 
     let verdict = decide(&meta, &cfg, blocklisted, rule.map(port_rule_action));
     // Per-rule logging: this rule's own log bit, and the effective flag combining
@@ -1058,7 +1061,6 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     // the post-firewall state through a per-CPU scratch slot; a tail call cannot
     // pass the stack. Behaviour is identical to running the phases inline.
     let scratch = ForwardScratch {
-        port_forward,
         src_addr,
         dst_addr,
         checksum,
@@ -1139,8 +1141,12 @@ fn try_velstra_forward(ctx: &XdpContext) -> Result<u32, ()> {
     // Phase 3a: DNAT port-forward. A new inbound flow to a forwarded port is
     // rewritten to its internal host here; established flows and the reply path
     // are handled by the conntrack path in try_load_balance below (shared
-    // CONNTRACK map), so this only fires once per connection.
-    if s.has_port_forward != 0 {
+    // CONNTRACK map), so this only fires once per connection. The main program
+    // only stashed a bool (that a forward exists); the target itself is re-looked
+    // up here with a fresh stack — see [`ForwardScratch`] for why it isn't carried.
+    if s.has_port_forward != 0
+        && let Some(target) = lookup_port_forward(s.policy_id, s.proto, s.dst_port)
+    {
         if let Some(action) = try_port_forward(
             ctx,
             ihl_bytes,
@@ -1151,7 +1157,7 @@ fn try_velstra_forward(ctx: &XdpContext) -> Result<u32, ()> {
             s.dst_port,
             s.proto,
             s.checksum,
-            s.port_forward,
+            target,
         )? {
             return Ok(action);
         }
@@ -2063,6 +2069,18 @@ fn lookup_port_forward(policy_id: PolicyId, proto: u8, dst_port: u16) -> Option<
         Some(v) => Some(*v),
         None => None,
     }
+}
+
+/// Whether a port-forward is configured for `(policy, proto, dst_port)` — the
+/// bool the main program needs to open the firewall, without materialising the
+/// `PortFwd` value. Returning a plain bool from the lookup discriminant keeps any
+/// map-value pointer from being live at a merge point in `try_velstra`, which is
+/// what triggered the verifier's pointer-OR / `R3 !read_ok` rejections; the
+/// actual target is fetched by [`lookup_port_forward`] in `velstra_forward`.
+#[inline(always)]
+fn port_forward_exists(policy_id: PolicyId, proto: u8, dst_port: u16) -> bool {
+    let key = ScopedPortKey::new(policy_id, proto, dst_port);
+    unsafe { PORT_FORWARDS.get(key) }.is_some()
 }
 
 #[cfg(not(test))]
