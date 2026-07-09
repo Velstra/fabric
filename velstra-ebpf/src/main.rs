@@ -153,6 +153,18 @@ static BACKENDS: Array<Backend> = Array::with_max_entries(4096, 0);
 #[map]
 static CONNTRACK: LruHashMap<FlowKey, FlowState> = LruHashMap::with_max_entries(65536, 0);
 
+/// The policy namespace router-style DNAT (port-forward) records its `CONNTRACK`
+/// entries under. A tenant load-balancer flow is scoped to its own policy so the
+/// same VIP can exist in different tenants without crossing — but a router's
+/// DNAT inherently bridges zones: the forward packet enters through the *ingress*
+/// zone's policy while the reply enters through the *internal* zone's policy, so
+/// a policy-scoped reverse entry can never be found on the reply. Router NAT
+/// therefore keys its conntrack under this single, policy-independent namespace
+/// (`0`, the default policy — never a real tenant, and unused by a zoned
+/// firewall/router config); the reply path in [`try_load_balance`] falls back to
+/// it after the policy-scoped miss. LB tenant isolation is untouched.
+const ROUTER_NAT_POLICY: PolicyId = 0;
+
 /// Stateful-firewall connection table: a flow (both directions) that the
 /// firewall allowed, so replies are permitted even under deny-by-default. An LRU
 /// map, populated and read entirely by the data plane.
@@ -1148,15 +1160,7 @@ fn try_velstra_forward(ctx: &XdpContext) -> Result<u32, ()> {
         && let Some(target) = lookup_port_forward(s.policy_id, s.proto, s.dst_port)
     {
         if let Some(action) = try_port_forward(
-            ctx,
-            ihl_bytes,
-            s.policy_id,
-            s.src_addr,
-            s.dst_addr,
-            s.src_port,
-            s.dst_port,
-            s.proto,
-            s.checksum,
+            ctx, ihl_bytes, s.src_addr, s.dst_addr, s.src_port, s.dst_port, s.proto, s.checksum,
             target,
         )? {
             return Ok(action);
@@ -1607,9 +1611,25 @@ fn try_load_balance(
     };
 
     // 1. Established flow? Conntrack tells us the NAT target and direction.
-    let fkey = FlowKey::new(policy_id, src_addr, dst_addr, src_port, dst_port, proto);
     // SAFETY: see `lookup_port_rule`; we copy the value out immediately.
-    if let Some(state) = (unsafe { CONNTRACK.get(&fkey) }).copied() {
+    let fkey = FlowKey::new(policy_id, src_addr, dst_addr, src_port, dst_port, proto);
+    let mut ct_state = (unsafe { CONNTRACK.get(&fkey) }).copied();
+    // Router NAT (port-forward) records its conntrack under the policy-independent
+    // namespace, since its forward and reply enter through different zones' policies
+    // (see [`ROUTER_NAT_POLICY`]). Fall back to it after the tenant-scoped miss —
+    // skipped when the packet is already in that namespace (the lookup above was it).
+    if ct_state.is_none() && policy_id != ROUTER_NAT_POLICY {
+        let gkey = FlowKey::new(
+            ROUTER_NAT_POLICY,
+            src_addr,
+            dst_addr,
+            src_port,
+            dst_port,
+            proto,
+        );
+        ct_state = (unsafe { CONNTRACK.get(&gkey) }).copied();
+    }
+    if let Some(state) = ct_state {
         let reverse = state.is_reverse();
         let (old_ip, old_port) = if reverse {
             (src_addr, src_port)
@@ -1741,7 +1761,6 @@ fn try_load_balance(
 fn try_port_forward(
     ctx: &XdpContext,
     ihl_bytes: usize,
-    policy_id: PolicyId,
     src_addr: [u8; 4],
     dst_addr: [u8; 4],
     src_port: u16,
@@ -1753,7 +1772,17 @@ fn try_port_forward(
     if (proto != ip_proto::TCP && proto != ip_proto::UDP) || ihl_bytes != Ipv4Hdr::LEN {
         return Ok(None);
     }
-    let fkey = FlowKey::new(policy_id, src_addr, dst_addr, src_port, dst_port, proto);
+    // Router NAT keys its conntrack under the policy-independent namespace so the
+    // reply — which enters through the internal zone's (different) policy — still
+    // matches. See [`ROUTER_NAT_POLICY`].
+    let fkey = FlowKey::new(
+        ROUTER_NAT_POLICY,
+        src_addr,
+        dst_addr,
+        src_port,
+        dst_port,
+        proto,
+    );
     // Already tracked? The conntrack path in try_load_balance handles it.
     if (unsafe { CONNTRACK.get(&fkey) }).is_some() {
         return Ok(None);
@@ -1780,7 +1809,14 @@ fn try_port_forward(
     // a full-table failure leaves neither and the next packet retries both.
     // Reverse: the reply (internal host -> client) SNATs its source back to the
     // original destination (our public ip:port).
-    let rkey = FlowKey::new(policy_id, target.ip, src_addr, target_port, src_port, proto);
+    let rkey = FlowKey::new(
+        ROUTER_NAT_POLICY,
+        target.ip,
+        src_addr,
+        target_port,
+        src_port,
+        proto,
+    );
     if CONNTRACK
         .insert(&rkey, &FlowState::reverse(dst_addr, dst_port), 0)
         .is_ok()
@@ -1788,7 +1824,10 @@ fn try_port_forward(
         // Forward: rewrite the destination on subsequent packets of this flow.
         let _ = CONNTRACK.insert(&fkey, &FlowState::forward(target.ip, target.port), 0);
     }
-    // Let that reply through a stateful, deny-by-default internal zone.
+    // Record the reply in FW_FLOWS under the same router-NAT namespace. The reply
+    // leaves the internal host outbound (internal zone -> WAN), which a normal
+    // config already permits; this entry additionally clears a deny-by-default
+    // internal zone once the firewall path consults the router-NAT namespace.
     let _ = FW_FLOWS.insert(&rkey, &1u8, 0);
 
     // DNAT this first packet.
