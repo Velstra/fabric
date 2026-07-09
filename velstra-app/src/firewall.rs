@@ -887,7 +887,7 @@ fn program_port_forwards(ebpf: &mut Ebpf, forwards: &[ResolvedPortForward]) -> R
     for pf in forwards {
         map.insert(
             ScopedPortKey::new(pf.policy, pf.proto, pf.port),
-            PortFwd::new(pf.dst_ip, pf.dst_port),
+            PortFwd::new_hairpin(pf.dst_ip, pf.dst_port, pf.match_dst, pf.snat_ip),
             0,
         )
         .context("inserting port-forward")?;

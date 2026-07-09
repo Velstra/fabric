@@ -301,15 +301,31 @@ impl FlowKey {
 }
 
 /// Value for `CONNTRACK`: where to NAT a tracked flow, and in which direction.
+///
+/// The **primary** rewrite (`nat_ip`/`nat_port`) touches one address — the
+/// destination for a forward (DNAT) entry, the source for a reverse (SNAT) one.
+/// A **hairpin** flow (NAT reflection, C10) additionally needs the *other*
+/// address rewritten in the same packet, so an optional **secondary** rewrite
+/// (`nat2_ip`/`nat2_port`, applied to the opposite field) is carried alongside;
+/// `nat2_ip == [0; 4]` means "no second rewrite" — the common (single-NAT) case.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FlowState {
     /// NAT target IP (the backend for a forward flow, the VIP for a reply).
     pub nat_ip: [u8; 4],
+    /// Secondary NAT target IP, applied to the *opposite* field (hairpin only);
+    /// `[0; 4]` disables it. A forward entry SNATs the source to this; a reverse
+    /// entry un-DNATs the destination to this.
+    pub nat2_ip: [u8; 4],
     /// NAT target port (`0` keeps the packet's port).
     pub nat_port: u16,
+    /// Secondary NAT target port (`0` keeps the packet's port). Meaningful only
+    /// when `nat2_ip != [0; 4]`.
+    pub nat2_port: u16,
     /// Bit flags; see [`FlowState::REVERSE`].
     pub flags: u16,
+    /// Explicit padding, always zero.
+    pub _pad: u16,
 }
 
 impl FlowState {
@@ -322,8 +338,11 @@ impl FlowState {
     pub const fn forward(nat_ip: [u8; 4], nat_port: u16) -> Self {
         Self {
             nat_ip,
+            nat2_ip: [0; 4],
             nat_port,
+            nat2_port: 0,
             flags: 0,
+            _pad: 0,
         }
     }
 
@@ -332,8 +351,49 @@ impl FlowState {
     pub const fn reverse(nat_ip: [u8; 4], nat_port: u16) -> Self {
         Self {
             nat_ip,
+            nat2_ip: [0; 4],
             nat_port,
+            nat2_port: 0,
             flags: Self::REVERSE,
+            _pad: 0,
+        }
+    }
+
+    /// A **hairpin forward** entry: DNAT the destination to `nat_ip:nat_port` and
+    /// SNAT the source to `nat2_ip:nat2_port` in the same packet.
+    #[inline]
+    pub const fn forward2(
+        nat_ip: [u8; 4],
+        nat_port: u16,
+        nat2_ip: [u8; 4],
+        nat2_port: u16,
+    ) -> Self {
+        Self {
+            nat_ip,
+            nat2_ip,
+            nat_port,
+            nat2_port,
+            flags: 0,
+            _pad: 0,
+        }
+    }
+
+    /// A **hairpin reverse** entry: SNAT the source to `nat_ip:nat_port` and
+    /// un-DNAT the destination to `nat2_ip:nat2_port` in the same packet.
+    #[inline]
+    pub const fn reverse2(
+        nat_ip: [u8; 4],
+        nat_port: u16,
+        nat2_ip: [u8; 4],
+        nat2_port: u16,
+    ) -> Self {
+        Self {
+            nat_ip,
+            nat2_ip,
+            nat_port,
+            nat2_port,
+            flags: Self::REVERSE,
+            _pad: 0,
         }
     }
 
@@ -341,6 +401,13 @@ impl FlowState {
     #[inline]
     pub const fn is_reverse(&self) -> bool {
         self.flags & Self::REVERSE != 0
+    }
+
+    /// Whether a secondary (hairpin) rewrite is present on the opposite field.
+    #[inline]
+    pub const fn has_second(&self) -> bool {
+        let [a, b, c, d] = self.nat2_ip;
+        (a | b | c | d) != 0
     }
 }
 
@@ -352,6 +419,17 @@ impl FlowState {
 pub struct PortFwd {
     /// Internal host the connection is rewritten to.
     pub ip: [u8; 4],
+    /// Match guard: only DNAT when the packet's destination equals this address.
+    /// `[0; 4]` means "match any destination" — the plain WAN port-forward, where
+    /// the ingress policy + port already scope the match. A **hairpin** (NAT
+    /// reflection) entry programmed under an *internal* zone's policy sets this to
+    /// the box's public address, so it only catches internal clients dialling the
+    /// public IP — never internal-to-internal traffic to the same port.
+    pub match_dst: [u8; 4],
+    /// Hairpin source NAT: when non-zero, also SNAT the packet's source to this
+    /// address (the box's IP on the client's segment) so the internal server's
+    /// reply routes back through the box. `[0; 4]` = no SNAT (plain DNAT).
+    pub snat_ip: [u8; 4],
     /// Internal port (`0` keeps the original destination port).
     pub port: u16,
     /// Explicit padding, always zero.
@@ -359,10 +437,29 @@ pub struct PortFwd {
 }
 
 impl PortFwd {
-    /// Build a port-forward target.
+    /// Build a plain port-forward target (match any destination, no hairpin SNAT).
     #[inline]
     pub const fn new(ip: [u8; 4], port: u16) -> Self {
-        Self { ip, port, _pad: 0 }
+        Self {
+            ip,
+            match_dst: [0; 4],
+            snat_ip: [0; 4],
+            port,
+            _pad: 0,
+        }
+    }
+
+    /// Build a hairpin (NAT-reflection) port-forward: DNAT to `ip:port` only when
+    /// the destination is `match_dst`, and SNAT the source to `snat_ip`.
+    #[inline]
+    pub const fn new_hairpin(ip: [u8; 4], port: u16, match_dst: [u8; 4], snat_ip: [u8; 4]) -> Self {
+        Self {
+            ip,
+            match_dst,
+            snat_ip,
+            port,
+            _pad: 0,
+        }
     }
 }
 
@@ -602,8 +699,37 @@ mod tests {
     fn flow_state_direction() {
         let f = FlowState::forward([10, 0, 0, 7], 8080);
         assert!(!f.is_reverse());
+        assert!(!f.has_second());
         let r = FlowState::reverse([10, 0, 0, 100], 80);
         assert!(r.is_reverse());
+        assert!(!r.has_second());
+    }
+
+    #[test]
+    fn flow_state_hairpin_carries_a_second_rewrite() {
+        // A hairpin forward DNATs the destination and SNATs the source.
+        let f = FlowState::forward2([10, 0, 0, 9], 8443, [10, 0, 0, 1], 0);
+        assert!(!f.is_reverse());
+        assert!(f.has_second());
+        assert_eq!(f.nat_ip, [10, 0, 0, 9]);
+        assert_eq!(f.nat2_ip, [10, 0, 0, 1]);
+        // A hairpin reverse SNATs the source (→ public) and un-DNATs the dest (→ client).
+        let r = FlowState::reverse2([198, 51, 100, 1], 443, [10, 0, 0, 50], 0);
+        assert!(r.is_reverse());
+        assert!(r.has_second());
+        assert_eq!(r.nat_ip, [198, 51, 100, 1]);
+        assert_eq!(r.nat2_ip, [10, 0, 0, 50]);
+    }
+
+    #[test]
+    fn port_fwd_hairpin_fields() {
+        let plain = PortFwd::new([10, 0, 0, 9], 8443);
+        assert_eq!(plain.match_dst, [0; 4]);
+        assert_eq!(plain.snat_ip, [0; 4]);
+        let hp = PortFwd::new_hairpin([10, 0, 0, 9], 8443, [198, 51, 100, 1], [10, 0, 0, 1]);
+        assert_eq!(hp.ip, [10, 0, 0, 9]);
+        assert_eq!(hp.match_dst, [198, 51, 100, 1]);
+        assert_eq!(hp.snat_ip, [10, 0, 0, 1]);
     }
 
     #[test]
@@ -632,6 +758,10 @@ mod tests {
         assert_eq!(core::mem::size_of::<ServiceValue>(), 8);
         assert_eq!(core::mem::size_of::<Backend>(), 8);
         assert_eq!(core::mem::size_of::<FlowKey>(), 20);
-        assert_eq!(core::mem::size_of::<FlowState>(), 8);
+        // FlowState carries a second (hairpin) rewrite: 2×(ip[4]+port) + flags +
+        // pad = 16 bytes.
+        assert_eq!(core::mem::size_of::<FlowState>(), 16);
+        // PortFwd: target ip + match_dst + snat_ip (3×4) + port + pad = 16 bytes.
+        assert_eq!(core::mem::size_of::<PortFwd>(), 16);
     }
 }
