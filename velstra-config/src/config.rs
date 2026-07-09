@@ -470,6 +470,17 @@ pub struct PortForwardCfg {
     /// Internal port (`0` keeps the public port).
     #[serde(default)]
     pub dst_port: u16,
+    /// Hairpin (NAT reflection): only DNAT when the packet's destination equals
+    /// this address (the box's public IP). Unset ⇒ match any destination — the
+    /// plain WAN forward. Set on the internal-zone reflection entries so they never
+    /// hijack internal-to-internal traffic to the same port.
+    #[serde(default)]
+    pub match_dst: Option<String>,
+    /// Hairpin (NAT reflection): also SNAT the source to this address (the box's IP
+    /// on the client's segment) so the internal server's reply routes back through
+    /// the box. Unset ⇒ plain DNAT, no source rewrite.
+    #[serde(default)]
+    pub snat_ip: Option<String>,
 }
 
 /// A resolved port-forward, ready for the `PORT_FORWARDS` map.
@@ -485,6 +496,10 @@ pub struct ResolvedPortForward {
     pub dst_ip: [u8; 4],
     /// Internal port (`0` keeps the public port).
     pub dst_port: u16,
+    /// Hairpin match guard (network-order octets); `[0; 4]` ⇒ match any.
+    pub match_dst: [u8; 4],
+    /// Hairpin source-NAT address (network-order octets); `[0; 4]` ⇒ no SNAT.
+    pub snat_ip: [u8; 4],
 }
 
 /// A resolved tenant policy: the firewall map contents for one `policy_id`.
@@ -882,12 +897,29 @@ impl FileConfig {
                 .dst_ip
                 .parse()
                 .map_err(|_| anyhow::anyhow!("invalid port-forward dst_ip {:?}", pf.dst_ip))?;
+            // Optional hairpin (NAT reflection) fields; each defaults to the zero
+            // address (match-any / no-SNAT) when unset.
+            let parse_opt_v4 = |field: &str, v: &Option<String>| -> Result<[u8; 4]> {
+                match v {
+                    Some(s) => {
+                        let a: Ipv4Addr = s
+                            .parse()
+                            .map_err(|_| anyhow::anyhow!("invalid port-forward {field} {s:?}"))?;
+                        Ok(a.octets())
+                    }
+                    None => Ok([0; 4]),
+                }
+            };
+            let match_dst = parse_opt_v4("match_dst", &pf.match_dst)?;
+            let snat_ip = parse_opt_v4("snat_ip", &pf.snat_ip)?;
             port_forwards.push(ResolvedPortForward {
                 policy: pf.policy,
                 proto,
                 port: pf.port,
                 dst_ip: dst_ip.octets(),
                 dst_port: pf.dst_port,
+                match_dst,
+                snat_ip,
             });
         }
 

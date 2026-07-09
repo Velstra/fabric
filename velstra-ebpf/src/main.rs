@@ -1646,6 +1646,28 @@ fn try_load_balance(
             proto,
         );
         apply_nat(ctx, &nat, reverse, proto)?;
+        // Hairpin (NAT reflection): a second rewrite on the OPPOSITE address of the
+        // same packet — SNAT the source on a forward flow, un-DNAT the destination
+        // on the reply — chaining its checksum onto the primary rewrite's. Ordinary
+        // single-NAT flows have `has_second() == false`, so the common path pays one
+        // predictable branch.
+        if state.has_second() {
+            let (old2_ip, old2_port) = if reverse {
+                (dst_addr, dst_port)
+            } else {
+                (src_addr, src_port)
+            };
+            let nat2 = plan_nat(
+                old2_ip,
+                old2_port,
+                state.nat2_ip,
+                state.nat2_port,
+                nat.new_ip_checksum,
+                nat.new_l4_checksum,
+                proto,
+            );
+            apply_nat(ctx, &nat2, !reverse, proto)?;
+        }
         bump(if reverse {
             Counter::LbReverse
         } else {
@@ -1772,6 +1794,18 @@ fn try_port_forward(
     if (proto != ip_proto::TCP && proto != ip_proto::UDP) || ihl_bytes != Ipv4Hdr::LEN {
         return Ok(None);
     }
+    // Hairpin (NAT reflection) guard: a reflection entry programmed under an
+    // internal zone's policy carries `match_dst` = the box's public address, so it
+    // must only fire for an internal client dialling the public IP — never for
+    // internal-to-internal traffic to the same port. A plain WAN forward leaves
+    // `match_dst` zero (the ingress policy + port already scope it).
+    if target.match_dst != [0u8; 4] && dst_addr != target.match_dst {
+        return Ok(None);
+    }
+    // When set, also SNAT the source to `snat_ip` so the internal server's reply
+    // routes back through the box (else it would answer the client directly with
+    // its real address and the client would drop the unexpected source).
+    let hairpin = target.snat_ip != [0u8; 4];
     // Router NAT keys its conntrack under the policy-independent namespace so the
     // reply — which enters through the internal zone's (different) policy — still
     // matches. See [`ROUTER_NAT_POLICY`].
@@ -1809,20 +1843,37 @@ fn try_port_forward(
     // a full-table failure leaves neither and the next packet retries both.
     // Reverse: the reply (internal host -> client) SNATs its source back to the
     // original destination (our public ip:port).
+    // The reply's destination is the original client for a plain forward, but the
+    // SNAT address for a hairpin flow (we rewrote the source to snat_ip inbound, so
+    // the server answers to snat_ip, not the client).
+    let reply_dst = if hairpin { target.snat_ip } else { src_addr };
     let rkey = FlowKey::new(
         ROUTER_NAT_POLICY,
         target.ip,
-        src_addr,
+        reply_dst,
         target_port,
         src_port,
         proto,
     );
-    if CONNTRACK
-        .insert(&rkey, &FlowState::reverse(dst_addr, dst_port), 0)
-        .is_ok()
-    {
-        // Forward: rewrite the destination on subsequent packets of this flow.
-        let _ = CONNTRACK.insert(&fkey, &FlowState::forward(target.ip, target.port), 0);
+    // A hairpin flow tracks a dual rewrite in each direction; a plain forward keeps
+    // the single-rewrite entries.
+    let (fwd_state, rev_state) = if hairpin {
+        (
+            // Forward: DNAT dst -> server, SNAT src -> snat_ip.
+            FlowState::forward2(target.ip, target.port, target.snat_ip, 0),
+            // Reverse: SNAT src (server) -> public (dst_addr:dst_port), un-DNAT dst
+            // (snat_ip) -> the client (src_addr, port kept).
+            FlowState::reverse2(dst_addr, dst_port, src_addr, 0),
+        )
+    } else {
+        (
+            FlowState::forward(target.ip, target.port),
+            FlowState::reverse(dst_addr, dst_port),
+        )
+    };
+    if CONNTRACK.insert(&rkey, &rev_state, 0).is_ok() {
+        // Forward: rewrite subsequent packets of this flow.
+        let _ = CONNTRACK.insert(&fkey, &fwd_state, 0);
     }
     // Record the reply in FW_FLOWS under the same router-NAT namespace. The reply
     // leaves the internal host outbound (internal zone -> WAN), which a normal
@@ -1830,7 +1881,8 @@ fn try_port_forward(
     // internal zone once the firewall path consults the router-NAT namespace.
     let _ = FW_FLOWS.insert(&rkey, &1u8, 0);
 
-    // DNAT this first packet.
+    // DNAT this first packet; a hairpin flow additionally SNATs the source, its
+    // checksum chained onto the DNAT's repaired checksums.
     let nat = plan_nat(
         dst_addr,
         dst_port,
@@ -1841,6 +1893,18 @@ fn try_port_forward(
         proto,
     );
     apply_nat(ctx, &nat, false, proto)?;
+    if hairpin {
+        let nat2 = plan_nat(
+            src_addr,
+            src_port,
+            target.snat_ip,
+            0,
+            nat.new_ip_checksum,
+            nat.new_l4_checksum,
+            proto,
+        );
+        apply_nat(ctx, &nat2, true, proto)?;
+    }
     bump(Counter::LoadBalanced);
     Ok(Some(xdp_action::XDP_PASS))
 }
