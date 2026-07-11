@@ -20,14 +20,14 @@ use clap::ValueEnum;
 use log::warn;
 use velstra_common::{
     ArpEntry, ArpKey, Backend, Cidr4, Counter, FloodSet, GlobalConfig, LocalMac, LocalMacKey,
-    MacFdbKey, NdKey, OverlayConfig, PolicyId, PortFwd, RouteEntry, ScopedAddr, ScopedAddr6,
+    MacFdbKey, NdKey, Npt66, OverlayConfig, PolicyId, PortFwd, RouteEntry, ScopedAddr, ScopedAddr6,
     ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue, TunnelEndpoint, TunnelKey,
     parse_mac, port_rule_value,
 };
 use velstra_config::{
     PolicyConfig, ResolvedFloodVtep, ResolvedInterface, ResolvedMacRoute, ResolvedNd6,
-    ResolvedNeighbor, ResolvedOverlay, ResolvedPortForward, ResolvedRoute, ResolvedService,
-    ResolvedTunnel, RuntimeConfig,
+    ResolvedNeighbor, ResolvedNpt66, ResolvedOverlay, ResolvedPortForward, ResolvedRoute,
+    ResolvedService, ResolvedTunnel, RuntimeConfig,
 };
 
 /// How to attach the XDP program to the interface.
@@ -169,6 +169,16 @@ impl Firewall {
                 && if_nametoindex(&i.name).is_ok()
             {
                 egress_ifaces.push(i.name.clone());
+            }
+        }
+        // C16: an NPTv6 boundary interface also needs the TC egress hook, where the
+        // source prefix is translated on the way out (the ingress/destination half
+        // rides the XDP hook already attached to every config interface).
+        for r in &cfg.npt66 {
+            if !egress_ifaces.iter().any(|n| n == &r.interface)
+                && if_nametoindex(&r.interface).is_ok()
+            {
+                egress_ifaces.push(r.interface.clone());
             }
         }
         if !egress_ifaces.is_empty() {
@@ -693,6 +703,7 @@ fn apply_config(ebpf: &mut Ebpf, cfg: &RuntimeConfig, old: Option<&RuntimeConfig
     program_services(ebpf, &cfg.services)?;
     program_port_forwards(ebpf, &cfg.port_forwards)?;
     program_masquerade(ebpf, &cfg.interfaces)?;
+    program_npt66(ebpf, &cfg.npt66)?;
     program_overlay(
         ebpf,
         cfg.overlay.as_ref(),
@@ -926,6 +937,38 @@ fn program_masquerade(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Resu
     for (ifindex, ip) in prepared {
         map.insert(ifindex, ip, 0)
             .with_context(|| format!("inserting masquerade ifindex {ifindex}"))?;
+    }
+    Ok(())
+}
+
+/// Write the C16 `NPTV6` map: boundary ifindex → its NPTv6 (RFC 6296) prefix
+/// translation. The interface name resolves to the live ifindex here (the data
+/// plane keys on ifindex); an absent interface is skipped with a warning, so a
+/// later reconfigure picks it up once the NIC appears.
+fn program_npt66(ebpf: &mut Ebpf, rules: &[ResolvedNpt66]) -> Result<()> {
+    let prepared: Vec<(u32, Npt66)> = rules
+        .iter()
+        .filter_map(|r| match if_nametoindex(&r.interface) {
+            Ok(ifindex) => Some((ifindex, r.npt)),
+            Err(_) => {
+                warn!(
+                    "npt66 interface {} not present yet; deferring its translation",
+                    r.interface
+                );
+                None
+            }
+        })
+        .collect();
+    if prepared.is_empty() {
+        return Ok(());
+    }
+    let mut map: HashMap<_, u32, Npt66> = HashMap::try_from(
+        ebpf.map_mut("NPTV6")
+            .ok_or_else(|| anyhow!("NPTV6 map missing"))?,
+    )?;
+    for (ifindex, npt) in prepared {
+        map.insert(ifindex, npt, 0)
+            .with_context(|| format!("inserting npt66 ifindex {ifindex}"))?;
     }
     Ok(())
 }

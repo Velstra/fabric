@@ -31,9 +31,9 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use velstra_common::{
-    Action, Backend, Cidr4, Cidr6, ConfigFlags, GENEVE_PORT, GlobalConfig, PolicyId, PortKey,
-    RouteEntry, ServiceKey, VXLAN_PORT, encap_kind, ip_proto, parse_cidr_v4, parse_cidr_v6,
-    parse_mac,
+    Action, Backend, Cidr4, Cidr6, ConfigFlags, GENEVE_PORT, GlobalConfig, Npt66, PolicyId,
+    PortKey, RouteEntry, ServiceKey, VXLAN_PORT, encap_kind, ip_proto, parse_cidr_v4,
+    parse_cidr_v6, parse_mac,
 };
 
 /// A firewall verdict as written in TOML (`"pass"` / `"drop"`).
@@ -422,6 +422,33 @@ pub struct FileConfig {
     /// TOML.
     #[serde(rename = "flood_vtep")]
     pub flood_vteps: Vec<FloodVtepCfg>,
+    /// C16 NPTv6 (RFC 6296) stateless prefix translations. Spelled `[[npt66]]`.
+    #[serde(default, rename = "npt66")]
+    pub npt66: Vec<Npt66Cfg>,
+}
+
+/// A NPTv6 (RFC 6296) prefix-translation rule: on the boundary `interface`, an
+/// internal source leaving is rewritten to the external prefix, and an external
+/// destination arriving is rewritten back — stateless and checksum-neutral.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Npt66Cfg {
+    /// The boundary (external/WAN) interface this rule is applied on.
+    pub interface: String,
+    /// Internal IPv6 prefix, e.g. `"fd00:1::/48"`.
+    pub internal: String,
+    /// External (provider-delegated) IPv6 prefix, e.g. `"2001:db8:1::/48"`.
+    pub external: String,
+}
+
+/// A resolved NPTv6 rule, ready for the `NPTV6` map. The agent resolves
+/// `interface` to an ifindex at program time (the live index the box has now).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedNpt66 {
+    /// Boundary interface name (resolved to an ifindex by the agent).
+    pub interface: String,
+    /// The precomputed translation (prefixes + checksum-neutral adjustment).
+    pub npt: Npt66,
 }
 
 /// A resolved load-balancer service: a service key and its (validated) backends.
@@ -658,6 +685,8 @@ pub struct RuntimeConfig {
     /// BUM head-end replication flood entries for the `FLOOD_LIST` map (B2). The
     /// agent groups these by `vni` into one `FloodSet` per segment.
     pub flood_vteps: Vec<ResolvedFloodVtep>,
+    /// NPTv6 (RFC 6296) prefix translations for the `NPTV6` map (C16).
+    pub npt66: Vec<ResolvedNpt66>,
 }
 
 impl RuntimeConfig {
@@ -682,6 +711,7 @@ impl RuntimeConfig {
             neighbors: Vec::new(),
             nd_neighbors: Vec::new(),
             flood_vteps: Vec::new(),
+            npt66: Vec::new(),
         }
     }
 }
@@ -923,6 +953,45 @@ impl FileConfig {
             });
         }
 
+        // C16: NPTv6 (RFC 6296) prefix translations. Both prefixes must parse as
+        // v6 CIDRs of equal length, and (v1) a non-zero multiple of 16 bits ≤ /64.
+        let mut npt66 = Vec::with_capacity(self.npt66.len());
+        for rule in &self.npt66 {
+            let int = parse_cidr_v6(&rule.internal).map_err(|e| {
+                anyhow::anyhow!(
+                    "npt66 {}: invalid internal prefix {:?}: {e}",
+                    rule.interface,
+                    rule.internal
+                )
+            })?;
+            let ext = parse_cidr_v6(&rule.external).map_err(|e| {
+                anyhow::anyhow!(
+                    "npt66 {}: invalid external prefix {:?}: {e}",
+                    rule.interface,
+                    rule.external
+                )
+            })?;
+            if int.prefix != ext.prefix {
+                bail!(
+                    "npt66 {}: internal /{} and external /{} prefix lengths must match",
+                    rule.interface,
+                    int.prefix,
+                    ext.prefix
+                );
+            }
+            if int.prefix == 0 || int.prefix > 64 || int.prefix % 16 != 0 {
+                bail!(
+                    "npt66 {}: prefix /{} must be a non-zero multiple of 16 bits, ≤ /64 (v1)",
+                    rule.interface,
+                    int.prefix
+                );
+            }
+            npt66.push(ResolvedNpt66 {
+                interface: rule.interface.clone(),
+                npt: Npt66::new(int.octets, ext.octets, (int.prefix / 16) as u8),
+            });
+        }
+
         // Phase 4: overlay endpoint + forwarding entries.
         let overlay = match &self.overlay {
             Some(o) => {
@@ -1072,6 +1141,7 @@ impl FileConfig {
             neighbors,
             nd_neighbors,
             flood_vteps,
+            npt66,
         })
     }
 }
