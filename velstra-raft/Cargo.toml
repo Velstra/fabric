@@ -1,6 +1,6 @@
 [package]
 name = "velstra-raft"
-version = "0.2.0"
+version = "0.3.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -12,9 +12,9 @@ categories = ["network-programming", "concurrency"]
 readme = "README.md"
 
 [dependencies]
-velstra-common = { path = "../velstra-common", version = "0.2" }
-velstra-config = { path = "../velstra-config", version = "0.2" }
-velstra-orchestrator = { path = "../velstra-orchestrator", version = "0.2" }
+velstra-common = { path = "../velstra-common", version = "0.3" }
+velstra-config = { path = "../velstra-config", version = "0.3" }
+velstra-orchestrator = { path = "../velstra-orchestrator", version = "0.3" }
 
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "time", "net"] }

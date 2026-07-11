@@ -2725,7 +2725,7 @@ dependencies = [
 
 [[package]]
 name = "velstra"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "aya",
@@ -2747,7 +2747,7 @@ dependencies = [
 
 [[package]]
 name = "velstra-cni"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "env_logger",
@@ -2762,14 +2762,14 @@ dependencies = [
 
 [[package]]
 name = "velstra-common"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aya",
 ]
 
 [[package]]
 name = "velstra-config"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -2780,7 +2780,7 @@ dependencies = [
 
 [[package]]
 name = "velstra-controller"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2816,7 +2816,7 @@ dependencies = [
 
 [[package]]
 name = "velstra-orchestrator"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -2826,7 +2826,7 @@ dependencies = [
 
 [[package]]
 name = "velstra-proto"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
@@ -2836,7 +2836,7 @@ dependencies = [
 
 [[package]]
 name = "velstra-raft"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "openraft",
