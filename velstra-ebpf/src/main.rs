@@ -65,7 +65,7 @@ use velstra_common::{
     ARP_REPLY, ARP_REQUEST, Action, ArpEntry, ArpKey, Backend, ConfigFlags, Counter, ETHERTYPE_ARP,
     ETHERTYPE_IPV4, ETHERTYPE_IPV6, FloodSet, FlowKey, FlowState, ForwardOutcome, GlobalConfig,
     ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, ICMPV6_NEIGHBOR_SOLICIT, LocalMac, LocalMacKey,
-    MAX_FLOOD_VTEPS, MacFdbKey, ND_NA_MSG_LEN, Nat, NdKey, OVERLAY_OUTER_LEN, OverlayConfig,
+    MAX_FLOOD_VTEPS, MacFdbKey, ND_NA_MSG_LEN, Nat, NdKey, Npt66, OVERLAY_OUTER_LEN, OverlayConfig,
     PacketMeta, PolicyId, PortFwd, Rewrite, RouteEntry, ScopedAddr, ScopedAddr6, ScopedPortKey,
     ScopedSrcPortKey, ServiceKey, ServiceValue, TunnelEndpoint, TunnelKey, build_encap, decide,
     icmp, icmp_checksum, ip_proto, is_overlay_dport, lpm_key_addr, plan_arp_reply, plan_forward,
@@ -122,6 +122,15 @@ static PORT_FORWARDS: HashMap<ScopedPortKey, PortFwd> = HashMap::with_max_entrie
 /// control plane (`program_masquerade`), which reads the live interface address.
 #[map]
 static MASQUERADE: HashMap<u32, [u8; 4]> = HashMap::with_max_entries(64, 0);
+
+/// Per-interface NPTv6 (RFC 6296) prefix translation: boundary ifindex → the
+/// stateless mapping between an internal and an external IPv6 prefix. On TC egress
+/// of this interface an internal source is rewritten to the external prefix; on
+/// XDP ingress an external destination is rewritten back to the internal prefix.
+/// Checksum-neutral (the [`Npt66`] adjustment keeps the L4 checksum valid with no
+/// recompute). Empty by default; opt-in per interface via `program_npt66`.
+#[map]
+static NPTV6: HashMap<u32, Npt66> = HashMap::with_max_entries(64, 0);
 
 /// Phase 2 forwarding table: `(policy, destination-IP prefix)` → [`RouteEntry`].
 /// The FIB is scoped by policy (C3) so two tenants with overlapping prefixes
@@ -562,7 +571,14 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
     bump(Counter::TxPackets);
 
     let eth: *const EthHdr = unsafe { ptr_at_tc(ctx, 0)? };
-    if u16::from_be(unsafe { (*eth).ether_type }) != ETHERTYPE_IPV4 {
+    let ethertype = u16::from_be(unsafe { (*eth).ether_type });
+    if ethertype != ETHERTYPE_IPV4 {
+        // NPTv6 (RFC 6296) source translation happens on the way out: an internal
+        // IPv6 source leaving a boundary interface is rewritten to the external
+        // prefix. Other v6 traffic (and non-IP) passes untouched.
+        if ethertype == ETHERTYPE_IPV6 {
+            return npt66_egress_v6(ctx);
+        }
         return Ok(TC_ACT_OK as i32);
     }
     let ipv4: *const Ipv4Hdr = unsafe { ptr_at_tc(ctx, EthHdr::LEN)? };
@@ -705,6 +721,36 @@ fn masquerade_egress(
         return Ok(TC_ACT_OK as i32);
     }
     bump(Counter::EgressMasqueraded);
+    Ok(TC_ACT_OK as i32)
+}
+
+/// NPTv6 (RFC 6296) **egress** source translation on the TC egress hook: if this
+/// egress interface carries an NPTv6 rule and the packet's IPv6 source matches the
+/// internal prefix, rewrite it to the external prefix in place. Checksum-neutral —
+/// the [`Npt66`] adjustment keeps the one's-complement address sum invariant, so
+/// the L4 checksum (and `skb->csum`) stay valid with a plain store (no
+/// `BPF_F_RECOMPUTE_CSUM`). Fails open (`TC_ACT_OK`) so non-NPTv6 v6 traffic and a
+/// too-short frame pass untouched.
+#[inline(always)]
+fn npt66_egress_v6(ctx: &TcContext) -> Result<i32, ()> {
+    let ifindex = unsafe { (*ctx.skb.skb).ifindex };
+    let Some(rule) = (unsafe { NPTV6.get(&ifindex) }).copied() else {
+        return Ok(TC_ACT_OK as i32);
+    };
+    // The IPv6 source sits at a constant offset (Ethernet + 8 bytes into the v6
+    // header). Read it, and bail out cleanly on a truncated frame.
+    let src_off = EthHdr::LEN + 8;
+    let src: [u8; 16] = match ctx.load(src_off) {
+        Ok(s) => s,
+        Err(_) => return Ok(TC_ACT_OK as i32),
+    };
+    if !rule.matches_internal(&src) {
+        return Ok(TC_ACT_OK as i32);
+    }
+    let new_src = rule.translate_out(src);
+    if ctx.store(src_off, &new_src, 0).is_err() {
+        return Ok(TC_ACT_OK as i32);
+    }
     Ok(TC_ACT_OK as i32)
 }
 
@@ -1290,7 +1336,42 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
         }
         return Ok(xdp_action::XDP_DROP);
     }
+    // NPTv6 (RFC 6296) ingress: on a boundary interface, an inbound packet whose
+    // destination matches the external prefix is rewritten back to the internal
+    // prefix (checksum-neutral). A no-op when this interface has no rule or the
+    // destination doesn't match.
+    npt66_ingress_v6(ctx, ifindex)?;
     Ok(xdp_action::XDP_PASS)
+}
+
+/// NPTv6 (RFC 6296) **ingress** destination translation on the XDP hook: if this
+/// interface carries an NPTv6 rule and the packet's IPv6 destination matches the
+/// external prefix, rewrite it back to the internal prefix in place (constant
+/// offset, one freshly bounds-checked write). Checksum-neutral, so no L4 fix-up.
+///
+/// Kept out of line (`inline(never)`) so its 36-byte rule copy + address locals
+/// live in their own BPF stack frame rather than inflating the main program's.
+#[inline(never)]
+fn npt66_ingress_v6(ctx: &XdpContext, ifindex: u32) -> Result<(), ()> {
+    let Some(rule) = (unsafe { NPTV6.get(&ifindex) }) else {
+        return Ok(());
+    };
+    // IPv6 destination @ Ethernet + 24 bytes into the v6 header.
+    let off = EthHdr::LEN + 24;
+    let dst: [u8; 16] = unsafe { *ptr_at::<[u8; 16]>(ctx, off)? };
+    if !rule.matches_external(&dst) {
+        return Ok(());
+    }
+    let new_dst = rule.translate_in(dst);
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    if data + off + 16 > data_end {
+        return Err(());
+    }
+    unsafe {
+        *((data + off) as *mut [u8; 16]) = new_dst;
+    }
+    Ok(())
 }
 
 /// Phase 4 **ARP suppression**: answer a tenant's ARP request locally from

@@ -35,6 +35,7 @@ mod config;
 mod forward;
 mod lb;
 mod mac;
+mod npt;
 mod overlay;
 mod packet;
 pub mod parse;
@@ -51,6 +52,7 @@ pub use lb::{
     select_backend, session_hash,
 };
 pub use mac::{MacError, parse_mac};
+pub use npt::{Npt66, npt66_rewrite, oc_add};
 pub use overlay::{
     ARP_REPLY, ARP_REQUEST, ArpEntry, ArpKey, ArpReply, ETHERTYPE_ARP, Encap, FloodSet,
     GENEVE_PORT, ICMPV6_NEIGHBOR_ADVERT, ICMPV6_NEIGHBOR_SOLICIT, LocalMac, LocalMacKey,

@@ -376,6 +376,9 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
                 out_iface: fv.out_iface.clone(),
             })
             .collect(),
+        // NPTv6 is a file-config-only (appliance) feature; the gRPC NodeConfig has
+        // no equivalent message, so it converts to/from empty.
+        npt66: Vec::new(),
     }
 }
 
