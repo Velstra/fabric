@@ -1,5 +1,30 @@
 # Changelog
 
+## [Unreleased]
+
+## [0.3.0] — 2026-07-11
+
+NAT completeness in the eBPF/XDP data plane, plus two datapath correctness fixes.
+
+### Added
+- **Hairpin NAT (NAT reflection).** A dual-translation datapath so an internal
+  client can reach a port-forwarded service via its public IP: the packet is
+  DNAT'd to the internal host and source-NAT'd to the box's address on the
+  client's segment, so the reply routes back through the firewall.
+- **NPTv6 / NAT66 (RFC 6296).** Stateless, checksum-neutral IPv6 prefix
+  translation between an internal ULA prefix and a delegated external prefix, on
+  both the TC-egress and XDP-ingress datapaths.
+
+### Fixed
+- **Port-forward DNAT reply crossing zones.** The reply to a router-DNAT
+  (port-forward) connection is now keyed in conntrack policy-independently, so it
+  is matched even though the forward and reply packets enter through different
+  zones.
+- **eBPF verifier: `Option<PortFwd>` across the forward path.** The main program
+  no longer keeps a map-value-pointer niche live across the tail-call split
+  (which the verifier rejected as an uninitialised read); it carries a plain
+  bool and re-looks-up the target downstream.
+
 ## [0.2.0] — 2026-07-07
 
 Extends the fabric orchestration model and adds an HTTP northbound.
