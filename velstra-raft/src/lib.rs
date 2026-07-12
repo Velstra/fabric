@@ -47,12 +47,11 @@ fn raft_config() -> Result<Arc<Config>> {
         heartbeat_interval: 250,
         election_timeout_min: 500,
         election_timeout_max: 1000,
-        // The Raft log is in-memory only; durability comes exclusively from
-        // persisted snapshots. openraft's default policy snapshots every 5000
-        // committed logs, so a fabric with fewer mutations than that since the
-        // last snapshot would lose its ENTIRE topology on a full-cluster restart.
-        // Snapshot far more eagerly, and also on graceful shutdown (see
-        // RaftNode::shutdown), so `--raft-dir` actually protects the topology.
+        // Committed writes are durable via the write-ahead log (LogStore persists
+        // every append/vote/commit under `--raft-dir`), so a full-cluster restart
+        // no longer loses the topology. Snapshots still bound the log's growth and
+        // speed up recovery; keep them eager (openraft's default is every 5000
+        // logs) and also snapshot on graceful shutdown (see RaftNode::shutdown).
         snapshot_policy: SnapshotPolicy::LogsSinceLast(100),
         ..Default::default()
     }
@@ -96,7 +95,7 @@ impl RaftNode {
         // Seed the (volatile) log's purge point so its reported last_log_id lines
         // up with the state machine's restored last_applied.
         let last_purged = loaded.as_ref().and_then(|s| s.meta.last_log_id);
-        let log = LogStore::new(last_purged);
+        let log = LogStore::new(dir.clone(), last_purged)?;
         let sm = StateMachineStore::new(dir, loaded)?;
         let raft = Raft::new(
             id,
