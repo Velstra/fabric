@@ -69,9 +69,9 @@ use velstra_common::{
     PacketMeta, PolicyId, PortFwd, Rewrite, RouteEntry, SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6,
     ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue, Srv6Config, Srv6Endpoint,
     Srv6LocalSid, Srv6SidKey, TunnelEndpoint, TunnelKey, build_encap, build_srv6_encap, decide,
-    icmp, icmp_checksum, ip_proto, is_overlay_dport, lpm_key_addr, plan_arp_reply, plan_forward,
-    plan_icmp_unreachable, plan_na_reply, plan_nat, plan_tcp_rst, port_rule_action, port_rule_logs,
-    select_backend, session_hash, tcp_flags,
+    decode_vni, icmp, icmp_checksum, ip_proto, is_overlay_dport, lpm_key_addr, plan_arp_reply,
+    plan_forward, plan_icmp_unreachable, plan_na_reply, plan_nat, plan_tcp_rst, port_rule_action,
+    port_rule_logs, select_backend, session_hash, tcp_flags,
 };
 
 /// Maps an ingress interface index to its policy id, so one XDP program can
@@ -85,6 +85,16 @@ static IFACE_POLICY: HashMap<u32, PolicyId> = HashMap::with_max_entries(1024, 0)
 /// traffic is never encapsulated.
 #[map]
 static IFACE_VNI: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
+
+/// The set of overlay segments (VNIs) this host actually serves — one entry per
+/// distinct VNI a local tenant port lives on. Consulted at overlay **decap**: an
+/// inbound tunnel frame is only admitted when its inner VNI is present here, so a
+/// (trusted-or-spoofed) peer VTEP cannot inject an inner frame under an arbitrary
+/// VNI into whatever local segment its inner MAC happens to match. The value is a
+/// reserved per-VNI bridge ifindex for a future dedicated-bridge demux (`0` today
+/// ⇒ hand the decapsulated frame to the kernel bridge as before).
+#[map]
+static LOCAL_VNIS: HashMap<u32, u32> = HashMap::with_max_entries(4096, 0);
 
 /// Per-policy global configuration (`policy_id` → default action + flags).
 #[map]
@@ -1801,18 +1811,38 @@ fn try_srv6_encap(
     ))
 }
 
-/// Phase 4 **decapsulation**: strip the outer Ethernet/IPv4/UDP/shim headers of a
-/// tunnel packet and `XDP_PASS` the inner frame to the kernel stack.
+/// Phase 4 **decapsulation**: validate the inner VNI, then strip the outer
+/// Ethernet/IPv4/UDP/shim headers of a tunnel packet and `XDP_PASS` the inner
+/// frame to the kernel stack.
+///
+/// The shim's 24-bit VNI is read (and enforced) BEFORE anything is stripped:
+/// tenant isolation at the decap boundary requires that a peer VTEP may only
+/// inject into a segment this host actually serves. VTEP authentication upstream
+/// (`local_vtep_ip` + `VTEP_PEERS`) proves the outer source is a known peer, but
+/// its outer IPv4 is spoofable and a trusted peer serves many tenants; without
+/// this check any such sender could push an inner frame under an arbitrary VNI
+/// and have the kernel bridge deliver it into whatever local segment its inner
+/// MAC matched. So an inner VNI absent from [`LOCAL_VNIS`] is dropped.
 ///
 /// `bpf_xdp_adjust_head` with a positive delta removes `delta` bytes from the
 /// front of the packet. We remove exactly the outer stack — `eth + ihl + udp +
 /// shim` — which for our own (option-less) encapsulation equals
-/// [`OVERLAY_OUTER_LEN`]. The VNI is read first, purely for the log line.
+/// [`OVERLAY_OUTER_LEN`].
 #[inline(always)]
 fn try_decap(ctx: &XdpContext, ihl_bytes: usize) -> Result<u32, ()> {
-    // Outer headers to strip: eth + IPv4(ihl) + UDP(8) + shim(8). (The shim's VNI
-    // is left for a future inner-firewall pass; v1 decaps and lets the kernel
-    // bridge deliver by inner MAC.)
+    // The VXLAN/Geneve shim follows eth + IPv4(ihl) + UDP(8); its VNI is bytes 4..7
+    // (`decode_vni`). Read it through a bounds-checked pointer before any header is
+    // stripped.
+    let shim = unsafe { *ptr_at::<[u8; 8]>(ctx, EthHdr::LEN + ihl_bytes + 8)? };
+    let vni = decode_vni(shim);
+    // Admit the inner frame only into a segment this host serves. (The looked-up
+    // value reserves a per-VNI bridge ifindex for a future dedicated-bridge demux;
+    // today every served VNI shares the kernel bridge, so the value is unused.)
+    if unsafe { LOCAL_VNIS.get(&vni) }.is_none() {
+        bump(Counter::OverlayDropVni);
+        return Ok(xdp_action::XDP_DROP);
+    }
+
     let delta = (EthHdr::LEN + ihl_bytes + 8 + 8) as i32;
     // SAFETY: `ctx.ctx` is the live `xdp_md`; a positive delta only shrinks the
     // packet. A non-zero return means the kernel refused — pass the frame as-is.

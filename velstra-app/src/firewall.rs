@@ -856,14 +856,31 @@ fn program_interfaces(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Resu
         }
     }
 
-    let mut iface_vni: HashMap<_, u32, u32> = HashMap::try_from(
-        ebpf.map_mut("IFACE_VNI")
-            .ok_or_else(|| anyhow!("IFACE_VNI map missing"))?,
+    {
+        let mut iface_vni: HashMap<_, u32, u32> = HashMap::try_from(
+            ebpf.map_mut("IFACE_VNI")
+                .ok_or_else(|| anyhow!("IFACE_VNI map missing"))?,
+        )?;
+        for (ifindex, _, vni) in &prepared {
+            iface_vni
+                .insert(ifindex, vni, 0)
+                .with_context(|| format!("assigning ifindex {ifindex} to vni {vni}"))?;
+        }
+    }
+
+    // The set of segments this host serves, for decap VNI enforcement: a tunnel
+    // frame is only decapsulated into a VNI a local tenant port lives on. Value is
+    // a reserved per-VNI bridge ifindex (0 today ⇒ shared kernel bridge).
+    let mut local_vnis: HashMap<_, u32, u32> = HashMap::try_from(
+        ebpf.map_mut("LOCAL_VNIS")
+            .ok_or_else(|| anyhow!("LOCAL_VNIS map missing"))?,
     )?;
-    for (ifindex, _, vni) in &prepared {
-        iface_vni
-            .insert(ifindex, vni, 0)
-            .with_context(|| format!("assigning ifindex {ifindex} to vni {vni}"))?;
+    for (_, _, vni) in &prepared {
+        if *vni != 0 {
+            local_vnis
+                .insert(vni, 0u32, 0)
+                .with_context(|| format!("registering local vni {vni}"))?;
+        }
     }
     Ok(())
 }
