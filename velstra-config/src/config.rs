@@ -24,7 +24,7 @@
 
 use std::{
     fmt,
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
 };
 
@@ -425,6 +425,9 @@ pub struct FileConfig {
     /// C16 NPTv6 (RFC 6296) stateless prefix translations. Spelled `[[npt66]]`.
     #[serde(default, rename = "npt66")]
     pub npt66: Vec<Npt66Cfg>,
+    /// C9 stateful-HA conntrack sync. Spelled `[conntrack_sync]` in TOML.
+    #[serde(default)]
+    pub conntrack_sync: Option<ConntrackSyncCfg>,
 }
 
 /// A NPTv6 (RFC 6296) prefix-translation rule: on the boundary `interface`, an
@@ -449,6 +452,43 @@ pub struct ResolvedNpt66 {
     pub interface: String,
     /// The precomputed translation (prefixes + checksum-neutral adjustment).
     pub npt: Npt66,
+}
+
+/// C9 stateful-HA conntrack-state sync (a pfsync-analog for the eBPF `CONNTRACK`
+/// map). Spelled `[conntrack_sync]` in TOML. When present, the agent binds a UDP
+/// socket on `listen`, periodically pushes its live conntrack entries to each
+/// `peer`, and applies entries received from peers into its own `CONNTRACK` map —
+/// so a VRRP failover onto the backup keeps established (NAT'd) flows alive
+/// instead of dropping every connection.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConntrackSyncCfg {
+    /// UDP endpoint to bind for receiving peer state, e.g. `"0.0.0.0:5429"`.
+    pub listen: String,
+    /// Peer endpoints to push local conntrack state to, e.g. `"10.0.0.2:5429"`.
+    #[serde(default)]
+    pub peer: Vec<String>,
+    /// Seconds between pushes. Defaults to 1.
+    #[serde(default = "default_ct_interval_secs")]
+    pub interval_secs: u64,
+}
+
+/// Default conntrack-sync push interval (seconds).
+fn default_ct_interval_secs() -> u64 {
+    1
+}
+
+/// A resolved conntrack-sync config: the `listen`/`peer` endpoints parsed to
+/// `SocketAddr` so binding and sending cannot fail on a malformed address at
+/// runtime — the failure surfaces at config-load time instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedConntrackSync {
+    /// Local UDP bind endpoint.
+    pub listen: SocketAddr,
+    /// Peer endpoints pushed to each interval.
+    pub peers: Vec<SocketAddr>,
+    /// Seconds between pushes (at least 1).
+    pub interval_secs: u64,
 }
 
 /// A resolved load-balancer service: a service key and its (validated) backends.
@@ -687,6 +727,8 @@ pub struct RuntimeConfig {
     pub flood_vteps: Vec<ResolvedFloodVtep>,
     /// NPTv6 (RFC 6296) prefix translations for the `NPTV6` map (C16).
     pub npt66: Vec<ResolvedNpt66>,
+    /// C9 stateful-HA conntrack sync, or `None` if this node is not in an HA pair.
+    pub conntrack_sync: Option<ResolvedConntrackSync>,
 }
 
 impl RuntimeConfig {
@@ -712,8 +754,30 @@ impl RuntimeConfig {
             nd_neighbors: Vec::new(),
             flood_vteps: Vec::new(),
             npt66: Vec::new(),
+            conntrack_sync: None,
         }
     }
+}
+
+/// Parse and validate a `[conntrack_sync]` block into its resolved form.
+fn resolve_conntrack_sync(cfg: &ConntrackSyncCfg) -> Result<ResolvedConntrackSync> {
+    let listen: SocketAddr = cfg
+        .listen
+        .parse()
+        .with_context(|| format!("conntrack_sync.listen `{}` is not an ip:port", cfg.listen))?;
+    let mut peers = Vec::with_capacity(cfg.peer.len());
+    for p in &cfg.peer {
+        let addr: SocketAddr = p
+            .parse()
+            .with_context(|| format!("conntrack_sync.peer `{p}` is not an ip:port"))?;
+        peers.push(addr);
+    }
+    Ok(ResolvedConntrackSync {
+        listen,
+        peers,
+        // Never sleep zero seconds — a `0` in TOML would spin the push loop.
+        interval_secs: cfg.interval_secs.max(1),
+    })
 }
 
 /// Resolve one policy's firewall fields into map contents.
@@ -1142,6 +1206,11 @@ impl FileConfig {
             nd_neighbors,
             flood_vteps,
             npt66,
+            conntrack_sync: self
+                .conntrack_sync
+                .as_ref()
+                .map(resolve_conntrack_sync)
+                .transpose()?,
         })
     }
 }
@@ -1358,6 +1427,19 @@ impl fmt::Display for RuntimeConfig {
                 )?;
             }
         }
+
+        if let Some(cts) = &self.conntrack_sync {
+            writeln!(
+                f,
+                "conntrack-sync : listen {}, {} peer(s), every {}s",
+                cts.listen,
+                cts.peers.len(),
+                cts.interval_secs,
+            )?;
+            for p in &cts.peers {
+                writeln!(f, "  - peer {p}")?;
+            }
+        }
         Ok(())
     }
 }
@@ -1365,6 +1447,62 @@ impl fmt::Display for RuntimeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolves_conntrack_sync() {
+        let toml = r#"
+            [conntrack_sync]
+            listen = "0.0.0.0:5429"
+            peer = ["10.0.0.2:5429", "10.0.0.3:5429"]
+            interval_secs = 2
+        "#;
+        let cfg = toml::from_str::<FileConfig>(toml)
+            .unwrap()
+            .resolve()
+            .unwrap();
+        let cts = cfg.conntrack_sync.expect("conntrack_sync present");
+        assert_eq!(cts.listen, "0.0.0.0:5429".parse().unwrap());
+        assert_eq!(cts.peers.len(), 2);
+        assert_eq!(cts.peers[1], "10.0.0.3:5429".parse().unwrap());
+        assert_eq!(cts.interval_secs, 2);
+    }
+
+    #[test]
+    fn conntrack_sync_defaults_interval_and_clamps_zero() {
+        // No `interval_secs` → default 1; an explicit `0` is clamped up to 1 so
+        // the push loop never busy-spins.
+        let cfg = toml::from_str::<FileConfig>(
+            "[conntrack_sync]\nlisten = \"0.0.0.0:5429\"\ninterval_secs = 0\n",
+        )
+        .unwrap()
+        .resolve()
+        .unwrap();
+        assert_eq!(cfg.conntrack_sync.unwrap().interval_secs, 1);
+
+        let cfg = toml::from_str::<FileConfig>("[conntrack_sync]\nlisten = \"0.0.0.0:5429\"\n")
+            .unwrap()
+            .resolve()
+            .unwrap();
+        assert_eq!(cfg.conntrack_sync.unwrap().interval_secs, 1);
+    }
+
+    #[test]
+    fn conntrack_sync_rejects_bad_listen() {
+        let err = toml::from_str::<FileConfig>("[conntrack_sync]\nlisten = \"not-an-addr\"\n")
+            .unwrap()
+            .resolve()
+            .unwrap_err();
+        assert!(err.to_string().contains("conntrack_sync.listen"));
+    }
+
+    #[test]
+    fn no_conntrack_sync_is_none() {
+        let cfg = toml::from_str::<FileConfig>("default_action = \"drop\"\n")
+            .unwrap()
+            .resolve()
+            .unwrap();
+        assert!(cfg.conntrack_sync.is_none());
+    }
 
     #[test]
     fn parses_full_config() {

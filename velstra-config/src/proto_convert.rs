@@ -379,6 +379,9 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
         // NPTv6 is a file-config-only (appliance) feature; the gRPC NodeConfig has
         // no equivalent message, so it converts to/from empty.
         npt66: Vec::new(),
+        // Conntrack sync (C9) is a file-config-only HA-appliance feature; the
+        // controller never pushes it, so it converts to/from `None`.
+        conntrack_sync: None,
     }
 }
 
