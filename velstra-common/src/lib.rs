@@ -41,6 +41,7 @@ mod packet;
 pub mod parse;
 mod policy;
 mod reject;
+pub mod srv6;
 
 pub use cidr::{Cidr4, Cidr6, CidrError, mask_v4, mask_v6, parse_cidr_v4, parse_cidr_v6};
 pub use config::{ConfigFlags, GlobalConfig};
@@ -72,4 +73,8 @@ pub use policy::{
 pub use reject::{
     ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, IcmpUnreach, TcpRst, icmp, icmp_checksum,
     plan_icmp_unreachable, plan_tcp_rst, tcp_flags,
+};
+pub use srv6::{
+    SRV6_L2_OUTER_LEN, Srv6Encap, Srv6Endpoint, Srv6LocalSid, Srv6Sid, Srv6SidKey,
+    build_service_sid, build_srv6_encap, decode_service_sid,
 };

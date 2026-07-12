@@ -3,6 +3,17 @@
 ## [Unreleased]
 
 ### Added
+- **SRv6 L2 codec (B9, part 1) — `velstra-common::srv6`.** The pure, `no_std`,
+  unit-tested contract for an SRv6 (RFC 8986) overlay data plane, ahead of wiring
+  it into the XDP datapath. `build_srv6_encap` produces the outer Ethernet + IPv6
+  stack for reduced encapsulation (H.Encaps.Red — a single service SID in the IPv6
+  destination, no Segment Routing Header), the `End.DT2*` L2 case; `build_service_sid`
+  / `decode_service_sid` compose and read wren's locator-derived SID layout
+  (`[locator][disc][vni]`, RFC 9252) so both sides agree on a SID's tenant and
+  behaviour. New `#[repr(C)]` map types `Srv6Endpoint`, `Srv6SidKey`, `Srv6LocalSid`
+  (padding-free, `aya::Pod` under the `user` feature) and the `behavior` /
+  `sid_disc` code-point modules. Pure contract only — no eBPF object change, so no
+  `ebpfHash` bump; the encap/decap datapath (parts 2–3) follows.
 - **Stateful-HA conntrack sync (C9)** — a *pfsync*-analog for the eBPF `CONNTRACK`
   map. When `[conntrack_sync]` is set, the agent binds a UDP socket, pushes its live
   conntrack entries to each `peer` every interval, and applies the entries a peer
