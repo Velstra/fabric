@@ -703,15 +703,40 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
     Ok(TC_ACT_OK as i32)
 }
 
-/// Phase 4b **masquerade** (source NAT). A packet leaving a masquerade interface
-/// has its source rewritten to that interface's public `wan_ip`, so a private
-/// network reaches the internet behind one address. A reverse `CONNTRACK` entry
-/// is recorded so the reply — arriving at the XDP ingress hook — is DNAT'd back
-/// to the original client by [`try_load_balance`]'s conntrack path (shared map),
-/// and an `FW_FLOWS` entry lets that reply through the WAN zone's deny-by-default
-/// ingress posture. Only TCP/UDP over a 20-byte IPv4 header are masqueraded
-/// (the 5-tuple conntrack needs ports + constant L4 offsets); anything else, or
-/// a packet whose source is already `wan_ip` (host-originated), passes unchanged.
+/// How many ephemeral ports the masquerade NAPT probe tries before falling back
+/// to the client's own source port. Small and bounded to keep the egress path
+/// within the verifier's complexity budget.
+const NAPT_PROBES: u16 = 8;
+
+/// The base ephemeral port for a masquerade flow, mixed from its 4-tuple so
+/// distinct clients spread across the port range rather than clustering.
+#[inline(always)]
+fn napt_seed(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16) -> u32 {
+    let h = u32::from_ne_bytes(src)
+        ^ u32::from_ne_bytes(dst).rotate_left(16)
+        ^ ((sport as u32) << 16)
+        ^ (dport as u32);
+    // Knuth multiplicative hash — cheap, no map, and stable across a flow's packets.
+    h.wrapping_mul(2654435761)
+}
+
+/// The `i`-th NAPT candidate port, in the ephemeral range [32768, 65535]; never 0.
+#[inline(always)]
+fn napt_port(seed: u32, i: u16) -> u16 {
+    32768 + (seed.wrapping_add(i as u32) % 32768) as u16
+}
+
+/// Phase 4b **masquerade** (source NAT + NAPT). A packet leaving a masquerade
+/// interface has its source rewritten to that interface's public `wan_ip` and its
+/// source port to a per-flow-unique WAN port, so a private network reaches the
+/// internet behind one address. A reverse `CONNTRACK` entry (keyed on the
+/// allocated WAN port) is recorded so the reply — arriving at the XDP ingress hook
+/// — is DNAT'd back to the original client:port by [`try_load_balance`]'s conntrack
+/// path (shared map), and an `FW_FLOWS` entry lets that reply through the WAN
+/// zone's deny-by-default ingress posture. Only TCP/UDP over a 20-byte IPv4 header
+/// are masqueraded (the 5-tuple conntrack needs ports + constant L4 offsets);
+/// anything else, or a packet whose source is already `wan_ip` (host-originated),
+/// passes unchanged.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn masquerade_egress(
@@ -733,14 +758,43 @@ fn masquerade_egress(
         return Ok(TC_ACT_OK as i32);
     }
 
-    // The reply (remote -> wan_ip) seen at XDP ingress: DNAT its destination back
-    // to the original client. The conntrack key is exactly that reply 5-tuple.
-    let rkey = FlowKey::new(policy_id, dst_addr, wan_ip, dst_port, src_port, proto);
-    let _ = CONNTRACK.insert(&rkey, &FlowState::forward(src_addr, src_port), 0);
+    // NAPT (port address translation). Allocate a WAN source port unique to this
+    // client flow so replies to (wan_ip, wan_port) demux back to the right client:
+    // two internal hosts sending from the same source port to the same destination
+    // would otherwise share one reverse conntrack key and misroute each other's
+    // replies (pure SNAT without PAT). Probe a small window of ephemeral ports
+    // seeded by the flow hash — reuse the slot already recording THIS flow (a
+    // retransmit reuses the same port), take the first free slot, else fall back to
+    // the client's own port (the pre-NAPT behaviour) on exhaustion.
+    let fwd = FlowState::forward(src_addr, src_port);
+    let seed = napt_seed(src_addr, dst_addr, src_port, dst_port);
+    let mut wan_port = src_port;
+    for i in 0..NAPT_PROBES {
+        let cand = napt_port(seed, i);
+        let pkey = FlowKey::new(policy_id, dst_addr, wan_ip, dst_port, cand, proto);
+        match unsafe { CONNTRACK.get(&pkey) }.copied() {
+            None => {
+                wan_port = cand;
+                break;
+            }
+            Some(s) if s.nat_ip == src_addr && s.nat_port == src_port => {
+                wan_port = cand;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // The reply (remote -> wan_ip:wan_port) seen at XDP ingress: DNAT its
+    // destination back to the original client:client_port. The conntrack key is
+    // that reply 5-tuple (keyed on the allocated wan_port); the stored forward
+    // state carries the client address+port the reply is restored to.
+    let rkey = FlowKey::new(policy_id, dst_addr, wan_ip, dst_port, wan_port, proto);
+    let _ = CONNTRACK.insert(&rkey, &fwd, 0);
     // …and let that reply pass the WAN zone's deny-by-default stateful firewall.
     let _ = FW_FLOWS.insert(&rkey, &1u8, 0);
 
-    if snat_tc(ctx, src_addr, wan_ip, proto).is_err() {
+    if snat_tc(ctx, src_addr, wan_ip, src_port, wan_port, proto).is_err() {
         // Too short to rewrite — let it out un-NAT'd rather than black-hole it.
         return Ok(TC_ACT_OK as i32);
     }
@@ -784,11 +838,19 @@ fn npt66_egress_v6(ctx: &TcContext) -> Result<i32, ()> {
 /// 20-byte IPv4 header, so the L4 checksum offset is a constant — the caller
 /// guarantees it.
 #[inline(always)]
-fn snat_tc(ctx: &TcContext, old_src: [u8; 4], new_src: [u8; 4], proto: u8) -> Result<(), ()> {
+fn snat_tc(
+    ctx: &TcContext,
+    old_src: [u8; 4],
+    new_src: [u8; 4],
+    old_port: u16,
+    new_port: u16,
+    proto: u8,
+) -> Result<(), ()> {
     // `bpf_l3/l4_csum_replace` take the changed field as a native-endian integer
     // whose in-memory bytes are the on-the-wire (network-order) bytes — i.e. the
-    // packet's 4 address bytes read in native order. `from_ne_bytes` does exactly
-    // that; `from_be_bytes` would byte-swap and corrupt the checksum.
+    // packet's address/port bytes read in native order. `from_ne_bytes` of the
+    // on-wire bytes does exactly that; `from_be_bytes` would byte-swap and corrupt
+    // the checksum.
     let from = u32::from_ne_bytes(old_src) as u64;
     let to = u32::from_ne_bytes(new_src) as u64;
     let l4_csum_off = if proto == ip_proto::TCP {
@@ -799,7 +861,8 @@ fn snat_tc(ctx: &TcContext, old_src: [u8; 4], new_src: [u8; 4], proto: u8) -> Re
 
     // A UDP datagram with a zero checksum has L4 checksums disabled — leave it.
     let cur_l4: [u8; 2] = ctx.load(l4_csum_off).map_err(|_| ())?;
-    if !(proto == ip_proto::UDP && cur_l4 == [0, 0]) {
+    let l4_active = !(proto == ip_proto::UDP && cur_l4 == [0, 0]);
+    if l4_active {
         // BPF_F_PSEUDO_HDR | size(4): the L4 checksum covers the IP pseudo-header,
         // so a source-address change must update it too.
         ctx.l4_csum_replace(l4_csum_off, from, to, (BPF_F_PSEUDO_HDR as u64) | 4)
@@ -808,6 +871,20 @@ fn snat_tc(ctx: &TcContext, old_src: [u8; 4], new_src: [u8; 4], proto: u8) -> Re
     ctx.l3_csum_replace(O_IP_CSUM, from, to, 4)
         .map_err(|_| ())?;
     ctx.store(O_IP_SRC, &new_src, 0).map_err(|_| ())?;
+    // NAPT source-port rewrite. The port is part of the L4 segment the checksum
+    // covers but NOT the pseudo-header, so its delta is a plain 2-byte update (no
+    // BPF_F_PSEUDO_HDR). Pass the on-wire (big-endian) port bytes as a native int,
+    // mirroring the address handling above.
+    if old_port != new_port {
+        if l4_active {
+            let pfrom = u16::from_ne_bytes(old_port.to_be_bytes()) as u64;
+            let pto = u16::from_ne_bytes(new_port.to_be_bytes()) as u64;
+            ctx.l4_csum_replace(l4_csum_off, pfrom, pto, 2)
+                .map_err(|_| ())?;
+        }
+        ctx.store(O_L4_SPORT, &new_port.to_be_bytes(), 0)
+            .map_err(|_| ())?;
+    }
     Ok(())
 }
 
