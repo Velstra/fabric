@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Added
+- **Stateful-HA conntrack sync (C9)** — a *pfsync*-analog for the eBPF `CONNTRACK`
+  map. When `[conntrack_sync]` is set, the agent binds a UDP socket, pushes its live
+  conntrack entries to each `peer` every interval, and applies the entries a peer
+  pushes — so established NAT'd flows survive a VRRP failover onto the backup. The
+  `peer` list is repeatable, so a three-or-more-node cluster forms a full mesh. The
+  wire framing is explicit little-endian records and untrusted input is bounded and
+  dropped on any malformation; the stream is unauthenticated, so it belongs on a
+  trusted/dedicated sync link. File-config-only (an HA-appliance concern) and no
+  eBPF change — the `CONNTRACK` map already existed, so no `ebpfHash` bump.
+
 ## [0.3.0] — 2026-07-11
 
 NAT completeness in the eBPF/XDP data plane, plus two datapath correctness fixes.

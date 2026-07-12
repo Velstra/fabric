@@ -19,10 +19,10 @@ use aya::{
 use clap::ValueEnum;
 use log::warn;
 use velstra_common::{
-    ArpEntry, ArpKey, Backend, Cidr4, Counter, FloodSet, GlobalConfig, LocalMac, LocalMacKey,
-    MacFdbKey, NdKey, Npt66, OverlayConfig, PolicyId, PortFwd, RouteEntry, ScopedAddr, ScopedAddr6,
-    ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue, TunnelEndpoint, TunnelKey,
-    parse_mac, port_rule_value,
+    ArpEntry, ArpKey, Backend, Cidr4, Counter, FloodSet, FlowKey, FlowState, GlobalConfig,
+    LocalMac, LocalMacKey, MacFdbKey, NdKey, Npt66, OverlayConfig, PolicyId, PortFwd, RouteEntry,
+    ScopedAddr, ScopedAddr6, ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue,
+    TunnelEndpoint, TunnelKey, parse_mac, port_rule_value,
 };
 use velstra_config::{
     PolicyConfig, ResolvedFloodVtep, ResolvedInterface, ResolvedMacRoute, ResolvedNd6,
@@ -435,6 +435,27 @@ impl Firewall {
             .take_map("LOCAL_MACS")
             .ok_or_else(|| anyhow!("LOCAL_MACS map missing"))?;
         HashMap::try_from(map).context("LOCAL_MACS as a HashMap")
+    }
+
+    /// Take ownership of the `CONNTRACK` map handle out of the loaded eBPF object,
+    /// for the C9 stateful-HA conntrack-sync background task.
+    ///
+    /// Same rationale as [`take_local_macs`]: the XDP program's map references are
+    /// already resolved, so moving the userspace handle out is safe — the kernel
+    /// map lives on, the data plane keeps recording NAT flows into it, and nothing
+    /// else in the control plane touches `CONNTRACK` (a live [`reconfigure`] leaves
+    /// it alone by design). The sync task both **reads** it (dump-and-push) and
+    /// **writes** it (apply a peer's entries) through this one handle. (aya reads
+    /// and writes an LRU hash map through the same userspace `HashMap` type.)
+    ///
+    /// [`take_local_macs`]: Firewall::take_local_macs
+    /// [`reconfigure`]: Firewall::reconfigure
+    pub fn take_conntrack(&mut self) -> Result<HashMap<MapData, FlowKey, FlowState>> {
+        let map = self
+            .ebpf
+            .take_map("CONNTRACK")
+            .ok_or_else(|| anyhow!("CONNTRACK map missing"))?;
+        HashMap::try_from(map).context("CONNTRACK as a HashMap")
     }
 }
 

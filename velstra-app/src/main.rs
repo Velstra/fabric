@@ -12,6 +12,7 @@
 //! velstra validate rules.toml                                   # parse + print
 //! ```
 
+mod conntrack_sync;
 mod controller_client;
 mod firewall;
 mod wren;
@@ -311,6 +312,29 @@ async fn run(args: RunArgs) -> Result<()> {
                 ));
             }
             Err(e) => warn!("could not start local-MAC learning: {e:#}"),
+        }
+    }
+
+    // C9 stateful-HA conntrack sync: when the config carries `[conntrack_sync]`,
+    // take the CONNTRACK map handle and run the pfsync-analog task — push our flow
+    // table to the HA peer(s) and apply theirs — so established NAT flows survive a
+    // VRRP failover. Opt-in (present only on an HA appliance) and best-effort.
+    if let Some(cts) = initial.conntrack_sync.clone() {
+        match firewall.lock().await.take_conntrack() {
+            Ok(map) => {
+                info!(
+                    "conntrack-sync: enabled (listen {}, {} peer(s))",
+                    cts.listen,
+                    cts.peers.len()
+                );
+                tokio::spawn(conntrack_sync::run(
+                    map,
+                    cts.listen,
+                    cts.peers,
+                    cts.interval_secs,
+                ));
+            }
+            Err(e) => warn!("could not start conntrack-sync: {e:#}"),
         }
     }
 
