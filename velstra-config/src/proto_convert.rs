@@ -382,6 +382,11 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
         // Conntrack sync (C9) is a file-config-only HA-appliance feature; the
         // controller never pushes it, so it converts to/from `None`.
         conntrack_sync: None,
+        // SRv6 (B9) is driven from file config (and, later, the controller's own
+        // SID feed); the current gRPC NodeConfig has no SRv6 message, so it
+        // converts to/from an empty endpoint + entries.
+        srv6: None,
+        srv6_routes: Vec::new(),
     }
 }
 

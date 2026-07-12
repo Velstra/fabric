@@ -82,6 +82,76 @@ pub const IPPROTO_IPV6: u8 = 41;
 /// `bpf_xdp_adjust_head(-SRV6_L2_OUTER_LEN)` grows the headroom.
 pub const SRV6_L2_OUTER_LEN: usize = 14 + 40;
 
+/// Per-host SRv6 configuration: this node's tunnel-source identity. Exactly one
+/// entry (index `0`) of the `SRV6_CONFIG` array map — the SRv6 analogue of
+/// [`crate::OverlayConfig`]. SRv6 and VXLAN/Geneve are mutually exclusive per
+/// host (one overlay wire format at a time), so when this is enabled the
+/// `OverlayConfig` is disabled and vice versa.
+///
+/// Field order keeps the 28-byte layout padding-free (the 16-byte SID leads,
+/// then the MAC, then the `u16`, closing with `enabled` + explicit `_pad`).
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Srv6Config {
+    /// This host's SRv6 source address (the outer IPv6 **source**): an address
+    /// out of its own locator, network-order octets.
+    pub local_src: Srv6Sid,
+    /// This host's underlay MAC (outer source MAC).
+    pub local_mac: [u8; 6],
+    /// Underlay path MTU in bytes (the largest outer IPv6 packet that fits). An
+    /// inner frame whose encapsulation would exceed this is dropped rather than
+    /// silently black-holed. The outer IPv6 packet is `40 + inner_len` bytes.
+    pub underlay_mtu: u16,
+    /// `1` when the SRv6 overlay is active; `0` disables encap/decap entirely.
+    pub enabled: u8,
+    /// Explicit padding, always zero.
+    pub _pad: [u8; 3],
+}
+
+impl Srv6Config {
+    /// A disabled config — no SRv6 encap/decap. The default when no `[srv6]`
+    /// section is present.
+    pub const DISABLED: Self = Self {
+        local_src: [0; 16],
+        local_mac: [0; 6],
+        underlay_mtu: 1500,
+        enabled: 0,
+        _pad: [0; 3],
+    };
+
+    /// Build an enabled config.
+    #[inline]
+    pub const fn new(local_src: Srv6Sid, local_mac: [u8; 6], underlay_mtu: u16) -> Self {
+        Self {
+            local_src,
+            local_mac,
+            underlay_mtu,
+            enabled: 1,
+            _pad: [0; 3],
+        }
+    }
+
+    /// Whether the SRv6 overlay is active.
+    #[inline]
+    pub const fn is_enabled(&self) -> bool {
+        self.enabled != 0
+    }
+
+    /// The largest inner frame (in bytes) that still fits the underlay MTU once
+    /// the outer IPv6 header is added. The outer IPv6 packet is `40 + inner_len`
+    /// bytes (no UDP, no shim, no SRH — reduced encap), so the inner frame must
+    /// be `≤ underlay_mtu - 40`. Returns `0` for absurdly small MTUs.
+    #[inline]
+    pub const fn max_inner_len(&self) -> u16 {
+        let overhead = (SRV6_L2_OUTER_LEN - 14) as u16; // outer IPv6 = 40
+        self.underlay_mtu.saturating_sub(overhead)
+    }
+}
+
+// SAFETY: `#[repr(C)]`, byte arrays + `u16` + bytes, padding explicitly zeroed.
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for Srv6Config {}
+
 /// The remote endpoint an inner `(vni, dst-mac)` resolves to for SRv6 encap:
 /// which service SID to send *to* (the outer IPv6 destination), which underlay
 /// interface to redirect out of, and the underlay next-hop L2 address. The SRv6
@@ -325,8 +395,27 @@ mod tests {
         // 4 (vni) + 2 (behavior) + 2 (pad) = 8, 4-aligned.
         assert_eq!(core::mem::size_of::<Srv6LocalSid>(), 8);
         assert_eq!(core::mem::align_of::<Srv6LocalSid>(), 4);
+        // 16 (src) + 6 (mac) + 2 (mtu) + 1 (enabled) + 3 (pad) = 28, 2-aligned.
+        assert_eq!(core::mem::size_of::<Srv6Config>(), 28);
+        assert_eq!(core::mem::align_of::<Srv6Config>(), 2);
         // Outer stack: eth 14 + IPv6 40, no SRH (reduced encap).
         assert_eq!(SRV6_L2_OUTER_LEN, 54);
+    }
+
+    #[test]
+    fn config_disabled_and_mtu_headroom() {
+        assert!(!Srv6Config::DISABLED.is_enabled());
+        let c = Srv6Config::new(
+            [0xfc, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            [0; 6],
+            1500,
+        );
+        assert!(c.is_enabled());
+        assert_eq!(c._pad, [0, 0, 0]);
+        // Inner frame must leave room for the 40-byte outer IPv6 header.
+        assert_eq!(c.max_inner_len(), 1460);
+        // An absurdly small MTU saturates to zero rather than underflowing.
+        assert_eq!(Srv6Config::new([0; 16], [0; 6], 20).max_inner_len(), 0);
     }
 
     #[test]

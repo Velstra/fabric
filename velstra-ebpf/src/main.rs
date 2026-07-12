@@ -66,11 +66,12 @@ use velstra_common::{
     ETHERTYPE_IPV4, ETHERTYPE_IPV6, FloodSet, FlowKey, FlowState, ForwardOutcome, GlobalConfig,
     ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, ICMPV6_NEIGHBOR_SOLICIT, LocalMac, LocalMacKey,
     MAX_FLOOD_VTEPS, MacFdbKey, ND_NA_MSG_LEN, Nat, NdKey, Npt66, OVERLAY_OUTER_LEN, OverlayConfig,
-    PacketMeta, PolicyId, PortFwd, Rewrite, RouteEntry, ScopedAddr, ScopedAddr6, ScopedPortKey,
-    ScopedSrcPortKey, ServiceKey, ServiceValue, TunnelEndpoint, TunnelKey, build_encap, decide,
-    icmp, icmp_checksum, ip_proto, is_overlay_dport, lpm_key_addr, plan_arp_reply, plan_forward,
-    plan_icmp_unreachable, plan_na_reply, plan_nat, plan_tcp_rst, port_rule_action, port_rule_logs,
-    select_backend, session_hash, tcp_flags,
+    PacketMeta, PolicyId, PortFwd, Rewrite, RouteEntry, SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6,
+    ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue, Srv6Config, Srv6Endpoint,
+    TunnelEndpoint, TunnelKey, build_encap, build_srv6_encap, decide, icmp, icmp_checksum,
+    ip_proto, is_overlay_dport, lpm_key_addr, plan_arp_reply, plan_forward, plan_icmp_unreachable,
+    plan_na_reply, plan_nat, plan_tcp_rst, port_rule_action, port_rule_logs, select_backend,
+    session_hash, tcp_flags,
 };
 
 /// Maps an ingress interface index to its policy id, so one XDP program can
@@ -212,6 +213,20 @@ static OVERLAY_FDB: LpmTrie<TunnelKey, TunnelEndpoint> = LpmTrie::with_max_entri
 /// overlay bridges by destination MAC; a miss falls through to the L3 path.
 #[map]
 static MAC_FDB: HashMap<MacFdbKey, TunnelEndpoint> = HashMap::with_max_entries(8192, 0);
+
+/// B9 per-host **SRv6** configuration: this node's tunnel-source identity (its
+/// SRv6 source address + underlay MAC + MTU). One entry (index `0`); absent /
+/// disabled means the SRv6 overlay is off. SRv6 and VXLAN/Geneve are mutually
+/// exclusive per host — when this is enabled the `OVERLAY_CONFIG` is not.
+#[map]
+static SRV6_CONFIG: Array<Srv6Config> = Array::with_max_entries(1, 0);
+
+/// B9 SRv6 per-MAC forwarding DB: exact-match `(vni, inner dst MAC)` → the remote
+/// [`Srv6Endpoint`] (which `End.DT2U` service SID to encapsulate toward). The
+/// SRv6 analogue of [`MAC_FDB`]; a miss means the destination is local or must be
+/// flooded (`End.DT2M`, not yet head-end replicated), so the frame falls through.
+#[map]
+static SRV6_FDB: HashMap<MacFdbKey, Srv6Endpoint> = HashMap::with_max_entries(8192, 0);
 
 /// B2 per-VNI **flood set**: `vni` → the [`FloodSet`] of remote VTEPs a
 /// broadcast/unknown-unicast/multicast (BUM) frame on that segment must be
@@ -1186,6 +1201,18 @@ fn try_velstra_forward(ctx: &XdpContext) -> Result<u32, ()> {
     let ocfg = overlay_config();
     let log = s.log != 0;
 
+    // Phase 4 (B9): SRv6 overlay encapsulation. When the host runs the SRv6 wire
+    // format, a tenant frame whose inner destination MAC resolves to a remote
+    // End.DT2U service SID is encapsulated in outer Ethernet + IPv6 and redirected
+    // onto the underlay. Mutually exclusive with the VXLAN/Geneve path below (one
+    // overlay wire format per host); a miss falls through unchanged.
+    let scfg = srv6_config();
+    if let Some(action) = try_srv6_encap(
+        ctx, &scfg, s.vni, s.src_addr, s.src_port, s.dst_port, s.proto, log,
+    )? {
+        return Ok(action);
+    }
+
     // Phase 4: overlay encapsulation. If this tenant's (vni == policy) inner
     // destination lives on another host, wrap the frame in a VXLAN/Geneve tunnel
     // and redirect it onto the underlay. A miss means "local" — fall through to
@@ -1532,6 +1559,97 @@ fn overlay_config() -> OverlayConfig {
         .get(0)
         .copied()
         .unwrap_or(OverlayConfig::DISABLED)
+}
+
+/// Read this host's [`Srv6Config`] out of the single-slot `SRV6_CONFIG` map,
+/// falling back to the disabled default when the control plane has not written
+/// one.
+#[inline(always)]
+fn srv6_config() -> Srv6Config {
+    SRV6_CONFIG.get(0).copied().unwrap_or(Srv6Config::DISABLED)
+}
+
+/// B9 SRv6 **encapsulation** (headend, `End.DT2U`): if the inner destination MAC
+/// of a tenant frame resolves to a remote service SID, prepend the outer
+/// Ethernet + IPv6 stack (reduced encap — a single SID in the IPv6 destination,
+/// no SRH) and redirect it onto the underlay.
+///
+/// Returns `Ok(Some(action))` when it took over the packet, or `Ok(None)` to
+/// fall through (no SRv6 FDB entry / SRv6 disabled — treated as local).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn try_srv6_encap(
+    ctx: &XdpContext,
+    scfg: &Srv6Config,
+    vni: u32,
+    src_addr: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    proto: u8,
+    log: bool,
+) -> Result<Option<u32>, ()> {
+    // No SRv6 overlay configured, or the ingress port is not on a tenant segment.
+    if !scfg.is_enabled() || vni == 0 {
+        return Ok(None);
+    }
+    // Bridge by the inner destination MAC (End.DT2U unicast). Read it now, before
+    // any `bpf_xdp_adjust_head` grows the head. A miss means local delivery or a
+    // BUM frame (End.DT2M flood, handled elsewhere) — fall through unchanged.
+    let inner_dst_mac = unsafe { *ptr_at::<[u8; 6]>(ctx, O_ETH_DST)? };
+    let ep = match unsafe { SRV6_FDB.get(&MacFdbKey::new(vni, inner_dst_mac)) } {
+        Some(ep) => *ep,
+        None => return Ok(None),
+    };
+
+    // Entropy for the outer IPv6 flow label: hash the inner flow so the underlay
+    // spreads tunnels across ECMP paths while pinning each flow to one path.
+    let entropy = session_hash(src_addr, src_port, proto) ^ ((dst_port as u32) << 16);
+    let inner_len = (ctx.data_end() - ctx.data()) as u16;
+
+    // MTU guard: the outer IPv6 header adds 40 bytes; if the result would exceed
+    // the underlay MTU, drop loudly rather than emit a frame the underlay silently
+    // black-holes. Size the tenant MTU to `underlay_mtu - 40`.
+    if inner_len > scfg.max_inner_len() {
+        bump(Counter::OverlayTooBig);
+        return Ok(Some(xdp_action::XDP_DROP));
+    }
+
+    let encap = build_srv6_encap(&scfg.local_src, &scfg.local_mac, &ep, inner_len, entropy);
+
+    // Grow the head by exactly the outer stack length.
+    // SAFETY: negative delta adds headroom; checked for failure below.
+    if unsafe { bpf_xdp_adjust_head(ctx.ctx, -(SRV6_L2_OUTER_LEN as i32)) } != 0 {
+        bump(Counter::Malformed);
+        return Ok(Some(xdp_action::XDP_PASS));
+    }
+
+    // Write the outer headers as one fixed-size store at constant offset 0,
+    // through a freshly bounds-checked pointer (the verifier-friendly pattern).
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    if data + SRV6_L2_OUTER_LEN > data_end {
+        return Err(());
+    }
+    // SAFETY: the bounds check above proves all `SRV6_L2_OUTER_LEN` bytes from
+    // `data` are within the (now larger) packet.
+    unsafe {
+        *(data as *mut [u8; SRV6_L2_OUTER_LEN]) = encap.headers;
+    }
+
+    bump(Counter::Srv6Encap);
+    if log {
+        info!(
+            ctx,
+            "SRV6 ENCAP vni={} -> ifindex {}", vni, encap.out_ifindex
+        );
+    }
+    // Redirect onto the underlay; an absent devmap entry aborts (the control
+    // plane mirrors every overlay egress ifindex into `TX_PORTS`).
+    Ok(Some(
+        TX_PORTS
+            .redirect(encap.out_ifindex, 0)
+            .unwrap_or(xdp_action::XDP_ABORTED),
+    ))
 }
 
 /// Phase 4 **decapsulation**: strip the outer Ethernet/IPv4/UDP/shim headers of a

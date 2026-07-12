@@ -3,6 +3,19 @@
 ## [Unreleased]
 
 ### Added
+- **SRv6 L2 encap data plane (B9, part 2) — headend `End.DT2U`.** The XDP
+  datapath now speaks SRv6 as an alternative overlay wire format to VXLAN/Geneve.
+  `[srv6]` sets this host's tunnel-source identity (a 128-bit source address out
+  of its locator) and `[[srv6_route]]` maps a tenant `(vni, dst-MAC)` to a remote
+  `End.DT2U` service SID. On egress, `try_srv6_encap` wraps the tenant frame in
+  outer Ethernet + IPv6 (reduced encap — the single SID rides in the IPv6
+  destination, no SRH) and redirects it onto the underlay, mirroring the VXLAN
+  MAC-FDB path but with no UDP/shim/checksum (IPv6 has no header checksum). New
+  BPF maps `SRV6_CONFIG` + `SRV6_FDB`, agent `program_srv6`, `srv6_encap` counter.
+  SRv6 and VXLAN are mutually exclusive per host (validated). Unit-tested end to
+  end (codec bytes, config resolve, `velstra validate`); a netns e2e scenario
+  (`srv6_encap`) exercises the loaded datapath. **eBPF object changed → sentinel
+  `ebpfHash` bump on repin.** Decap (`End.DT2U`/`DT2M`, part 3) follows.
 - **SRv6 L2 codec (B9, part 1) — `velstra-common::srv6`.** The pure, `no_std`,
   unit-tested contract for an SRv6 (RFC 8986) overlay data plane, ahead of wiring
   it into the XDP datapath. `build_srv6_encap` produces the outer Ethernet + IPv6

@@ -75,6 +75,6 @@ pub use reject::{
     plan_icmp_unreachable, plan_tcp_rst, tcp_flags,
 };
 pub use srv6::{
-    SRV6_L2_OUTER_LEN, Srv6Encap, Srv6Endpoint, Srv6LocalSid, Srv6Sid, Srv6SidKey,
+    SRV6_L2_OUTER_LEN, Srv6Config, Srv6Encap, Srv6Endpoint, Srv6LocalSid, Srv6Sid, Srv6SidKey,
     build_service_sid, build_srv6_encap, decode_service_sid,
 };

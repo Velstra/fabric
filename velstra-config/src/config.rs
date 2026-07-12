@@ -321,6 +321,48 @@ pub struct FloodVtepCfg {
     pub out_iface: String,
 }
 
+/// This host's SRv6 tunnel-source identity (`[srv6]`, B9): the modern, SID-based
+/// overlay wire format (RFC 8986). Mutually exclusive with `[overlay]` (one
+/// overlay format per host). The SRv6 analogue of [`OverlayCfg`] — but the outer
+/// source is a 128-bit IPv6 address out of this node's locator, and there is no
+/// UDP port or encap choice (reduced encap, a single service SID).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Srv6Cfg {
+    /// This host's SRv6 source address (the outer IPv6 source), an address from
+    /// its own locator.
+    pub local_src: String,
+    /// The underlay interface encapsulated traffic egresses (its MAC becomes the
+    /// outer source MAC unless `local_mac` overrides it).
+    pub underlay_iface: String,
+    /// Override the outer source MAC. Defaults to the `underlay_iface`'s own MAC.
+    #[serde(default)]
+    pub local_mac: Option<String>,
+    /// Underlay path MTU. Defaults to 1500 — inner frames must then be ≤ 1460
+    /// bytes (the 40-byte outer IPv6 header, over the inner's own 14-byte L2).
+    #[serde(default)]
+    pub underlay_mtu: Option<u16>,
+}
+
+/// One SRv6 L2 forwarding entry (`[[srv6_route]]`, B9): which remote `End.DT2U`
+/// service SID hosts a given tenant destination MAC. The SRv6 analogue of
+/// [`MacRouteCfg`] — the remote endpoint is a 128-bit service SID (the outer IPv6
+/// destination) rather than a 4-byte VTEP IPv4.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Srv6RouteCfg {
+    /// Tenant VXLAN Network Identifier (24-bit; also the firewall `policy_id`).
+    pub vni: u32,
+    /// Inner destination MAC this entry bridges (a tenant VM's hardware address).
+    pub mac: String,
+    /// Remote `End.DT2U` service SID (the outer IPv6 destination address).
+    pub remote_sid: String,
+    /// Next-hop MAC on the underlay toward the remote SID.
+    pub via_mac: String,
+    /// Underlay egress interface name.
+    pub out_iface: String,
+}
+
 /// A named tenant policy (`[[policy]]`): the same firewall fields as the
 /// top-level config, but with an explicit non-zero `id` that interfaces map to.
 #[derive(Debug, Deserialize)]
@@ -428,6 +470,12 @@ pub struct FileConfig {
     /// C9 stateful-HA conntrack sync. Spelled `[conntrack_sync]` in TOML.
     #[serde(default)]
     pub conntrack_sync: Option<ConntrackSyncCfg>,
+    /// B9 SRv6 overlay endpoint for this host. Spelled `[srv6]` in TOML.
+    #[serde(default)]
+    pub srv6: Option<Srv6Cfg>,
+    /// B9 SRv6 per-MAC L2 forwarding entries. Spelled `[[srv6_route]]` in TOML.
+    #[serde(default, rename = "srv6_route")]
+    pub srv6_routes: Vec<Srv6RouteCfg>,
 }
 
 /// A NPTv6 (RFC 6296) prefix-translation rule: on the boundary `interface`, an
@@ -698,6 +746,39 @@ pub struct ResolvedFloodVtep {
     pub out_iface: String,
 }
 
+/// This host's resolved SRv6 endpoint (B9). The egress interface stays a name
+/// (resolved to an ifindex at load time). The SRv6 analogue of
+/// [`ResolvedOverlay`].
+#[derive(Debug, Clone)]
+pub struct ResolvedSrv6 {
+    /// This host's SRv6 source address (outer IPv6 source, network-order octets).
+    pub local_src: [u8; 16],
+    /// Underlay interface whose MAC stamps the outer source (unless overridden).
+    pub underlay_iface: String,
+    /// Explicit outer source MAC, or `None` to use the underlay interface's MAC.
+    pub local_mac: Option<[u8; 6]>,
+    /// Underlay path MTU in bytes.
+    pub underlay_mtu: u16,
+}
+
+/// A resolved SRv6 L2 forwarding entry (B9): the tenant segment, the inner
+/// destination MAC it matches exactly, and the remote service SID it points at.
+/// The egress interface stays a name (resolved to an ifindex at load time). The
+/// SRv6 analogue of [`ResolvedMacRoute`].
+#[derive(Debug, Clone)]
+pub struct ResolvedSrv6Route {
+    /// Tenant VNI this entry belongs to (matched exactly in the SRv6 FDB).
+    pub vni: u32,
+    /// Inner destination MAC this entry bridges toward.
+    pub mac: [u8; 6],
+    /// Remote `End.DT2U` service SID (outer IPv6 destination, network-order).
+    pub remote_sid: [u8; 16],
+    /// Next-hop MAC on the underlay toward the remote SID.
+    pub outer_dst_mac: [u8; 6],
+    /// Underlay egress interface name.
+    pub out_iface: String,
+}
+
 /// Fully-resolved, validated configuration ready to be written into BPF maps.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -729,6 +810,10 @@ pub struct RuntimeConfig {
     pub npt66: Vec<ResolvedNpt66>,
     /// C9 stateful-HA conntrack sync, or `None` if this node is not in an HA pair.
     pub conntrack_sync: Option<ResolvedConntrackSync>,
+    /// This host's SRv6 endpoint (B9), or `None` if not running the SRv6 overlay.
+    pub srv6: Option<ResolvedSrv6>,
+    /// SRv6 per-MAC L2 forwarding entries for the `SRV6_FDB` map (B9).
+    pub srv6_routes: Vec<ResolvedSrv6Route>,
 }
 
 impl RuntimeConfig {
@@ -755,6 +840,8 @@ impl RuntimeConfig {
             flood_vteps: Vec::new(),
             npt66: Vec::new(),
             conntrack_sync: None,
+            srv6: None,
+            srv6_routes: Vec::new(),
         }
     }
 }
@@ -1193,6 +1280,58 @@ impl FileConfig {
             });
         }
 
+        // Phase 4 (B9): SRv6 endpoint + forwarding entries. SRv6 and VXLAN/Geneve
+        // are mutually exclusive per host (one overlay wire format at a time).
+        if self.srv6.is_some() && overlay.is_some() {
+            bail!("`[srv6]` and `[overlay]` are mutually exclusive (one overlay format per host)");
+        }
+        let srv6 = match &self.srv6 {
+            Some(s) => {
+                let local_src: Ipv6Addr = s
+                    .local_src
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("invalid srv6 local_src {:?}", s.local_src))?;
+                let local_mac = match &s.local_mac {
+                    Some(mac) => Some(
+                        parse_mac(mac)
+                            .map_err(|e| anyhow::anyhow!("invalid srv6 local_mac {mac:?}: {e}"))?,
+                    ),
+                    None => None,
+                };
+                Some(ResolvedSrv6 {
+                    local_src: local_src.octets(),
+                    underlay_iface: s.underlay_iface.clone(),
+                    local_mac,
+                    underlay_mtu: s.underlay_mtu.unwrap_or(1500),
+                })
+            }
+            None => None,
+        };
+
+        if !self.srv6_routes.is_empty() && srv6.is_none() {
+            bail!("`[[srv6_route]]` entries require an `[srv6]` section");
+        }
+        let mut srv6_routes = Vec::with_capacity(self.srv6_routes.len());
+        for sr in &self.srv6_routes {
+            if sr.vni > 0xFF_FFFF {
+                bail!("srv6_route vni {} exceeds 24 bits", sr.vni);
+            }
+            let mac = parse_mac(&sr.mac)
+                .map_err(|e| anyhow::anyhow!("invalid srv6_route mac {:?}: {e}", sr.mac))?;
+            let remote_sid: Ipv6Addr = sr.remote_sid.parse().map_err(|_| {
+                anyhow::anyhow!("invalid srv6_route remote_sid {:?}", sr.remote_sid)
+            })?;
+            let outer_dst_mac = parse_mac(&sr.via_mac)
+                .map_err(|e| anyhow::anyhow!("invalid srv6_route via_mac {:?}: {e}", sr.via_mac))?;
+            srv6_routes.push(ResolvedSrv6Route {
+                vni: sr.vni,
+                mac,
+                remote_sid: remote_sid.octets(),
+                outer_dst_mac,
+                out_iface: sr.out_iface.clone(),
+            });
+        }
+
         Ok(RuntimeConfig {
             policies,
             interfaces,
@@ -1211,6 +1350,8 @@ impl FileConfig {
                 .as_ref()
                 .map(resolve_conntrack_sync)
                 .transpose()?,
+            srv6,
+            srv6_routes,
         })
     }
 }
@@ -1376,6 +1517,29 @@ impl fmt::Display for RuntimeConfig {
                     f,
                     "  - vni {} {m0:02x}:{m1:02x}:{m2:02x}:{m3:02x}:{m4:02x}:{m5:02x} -> vtep {r0}.{r1}.{r2}.{r3} via {a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{ff:02x} dev {}",
                     mr.vni, mr.out_iface,
+                )?;
+            }
+        }
+        match &self.srv6 {
+            Some(s) => writeln!(
+                f,
+                "srv6           : src {} dev {} (End.DT2U)",
+                Ipv6Addr::from(s.local_src),
+                s.underlay_iface,
+            )?,
+            None => writeln!(f, "srv6           : disabled")?,
+        }
+        if !self.srv6_routes.is_empty() {
+            writeln!(f, "srv6_routes    : {} entry(ies)", self.srv6_routes.len())?;
+            for sr in &self.srv6_routes {
+                let [m0, m1, m2, m3, m4, m5] = sr.mac;
+                let [a, b, c, d, e, ff] = sr.outer_dst_mac;
+                writeln!(
+                    f,
+                    "  - vni {} {m0:02x}:{m1:02x}:{m2:02x}:{m3:02x}:{m4:02x}:{m5:02x} -> sid {} via {a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{ff:02x} dev {}",
+                    sr.vni,
+                    Ipv6Addr::from(sr.remote_sid),
+                    sr.out_iface,
                 )?;
             }
         }
@@ -1697,6 +1861,81 @@ mod tests {
         let toml = r#"blocklist = ["not-an-ip"]"#;
         let file: FileConfig = toml::from_str(toml).unwrap();
         assert!(file.resolve().is_err());
+    }
+
+    #[test]
+    fn resolves_srv6_endpoint_and_routes() {
+        let toml = r#"
+            [srv6]
+            local_src = "fc00:0:1::1"
+            underlay_iface = "eth0"
+            underlay_mtu = 9000
+
+            [[srv6_route]]
+            vni = 10000
+            mac = "02:00:00:00:00:0a"
+            remote_sid = "fc00:0:2:2710::"
+            via_mac = "02:00:00:00:00:02"
+            out_iface = "eth0"
+        "#;
+        let cfg = toml::from_str::<FileConfig>(toml)
+            .unwrap()
+            .resolve()
+            .unwrap();
+        let s = cfg.srv6.expect("srv6 endpoint");
+        assert_eq!(s.local_src[0..2], [0xfc, 0x00]);
+        assert_eq!(s.local_src[15], 1);
+        assert_eq!(s.underlay_iface, "eth0");
+        assert_eq!(s.local_mac, None);
+        assert_eq!(s.underlay_mtu, 9000);
+
+        assert_eq!(cfg.srv6_routes.len(), 1);
+        let r = &cfg.srv6_routes[0];
+        assert_eq!(r.vni, 10000);
+        assert_eq!(r.mac, [2, 0, 0, 0, 0, 0x0a]);
+        assert_eq!(r.remote_sid[0..2], [0xfc, 0x00]);
+        assert_eq!(r.outer_dst_mac, [2, 0, 0, 0, 0, 2]);
+        assert_eq!(r.out_iface, "eth0");
+    }
+
+    #[test]
+    fn srv6_route_requires_srv6_section() {
+        let toml = r#"
+            [[srv6_route]]
+            vni = 1
+            mac = "02:00:00:00:00:0a"
+            remote_sid = "fc00:0:2::1"
+            via_mac = "02:00:00:00:00:02"
+            out_iface = "eth0"
+        "#;
+        let err = toml::from_str::<FileConfig>(toml)
+            .unwrap()
+            .resolve()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[srv6]"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn srv6_and_overlay_are_mutually_exclusive() {
+        let toml = r#"
+            [srv6]
+            local_src = "fc00:0:1::1"
+            underlay_iface = "eth0"
+
+            [overlay]
+            local_vtep = "10.0.0.1"
+            underlay_iface = "eth0"
+        "#;
+        let err = toml::from_str::<FileConfig>(toml)
+            .unwrap()
+            .resolve()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
