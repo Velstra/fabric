@@ -186,11 +186,33 @@ impl RestState {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
             .map(str::trim);
-        match token.and_then(|t| self.tokens.get(t)) {
-            Some(cn) => Caller::Cert(cn.clone()),
-            None => Caller::Anonymous,
+        let Some(provided) = token else {
+            return Caller::Anonymous;
+        };
+        // Compare against each configured token in constant time rather than a
+        // hash lookup keyed by the secret, so a wrong token leaks no timing signal
+        // about how many bytes were right. The token set is small (per-CN stand-in
+        // for mTLS), so the linear scan is negligible.
+        for (tok, cn) in &self.tokens {
+            if ct_eq(provided.as_bytes(), tok.as_bytes()) {
+                return Caller::Cert(cn.clone());
+            }
         }
+        Caller::Anonymous
     }
+}
+
+/// Constant-time byte-slice equality: compares every byte regardless of where the
+/// first difference is, so the timing does not reveal the shared prefix length.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn actor_of(caller: &Caller) -> String {

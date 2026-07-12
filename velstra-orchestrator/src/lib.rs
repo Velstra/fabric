@@ -1092,12 +1092,26 @@ impl Topology {
         if span < 3 {
             bail!("network {vni} subnet is too small for a host address");
         }
-        let taken: HashSet<u32> = self
+        let mut taken: HashSet<u32> = self
             .ports
             .iter()
             .filter(|p| p.vni == vni)
             .map(|p| u32::from(p.ip))
             .collect();
+        // Also honour the D2 subnet IPAM: a subnet on this same network shares the
+        // address range, so an address it has already handed out (gateway,
+        // reserved, floating, or a subnet-bound port) must not be re-allocated
+        // here. Without this the two allocators — create_port's alloc_ip and
+        // bind_port_subnet's alloc_in — could hand the same address to two ports.
+        for subnet in self.subnets.values().filter(|s| s.vni == vni) {
+            if let Some(allocs) = self.ipam.get(&subnet.id) {
+                for key in allocs.keys() {
+                    if let Ok(v4) = u32::try_from(*key) {
+                        taken.insert(v4);
+                    }
+                }
+            }
+        }
         for off in 1..(span - 1) {
             let cand = base + off;
             if !taken.contains(&cand) {
@@ -1145,7 +1159,13 @@ impl Topology {
         let mut vnis: Vec<u32> = local_vnis.iter().copied().collect();
         vnis.sort_unstable(); // deterministic output
         for vni in &vnis {
-            let net = &self.networks[vni];
+            // Live mutation keeps every port's VNI backed by a network, but a
+            // corrupted or partially-restored snapshot could leave a dangling
+            // reference. Skip it rather than index-panic and take down the whole
+            // re-derive loop (which would then serve stale configs fabric-wide).
+            let Some(net) = self.networks.get(vni) else {
+                continue;
+            };
             cfg.policies.push(PolicyFile {
                 id: *vni,
                 name: Some(net.name.clone()),
@@ -1202,7 +1222,11 @@ impl Topology {
                     masquerade: false,
                 });
             } else if local_vnis.contains(&port.vni) {
-                let remote = &self.hosts[&port.host];
+                // Skip a remote port whose host is absent (corrupted/partial
+                // snapshot) rather than index-panic the re-derive loop.
+                let Some(remote) = self.hosts.get(&port.host) else {
+                    continue;
+                };
                 cfg.tunnels.push(TunnelCfg {
                     vni: port.vni,
                     inner_dst: format!("{}/32", port.ip),

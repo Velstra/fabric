@@ -660,6 +660,7 @@ async fn poll_loop(shared: Arc<Shared>, dir: PathBuf, interval: Duration) {
 
 struct ControlSvc {
     shared: Arc<Shared>,
+    authz: Authz,
 }
 
 #[tonic::async_trait]
@@ -668,7 +669,16 @@ impl VelstraControl for ControlSvc {
         &self,
         request: Request<NodeRequest>,
     ) -> Result<Response<NodeConfig>, Status> {
+        let caller = caller_of(&request);
         let node = request.into_inner().node_id;
+        // A node's derived config exposes the whole fabric from its vantage — peer
+        // VTEP IPs, underlay/neighbour MACs and inner IPs, policy/SG rules — so a
+        // read must be scoped to the caller's own host, mirroring the write path
+        // (H6). Disabled authz (no --client-ca) stays localhost-open for the
+        // single-operator default.
+        if !self.authz.allow_host(&caller, &node) {
+            return Err(deny(&format!("get config for node {node:?}")));
+        }
         let cfg = self.shared.state.read().await.served.get(&node).cloned();
         info!(
             "GetConfig({node:?}) -> {}",
@@ -683,7 +693,12 @@ impl VelstraControl for ControlSvc {
         &self,
         request: Request<NodeRequest>,
     ) -> Result<Response<Self::WatchConfigStream>, Status> {
+        let caller = caller_of(&request);
         let node = request.into_inner().node_id;
+        // Same scoping as get_config: a node may only watch its own config stream.
+        if !self.authz.allow_host(&caller, &node) {
+            return Err(deny(&format!("watch config for node {node:?}")));
+        }
         info!("WatchConfig({node:?}) subscribed");
         let shared = self.shared.clone();
         let mut notify = shared.notify.subscribe();
@@ -716,7 +731,13 @@ impl VelstraControl for ControlSvc {
     }
 
     async fn report_stats(&self, request: Request<StatsReport>) -> Result<Response<Ack>, Status> {
+        let caller = caller_of(&request);
         let report = request.into_inner();
+        // A node reports stats only as itself, so an enrolled node cannot forge
+        // another node's identity.
+        if !self.authz.allow_host(&caller, &report.node_id) {
+            return Err(deny(&format!("report stats for node {:?}", report.node_id)));
+        }
         let active: Vec<String> = report
             .counters
             .iter()
@@ -1878,6 +1899,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
     } else {
         Authz::disabled()
     };
+    // The agent-facing ControlSvc scopes reads with the same policy as the admin
+    // writes, so clone the authz handle before the admin task moves it.
+    let control_authz = authz.clone();
     let admin_shared = shared.clone();
     tokio::spawn(async move {
         info!("admin/orchestrator API listening on {admin_addr}");
@@ -1958,7 +1982,10 @@ async fn serve(args: ServeArgs) -> Result<()> {
     }
     info!("agent API listening on {addr}");
     builder
-        .add_service(VelstraControlServer::new(ControlSvc { shared }))
+        .add_service(VelstraControlServer::new(ControlSvc {
+            shared,
+            authz: control_authz,
+        }))
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;
     info!("shutting down");
