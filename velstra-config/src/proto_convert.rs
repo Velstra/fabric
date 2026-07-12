@@ -387,6 +387,7 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
         // converts to/from an empty endpoint + entries.
         srv6: None,
         srv6_routes: Vec::new(),
+        srv6_local_sids: Vec::new(),
     }
 }
 

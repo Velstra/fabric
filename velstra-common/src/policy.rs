@@ -145,11 +145,15 @@ pub enum Counter {
     /// Encapsulated into an SRv6 tunnel to a remote host — reduced encap, a
     /// single `End.DT2U` service SID (B9).
     Srv6Encap = 28,
+    /// Decapsulated an SRv6 packet whose IPv6 destination is a locally
+    /// instantiated `End.DT2U` service SID; the inner Ethernet frame is handed to
+    /// the kernel bridge (B9).
+    Srv6Decap = 29,
 }
 
 impl Counter {
     /// Number of distinct counters — the `max_entries` of the `STATS` map.
-    pub const COUNT: u32 = 29;
+    pub const COUNT: u32 = 30;
 
     /// The array index of this counter.
     #[inline]
@@ -190,6 +194,7 @@ impl Counter {
             26 => Counter::NdSuppressed,
             27 => Counter::BumReplicated,
             28 => Counter::Srv6Encap,
+            29 => Counter::Srv6Decap,
             _ => return None,
         };
         Some(counter)
@@ -235,6 +240,7 @@ impl Counter {
             Counter::NdSuppressed => "nd_suppressed",
             Counter::BumReplicated => "bum_replicated",
             Counter::Srv6Encap => "srv6_encap",
+            Counter::Srv6Decap => "srv6_decap",
         }
     }
 }

@@ -14,7 +14,8 @@ pub use config::{
     MacRouteCfg, Nd6Cfg, NeighborCfg, Npt66Cfg, OverlayCfg, PolicyConfig, PolicyFile,
     PortForwardCfg, PortRule, ProtoName, ResolvedFloodVtep, ResolvedInterface, ResolvedMacRoute,
     ResolvedNd6, ResolvedNeighbor, ResolvedNpt66, ResolvedOverlay, ResolvedPortForward,
-    ResolvedRoute, ResolvedService, ResolvedSrv6, ResolvedSrv6Route, ResolvedTunnel, RouteCfg,
-    RuntimeConfig, ServiceCfg, Srv6Cfg, Srv6RouteCfg, TunnelCfg, load_file,
+    ResolvedRoute, ResolvedService, ResolvedSrv6, ResolvedSrv6LocalSid, ResolvedSrv6Route,
+    ResolvedTunnel, RouteCfg, RuntimeConfig, ServiceCfg, Srv6Cfg, Srv6LocalSidCfg, Srv6RouteCfg,
+    TunnelCfg, load_file,
 };
 pub use proto_convert::{file_config_from_proto, file_config_to_proto, runtime_from_proto};
