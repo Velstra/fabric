@@ -21,13 +21,13 @@ use log::warn;
 use velstra_common::{
     ArpEntry, ArpKey, Backend, Cidr4, Counter, FloodSet, FlowKey, FlowState, GlobalConfig,
     LocalMac, LocalMacKey, MacFdbKey, NdKey, Npt66, OverlayConfig, PolicyId, PortFwd, RouteEntry,
-    ScopedAddr, ScopedAddr6, ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue,
-    TunnelEndpoint, TunnelKey, parse_mac, port_rule_value,
+    ScopedAddr, ScopedAddr6, ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue, Srv6Config,
+    Srv6Endpoint, TunnelEndpoint, TunnelKey, parse_mac, port_rule_value,
 };
 use velstra_config::{
     PolicyConfig, ResolvedFloodVtep, ResolvedInterface, ResolvedMacRoute, ResolvedNd6,
     ResolvedNeighbor, ResolvedNpt66, ResolvedOverlay, ResolvedPortForward, ResolvedRoute,
-    ResolvedService, ResolvedTunnel, RuntimeConfig,
+    ResolvedService, ResolvedSrv6, ResolvedSrv6Route, ResolvedTunnel, RuntimeConfig,
 };
 
 /// How to attach the XDP program to the interface.
@@ -734,6 +734,7 @@ fn apply_config(ebpf: &mut Ebpf, cfg: &RuntimeConfig, old: Option<&RuntimeConfig
         &cfg.nd_neighbors,
         &cfg.flood_vteps,
     )?;
+    program_srv6(ebpf, cfg.srv6.as_ref(), &cfg.srv6_routes)?;
 
     Ok(())
 }
@@ -1271,6 +1272,85 @@ fn program_overlay(
                 .set(endpoint.out_ifindex, endpoint.out_ifindex, None, 0)
                 .context("registering overlay redirect device (flood vtep)")?;
         }
+    }
+
+    Ok(())
+}
+
+/// B9: program this host's SRv6 identity (`SRV6_CONFIG`) and its `End.DT2U`
+/// per-MAC forwarding entries (`SRV6_FDB`), plus register each egress ifindex in
+/// the `TX_PORTS` devmap so the datapath can redirect encapsulated frames. The
+/// SRv6 analogue of the [`program_overlay`] unicast path; SRv6 and VXLAN are
+/// mutually exclusive per host, so exactly one of the two configs is enabled.
+fn program_srv6(
+    ebpf: &mut Ebpf,
+    srv6: Option<&ResolvedSrv6>,
+    routes: &[ResolvedSrv6Route],
+) -> Result<()> {
+    // Resolve the host config (source MAC) before borrowing any map.
+    let config = match srv6 {
+        Some(s) => {
+            let local_mac = match s.local_mac {
+                Some(mac) => mac,
+                None => read_iface_mac(&s.underlay_iface)?,
+            };
+            Srv6Config::new(s.local_src, local_mac, s.underlay_mtu)
+        }
+        None => Srv6Config::DISABLED,
+    };
+
+    {
+        let mut cfg_map: Array<_, Srv6Config> = Array::try_from(
+            ebpf.map_mut("SRV6_CONFIG")
+                .ok_or_else(|| anyhow!("SRV6_CONFIG map missing"))?,
+        )?;
+        cfg_map.set(0, config, 0).context("writing SRV6_CONFIG")?;
+    }
+
+    if routes.is_empty() {
+        return Ok(());
+    }
+
+    // Resolve every route's egress ifindex (needs the OS). Each becomes an
+    // exact-match SRv6-FDB key `(vni, inner dst MAC)` → remote-SID endpoint. Skip
+    // (defer) a route whose out_iface isn't present yet rather than hard-aborting
+    // the whole reconfigure — consistent with program_overlay/program_routes.
+    let prepared: Vec<(MacFdbKey, Srv6Endpoint)> = routes
+        .iter()
+        .filter_map(|r| match if_nametoindex(&r.out_iface) {
+            Ok(ifindex) => Some((
+                MacFdbKey::new(r.vni, r.mac),
+                Srv6Endpoint::new(ifindex, r.remote_sid, r.outer_dst_mac),
+            )),
+            Err(_) => {
+                log::debug!(
+                    "srv6_route egress {} not present yet; deferring its SRv6-FDB entry",
+                    r.out_iface
+                );
+                None
+            }
+        })
+        .collect();
+
+    {
+        let mut fdb: HashMap<_, MacFdbKey, Srv6Endpoint> = HashMap::try_from(
+            ebpf.map_mut("SRV6_FDB")
+                .ok_or_else(|| anyhow!("SRV6_FDB map missing"))?,
+        )?;
+        for (key, endpoint) in &prepared {
+            fdb.insert(key, endpoint, 0)
+                .context("inserting SRv6-FDB entry")?;
+        }
+    }
+
+    let mut tx_ports: DevMap<_> = DevMap::try_from(
+        ebpf.map_mut("TX_PORTS")
+            .ok_or_else(|| anyhow!("TX_PORTS map missing"))?,
+    )?;
+    for (_, endpoint) in &prepared {
+        tx_ports
+            .set(endpoint.out_ifindex, endpoint.out_ifindex, None, 0)
+            .context("registering SRv6 redirect device")?;
     }
 
     Ok(())

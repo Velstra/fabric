@@ -142,11 +142,14 @@ pub enum Counter {
     /// VTEP in the ingress VNI's flood set (B2). Counted once per emitted copy,
     /// so a BUM frame flooded to N VTEPs bumps this N times.
     BumReplicated = 27,
+    /// Encapsulated into an SRv6 tunnel to a remote host — reduced encap, a
+    /// single `End.DT2U` service SID (B9).
+    Srv6Encap = 28,
 }
 
 impl Counter {
     /// Number of distinct counters — the `max_entries` of the `STATS` map.
-    pub const COUNT: u32 = 28;
+    pub const COUNT: u32 = 29;
 
     /// The array index of this counter.
     #[inline]
@@ -186,6 +189,7 @@ impl Counter {
             25 => Counter::OverlayDropUntrusted,
             26 => Counter::NdSuppressed,
             27 => Counter::BumReplicated,
+            28 => Counter::Srv6Encap,
             _ => return None,
         };
         Some(counter)
@@ -230,6 +234,7 @@ impl Counter {
             Counter::OverlayDropUntrusted => "overlay_drop_untrusted",
             Counter::NdSuppressed => "nd_suppressed",
             Counter::BumReplicated => "bum_replicated",
+            Counter::Srv6Encap => "srv6_encap",
         }
     }
 }

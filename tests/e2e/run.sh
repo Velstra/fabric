@@ -297,6 +297,53 @@ scenario_overlay_mac_fdb() {
   agent_stop
 }
 
+# B9 — SRv6 per-MAC End.DT2U encap. The SRv6 analogue of `overlay_mac_fdb`:
+# programs an `[srv6]` endpoint + a `[[srv6_route]]` (and NO `[overlay]`), so the
+# ONLY way a tenant frame leaves is by matching its inner destination MAC in
+# SRV6_FDB and being wrapped in outer Ethernet+IPv6 (reduced encap, a single
+# End.DT2U service SID). The `srv6_encap` counter firing proves the L2-over-SRv6
+# headend path resolves and redirects; the exact outer-header bytes are covered
+# by the `build_srv6_encap` unit test in velstra-common.
+scenario_srv6_encap() {
+  section "B9 — SRv6 per-MAC End.DT2U encap"
+  ns_add s6h  # host (SRv6 source)
+  ns_add s6c  # tenant VM
+  ns_add s6u  # remote underlay peer
+  veth_pair s6h tap0 - s6c tap0c 192.168.100.1/24
+  veth_pair s6h uplink0 fc00:0:1::1/64 s6u under0 fc00:0:1::2/64
+  local umac
+  umac="$(nse s6u cat /sys/class/net/under0/address)"
+  # The tenant peer's MAC — the frame's inner dst MAC, and the SRV6_FDB key.
+  local peer_mac="02:00:00:00:0b:02"
+  cat >"$WORKDIR/srv6.toml" <<-EOF
+	default_action = "pass"
+	[srv6]
+	local_src = "fc00:0:1::1"
+	underlay_iface = "uplink0"
+	underlay_mtu = 1500
+	[[interface]]
+	name = "tap0"
+	policy = 0
+	vni = 10000
+	[[srv6_route]]
+	vni = 10000
+	mac = "$peer_mac"
+	remote_sid = "fc00:0:2:2710::"
+	via_mac = "$umac"
+	out_iface = "uplink0"
+	EOF
+  agent_start s6h -- --iface tap0 --iface uplink0 --config "$WORKDIR/srv6.toml" \
+    || { bad "agent start"; return; }
+  # Pre-seed the VM's neighbour so it emits an IP frame addressed to peer_mac at
+  # L2 (no ARP). There is NO tunnel/overlay for 192.168.100.2, so only SRV6_FDB
+  # can resolve it — the srv6_encap counter firing proves the SRv6 path standalone.
+  nse s6c ip neigh replace 192.168.100.2 lladdr "$peer_mac" dev tap0c
+  nse s6c ping -c2 -W1 192.168.100.2 >/dev/null 2>&1 || true
+  settle
+  assert_ge "$LAST_LOG" srv6_encap 1 "tenant frame encapsulated via SRv6 End.DT2U (SRV6_FDB)"
+  agent_stop
+}
+
 # B4b — local MAC learning. A tenant frame ingressing a tenant port (`vni != 0`)
 # is learned into the `LOCAL_MACS` map on the firewall-allowed path, so the agent
 # can advertise it to a co-located Wren daemon (EVPN type-2). This asserts the
@@ -394,7 +441,7 @@ scenario_lb() {
 ALL=(
   fw_pass fw_default_drop fw_blocklist_v4 fw_icmp fw_port fw_blocklist_v6
   egress_blocklist routing lb overlay_arp overlay_nd overlay_encap overlay_mac_fdb
-  local_mac_learn
+  srv6_encap local_mac_learn
 )
 
 main() {
