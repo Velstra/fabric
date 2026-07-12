@@ -7,7 +7,7 @@
 use std::{
     collections::BTreeMap,
     fmt::Debug,
-    io::Cursor,
+    io::{Cursor, Write},
     net::IpAddr,
     ops::RangeBounds,
     path::{Path, PathBuf},
@@ -503,7 +503,7 @@ pub fn apply(topo: &mut Topology, req: &TopoRequest) -> TopoResponse {
 
 // --- Log store --------------------------------------------------------------
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct LogInner {
     log: BTreeMap<u64, Entry<TypeConfig>>,
     last_purged: Option<LogId<NodeId>>,
@@ -511,25 +511,86 @@ struct LogInner {
     vote: Option<Vote<NodeId>>,
 }
 
-/// In-memory Raft log store (durability comes from snapshots persisted by the
-/// state machine; the uncommitted log tail is volatile, which is acceptable for
-/// a small control-plane cluster that re-replicates on restart).
+/// The on-disk write-ahead log file inside the raft dir.
+const LOG_FILE: &str = "raftlog.json";
+
+/// Load a persisted log (write-ahead log) from `dir`, if one is present. Returns
+/// `Ok(None)` when the directory holds no log yet (a fresh node, or one that only
+/// ever persisted snapshots).
+fn load_log(dir: &Path) -> Result<Option<LogInner>> {
+    let path = dir.join(LOG_FILE);
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let inner: LogInner = serde_json::from_slice(&bytes)
+                .map_err(|e| anyhow!("parsing {}: {e}", path.display()))?;
+            Ok(Some(inner))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow!("reading {}: {e}", path.display())),
+    }
+}
+
+/// Raft log store with a durable write-ahead log. Every mutation — appended
+/// entries, the vote, the committed marker, truncation and purge — is written
+/// through to `raftlog.json` (atomic temp+rename, fsynced) before it is
+/// acknowledged, so a committed+acked write survives a correlated full-cluster
+/// power loss instead of vanishing when it happened <100 entries since the last
+/// snapshot. With `dir == None` the log is purely in-memory (dev / single-node /
+/// trusted use), matching the previous behaviour.
 #[derive(Clone, Debug, Default)]
 pub struct LogStore {
     inner: Arc<Mutex<LogInner>>,
+    dir: Option<Arc<PathBuf>>,
 }
 
 impl LogStore {
-    /// A log store seeded with `last_purged` — used after reloading a persisted
-    /// snapshot so the log's reported `last_log_id` is consistent with the state
-    /// machine's `last_applied` (both point at the snapshot's last log id).
-    pub fn new(last_purged: Option<LogId<NodeId>>) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(LogInner {
+    /// Build a log store under `dir`, resuming from the persisted write-ahead log
+    /// there if one exists. With no persisted log the store starts empty but with
+    /// its `last_purged` seeded from `last_purged` (the reloaded snapshot's last
+    /// log id) so the reported `last_log_id` stays consistent with the state
+    /// machine's `last_applied`. `dir == None` keeps the log volatile.
+    pub fn new(dir: Option<PathBuf>, last_purged: Option<LogId<NodeId>>) -> Result<Self> {
+        let inner = match &dir {
+            Some(d) => match load_log(d)? {
+                Some(loaded) => loaded,
+                None => LogInner {
+                    last_purged,
+                    ..Default::default()
+                },
+            },
+            None => LogInner {
                 last_purged,
                 ..Default::default()
-            })),
+            },
+        };
+        Ok(Self {
+            inner: Arc::new(Mutex::new(inner)),
+            dir: dir.map(Arc::new),
+        })
+    }
+
+    /// Atomically persist the current log state to `raftlog.json`, if a directory
+    /// is configured. Writes a temp file, fsyncs its contents, renames it over the
+    /// live file, then fsyncs the directory — so a crash at any point leaves either
+    /// the old complete log or the new complete log, never a torn one, and a
+    /// power-loss after the return still has the bytes on stable storage.
+    fn persist(&self, inner: &LogInner) -> Result<(), StorageError<NodeId>> {
+        let Some(dir) = &self.dir else {
+            return Ok(());
+        };
+        let bytes = serde_json::to_vec(inner).map_err(io_err)?;
+        let path = dir.join(LOG_FILE);
+        let tmp = dir.join(format!("{LOG_FILE}.tmp"));
+        let mut f = std::fs::File::create(&tmp).map_err(io_err)?;
+        f.write_all(&bytes).map_err(io_err)?;
+        f.sync_all().map_err(io_err)?;
+        drop(f);
+        std::fs::rename(&tmp, &path).map_err(io_err)?;
+        // fsync the directory so the rename itself is durable across a power loss.
+        if let Ok(d) = std::fs::File::open(dir.as_path()) {
+            let _ = d.sync_all();
         }
+        Ok(())
     }
 }
 
@@ -565,8 +626,11 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     }
 
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
-        self.inner.lock().await.vote = Some(*vote);
-        Ok(())
+        let mut inner = self.inner.lock().await;
+        inner.vote = Some(*vote);
+        // The vote MUST be durable before we act on it (RFC: a granted vote may
+        // never be forgotten across a restart, or two leaders could form).
+        self.persist(&inner)
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
@@ -577,8 +641,9 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         &mut self,
         committed: Option<LogId<NodeId>>,
     ) -> Result<(), StorageError<NodeId>> {
-        self.inner.lock().await.committed = committed;
-        Ok(())
+        let mut inner = self.inner.lock().await;
+        inner.committed = committed;
+        self.persist(&inner)
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
@@ -594,21 +659,31 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        {
-            let mut inner = self.inner.lock().await;
-            for entry in entries {
-                inner.log.insert(entry.log_id.index, entry);
+        let mut inner = self.inner.lock().await;
+        for entry in entries {
+            inner.log.insert(entry.log_id.index, entry);
+        }
+        // Flush the appended tail to stable storage before acknowledging it: the
+        // callback is what lets the leader count this replica toward the commit
+        // quorum, so it must not fire until the bytes are durable.
+        let res = self.persist(&inner);
+        drop(inner);
+        match res {
+            Ok(()) => {
+                callback.log_io_completed(Ok(()));
+                Ok(())
+            }
+            Err(e) => {
+                callback.log_io_completed(Err(std::io::Error::other("raft log persist failed")));
+                Err(e)
             }
         }
-        // The log is in memory, so it is "flushed" the moment it is inserted.
-        callback.log_io_completed(Ok(()));
-        Ok(())
     }
 
     async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         let mut inner = self.inner.lock().await;
         inner.log.split_off(&log_id.index); // drops [index, +oo)
-        Ok(())
+        self.persist(&inner)
     }
 
     async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
@@ -616,7 +691,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         inner.last_purged = Some(log_id);
         let keep = inner.log.split_off(&(log_id.index + 1)); // keep (index, +oo)
         inner.log = keep;
-        Ok(())
+        self.persist(&inner)
     }
 }
 
@@ -1393,5 +1468,61 @@ mod tests {
             .floating_ip(&f2.id)
             .expect("floating ip survives failover");
         assert!(rf.association.is_some());
+    }
+
+    #[tokio::test]
+    async fn wal_recovers_committed_state_after_restart() {
+        use openraft::CommittedLeaderId;
+
+        // A unique per-run directory so parallel test runs don't collide.
+        let dir =
+            std::env::temp_dir().join(format!("velstra-wal-{}-{:p}", std::process::id(), &0u8));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let entry = Entry {
+            log_id: LogId::new(CommittedLeaderId::new(3, 1), 7),
+            payload: EntryPayload::Normal(TopoRequest::AddHost(host_spec("h1", "10.0.0.1"))),
+        };
+        let vote = Vote::new_committed(3, 1);
+
+        // First "process": persist a vote, a log entry, and the committed marker —
+        // then drop the store, simulating a full-cluster power loss.
+        {
+            let mut store = LogStore::new(Some(dir.clone()), None).unwrap();
+            store.save_vote(&vote).await.unwrap();
+            {
+                // `append` needs an openraft-internal LogFlushed callback we cannot
+                // build here, so drive the same insert+persist it performs.
+                let mut inner = store.inner.lock().await;
+                inner.log.insert(entry.log_id.index, entry.clone());
+                store.persist(&inner).unwrap();
+            }
+            store.save_committed(Some(entry.log_id)).await.unwrap();
+        }
+
+        // Second "process": a fresh store over the same directory recovers the vote,
+        // the committed marker and the log entry from the write-ahead log — none of
+        // which a snapshot had captured yet.
+        let mut store = LogStore::new(Some(dir.clone()), None).unwrap();
+        assert_eq!(store.read_vote().await.unwrap(), Some(vote));
+        assert_eq!(
+            store.read_committed().await.unwrap().map(|l| l.index),
+            Some(7)
+        );
+        let entries = store.try_get_log_entries(0..u64::MAX).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].log_id.index, 7);
+        assert_eq!(
+            store
+                .get_log_state()
+                .await
+                .unwrap()
+                .last_log_id
+                .map(|l| l.index),
+            Some(7)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
