@@ -149,11 +149,16 @@ pub enum Counter {
     /// instantiated `End.DT2U` service SID; the inner Ethernet frame is handed to
     /// the kernel bridge (B9).
     Srv6Decap = 29,
+    /// A tunnel packet was dropped after VTEP authentication because its inner VNI
+    /// is not one this host serves — a (trusted-or-spoofed) peer VTEP may only
+    /// inject into a locally-hosted segment, never an arbitrary one (decap VNI
+    /// enforcement / tenant isolation at the ingress boundary).
+    OverlayDropVni = 30,
 }
 
 impl Counter {
     /// Number of distinct counters — the `max_entries` of the `STATS` map.
-    pub const COUNT: u32 = 30;
+    pub const COUNT: u32 = 31;
 
     /// The array index of this counter.
     #[inline]
@@ -195,6 +200,7 @@ impl Counter {
             27 => Counter::BumReplicated,
             28 => Counter::Srv6Encap,
             29 => Counter::Srv6Decap,
+            30 => Counter::OverlayDropVni,
             _ => return None,
         };
         Some(counter)
@@ -241,6 +247,7 @@ impl Counter {
             Counter::BumReplicated => "bum_replicated",
             Counter::Srv6Encap => "srv6_encap",
             Counter::Srv6Decap => "srv6_decap",
+            Counter::OverlayDropVni => "overlay_drop_vni",
         }
     }
 }
