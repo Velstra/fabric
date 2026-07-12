@@ -68,10 +68,10 @@ use velstra_common::{
     MAX_FLOOD_VTEPS, MacFdbKey, ND_NA_MSG_LEN, Nat, NdKey, Npt66, OVERLAY_OUTER_LEN, OverlayConfig,
     PacketMeta, PolicyId, PortFwd, Rewrite, RouteEntry, SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6,
     ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue, Srv6Config, Srv6Endpoint,
-    TunnelEndpoint, TunnelKey, build_encap, build_srv6_encap, decide, icmp, icmp_checksum,
-    ip_proto, is_overlay_dport, lpm_key_addr, plan_arp_reply, plan_forward, plan_icmp_unreachable,
-    plan_na_reply, plan_nat, plan_tcp_rst, port_rule_action, port_rule_logs, select_backend,
-    session_hash, tcp_flags,
+    Srv6LocalSid, Srv6SidKey, TunnelEndpoint, TunnelKey, build_encap, build_srv6_encap, decide,
+    icmp, icmp_checksum, ip_proto, is_overlay_dport, lpm_key_addr, plan_arp_reply, plan_forward,
+    plan_icmp_unreachable, plan_na_reply, plan_nat, plan_tcp_rst, port_rule_action, port_rule_logs,
+    select_backend, session_hash, tcp_flags,
 };
 
 /// Maps an ingress interface index to its policy id, so one XDP program can
@@ -227,6 +227,15 @@ static SRV6_CONFIG: Array<Srv6Config> = Array::with_max_entries(1, 0);
 /// flooded (`End.DT2M`, not yet head-end replicated), so the frame falls through.
 #[map]
 static SRV6_FDB: HashMap<MacFdbKey, Srv6Endpoint> = HashMap::with_max_entries(8192, 0);
+
+/// B9 SRv6 **local-SID** table: every 128-bit service SID this node has
+/// instantiated → the `(vni, behaviour)` it terminates into ([`Srv6LocalSid`]).
+/// An arriving packet whose outer IPv6 destination is an exact-match key here is
+/// decapsulated and its inner Ethernet frame bridged into the tenant. Pushed by
+/// the control plane; a miss means the packet is not for one of our SIDs and
+/// falls through to the ordinary IPv6 firewall path.
+#[map]
+static SRV6_LOCAL_SIDS: HashMap<Srv6SidKey, Srv6LocalSid> = HashMap::with_max_entries(8192, 0);
 
 /// B2 per-VNI **flood set**: `vni` → the [`FloodSet`] of remote VTEPs a
 /// broadcast/unknown-unicast/multicast (BUM) frame on that segment must be
@@ -1297,6 +1306,15 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
     let hdr: *const [u8; Ipv6Hdr::LEN] = unsafe { ptr_at(ctx, EthHdr::LEN)? };
     let hdr = unsafe { *hdr };
 
+    // B9: SRv6 decapsulation (End.DT2U). If this packet's IPv6 destination is a
+    // service SID we instantiated, strip the outer Ethernet+IPv6 and hand the
+    // inner Ethernet frame to the kernel bridge (deliver by inner MAC). Runs
+    // before the firewall — the SID match is the authorization (we only ever
+    // instantiate our own SIDs). A miss falls through to the IPv6 firewall below.
+    if let Some(action) = try_srv6_decap(ctx, &hdr)? {
+        return Ok(action);
+    }
+
     // payload length @4..6 (big-endian), next-header @6, addresses @8 and @24.
     let payload_len = u16::from_be_bytes([hdr[4], hdr[5]]);
     let next_hdr = hdr[6];
@@ -1567,6 +1585,60 @@ fn overlay_config() -> OverlayConfig {
 #[inline(always)]
 fn srv6_config() -> Srv6Config {
     SRV6_CONFIG.get(0).copied().unwrap_or(Srv6Config::DISABLED)
+}
+
+/// B9 SRv6 **decapsulation** (`End.DT2U`): if the outer IPv6 destination of an
+/// arriving packet is a service SID this node instantiated, strip the outer
+/// Ethernet + IPv6 stack and `XDP_PASS` the inner Ethernet frame to the kernel
+/// bridge (which delivers it by inner MAC).
+///
+/// Returns `Ok(Some(action))` when it took over the packet, or `Ok(None)` to
+/// fall through (SRv6 disabled / not one of our SIDs / a non-`End.DT2U` SID / a
+/// tenant ingress port).
+#[inline(always)]
+fn try_srv6_decap(ctx: &XdpContext, hdr: &[u8; Ipv6Hdr::LEN]) -> Result<Option<u32>, ()> {
+    // Cheap gate first, reading the enabled flag *through* the map pointer so the
+    // 28-byte `Srv6Config` is never copied onto this (already deep) stack frame.
+    if !SRV6_CONFIG.get(0).map(|c| c.is_enabled()).unwrap_or(false) {
+        return Ok(None);
+    }
+    // Only decapsulate on a non-tenant (underlay) ingress port: a tenant tap
+    // (`vni != 0`) must never be able to forge a packet addressed to one of our
+    // SIDs and have its inner frame injected past tenant isolation. (Full
+    // trusted-source auth — an `SRV6_PEERS` set, the C2 analogue of
+    // `VTEP_PEERS` — is a follow-on.)
+    let ifindex = ctx.ingress_ifindex() as u32;
+    if unsafe { IFACE_VNI.get(&ifindex) }.copied().unwrap_or(0) != 0 {
+        return Ok(None);
+    }
+    // The 16-byte outer IPv6 destination is already contiguous in `hdr` at offset
+    // 24; view it as the `Srv6SidKey` *in place* (both are `[u8; 16]`, align 1) so
+    // the map lookup needs no on-stack key buffer at all — critical for staying
+    // under the verifier's combined-stack limit when this leaf is reached from the
+    // deep IPv6 firewall frame. Only the behaviour field is read back through the
+    // value pointer (no `Srv6LocalSid` copy).
+    // SAFETY: `hdr` is a live 40-byte array; bytes 24..40 are in bounds, and the
+    // byte-array key has alignment 1 so the reinterpret is always well-aligned.
+    let key = unsafe { &*(hdr.as_ptr().add(24) as *const Srv6SidKey) };
+    let behavior = match unsafe { SRV6_LOCAL_SIDS.get(key) } {
+        Some(l) => l.behavior,
+        None => return Ok(None),
+    };
+    // Only the L2 unicast behaviour is decapsulated in this fast path; End.DT2M
+    // (BUM flood) needs head-end replication at the TC layer and is not here.
+    if behavior != velstra_common::srv6::behavior::END_DT2U {
+        return Ok(None);
+    }
+    // Strip outer Ethernet (14) + IPv6 (40) = SRV6_L2_OUTER_LEN. The inner frame
+    // is an Ethernet frame, left for the kernel bridge to deliver by inner MAC.
+    // SAFETY: `ctx.ctx` is the live `xdp_md`; a positive delta only shrinks the
+    // packet. A non-zero return means the kernel refused — pass the frame as-is.
+    if unsafe { bpf_xdp_adjust_head(ctx.ctx, SRV6_L2_OUTER_LEN as i32) } != 0 {
+        bump(Counter::Malformed);
+        return Ok(Some(xdp_action::XDP_PASS));
+    }
+    bump(Counter::Srv6Decap);
+    Ok(Some(xdp_action::XDP_PASS))
 }
 
 /// B9 SRv6 **encapsulation** (headend, `End.DT2U`): if the inner destination MAC

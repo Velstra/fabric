@@ -344,6 +344,68 @@ scenario_srv6_encap() {
   agent_stop
 }
 
+# B9 — SRv6 End.DT2U encap↔decap round-trip across TWO agents. Host A encaps a
+# tenant frame toward host B's service SID; host B, whose SID this is, decaps it.
+# Asserts both halves: A's `srv6_encap` and B's `srv6_decap` counters. This is the
+# true L2-over-SRv6 datapath, end to end, with no packet crafting — just the two
+# real agents and a ping from the tenant.
+scenario_srv6_roundtrip() {
+  section "B9 — SRv6 End.DT2U encap↔decap round-trip"
+  ns_add s6a   # host A: SRv6 source (encap)
+  ns_add s6ac  # tenant VM behind A
+  ns_add s6b   # host B: SRv6 endpoint (decap)
+  veth_pair s6a tap0 - s6ac tap0c 192.168.100.1/24
+  veth_pair s6a uplink0 fc00:0:1::1/64 s6b under0 fc00:0:1::2/64
+  local bmac sid peer_mac
+  bmac="$(nse s6b cat /sys/class/net/under0/address)"
+  sid="fc00:0:2:2710::"
+  peer_mac="02:00:00:00:0b:02"
+  # Host A: encap tenant (vni 10000) frames whose inner dst MAC = peer_mac toward
+  # host B's service SID.
+  cat >"$WORKDIR/srv6-a.toml" <<-EOF
+	default_action = "pass"
+	[srv6]
+	local_src = "fc00:0:1::1"
+	underlay_iface = "uplink0"
+	[[interface]]
+	name = "tap0"
+	policy = 0
+	vni = 10000
+	[[srv6_route]]
+	vni = 10000
+	mac = "$peer_mac"
+	remote_sid = "$sid"
+	via_mac = "$bmac"
+	out_iface = "uplink0"
+	EOF
+  # Host B: instantiate that SID and decapsulate End.DT2U into vni 10000.
+  cat >"$WORKDIR/srv6-b.toml" <<-EOF
+	default_action = "pass"
+	[srv6]
+	local_src = "fc00:0:2::1"
+	underlay_iface = "under0"
+	[[srv6_local_sid]]
+	sid = "$sid"
+	vni = 10000
+	behavior = "end.dt2u"
+	EOF
+  agent_start s6b -- --iface under0 --config "$WORKDIR/srv6-b.toml" \
+    || { bad "agent B start"; return; }
+  local logb="$LAST_LOG" pidb="$LAST_PID"
+  agent_start s6a -- --iface tap0 --iface uplink0 --config "$WORKDIR/srv6-a.toml" \
+    || { bad "agent A start"; kill -TERM "$pidb" 2>/dev/null; return; }
+  local loga="$LAST_LOG"
+  # Tenant emits an IP frame addressed to peer_mac at L2 (no ARP), which A encaps
+  # toward the SID and B (owning the SID) decaps.
+  nse s6ac ip neigh replace 192.168.100.2 lladdr "$peer_mac" dev tap0c
+  nse s6ac ping -c3 -W1 192.168.100.2 >/dev/null 2>&1 || true
+  settle
+  assert_ge "$loga" srv6_encap 1 "host A encapsulated the tenant frame (End.DT2U)"
+  assert_ge "$logb" srv6_decap 1 "host B decapsulated it into the tenant (End.DT2U)"
+  agent_stop                              # stops A (LAST_PID)
+  kill -TERM "$pidb" 2>/dev/null || true  # stop B (the EXIT trap also reaps it)
+}
+
 # B4b — local MAC learning. A tenant frame ingressing a tenant port (`vni != 0`)
 # is learned into the `LOCAL_MACS` map on the firewall-allowed path, so the agent
 # can advertise it to a co-located Wren daemon (EVPN type-2). This asserts the
@@ -441,7 +503,7 @@ scenario_lb() {
 ALL=(
   fw_pass fw_default_drop fw_blocklist_v4 fw_icmp fw_port fw_blocklist_v6
   egress_blocklist routing lb overlay_arp overlay_nd overlay_encap overlay_mac_fdb
-  srv6_encap local_mac_learn
+  srv6_encap srv6_roundtrip local_mac_learn
 )
 
 main() {

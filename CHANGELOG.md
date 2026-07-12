@@ -3,6 +3,21 @@
 ## [Unreleased]
 
 ### Added
+- **SRv6 L2 decap data plane (B9, part 3) — endpoint `End.DT2U`.** The symmetric
+  counterpart of the headend encap: the XDP datapath now *terminates* SRv6, so two
+  fabric hosts bridge an L2 tenant over SRv6 end to end. `[[srv6_local_sid]]`
+  declares the service SIDs this node instantiates (`sid`, `vni`, `behavior`);
+  `try_srv6_decap` — first thing on the IPv6 path, before the firewall — strips
+  the outer Ethernet + IPv6 of a packet whose destination is one of our SIDs and
+  hands the inner Ethernet frame to the kernel bridge (delivered by inner MAC). It
+  is gated to non-tenant (underlay) ingress so a tenant tap can't forge an
+  encapsulated frame and inject its inner frame past isolation (full `SRV6_PEERS`
+  trusted-source auth — the C2 analogue of `VTEP_PEERS` — is a follow-on, as is
+  `End.DT2M` BUM flood). New map `SRV6_LOCAL_SIDS`, agent programming in
+  `program_srv6`, `srv6_decap` counter. Unit-tested (config resolve incl. the
+  behaviour keyword, `velstra validate`); a two-agent netns e2e scenario
+  (`srv6_roundtrip`: A encaps → B decaps, both counters) exercises the full loaded
+  datapath. **eBPF object changed → sentinel `ebpfHash` bump on repin.**
 - **SRv6 L2 encap data plane (B9, part 2) — headend `End.DT2U`.** The XDP
   datapath now speaks SRv6 as an alternative overlay wire format to VXLAN/Geneve.
   `[srv6]` sets this host's tunnel-source identity (a 128-bit source address out

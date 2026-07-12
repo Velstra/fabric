@@ -363,6 +363,23 @@ pub struct Srv6RouteCfg {
     pub out_iface: String,
 }
 
+/// One SRv6 local-SID this node instantiates (`[[srv6_local_sid]]`, B9): a
+/// 128-bit service SID it advertises and terminates. An arriving packet whose
+/// outer IPv6 destination matches `sid` is decapsulated and bridged into `vni`
+/// per `behavior`. The decap counterpart of a peer's `[[srv6_route]]`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Srv6LocalSidCfg {
+    /// The instantiated service SID (an IPv6 address out of this node's locator).
+    pub sid: String,
+    /// Tenant VNI this SID terminates into.
+    pub vni: u32,
+    /// Endpoint behaviour: `end.dt2u` (L2 unicast, default) or `end.dt2m` (L2
+    /// flood). Only `end.dt2u` is decapsulated by the datapath today.
+    #[serde(default)]
+    pub behavior: Option<String>,
+}
+
 /// A named tenant policy (`[[policy]]`): the same firewall fields as the
 /// top-level config, but with an explicit non-zero `id` that interfaces map to.
 #[derive(Debug, Deserialize)]
@@ -476,6 +493,9 @@ pub struct FileConfig {
     /// B9 SRv6 per-MAC L2 forwarding entries. Spelled `[[srv6_route]]` in TOML.
     #[serde(default, rename = "srv6_route")]
     pub srv6_routes: Vec<Srv6RouteCfg>,
+    /// B9 SRv6 local-SID instantiations. Spelled `[[srv6_local_sid]]` in TOML.
+    #[serde(default, rename = "srv6_local_sid")]
+    pub srv6_local_sids: Vec<Srv6LocalSidCfg>,
 }
 
 /// A NPTv6 (RFC 6296) prefix-translation rule: on the boundary `interface`, an
@@ -779,6 +799,18 @@ pub struct ResolvedSrv6Route {
     pub out_iface: String,
 }
 
+/// A resolved SRv6 local-SID (B9): the parsed 128-bit SID, the tenant it
+/// terminates into, and its endpoint-behaviour code ([`velstra_common::srv6::behavior`]).
+#[derive(Debug, Clone)]
+pub struct ResolvedSrv6LocalSid {
+    /// The instantiated service SID (network-order octets, IPv6 wire form).
+    pub sid: [u8; 16],
+    /// Tenant VNI this SID terminates into.
+    pub vni: u32,
+    /// Endpoint-behaviour code point (`END_DT2U` / `END_DT2M`).
+    pub behavior: u16,
+}
+
 /// Fully-resolved, validated configuration ready to be written into BPF maps.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -814,6 +846,8 @@ pub struct RuntimeConfig {
     pub srv6: Option<ResolvedSrv6>,
     /// SRv6 per-MAC L2 forwarding entries for the `SRV6_FDB` map (B9).
     pub srv6_routes: Vec<ResolvedSrv6Route>,
+    /// SRv6 local-SID instantiations for the `SRV6_LOCAL_SIDS` map (B9 decap).
+    pub srv6_local_sids: Vec<ResolvedSrv6LocalSid>,
 }
 
 impl RuntimeConfig {
@@ -842,6 +876,7 @@ impl RuntimeConfig {
             conntrack_sync: None,
             srv6: None,
             srv6_routes: Vec::new(),
+            srv6_local_sids: Vec::new(),
         }
     }
 }
@@ -1332,6 +1367,32 @@ impl FileConfig {
             });
         }
 
+        if !self.srv6_local_sids.is_empty() && srv6.is_none() {
+            bail!("`[[srv6_local_sid]]` entries require an `[srv6]` section");
+        }
+        let mut srv6_local_sids = Vec::with_capacity(self.srv6_local_sids.len());
+        for ls in &self.srv6_local_sids {
+            if ls.vni > 0xFF_FFFF {
+                bail!("srv6_local_sid vni {} exceeds 24 bits", ls.vni);
+            }
+            let sid: Ipv6Addr = ls
+                .sid
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid srv6_local_sid sid {:?}", ls.sid))?;
+            let behavior = match ls.behavior.as_deref().unwrap_or("end.dt2u") {
+                "end.dt2u" => velstra_common::srv6::behavior::END_DT2U,
+                "end.dt2m" => velstra_common::srv6::behavior::END_DT2M,
+                other => bail!(
+                    "invalid srv6_local_sid behavior {other:?} (expected end.dt2u or end.dt2m)"
+                ),
+            };
+            srv6_local_sids.push(ResolvedSrv6LocalSid {
+                sid: sid.octets(),
+                vni: ls.vni,
+                behavior,
+            });
+        }
+
         Ok(RuntimeConfig {
             policies,
             interfaces,
@@ -1352,6 +1413,7 @@ impl FileConfig {
                 .transpose()?,
             srv6,
             srv6_routes,
+            srv6_local_sids,
         })
     }
 }
@@ -1540,6 +1602,26 @@ impl fmt::Display for RuntimeConfig {
                     sr.vni,
                     Ipv6Addr::from(sr.remote_sid),
                     sr.out_iface,
+                )?;
+            }
+        }
+        if !self.srv6_local_sids.is_empty() {
+            writeln!(
+                f,
+                "srv6_local_sids: {} entry(ies)",
+                self.srv6_local_sids.len()
+            )?;
+            for ls in &self.srv6_local_sids {
+                let beh = if ls.behavior == velstra_common::srv6::behavior::END_DT2M {
+                    "End.DT2M"
+                } else {
+                    "End.DT2U"
+                };
+                writeln!(
+                    f,
+                    "  - sid {} -> vni {} ({beh})",
+                    Ipv6Addr::from(ls.sid),
+                    ls.vni,
                 )?;
             }
         }
@@ -1896,6 +1978,60 @@ mod tests {
         assert_eq!(r.remote_sid[0..2], [0xfc, 0x00]);
         assert_eq!(r.outer_dst_mac, [2, 0, 0, 0, 0, 2]);
         assert_eq!(r.out_iface, "eth0");
+    }
+
+    #[test]
+    fn resolves_srv6_local_sids_with_behavior() {
+        let toml = r#"
+            [srv6]
+            local_src = "fc00:0:1::1"
+            underlay_iface = "eth0"
+
+            [[srv6_local_sid]]
+            sid = "fc00:0:1:2710::"
+            vni = 10000
+
+            [[srv6_local_sid]]
+            sid = "fc00:0:1:2711::"
+            vni = 10000
+            behavior = "end.dt2m"
+        "#;
+        let cfg = toml::from_str::<FileConfig>(toml)
+            .unwrap()
+            .resolve()
+            .unwrap();
+        assert_eq!(cfg.srv6_local_sids.len(), 2);
+        // Default behaviour is End.DT2U.
+        assert_eq!(
+            cfg.srv6_local_sids[0].behavior,
+            velstra_common::srv6::behavior::END_DT2U
+        );
+        assert_eq!(cfg.srv6_local_sids[0].vni, 10000);
+        assert_eq!(cfg.srv6_local_sids[0].sid[0..2], [0xfc, 0x00]);
+        // Explicit end.dt2m maps to the flood behaviour.
+        assert_eq!(
+            cfg.srv6_local_sids[1].behavior,
+            velstra_common::srv6::behavior::END_DT2M
+        );
+    }
+
+    #[test]
+    fn srv6_local_sid_rejects_bad_behavior() {
+        let toml = r#"
+            [srv6]
+            local_src = "fc00:0:1::1"
+            underlay_iface = "eth0"
+            [[srv6_local_sid]]
+            sid = "fc00:0:1:2710::"
+            vni = 1
+            behavior = "end.dx2"
+        "#;
+        let err = toml::from_str::<FileConfig>(toml)
+            .unwrap()
+            .resolve()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("behavior"), "unexpected error: {err}");
     }
 
     #[test]

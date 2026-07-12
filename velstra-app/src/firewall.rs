@@ -22,12 +22,13 @@ use velstra_common::{
     ArpEntry, ArpKey, Backend, Cidr4, Counter, FloodSet, FlowKey, FlowState, GlobalConfig,
     LocalMac, LocalMacKey, MacFdbKey, NdKey, Npt66, OverlayConfig, PolicyId, PortFwd, RouteEntry,
     ScopedAddr, ScopedAddr6, ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue, Srv6Config,
-    Srv6Endpoint, TunnelEndpoint, TunnelKey, parse_mac, port_rule_value,
+    Srv6Endpoint, Srv6LocalSid, Srv6SidKey, TunnelEndpoint, TunnelKey, parse_mac, port_rule_value,
 };
 use velstra_config::{
     PolicyConfig, ResolvedFloodVtep, ResolvedInterface, ResolvedMacRoute, ResolvedNd6,
     ResolvedNeighbor, ResolvedNpt66, ResolvedOverlay, ResolvedPortForward, ResolvedRoute,
-    ResolvedService, ResolvedSrv6, ResolvedSrv6Route, ResolvedTunnel, RuntimeConfig,
+    ResolvedService, ResolvedSrv6, ResolvedSrv6LocalSid, ResolvedSrv6Route, ResolvedTunnel,
+    RuntimeConfig,
 };
 
 /// How to attach the XDP program to the interface.
@@ -734,7 +735,12 @@ fn apply_config(ebpf: &mut Ebpf, cfg: &RuntimeConfig, old: Option<&RuntimeConfig
         &cfg.nd_neighbors,
         &cfg.flood_vteps,
     )?;
-    program_srv6(ebpf, cfg.srv6.as_ref(), &cfg.srv6_routes)?;
+    program_srv6(
+        ebpf,
+        cfg.srv6.as_ref(),
+        &cfg.srv6_routes,
+        &cfg.srv6_local_sids,
+    )?;
 
     Ok(())
 }
@@ -1286,6 +1292,7 @@ fn program_srv6(
     ebpf: &mut Ebpf,
     srv6: Option<&ResolvedSrv6>,
     routes: &[ResolvedSrv6Route],
+    local_sids: &[ResolvedSrv6LocalSid],
 ) -> Result<()> {
     // Resolve the host config (source MAC) before borrowing any map.
     let config = match srv6 {
@@ -1305,6 +1312,23 @@ fn program_srv6(
                 .ok_or_else(|| anyhow!("SRV6_CONFIG map missing"))?,
         )?;
         cfg_map.set(0, config, 0).context("writing SRV6_CONFIG")?;
+    }
+
+    // B9 decap: every service SID this host instantiates → its (vni, behaviour).
+    // A packet whose outer IPv6 destination matches is decapsulated and bridged.
+    if !local_sids.is_empty() {
+        let mut sids: HashMap<_, Srv6SidKey, Srv6LocalSid> = HashMap::try_from(
+            ebpf.map_mut("SRV6_LOCAL_SIDS")
+                .ok_or_else(|| anyhow!("SRV6_LOCAL_SIDS map missing"))?,
+        )?;
+        for ls in local_sids {
+            sids.insert(
+                Srv6SidKey::new(ls.sid),
+                Srv6LocalSid::new(ls.vni, ls.behavior),
+                0,
+            )
+            .context("inserting SRv6 local SID")?;
+        }
     }
 
     if routes.is_empty() {
