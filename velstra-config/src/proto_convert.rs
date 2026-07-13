@@ -28,7 +28,10 @@ fn port_rule_to_proto(r: &PortRule) -> proto::PortRule {
 fn port_rule_from_proto(r: &proto::PortRule) -> PortRule {
     PortRule {
         proto: proto_from_proto(r.proto()),
-        port: r.port as u16,
+        // The proto carries the port as u32; a value past 65535 is invalid. Saturate
+        // rather than `as u16`-truncate, which would wrap (e.g. 65536 → 0, the
+        // wildcard port) and silently open a rule the operator never wrote.
+        port: r.port.min(u16::MAX as u32) as u16,
         action: action_from_proto(r.action()),
         log: r.log,
         src: if r.src.is_empty() {
