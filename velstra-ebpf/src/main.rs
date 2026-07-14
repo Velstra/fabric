@@ -760,7 +760,10 @@ fn masquerade_egress(
     proto: u8,
     wan_ip: [u8; 4],
 ) -> Result<i32, ()> {
-    bump(Counter::TxPackets);
+    // `try_egress` already counted this packet in TxPackets before dispatching
+    // here; the masquerade path reports its own outcome via EgressMasqueraded, so
+    // it must not bump TxPackets again (that double-counted every masqueraded
+    // packet against the plain egress total).
     if (proto != ip_proto::TCP && proto != ip_proto::UDP)
         || ihl_bytes != Ipv4Hdr::LEN
         || src_addr == wan_ip
@@ -1714,6 +1717,15 @@ fn try_srv6_decap(ctx: &XdpContext, hdr: &[u8; Ipv6Hdr::LEN]) -> Result<Option<u
     // Only the L2 unicast behaviour is decapsulated in this fast path; End.DT2M
     // (BUM flood) needs head-end replication at the TC layer and is not here.
     if behavior != velstra_common::srv6::behavior::END_DT2U {
+        return Ok(None);
+    }
+    // Reduced End.DT2U encap carries the inner Ethernet frame directly after the
+    // outer IPv6 header, flagged by IPv6 Next Header 143 (Ethernet). Refuse to decap
+    // a packet to our SID whose outer next-header is anything else (an SRH, or an
+    // upper-layer protocol) — stripping the fixed outer stack off such a packet
+    // would hand a corrupt "inner" frame to the bridge. The next-header sits at
+    // offset 6 of the already-bounds-checked 40-byte outer IPv6 header.
+    if hdr[6] != velstra_common::srv6::IPPROTO_ETHERNET {
         return Ok(None);
     }
     // Strip outer Ethernet (14) + IPv6 (40) = SRV6_L2_OUTER_LEN. The inner frame
