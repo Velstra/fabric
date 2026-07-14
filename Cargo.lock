@@ -2850,6 +2850,7 @@ dependencies = [
  "velstra-common",
  "velstra-config",
  "velstra-orchestrator",
+ "x509-parser",
 ]
 
 [[package]]
