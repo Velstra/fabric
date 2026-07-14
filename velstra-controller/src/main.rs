@@ -175,6 +175,14 @@ struct ServeArgs {
     #[arg(long, requires = "node_id")]
     raft_tls_domain: Option<String>,
 
+    /// Common Name of a controller allowed to drive this node's Raft state
+    /// (repeatable, cluster mode). When at least one is given, an incoming Raft
+    /// RPC is rejected unless its client-certificate CN is listed — so a
+    /// compromised agent that shares the cluster CA cannot inject AppendEntries or
+    /// Vote. With none given, any TLS-authenticated peer is accepted (unchanged).
+    #[arg(long = "raft-peer-cn", requires = "node_id")]
+    raft_peer_cns: Vec<String>,
+
     /// Path to a Wren routing-daemon control socket to subscribe to for EVPN
     /// updates (roadmap B4a). When set, the controller runs a background task
     /// that folds EVPN-learned type-2 MAC/IP routes into every host's derived
@@ -1757,8 +1765,24 @@ async fn serve(args: ServeArgs) -> Result<()> {
                 "raft peer transport: PLAINTEXT (no --tls-cert/--client-ca) — secure the network"
             );
         }
+        // Restrict the Raft peer transport to the listed controller CNs, if any.
+        let allowed_cns = if args.raft_peer_cns.is_empty() {
+            None
+        } else {
+            info!(
+                "raft peer transport: CN allowlist ({} controllers)",
+                args.raft_peer_cns.len()
+            );
+            Some(Arc::new(args.raft_peer_cns.iter().cloned().collect()))
+        };
         let node = Arc::new(
-            velstra_raft::RaftNode::start_with_opts(id, args.raft_dir.clone(), client_tls).await?,
+            velstra_raft::RaftNode::start_with_opts(
+                id,
+                args.raft_dir.clone(),
+                client_tls,
+                allowed_cns,
+            )
+            .await?,
         );
         if let Some(dir) = &args.raft_dir {
             info!("raft snapshots persisted under {}", dir.display());

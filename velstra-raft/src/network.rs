@@ -3,6 +3,8 @@
 //! client side (openraft calls it to reach peers); [`RaftServer`] is the server
 //! side (it hands incoming RPCs to the local [`Raft`]).
 
+use std::{collections::HashSet, sync::Arc};
+
 use anyhow::Result;
 use openraft::{
     BasicNode, Raft,
@@ -31,12 +33,57 @@ use pb::{RaftMsg, raft_service_client::RaftServiceClient, raft_service_server::R
 /// them to the local Raft instance.
 pub struct RaftServer {
     raft: Raft<TypeConfig>,
+    /// The Common Names permitted to drive this node's Raft state (the other
+    /// controllers). `None` disables the check — any peer the transport TLS already
+    /// authenticated is accepted, matching the plaintext / single-CA deployments.
+    /// `Some(set)` requires the caller's client-certificate CN to be listed, so a
+    /// compromised agent that merely shares the cluster CA cannot inject
+    /// AppendEntries/Vote and hijack consensus.
+    allowed_cns: Option<Arc<HashSet<String>>>,
 }
 
 impl RaftServer {
-    pub fn new(raft: Raft<TypeConfig>) -> Self {
-        Self { raft }
+    pub fn new(raft: Raft<TypeConfig>, allowed_cns: Option<Arc<HashSet<String>>>) -> Self {
+        Self { raft, allowed_cns }
     }
+
+    /// Reject an RPC whose client-certificate CN is not on the allowlist. A `None`
+    /// allowlist accepts everyone (the check is off); a `Some` allowlist requires a
+    /// peer certificate whose CN is listed.
+    fn authorize<T>(&self, req: &Request<T>) -> Result<(), Status> {
+        let Some(allowed) = &self.allowed_cns else {
+            return Ok(());
+        };
+        let cn = peer_cn(req);
+        if cn_permitted(allowed, cn.as_deref()) {
+            Ok(())
+        } else {
+            Err(Status::permission_denied(match cn {
+                Some(cn) => format!("raft peer CN {cn:?} is not an authorized controller"),
+                None => "raft peer presented no client certificate".to_string(),
+            }))
+        }
+    }
+}
+
+/// Whether a client CN is permitted by the allowlist: it must be present *and*
+/// listed. An absent CN (no client certificate) is never permitted once an
+/// allowlist is in force.
+fn cn_permitted(allowed: &HashSet<String>, cn: Option<&str>) -> bool {
+    cn.is_some_and(|cn| allowed.contains(cn))
+}
+
+/// The subject Common Name of the request's client (leaf) certificate, if the
+/// transport carried one.
+fn peer_cn<T>(req: &Request<T>) -> Option<String> {
+    let certs = req.peer_certs()?;
+    let leaf = certs.first()?;
+    let (_, cert) = x509_parser::parse_x509_certificate(leaf.as_ref()).ok()?;
+    cert.subject()
+        .iter_common_name()
+        .next()
+        .and_then(|cn| cn.as_str().ok())
+        .map(str::to_string)
 }
 
 fn decode<T: serde::de::DeserializeOwned>(msg: &RaftMsg) -> Result<T, Status> {
@@ -51,6 +98,7 @@ fn encode<T: serde::Serialize>(value: &T) -> Result<Response<RaftMsg>, Status> {
 #[tonic::async_trait]
 impl RaftService for RaftServer {
     async fn append(&self, req: Request<RaftMsg>) -> Result<Response<RaftMsg>, Status> {
+        self.authorize(&req)?;
         let rpc: AppendEntriesRequest<TypeConfig> = decode(&req.into_inner())?;
         let resp = self
             .raft
@@ -61,6 +109,7 @@ impl RaftService for RaftServer {
     }
 
     async fn vote(&self, req: Request<RaftMsg>) -> Result<Response<RaftMsg>, Status> {
+        self.authorize(&req)?;
         let rpc: VoteRequest<NodeId> = decode(&req.into_inner())?;
         let resp = self
             .raft
@@ -71,6 +120,7 @@ impl RaftService for RaftServer {
     }
 
     async fn snapshot(&self, req: Request<RaftMsg>) -> Result<Response<RaftMsg>, Status> {
+        self.authorize(&req)?;
         let rpc: InstallSnapshotRequest<TypeConfig> = decode(&req.into_inner())?;
         let resp = self
             .raft
@@ -84,9 +134,14 @@ impl RaftService for RaftServer {
 /// The gRPC server type the controller mounts on its raft port.
 pub type RaftServiceServer = pb::raft_service_server::RaftServiceServer<RaftServer>;
 
-/// Build the tonic service for a Raft instance.
-pub fn service(raft: Raft<TypeConfig>) -> RaftServiceServer {
-    RaftServiceServer::new(RaftServer::new(raft))
+/// Build the tonic service for a Raft instance, restricting incoming RPCs to the
+/// controller CNs in `allowed_cns` (or accepting any TLS-authenticated peer when
+/// `None`).
+pub fn service(
+    raft: Raft<TypeConfig>,
+    allowed_cns: Option<Arc<HashSet<String>>>,
+) -> RaftServiceServer {
+    RaftServiceServer::new(RaftServer::new(raft, allowed_cns))
 }
 
 // --- Client side ------------------------------------------------------------
@@ -225,5 +280,26 @@ impl Network {
     #[allow(dead_code)]
     fn target(&self) -> NodeId {
         self.target
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cn_allowlist_admits_only_listed_controllers() {
+        let allowed: HashSet<String> = ["ctrl-a".to_string(), "ctrl-b".to_string()]
+            .into_iter()
+            .collect();
+        // A listed controller passes.
+        assert!(cn_permitted(&allowed, Some("ctrl-a")));
+        assert!(cn_permitted(&allowed, Some("ctrl-b")));
+        // A compromised agent that merely shares the CA (its own CN) is rejected.
+        assert!(!cn_permitted(&allowed, Some("agent-node-7")));
+        // No client certificate is never admitted once an allowlist is in force.
+        assert!(!cn_permitted(&allowed, None));
+        // An empty allowlist admits nothing (callers use `None` to disable instead).
+        assert!(!cn_permitted(&HashSet::new(), Some("ctrl-a")));
     }
 }

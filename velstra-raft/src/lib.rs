@@ -13,7 +13,12 @@
 //!
 //! [`Topology`]: velstra_orchestrator::Topology
 
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Result, anyhow};
 use openraft::{BasicNode, Config, Raft, ServerState, SnapshotPolicy};
@@ -39,6 +44,9 @@ pub struct RaftNode {
     sm: StateMachineStore,
     /// This node's id.
     pub id: NodeId,
+    /// The controller CNs allowed to drive this node's Raft state, if the peer
+    /// transport is CN-restricted (`None` accepts any TLS-authenticated peer).
+    allowed_cns: Option<Arc<HashSet<String>>>,
 }
 
 fn raft_config() -> Result<Arc<Config>> {
@@ -72,17 +80,23 @@ impl RaftNode {
     /// durability across a full restart: every controller reloads the last
     /// snapshot — the committed fabric — instead of coming up empty.
     pub async fn start_with_dir(id: NodeId, dir: Option<PathBuf>) -> Result<Self> {
-        Self::start_with_opts(id, dir, None).await
+        Self::start_with_opts(id, dir, None, None).await
     }
 
     /// Like [`RaftNode::start_with_dir`], but dialing peers with `client_tls`
     /// (the same TLS/mTLS material as the agent/admin channels) so the Raft peer
     /// transport is encrypted+authenticated rather than plaintext (C5). `None`
     /// keeps the plaintext transport for dev / single-node / trusted networks.
+    ///
+    /// `allowed_cns` restricts which client-certificate CNs may drive this node's
+    /// Raft state — the other controllers. `None` accepts any TLS-authenticated
+    /// peer (backwards-compatible); `Some` blocks a compromised agent that merely
+    /// shares the cluster CA from injecting AppendEntries/Vote.
     pub async fn start_with_opts(
         id: NodeId,
         dir: Option<PathBuf>,
         client_tls: Option<ClientTlsConfig>,
+        allowed_cns: Option<Arc<HashSet<String>>>,
     ) -> Result<Self> {
         let loaded = match &dir {
             Some(d) => {
@@ -105,13 +119,18 @@ impl RaftNode {
             sm.clone(),
         )
         .await?;
-        Ok(Self { raft, sm, id })
+        Ok(Self {
+            raft,
+            sm,
+            id,
+            allowed_cns,
+        })
     }
 
     /// The gRPC service to mount on this node's raft listen address so peers can
-    /// reach it.
+    /// reach it. It enforces this node's CN allowlist (if any) on every RPC.
     pub fn service(&self) -> RaftServiceServer {
-        service(self.raft.clone())
+        service(self.raft.clone(), self.allowed_cns.clone())
     }
 
     /// Initialise the cluster with `members` (`id -> raft address`). Run this on
