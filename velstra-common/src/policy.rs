@@ -154,11 +154,18 @@ pub enum Counter {
     /// inject into a locally-hosted segment, never an arbitrary one (decap VNI
     /// enforcement / tenant isolation at the ingress boundary).
     OverlayDropVni = 30,
+    /// A tenant port claimed a `(vni, MAC)` another port already owns, so the
+    /// local-MAC binding was **not** learned (B4b anti-spoof). The frame itself is
+    /// forwarded normally — only the binding is refused, which is what keeps a
+    /// tenant from having its neighbour's MAC advertised into EVPN on its behalf.
+    /// A non-zero count is either an attempted hijack or a workload that moved
+    /// ports while the old binding was still live.
+    MacLearnSpoof = 31,
 }
 
 impl Counter {
     /// Number of distinct counters — the `max_entries` of the `STATS` map.
-    pub const COUNT: u32 = 31;
+    pub const COUNT: u32 = 32;
 
     /// The array index of this counter.
     #[inline]
@@ -201,6 +208,7 @@ impl Counter {
             28 => Counter::Srv6Encap,
             29 => Counter::Srv6Decap,
             30 => Counter::OverlayDropVni,
+            31 => Counter::MacLearnSpoof,
             _ => return None,
         };
         Some(counter)
@@ -248,6 +256,7 @@ impl Counter {
             Counter::Srv6Encap => "srv6_encap",
             Counter::Srv6Decap => "srv6_decap",
             Counter::OverlayDropVni => "overlay_drop_vni",
+            Counter::MacLearnSpoof => "mac_learn_spoof",
         }
     }
 }

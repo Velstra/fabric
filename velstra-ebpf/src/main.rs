@@ -1250,11 +1250,20 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     if vni != 0
         && let Ok(src_mac) = unsafe { ptr_at::<[u8; 6]>(ctx, O_ETH_SRC) }
     {
-        let _ = LOCAL_MACS.insert(
-            &LocalMacKey::new(vni, unsafe { *src_mac }),
-            &LocalMac::new(src_addr),
-            0,
-        );
+        let key = LocalMacKey::new(vni, unsafe { *src_mac });
+        // Anti-spoof: the first port to claim a `(vni, MAC)` owns it. Without this
+        // any tenant could source-spoof a neighbour's MAC and the agent would
+        // advertise the neighbour's address as reachable via the attacker —
+        // poisoning EVPN across the fabric. Refuse the *binding* only; the frame
+        // still forwards, so this cannot black-hole traffic. A refused frame never
+        // refreshes the LRU, so a workload that genuinely moved ports is re-learned
+        // once the stale owner ages out.
+        match unsafe { LOCAL_MACS.get(&key) } {
+            Some(bound) if bound.ifindex != ifindex => bump(Counter::MacLearnSpoof),
+            _ => {
+                let _ = LOCAL_MACS.insert(&key, &LocalMac::new(src_addr, ifindex), 0);
+            }
+        }
     }
 
     // Hand the forwarding transforms (encap / DNAT / LB / route) to a tail-called
