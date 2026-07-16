@@ -12,6 +12,80 @@ pub mod ip_proto {
     pub const UDP: u8 = 17;
     /// ICMPv6 (the IPv6 equivalent of ICMP; also IPv6's next-header value).
     pub const ICMPV6: u8 = 58;
+
+    // --- IPv6 extension headers (RFC 8200 §4) -------------------------------
+    // These sit as next-header values *between* the fixed IPv6 header and the
+    // upper-layer protocol. A filter that stops at the fixed header sees one of
+    // these instead of the real protocol — which is precisely what makes them an
+    // evasion tool. See `is_ipv6_ext` / `ipv6_ext_len`.
+
+    /// Hop-by-Hop Options — must come first when present.
+    pub const HOPOPT: u8 = 0;
+    /// Routing header.
+    pub const ROUTING: u8 = 43;
+    /// Fragment header (fixed 8 bytes; carries the fragment offset).
+    pub const FRAGMENT: u8 = 44;
+    /// Encapsulating Security Payload — everything past it is encrypted, so the
+    /// chain cannot be walked further.
+    pub const ESP: u8 = 50;
+    /// Authentication Header (its length counts 4-byte units, unlike the others).
+    pub const AH: u8 = 51;
+    /// "No Next Header": nothing follows.
+    pub const NO_NEXT_HEADER: u8 = 59;
+    /// Destination Options.
+    pub const DSTOPTS: u8 = 60;
+    /// Mobility header (RFC 6275).
+    pub const MOBILITY: u8 = 135;
+    /// Host Identity Protocol.
+    pub const HIP: u8 = 139;
+    /// Shim6.
+    pub const SHIM6: u8 = 140;
+}
+
+/// Whether `proto` is an IPv6 extension header whose chain can be walked on to
+/// reach the upper-layer protocol.
+///
+/// [`ip_proto::ESP`] is deliberately **not** walkable — what follows it is
+/// encrypted — and [`ip_proto::NO_NEXT_HEADER`] terminates the chain. Both
+/// therefore read as "upper layer" to a caller, which stops the walk. That is the
+/// safe outcome: neither yields ports a rule could match.
+#[inline]
+pub const fn is_ipv6_ext(proto: u8) -> bool {
+    matches!(
+        proto,
+        ip_proto::HOPOPT
+            | ip_proto::ROUTING
+            | ip_proto::FRAGMENT
+            | ip_proto::AH
+            | ip_proto::DSTOPTS
+            | ip_proto::MOBILITY
+            | ip_proto::HIP
+            | ip_proto::SHIM6
+    )
+}
+
+/// The total length in bytes of the IPv6 extension header `proto`, given the
+/// `hdr_ext_len` byte at offset 1 of that header.
+///
+/// The units differ per header, which is why this is a named function rather than
+/// an inline expression: most extension headers count 8-byte units *excluding*
+/// the first 8 (`(len + 1) * 8`); the Authentication Header counts 4-byte units
+/// excluding the first 8 (`(len + 2) * 4`, RFC 4302 §2.2); and the Fragment header
+/// is a fixed 8 bytes, with that byte reserved. Returns `0` for a `proto` that is
+/// not a walkable extension header — callers gate on [`is_ipv6_ext`] first.
+#[inline]
+pub const fn ipv6_ext_len(proto: u8, hdr_ext_len: u8) -> usize {
+    match proto {
+        ip_proto::FRAGMENT => 8,
+        ip_proto::AH => (hdr_ext_len as usize + 2) * 4,
+        ip_proto::HOPOPT
+        | ip_proto::ROUTING
+        | ip_proto::DSTOPTS
+        | ip_proto::MOBILITY
+        | ip_proto::HIP
+        | ip_proto::SHIM6 => (hdr_ext_len as usize + 1) * 8,
+        _ => 0,
+    }
 }
 
 /// EtherType for IPv4, in **host** byte order. Compare against the value read
@@ -304,6 +378,56 @@ impl PacketMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipv6_ext_headers_are_classified_and_measured() {
+        // Walkable extension headers.
+        for p in [
+            ip_proto::HOPOPT,
+            ip_proto::ROUTING,
+            ip_proto::FRAGMENT,
+            ip_proto::AH,
+            ip_proto::DSTOPTS,
+            ip_proto::MOBILITY,
+            ip_proto::HIP,
+            ip_proto::SHIM6,
+        ] {
+            assert!(is_ipv6_ext(p), "{p} should be walkable");
+        }
+        // Upper-layer protocols end the walk.
+        for p in [
+            ip_proto::TCP,
+            ip_proto::UDP,
+            ip_proto::ICMPV6,
+            ip_proto::ICMP,
+        ] {
+            assert!(!is_ipv6_ext(p), "{p} is upper layer, not an ext header");
+        }
+        // ESP hides what follows and NO_NEXT_HEADER ends the chain: both must stop
+        // the walk rather than be treated as skippable.
+        assert!(!is_ipv6_ext(ip_proto::ESP));
+        assert!(!is_ipv6_ext(ip_proto::NO_NEXT_HEADER));
+
+        // The common headers count 8-byte units excluding the first 8.
+        assert_eq!(ipv6_ext_len(ip_proto::HOPOPT, 0), 8);
+        assert_eq!(ipv6_ext_len(ip_proto::DSTOPTS, 1), 16);
+        assert_eq!(ipv6_ext_len(ip_proto::ROUTING, 3), 32);
+        // The Fragment header is a fixed 8 bytes; its second byte is reserved, so
+        // a non-zero value there must not change the length.
+        assert_eq!(ipv6_ext_len(ip_proto::FRAGMENT, 0), 8);
+        assert_eq!(ipv6_ext_len(ip_proto::FRAGMENT, 0xff), 8);
+        // The Authentication Header counts 4-byte units excluding the first 8.
+        assert_eq!(ipv6_ext_len(ip_proto::AH, 1), 12);
+        assert_eq!(ipv6_ext_len(ip_proto::AH, 4), 24);
+        // A non-extension header has no extension length.
+        assert_eq!(ipv6_ext_len(ip_proto::TCP, 9), 0);
+        assert_eq!(ipv6_ext_len(ip_proto::ESP, 9), 0);
+
+        // The largest header the length byte can describe still fits the bound the
+        // data plane clamps its walk to (see MAX_EXT_CHAIN_LEN there).
+        assert_eq!(ipv6_ext_len(ip_proto::HOPOPT, u8::MAX), 2048);
+        assert_eq!(ipv6_ext_len(ip_proto::AH, u8::MAX), 1028);
+    }
 
     #[test]
     fn port_key_is_four_bytes_no_uninit() {
