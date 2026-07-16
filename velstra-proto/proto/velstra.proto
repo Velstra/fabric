@@ -377,6 +377,11 @@ message NodeConfig {
   repeated MacRoute mac_routes = 15; // B1 per-MAC L2 forwarding entries
   repeated Nd6 nd_neighbors = 16;   // B3 IPv6 ND-suppression neighbours
   repeated FloodVtep flood_vteps = 17; // B2 per-VNI BUM head-end flood entries
+
+  // Drop a packet the data plane cannot parse instead of passing it. Host-wide
+  // (the parse fails before any policy is known), so it is not a Policy field.
+  // Absent/false = fail open, the historical behaviour.
+  bool fail_closed = 18;
 }
 
 // Encapsulation format for the overlay.
