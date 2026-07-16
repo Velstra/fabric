@@ -351,15 +351,21 @@ unsafe impl aya::Pod for LocalMacKey {}
 pub struct LocalMac {
     /// The learned tenant IPv4, network-order octets.
     pub ip: [u8; 4],
-    /// Explicit padding, always zero.
-    pub _pad: [u8; 4],
+    /// The tenant port (ingress ifindex) this binding was learned on. A frame
+    /// arriving on a *different* port claiming the same `(vni, MAC)` is refused,
+    /// so a tenant cannot take over a neighbour's MAC and have the agent
+    /// advertise it into EVPN on its behalf. The first port to claim a MAC owns
+    /// it until the entry ages out of the LRU — the classic sticky-MAC trade: a
+    /// port that genuinely moved is re-learned once the old owner falls silent,
+    /// because a refused frame never refreshes the entry.
+    pub ifindex: u32,
 }
 
 impl LocalMac {
-    /// Build a value binding `ip` to a learned source MAC.
+    /// Build a value binding `ip`, learned on port `ifindex`, to a source MAC.
     #[inline]
-    pub const fn new(ip: [u8; 4]) -> Self {
-        Self { ip, _pad: [0; 4] }
+    pub const fn new(ip: [u8; 4], ifindex: u32) -> Self {
+        Self { ip, ifindex }
     }
 }
 
@@ -818,12 +824,16 @@ mod tests {
         assert_ne!(k, LocalMacKey::new(10, mac));
         assert_ne!(k, LocalMacKey::new(9, [0x02, 0, 0, 0, 0, 0x0b]));
 
-        // The value carries the bound IPv4 with zeroed padding.
-        let v = LocalMac::new([192, 168, 1, 5]);
-        assert_eq!(v._pad, [0, 0, 0, 0]);
+        // The value carries the bound IPv4 and the port it was learned on.
+        let v = LocalMac::new([192, 168, 1, 5], 7);
         assert_eq!(v.ip, [192, 168, 1, 5]);
-        assert_eq!(v, LocalMac::new([192, 168, 1, 5]));
-        assert_ne!(v, LocalMac::new([192, 168, 1, 6]));
+        assert_eq!(v.ifindex, 7);
+        assert_eq!(v, LocalMac::new([192, 168, 1, 5], 7));
+        assert_ne!(v, LocalMac::new([192, 168, 1, 6], 7));
+        // The owning port is part of the binding: the same MAC/IP learned on a
+        // different port is a different value — that difference is what the
+        // data plane's anti-spoof check keys on.
+        assert_ne!(v, LocalMac::new([192, 168, 1, 5], 8));
     }
 
     #[test]
