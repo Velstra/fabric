@@ -719,6 +719,7 @@ fn apply_config(ebpf: &mut Ebpf, cfg: &RuntimeConfig, old: Option<&RuntimeConfig
         remove_stale(ebpf, old)?;
     }
 
+    program_fail_closed(ebpf, cfg.fail_closed)?;
     program_policies(ebpf, &cfg.policies)?;
     program_interfaces(ebpf, &cfg.interfaces)?;
     program_routes(ebpf, &cfg.routes)?;
@@ -742,6 +743,20 @@ fn apply_config(ebpf: &mut Ebpf, cfg: &RuntimeConfig, old: Option<&RuntimeConfig
         &cfg.srv6_local_sids,
     )?;
 
+    Ok(())
+}
+
+/// Write the host-wide `FAIL_CLOSED` flag: whether the data plane drops a packet
+/// it cannot parse instead of passing it. Slot `0` is always written — including
+/// the `false` (fail-open) default — so a `reconfigure` that turns the flag off
+/// actually takes it back rather than leaving the old value in the map.
+fn program_fail_closed(ebpf: &mut Ebpf, fail_closed: bool) -> Result<()> {
+    let mut map: Array<_, u32> = Array::try_from(
+        ebpf.map_mut("FAIL_CLOSED")
+            .ok_or_else(|| anyhow!("FAIL_CLOSED map missing"))?,
+    )?;
+    map.set(0, u32::from(fail_closed), 0)
+        .context("writing FAIL_CLOSED")?;
     Ok(())
 }
 

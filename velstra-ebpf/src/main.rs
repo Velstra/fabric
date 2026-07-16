@@ -100,6 +100,19 @@ static LOCAL_VNIS: HashMap<u32, u32> = HashMap::with_max_entries(4096, 0);
 #[map]
 static CONFIG: HashMap<PolicyId, GlobalConfig> = HashMap::with_max_entries(1024, 0);
 
+/// Host-wide fail-closed switch: a single-slot flag (`0` / absent = fail **open**,
+/// non-zero = fail **closed**). It governs only what happens when the data plane
+/// cannot parse a packet at all — a `ptr_at` bounds failure — which is decided
+/// before any policy is known, so it cannot live in the per-policy [`CONFIG`].
+///
+/// Fail-open (the default, and the historical behaviour) lets an unparseable
+/// packet through: a firewall should not black-hole traffic because of its own
+/// parsing limits. Under a deny-by-default posture that is the wrong trade — a
+/// packet the filter cannot understand is exactly the one it must not admit — so
+/// an operator can flip this to drop instead.
+#[map]
+static FAIL_CLOSED: Array<u32> = Array::with_max_entries(1, 0);
+
 /// Per-policy source-IP CIDR blocklist, keyed by [`ScopedAddr`] (policy id +
 /// address prefix).
 #[map]
@@ -338,18 +351,26 @@ static VELSTRA_PROGS: ProgramArray = ProgramArray::with_max_entries(1, 0);
 /// Index of [`velstra_forward`] in [`VELSTRA_PROGS`].
 const PROG_FORWARD: u32 = 0;
 
-/// XDP entry point. Kept tiny: it delegates to [`try_velstra`] and turns a
-/// parse failure into a safe `XDP_PASS` (fail-open) rather than aborting.
+/// XDP entry point. Kept tiny: it delegates to [`try_velstra`] and turns a parse
+/// failure into `XDP_PASS` (fail-open) or `XDP_DROP` (fail-closed), per the
+/// host-wide [`FAIL_CLOSED`] flag, rather than aborting.
 #[xdp]
 pub fn velstra(ctx: XdpContext) -> u32 {
     match try_velstra(&ctx) {
         Ok(action) => action,
-        // A `ptr_at` bounds failure lands here. Count it and let the packet
-        // through — a firewall should never black-hole traffic because of its
-        // own parsing error.
+        // A `ptr_at` bounds failure lands here. Count it, then either let the
+        // packet through — a firewall should not black-hole traffic because of its
+        // own parsing limits — or, when the operator has chosen a deny-by-default
+        // posture, drop it: a packet the filter cannot parse is precisely the one
+        // it must not admit. The `Malformed` counter records the event either way,
+        // so the flag alone says which of the two happened.
         Err(()) => {
             bump(Counter::Malformed);
-            xdp_action::XDP_PASS
+            if fail_closed() {
+                xdp_action::XDP_DROP
+            } else {
+                xdp_action::XDP_PASS
+            }
         }
     }
 }
@@ -357,12 +378,21 @@ pub fn velstra(ctx: XdpContext) -> u32 {
 /// TC **egress** entry point (Phase B). Where the XDP hook above filters traffic
 /// arriving at a NIC, this filters traffic *leaving* one — closing the gap XDP
 /// can't reach: host-originated egress, and the receive side of a tenant tap.
-/// Delegates to [`try_egress`]; a parse failure fails open (`TC_ACT_OK`).
+/// Delegates to [`try_egress`]; a parse failure fails open (`TC_ACT_OK`) or, when
+/// the host-wide [`FAIL_CLOSED`] flag is set, closed (`TC_ACT_SHOT`) — the same
+/// trade the XDP hook above makes, counted the same way.
 #[classifier]
 pub fn velstra_egress(ctx: TcContext) -> i32 {
     match try_egress(&ctx) {
         Ok(action) => action,
-        Err(()) => TC_ACT_OK as i32,
+        Err(()) => {
+            bump(Counter::Malformed);
+            if fail_closed() {
+                TC_ACT_SHOT as i32
+            } else {
+                TC_ACT_OK as i32
+            }
+        }
     }
 }
 
@@ -1657,6 +1687,14 @@ fn try_nd(ctx: &XdpContext) -> Result<Option<u32>, ()> {
     }
     bump(Counter::NdSuppressed);
     Ok(Some(xdp_action::XDP_TX))
+}
+
+/// Whether this host runs **fail-closed**: an unparseable packet is dropped rather
+/// than passed. Reads the single-slot [`FAIL_CLOSED`] flag; absent (the control
+/// plane never wrote it) means fail-open, preserving the historical behaviour.
+#[inline(always)]
+fn fail_closed() -> bool {
+    FAIL_CLOSED.get(0).copied().unwrap_or(0) != 0
 }
 
 /// Read this host's [`OverlayConfig`] from the single-entry array map, falling

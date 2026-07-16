@@ -112,6 +112,7 @@ pub fn file_config_to_proto(cfg: &FileConfig, version: u64) -> proto::NodeConfig
         drop_icmp: cfg.drop_icmp,
         log: cfg.log,
         stateful: cfg.stateful,
+        fail_closed: cfg.fail_closed,
         blocklist: cfg.blocklist.clone(),
         port_rules: cfg.port_rules.iter().map(port_rule_to_proto).collect(),
         policies: cfg
@@ -236,6 +237,7 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
         drop_icmp: cfg.drop_icmp,
         log: cfg.log,
         stateful: cfg.stateful,
+        fail_closed: cfg.fail_closed,
         blocklist: cfg.blocklist.clone(),
         port_rules: cfg.port_rules.iter().map(port_rule_from_proto).collect(),
         policies: cfg
@@ -446,6 +448,33 @@ mod tests {
         assert_eq!(a.services[0].backends, b.services[0].backends);
         assert_eq!(a.routes.len(), b.routes.len());
         assert_eq!(a.routes[0].flags, b.routes[0].flags);
+    }
+
+    #[test]
+    fn fail_closed_survives_toml_proto_and_resolve() {
+        // Absent from the TOML: fail open, the historical behaviour, all the way
+        // through to the resolved map contents.
+        let default: FileConfig = toml::from_str("default_action = \"drop\"").unwrap();
+        assert!(!default.fail_closed);
+        assert!(!file_config_to_proto(&default, 1).fail_closed);
+        assert!(!default.resolve().unwrap().fail_closed);
+        // A passthrough config never fails closed either.
+        assert!(!RuntimeConfig::passthrough().fail_closed);
+
+        // Set in the TOML: carried across the wire and into the RuntimeConfig the
+        // agent programs into the FAIL_CLOSED map.
+        let toml = r#"
+            default_action = "drop"
+            fail_closed = true
+        "#;
+        let original: FileConfig = toml::from_str(toml).unwrap();
+        assert!(original.fail_closed);
+        let wire = file_config_to_proto(&original, 2);
+        assert!(wire.fail_closed);
+        let back = file_config_from_proto(&wire);
+        assert!(back.fail_closed);
+        assert!(back.resolve().unwrap().fail_closed);
+        assert!(runtime_from_proto(&wire).unwrap().fail_closed);
     }
 
     #[test]

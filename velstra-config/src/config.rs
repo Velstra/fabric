@@ -442,6 +442,13 @@ pub struct FileConfig {
     pub log: bool,
     /// Track connections and allow established flows (stateful firewall).
     pub stateful: bool,
+    /// Drop a packet the data plane cannot parse instead of passing it. Off by
+    /// default: a firewall should not black-hole traffic because of its own
+    /// parsing limits. Turn it on under a deny-by-default posture, where a packet
+    /// the filter cannot understand is exactly the one it must not admit. Host-wide
+    /// (the parse fails before any policy is known), covering the XDP ingress and
+    /// the TC egress hook alike.
+    pub fail_closed: bool,
     /// Source-IP CIDR blocks to drop unconditionally.
     pub blocklist: Vec<String>,
     /// Per-`(proto, port)` rules. Spelled `[[port_rule]]` in TOML.
@@ -848,6 +855,10 @@ pub struct RuntimeConfig {
     pub srv6_routes: Vec<ResolvedSrv6Route>,
     /// SRv6 local-SID instantiations for the `SRV6_LOCAL_SIDS` map (B9 decap).
     pub srv6_local_sids: Vec<ResolvedSrv6LocalSid>,
+    /// Host-wide fail-closed switch for the `FAIL_CLOSED` map: drop a packet the
+    /// data plane cannot parse instead of passing it. `false` (the default) keeps
+    /// the historical fail-open behaviour.
+    pub fail_closed: bool,
 }
 
 impl RuntimeConfig {
@@ -855,6 +866,9 @@ impl RuntimeConfig {
     /// invoked without a `--config` file.
     pub fn passthrough() -> Self {
         Self {
+            // Pass-everything means pass-everything: an unparseable packet is
+            // passed too, matching this config's whole premise.
+            fail_closed: false,
             policies: vec![PolicyConfig {
                 id: 0,
                 global: GlobalConfig::new(Action::Pass, 0),
@@ -1394,6 +1408,7 @@ impl FileConfig {
         }
 
         Ok(RuntimeConfig {
+            fail_closed: self.fail_closed,
             policies,
             interfaces,
             routes,
