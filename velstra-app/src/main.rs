@@ -320,15 +320,26 @@ async fn run(args: RunArgs) -> Result<()> {
     // table to the HA peer(s) and apply theirs — so established NAT flows survive a
     // VRRP failover. Opt-in (present only on an HA appliance) and best-effort.
     if let Some(cts) = initial.conntrack_sync.clone() {
-        match firewall.lock().await.take_conntrack() {
-            Ok(map) => {
+        // Take both flow tables the datapath keys on: CONNTRACK (NAT) and FW_FLOWS
+        // (stateful-firewall replies). Both must cross to the backup or a failover
+        // drops established connections.
+        let handles = {
+            let mut fw = firewall.lock().await;
+            match (fw.take_conntrack(), fw.take_fw_flows()) {
+                (Ok(ct), Ok(ff)) => Ok((ct, ff)),
+                (Err(e), _) | (_, Err(e)) => Err(e),
+            }
+        };
+        match handles {
+            Ok((conntrack, fw_flows)) => {
                 info!(
                     "conntrack-sync: enabled (listen {}, {} peer(s))",
                     cts.listen,
                     cts.peers.len()
                 );
                 tokio::spawn(conntrack_sync::run(
-                    map,
+                    conntrack,
+                    fw_flows,
                     cts.listen,
                     cts.peers,
                     cts.interval_secs,
