@@ -709,6 +709,20 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
             let _ = peers.remove(&fv.remote_vtep_ip);
         }
     }
+    if let Some(old_srv6) = &old.srv6 {
+        // B9 trusted-SRv6-peer set (C2): drop the old peers so a peer removed from
+        // the config stops being an authorized decap source on this live
+        // reconfigure; program_srv6 re-adds every still-current one. (Unlike the
+        // SRv6 SID/FDB maps this security-sensitive set is reconciled, so a
+        // de-authorized peer never lingers trusted until the next restart.)
+        let mut srv6_peers: HashMap<_, [u8; 16], u8> = HashMap::try_from(
+            ebpf.map_mut("SRV6_PEERS")
+                .ok_or_else(|| anyhow!("SRV6_PEERS map missing"))?,
+        )?;
+        for p in &old_srv6.peers {
+            let _ = srv6_peers.remove(p);
+        }
+    }
     {
         let mut arp: HashMap<_, ArpKey, ArpEntry> = HashMap::try_from(
             ebpf.map_mut("ARP_TABLE")
@@ -1362,6 +1376,23 @@ fn program_srv6(
                 .ok_or_else(|| anyhow!("SRV6_CONFIG map missing"))?,
         )?;
         cfg_map.set(0, config, 0).context("writing SRV6_CONFIG")?;
+    }
+
+    // C2 decap source-auth: every trusted peer's outer IPv6 source → the
+    // `SRV6_PEERS` set the datapath checks before decapsulating an End.DT2U frame
+    // to one of our SIDs. remove_stale dropped the old set first; an empty set
+    // (no peers configured) leaves decap fail-closed. The SRv6 analogue of the
+    // VTEP_PEERS population in program_overlay.
+    if let Some(s) = srv6 {
+        let mut peers: HashMap<_, [u8; 16], u8> = HashMap::try_from(
+            ebpf.map_mut("SRV6_PEERS")
+                .ok_or_else(|| anyhow!("SRV6_PEERS map missing"))?,
+        )?;
+        for src in &s.peers {
+            peers
+                .insert(src, 1, 0)
+                .context("inserting trusted SRv6 peer")?;
+        }
     }
 
     // B9 decap: every service SID this host instantiates → its (vni, behaviour).

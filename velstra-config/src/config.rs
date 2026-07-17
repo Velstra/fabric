@@ -342,6 +342,16 @@ pub struct Srv6Cfg {
     /// bytes (the 40-byte outer IPv6 header, over the inner's own 14-byte L2).
     #[serde(default)]
     pub underlay_mtu: Option<u16>,
+    /// Trusted decap peers: the outer IPv6 **source** addresses this node accepts
+    /// an SRv6 `End.DT2U` decap from (each peer's own `local_src`). A packet to one
+    /// of our local SIDs is decapsulated only when its outer source is in this set
+    /// — the SRv6 analogue of the VXLAN trusted-VTEP set, closing the same
+    /// forge-a-frame-past-the-firewall hole on the underlay. Empty ⇒ no source is
+    /// trusted and decap is refused (fail-closed). The remote SID we send *toward*
+    /// (`[[srv6_route]].remote_sid`) is a function-bearing SID and is generally not
+    /// a peer's source, so trust cannot be derived from routes — list it here.
+    #[serde(default)]
+    pub peers: Vec<String>,
 }
 
 /// One SRv6 L2 forwarding entry (`[[srv6_route]]`, B9): which remote `End.DT2U`
@@ -786,6 +796,11 @@ pub struct ResolvedSrv6 {
     pub local_mac: Option<[u8; 6]>,
     /// Underlay path MTU in bytes.
     pub underlay_mtu: u16,
+    /// Trusted decap-peer outer IPv6 sources (network-order octets). A packet to
+    /// one of our local SIDs is SRv6-decapsulated only when its outer source is in
+    /// this set. Empty ⇒ fail-closed (no decap). Programmed into the `SRV6_PEERS`
+    /// map, the SRv6 analogue of `VTEP_PEERS`.
+    pub peers: Vec<[u8; 16]>,
 }
 
 /// A resolved SRv6 L2 forwarding entry (B9): the tenant segment, the inner
@@ -1347,11 +1362,19 @@ impl FileConfig {
                     ),
                     None => None,
                 };
+                let mut peers = Vec::with_capacity(s.peers.len());
+                for p in &s.peers {
+                    let ip: Ipv6Addr = p
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("invalid srv6 peer {p:?}"))?;
+                    peers.push(ip.octets());
+                }
                 Some(ResolvedSrv6 {
                     local_src: local_src.octets(),
                     underlay_iface: s.underlay_iface.clone(),
                     local_mac,
                     underlay_mtu: s.underlay_mtu.unwrap_or(1500),
+                    peers,
                 })
             }
             None => None,
@@ -1600,9 +1623,10 @@ impl fmt::Display for RuntimeConfig {
         match &self.srv6 {
             Some(s) => writeln!(
                 f,
-                "srv6           : src {} dev {} (End.DT2U)",
+                "srv6           : src {} dev {} (End.DT2U, {} trusted decap peer(s))",
                 Ipv6Addr::from(s.local_src),
                 s.underlay_iface,
+                s.peers.len(),
             )?,
             None => writeln!(f, "srv6           : disabled")?,
         }
@@ -1967,6 +1991,7 @@ mod tests {
             local_src = "fc00:0:1::1"
             underlay_iface = "eth0"
             underlay_mtu = 9000
+            peers = ["fc00:0:2::1", "fc00:0:3::1"]
 
             [[srv6_route]]
             vni = 10000
@@ -1985,6 +2010,17 @@ mod tests {
         assert_eq!(s.underlay_iface, "eth0");
         assert_eq!(s.local_mac, None);
         assert_eq!(s.underlay_mtu, 9000);
+        // The trusted decap peers resolve to their outer IPv6 source octets — and
+        // are the peers' `local_src`, NOT the function-bearing `remote_sid` route.
+        assert_eq!(s.peers.len(), 2);
+        assert_eq!(
+            s.peers[0],
+            "fc00:0:2::1".parse::<Ipv6Addr>().unwrap().octets()
+        );
+        assert_eq!(
+            s.peers[1],
+            "fc00:0:3::1".parse::<Ipv6Addr>().unwrap().octets()
+        );
 
         assert_eq!(cfg.srv6_routes.len(), 1);
         let r = &cfg.srv6_routes[0];
@@ -1993,6 +2029,28 @@ mod tests {
         assert_eq!(r.remote_sid[0..2], [0xfc, 0x00]);
         assert_eq!(r.outer_dst_mac, [2, 0, 0, 0, 0, 2]);
         assert_eq!(r.out_iface, "eth0");
+    }
+
+    #[test]
+    fn srv6_peers_default_empty_and_reject_bad_address() {
+        // Omitting `peers` leaves the trusted set empty (fail-closed at the datapath).
+        let ok = r#"
+            [srv6]
+            local_src = "fc00:0:1::1"
+            underlay_iface = "eth0"
+        "#;
+        let cfg = toml::from_str::<FileConfig>(ok).unwrap().resolve().unwrap();
+        assert!(cfg.srv6.expect("srv6").peers.is_empty());
+
+        // A malformed peer address is rejected at resolve, not silently dropped.
+        let bad = r#"
+            [srv6]
+            local_src = "fc00:0:1::1"
+            underlay_iface = "eth0"
+            peers = ["not-an-ipv6"]
+        "#;
+        let err = toml::from_str::<FileConfig>(bad).unwrap().resolve();
+        assert!(err.is_err());
     }
 
     #[test]
