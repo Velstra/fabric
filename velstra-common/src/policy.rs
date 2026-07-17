@@ -161,11 +161,18 @@ pub enum Counter {
     /// A non-zero count is either an attempted hijack or a workload that moved
     /// ports while the old binding was still live.
     MacLearnSpoof = 31,
+    /// An SRv6 `End.DT2U` decap was refused because the packet's outer IPv6 source
+    /// was not a trusted peer (`SRV6_PEERS`). Without this the frame would be
+    /// decapsulated and its inner Ethernet frame bridged into a tenant — the SRv6
+    /// analogue of `OverlayDropUntrusted`. A non-zero count is a forged/misrouted
+    /// underlay packet aimed at one of our service SIDs, or a peer whose source is
+    /// missing from the trusted set.
+    Srv6DropUntrusted = 32,
 }
 
 impl Counter {
     /// Number of distinct counters — the `max_entries` of the `STATS` map.
-    pub const COUNT: u32 = 32;
+    pub const COUNT: u32 = 33;
 
     /// The array index of this counter.
     #[inline]
@@ -209,6 +216,7 @@ impl Counter {
             29 => Counter::Srv6Decap,
             30 => Counter::OverlayDropVni,
             31 => Counter::MacLearnSpoof,
+            32 => Counter::Srv6DropUntrusted,
             _ => return None,
         };
         Some(counter)
@@ -257,6 +265,7 @@ impl Counter {
             Counter::Srv6Decap => "srv6_decap",
             Counter::OverlayDropVni => "overlay_drop_vni",
             Counter::MacLearnSpoof => "mac_learn_spoof",
+            Counter::Srv6DropUntrusted => "srv6_drop_untrusted",
         }
     }
 }

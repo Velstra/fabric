@@ -260,6 +260,17 @@ static SRV6_FDB: HashMap<MacFdbKey, Srv6Endpoint> = HashMap::with_max_entries(81
 #[map]
 static SRV6_LOCAL_SIDS: HashMap<Srv6SidKey, Srv6LocalSid> = HashMap::with_max_entries(8192, 0);
 
+/// B9 SRv6 **trusted decap-peer set** (C2 analogue of [`VTEP_PEERS`]): the outer
+/// IPv6 **source** (network order) of every remote peer this host accepts an
+/// `End.DT2U` decap from — each peer's own `local_src`. A packet addressed to one
+/// of our SIDs is decapsulated only when its outer source is in this set;
+/// otherwise a host on the underlay could forge a frame to our SID and have its
+/// inner Ethernet frame bridged into a tenant, past the firewall. Empty ⇒ no
+/// source is trusted (fail-closed decap). Pushed by the control plane alongside
+/// `SRV6_LOCAL_SIDS`.
+#[map]
+static SRV6_PEERS: HashMap<[u8; 16], u8> = HashMap::with_max_entries(8192, 0);
+
 /// B2 per-VNI **flood set**: `vni` → the [`FloodSet`] of remote VTEPs a
 /// broadcast/unknown-unicast/multicast (BUM) frame on that segment must be
 /// head-end replicated to. Consulted by the TC ingress `velstra_bum` classifier
@@ -1741,9 +1752,9 @@ fn try_srv6_decap(ctx: &XdpContext, hdr: &[u8; Ipv6Hdr::LEN]) -> Result<Option<u
     }
     // Only decapsulate on a non-tenant (underlay) ingress port: a tenant tap
     // (`vni != 0`) must never be able to forge a packet addressed to one of our
-    // SIDs and have its inner frame injected past tenant isolation. (Full
-    // trusted-source auth — an `SRV6_PEERS` set, the C2 analogue of
-    // `VTEP_PEERS` — is a follow-on.)
+    // SIDs and have its inner frame injected past tenant isolation. (Trusted-source
+    // auth against `SRV6_PEERS` — the C2 analogue of `VTEP_PEERS` — is enforced
+    // below, once the packet is confirmed to be a decap candidate.)
     let ifindex = ctx.ingress_ifindex() as u32;
     if unsafe { IFACE_VNI.get(&ifindex) }.copied().unwrap_or(0) != 0 {
         return Ok(None);
@@ -1774,6 +1785,19 @@ fn try_srv6_decap(ctx: &XdpContext, hdr: &[u8; Ipv6Hdr::LEN]) -> Result<Option<u
     // offset 6 of the already-bounds-checked 40-byte outer IPv6 header.
     if hdr[6] != velstra_common::srv6::IPPROTO_ETHERNET {
         return Ok(None);
+    }
+    // C2 source auth: this is now a confirmed End.DT2U decap candidate for one of
+    // our SIDs. Decapsulate only when its outer IPv6 source is a trusted peer —
+    // otherwise a host on the underlay could forge a frame to our SID and have its
+    // inner Ethernet frame bridged into a tenant, past the firewall (the SRv6
+    // analogue of the VTEP_PEERS gate on the VXLAN path). The 16-byte outer source
+    // sits at offset 8 of the bounds-checked outer IPv6 header; view it in place
+    // (byte array, align 1) so no key is built on this already-deep stack frame.
+    // SAFETY: `hdr` is a live 40-byte array; bytes 8..24 are in bounds.
+    let outer_src = unsafe { &*(hdr.as_ptr().add(8) as *const [u8; 16]) };
+    if unsafe { SRV6_PEERS.get(outer_src) }.is_none() {
+        bump(Counter::Srv6DropUntrusted);
+        return Ok(Some(xdp_action::XDP_DROP));
     }
     // Strip outer Ethernet (14) + IPv6 (40) = SRV6_L2_OUTER_LEN. The inner frame
     // is an Ethernet frame, left for the kernel bridge to deliver by inner MAC.
