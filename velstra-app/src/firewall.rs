@@ -458,6 +458,24 @@ impl Firewall {
             .ok_or_else(|| anyhow!("CONNTRACK map missing"))?;
         HashMap::try_from(map).context("CONNTRACK as a HashMap")
     }
+
+    /// Take ownership of the `FW_FLOWS` map handle for the same C9 conntrack-sync
+    /// task. `FW_FLOWS` is the stateful-firewall reply table (`FlowKey → present`,
+    /// value a mere presence flag); replicating it alongside `CONNTRACK` is what
+    /// lets an established but *non-NAT'd* stateful flow's reply survive a VRRP
+    /// failover — without it the reply misses `FW_FLOWS` on the new master and the
+    /// deny-by-default zone drops it. Same take-out rationale as [`take_conntrack`]:
+    /// the XDP map reference is already resolved, the kernel map lives on, and
+    /// nothing else in the control plane touches `FW_FLOWS`.
+    ///
+    /// [`take_conntrack`]: Firewall::take_conntrack
+    pub fn take_fw_flows(&mut self) -> Result<HashMap<MapData, FlowKey, u8>> {
+        let map = self
+            .ebpf
+            .take_map("FW_FLOWS")
+            .ok_or_else(|| anyhow!("FW_FLOWS map missing"))?;
+        HashMap::try_from(map).context("FW_FLOWS as a HashMap")
+    }
 }
 
 /// Raise the locked-memory rlimit so map allocation succeeds on older kernels
