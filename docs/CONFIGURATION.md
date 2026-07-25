@@ -239,6 +239,7 @@ probes.
 | `/v1/floating-ips`, `/v1/floating-ips/<id>` | `GET` `POST` / `GET` `DELETE` |
 | `/v1/floating-ips/<id>/associate`, `/v1/floating-ips/<id>/disassociate` | `POST` |
 | `/v1/audit` | `GET` |
+| `/v1/events` | `GET` (SSE) |
 | `/healthz`, `/version` | `GET` |
 
 Reads are open; **mutations are admin-only** (a node token may only register its
@@ -251,6 +252,27 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" \
      -d '{"id":"web-vip","vni":5000,"vip":"192.168.100.200","port":80,
           "members":[{"port_id":"port-5000-192.168.100.10","port":8080}]}'
 ```
+
+#### Change events
+
+`GET /v1/events` is a Server-Sent Events stream of the same records the audit log
+keeps — which operation touched which target, by whom, and whether it succeeded.
+That is enough for a consuming product to react by re-reading the affected
+resource, instead of polling the whole fabric.
+
+```
+event: audit
+id: 9
+data: {"seq":9,"ts_millis":1785014747925,"actor":"ops-admin",
+       "operation":"network.create","target":"vni=101","result":"ok"}
+```
+
+Only records emitted *after* subscribing are delivered; `GET /v1/audit` serves
+the backlog, so a consumer that wants both reads the backlog first and
+de-duplicates on `seq`. A subscriber that cannot keep up is **lagged**, not
+blocked — it gets an `event: lagged` naming how many records it missed and the
+stream continues. Back-pressure is deliberately not an option here: a slow
+consumer must never stall the fabric's mutations.
 
 Errors use one envelope throughout:
 
