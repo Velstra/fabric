@@ -33,8 +33,8 @@ use std::{
 use anyhow::{Result, bail};
 use velstra_common::{Cidr4, Cidr6, PolicyId, mask_v4, mask_v6};
 use velstra_config::{
-    ActionName, EncapName, FileConfig, InterfaceFile, NeighborCfg, OverlayCfg, PolicyFile,
-    PortRule, TunnelCfg,
+    ActionName, BackendCfg, EncapName, FileConfig, InterfaceFile, NeighborCfg, OverlayCfg,
+    PolicyFile, PortRule, ProtoName, ServiceCfg, TunnelCfg,
 };
 
 /// A physical host that terminates tunnels (a VTEP).
@@ -392,6 +392,47 @@ pub struct FloatingIp {
     pub association: Option<FloatingAssociation>,
 }
 
+/// One member of a [`LoadBalancer`]'s pool: a **fabric port**, plus the L4 port
+/// traffic is translated to.
+///
+/// A member names a port rather than a raw address on purpose. The port owns the
+/// address, so a live-migrated workload stays in the pool at whatever address it
+/// carries, and a member can never point at an address nothing serves — the two
+/// ways a hand-written backend list rots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LbMember {
+    /// The fabric port serving this backend.
+    pub port_id: String,
+    /// Backend L4 port, or `0` to keep the client's original destination port.
+    pub port: u16,
+}
+
+/// A load-balanced virtual service (roadmap D2, "LBaaS"): a VIP fronting a pool
+/// of fabric ports, DNAT-rewritten in XDP at the ingress host.
+///
+/// The datapath has always had this (`SERVICES` + `BACKENDS`); what it lacked was
+/// a place in the *model*, so a VIP could only be hand-written into an agent's
+/// config file — invisible to the API, unreplicated, and stale the moment a
+/// backend moved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadBalancer {
+    /// Stable id.
+    pub id: String,
+    /// The network (VNI) the VIP lives on. Also scopes the service in the
+    /// datapath, so two tenants may front the same VIP:port.
+    pub vni: u32,
+    /// The virtual address clients connect to.
+    pub vip: Ipv4Addr,
+    /// The virtual service port.
+    pub port: u16,
+    /// Transport protocol — TCP or UDP; the datapath load-balances no others.
+    pub proto: ProtoName,
+    /// The backend pool. May be empty: a drained pool is a legitimate state (the
+    /// datapath counts the miss as `lb_no_backend` and passes the packet on),
+    /// not an error.
+    pub members: Vec<LbMember>,
+}
+
 /// The whole virtual fabric: networks, hosts, and the ports binding them.
 /// Holds no I/O — the controller owns persistence and distribution.
 #[derive(Debug, Default, Clone)]
@@ -414,6 +455,8 @@ pub struct Topology {
     /// with its floating subnet's VNI and holds an IPAM address under an
     /// [`IpAllocOwner::Floating`] owner.
     floating_ips: HashMap<String, FloatingIp>,
+    /// Load-balanced services (D2 LBaaS), keyed by id.
+    load_balancers: HashMap<String, LoadBalancer>,
 }
 
 /// Derive a locally-administered, deterministic MAC for an inner IPv4: `02:00`
@@ -536,6 +579,15 @@ impl Topology {
         if let Some(s) = self.subnets.values().find(|s| s.vni == vni) {
             bail!("network {vni} still has subnet {:?}; remove it first", s.id);
         }
+        // Leaving a removed network in an IP-VRF's member list would make that
+        // VRF route a segment that no longer exists — the same dangling
+        // reference `add_ip_vrf` refuses to create.
+        if let Some(vrf) = self.ip_vrf_of_network(vni) {
+            bail!(
+                "network {vni} is still routed by ip-vrf {:?}; remove it from the VRF first",
+                vrf.name
+            );
+        }
         Ok(self.networks.remove(&vni).is_some())
     }
 
@@ -622,6 +674,15 @@ impl Topology {
             );
         }
         for vni in &vrf.networks {
+            // An IP-VRF that routes a network nobody declared silently routes
+            // nothing: the derive finds no segment to expand a learned prefix
+            // over, so the tenant looks configured and has no gateway.
+            if !self.networks.contains_key(vni) {
+                bail!(
+                    "ip-vrf {:?} routes network {vni}, which does not exist",
+                    vrf.name
+                );
+            }
             if let Some(other) = self.ip_vrfs.values().find(|v| v.networks.contains(vni)) {
                 bail!(
                     "network {vni} is already routed by ip-vrf {:?}; a network belongs to one",
@@ -633,9 +694,100 @@ impl Topology {
         Ok(())
     }
 
+    /// Remove an IP-VRF by its L3 VNI, returning whether it existed. Its member
+    /// networks keep existing — they simply stop being routed, and the agents
+    /// stop being given IRB routes for them on the next derive.
+    pub fn remove_ip_vrf(&mut self, l3_vni: u32) -> Result<bool> {
+        Ok(self.ip_vrfs.remove(&l3_vni).is_some())
+    }
+
     /// All tenant IP-VRFs, in no particular order.
     pub fn ip_vrfs(&self) -> impl Iterator<Item = &IpVrf> {
         self.ip_vrfs.values()
+    }
+
+    /// Register a load-balanced service (D2 LBaaS).
+    ///
+    /// The validation here is what separates a modelled VIP from a hand-written
+    /// one: every rejection below is a configuration that the datapath would
+    /// accept and then silently misbehave on.
+    pub fn add_load_balancer(&mut self, lb: LoadBalancer) -> Result<()> {
+        if lb.id.is_empty() {
+            bail!("load balancer id must not be empty");
+        }
+        if self.load_balancers.contains_key(&lb.id) {
+            bail!("load balancer {:?} already exists", lb.id);
+        }
+        if !self.networks.contains_key(&lb.vni) {
+            bail!("load balancer {:?}: no network with vni {}", lb.id, lb.vni);
+        }
+        // The XDP load balancer only handles protocols that carry ports.
+        if !matches!(lb.proto, ProtoName::Tcp | ProtoName::Udp) {
+            bail!(
+                "load balancer {:?}: proto must be tcp or udp, not {:?}",
+                lb.id,
+                lb.proto
+            );
+        }
+        if lb.port == 0 {
+            bail!("load balancer {:?}: service port must not be 0", lb.id);
+        }
+        // The service key is (vni, vip, port, proto); a duplicate would not
+        // conflict, it would overwrite the earlier one in the map.
+        if let Some(other) = self.load_balancers.values().find(|o| {
+            o.vni == lb.vni && o.vip == lb.vip && o.port == lb.port && o.proto == lb.proto
+        }) {
+            bail!(
+                "load balancer {:?}: {}:{} is already fronted by {:?} on this network",
+                lb.id,
+                lb.vip,
+                lb.port,
+                other.id
+            );
+        }
+        // A VIP equal to a port's own address would DNAT that port's traffic away
+        // from it — the workload disappears from its own network.
+        if let Some(p) = self
+            .ports
+            .iter()
+            .find(|p| p.vni == lb.vni && p.ip == lb.vip)
+        {
+            bail!(
+                "load balancer {:?}: vip {} is port {:?}'s address",
+                lb.id,
+                lb.vip,
+                p.id
+            );
+        }
+        for m in &lb.members {
+            let Some(port) = self.ports.iter().find(|p| p.id == m.port_id) else {
+                bail!("load balancer {:?}: no port {:?}", lb.id, m.port_id);
+            };
+            // Load balancing across a tenant boundary is a tenant-isolation
+            // break, not a topology quirk: the client's packet would be handed
+            // to a workload on another network.
+            if port.vni != lb.vni {
+                bail!(
+                    "load balancer {:?}: member port {:?} is on vni {}, not {}",
+                    lb.id,
+                    m.port_id,
+                    port.vni,
+                    lb.vni
+                );
+            }
+        }
+        self.load_balancers.insert(lb.id.clone(), lb);
+        Ok(())
+    }
+
+    /// Remove a load-balanced service by id, returning whether it existed.
+    pub fn remove_load_balancer(&mut self, id: &str) -> Result<bool> {
+        Ok(self.load_balancers.remove(id).is_some())
+    }
+
+    /// All load-balanced services, in no particular order.
+    pub fn load_balancers(&self) -> impl Iterator<Item = &LoadBalancer> {
+        self.load_balancers.values()
     }
 
     /// The IP-VRF routing a given L2 VNI, if any.
@@ -750,6 +902,13 @@ impl Topology {
                 if fip.association.as_ref().is_some_and(|a| a.port_id == id) {
                     fip.association = None;
                 }
+            }
+            // Drop the port from every load-balancer pool it served, mirroring
+            // the floating-IP cleanup above. A member left pointing at a removed
+            // port is a backend the derive silently skips — the pool would shrink
+            // with nothing in the model saying so.
+            for lb in self.load_balancers.values_mut() {
+                lb.members.retain(|m| m.port_id != id);
             }
         }
         removed
@@ -1326,6 +1485,55 @@ impl Topology {
             }
         }
 
+        // Load-balanced services (D2 LBaaS) for every network this host serves.
+        //
+        // The datapath looks a service up under the **ingress port's** policy id,
+        // which is the VNI only for ports with no security group — so one entry
+        // per VNI would leave every SG-bound port unable to reach its own VIP.
+        // Emit the service once per distinct policy id in play on that segment
+        // instead; the pool is identical, only the scoping differs.
+        let mut lbs: Vec<&LoadBalancer> = self
+            .load_balancers
+            .values()
+            .filter(|lb| local_vnis.contains(&lb.vni))
+            .collect();
+        lbs.sort_by(|a, b| a.id.cmp(&b.id)); // deterministic output
+        for lb in lbs {
+            let backends: Vec<BackendCfg> = lb
+                .members
+                .iter()
+                .filter_map(|m| {
+                    // A member whose port vanished is skipped rather than
+                    // panicking the re-derive loop, which would serve stale
+                    // configs fabric-wide (`add_load_balancer` and `remove_port`
+                    // between them keep this from happening in practice).
+                    let port = self.ports.iter().find(|p| p.id == m.port_id)?;
+                    Some(BackendCfg {
+                        ip: port.ip.to_string(),
+                        port: (m.port != 0).then_some(m.port),
+                    })
+                })
+                .collect();
+            let mut policies: Vec<PolicyId> = self
+                .ports
+                .iter()
+                .filter(|p| p.host == host_id && p.vni == lb.vni)
+                .map(|p| p.effective_policy())
+                .collect();
+            policies.push(lb.vni);
+            policies.sort_unstable();
+            policies.dedup();
+            for policy in policies {
+                cfg.services.push(ServiceCfg {
+                    policy,
+                    vip: lb.vip.to_string(),
+                    port: lb.port,
+                    proto: lb.proto,
+                    backends: backends.clone(),
+                });
+            }
+        }
+
         Some(cfg)
     }
 }
@@ -1367,6 +1575,29 @@ pub struct FabricSnapshot {
     /// with no floating IPs.
     #[serde(default)]
     pub floating_ips: Vec<FloatingIpRec>,
+    /// All load-balanced services (D2 LBaaS). `#[serde(default)]` so pre-LBaaS
+    /// snapshots restore with no services — the fabric those clusters were
+    /// running.
+    #[serde(default)]
+    pub load_balancers: Vec<LoadBalancerRec>,
+}
+
+/// Serializable mirror of a [`LoadBalancer`] (D2 LBaaS).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LoadBalancerRec {
+    pub id: String,
+    pub vni: u32,
+    pub vip: [u8; 4],
+    pub port: u16,
+    pub proto: ProtoName,
+    pub members: Vec<LbMemberRec>,
+}
+
+/// Serializable mirror of an [`LbMember`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LbMemberRec {
+    pub port_id: String,
+    pub port: u16,
 }
 
 /// Serializable mirror of a [`Host`].
@@ -1619,6 +1850,25 @@ impl Topology {
                     }
                 })
                 .collect(),
+            load_balancers: self
+                .load_balancers
+                .values()
+                .map(|lb| LoadBalancerRec {
+                    id: lb.id.clone(),
+                    vni: lb.vni,
+                    vip: lb.vip.octets(),
+                    port: lb.port,
+                    proto: lb.proto,
+                    members: lb
+                        .members
+                        .iter()
+                        .map(|m| LbMemberRec {
+                            port_id: m.port_id.clone(),
+                            port: m.port,
+                        })
+                        .collect(),
+                })
+                .collect(),
         }
     }
 
@@ -1757,6 +2007,26 @@ impl Topology {
                     subnet_id: f.subnet_id.clone(),
                     addr: bytes16_to_ip(f.addr, f.is_v6),
                     association,
+                },
+            );
+        }
+        for lb in &snap.load_balancers {
+            t.load_balancers.insert(
+                lb.id.clone(),
+                LoadBalancer {
+                    id: lb.id.clone(),
+                    vni: lb.vni,
+                    vip: Ipv4Addr::from(lb.vip),
+                    port: lb.port,
+                    proto: lb.proto,
+                    members: lb
+                        .members
+                        .iter()
+                        .map(|m| LbMember {
+                            port_id: m.port_id.clone(),
+                            port: m.port,
+                        })
+                        .collect(),
                 },
             );
         }
@@ -2849,6 +3119,137 @@ mod tests {
         assert_eq!(restored.port_floating_ips(&p.id).len(), 1);
     }
 
+    /// A one-host, one-network fabric with two ports, for the LBaaS tests.
+    fn lb_fixture() -> (Topology, String, String) {
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.0.0.1", 0x11));
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+        let a = t.create_port(100, "h1", "tap0", None, None).unwrap();
+        let b = t.create_port(100, "h1", "tap1", None, None).unwrap();
+        (t, a.id, b.id)
+    }
+
+    fn lb(id: &str, vip: &str, members: Vec<LbMember>) -> LoadBalancer {
+        LoadBalancer {
+            id: id.into(),
+            vni: 100,
+            vip: vip.parse().unwrap(),
+            port: 80,
+            proto: ProtoName::Tcp,
+            members,
+        }
+    }
+
+    /// Every rejection here is a config the datapath would accept and then
+    /// silently misbehave on — which is the whole point of modelling the VIP.
+    #[test]
+    fn load_balancer_validation_guards_the_datapath() {
+        let (mut t, a, _b) = lb_fixture();
+        let member = |id: &str| LbMember {
+            port_id: id.into(),
+            port: 8080,
+        };
+
+        t.add_load_balancer(lb("web", "192.168.50.200", vec![member(&a)]))
+            .unwrap();
+        assert!(
+            t.add_load_balancer(lb("web", "192.168.50.201", vec![]))
+                .is_err()
+        );
+
+        // The service key is (vni, vip, port, proto): a second LB on the same
+        // tuple would not conflict, it would overwrite the first in the map.
+        let err = t
+            .add_load_balancer(lb("web2", "192.168.50.200", vec![]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already fronted by"), "{err}");
+
+        // A VIP equal to a port's own address DNATs that port's traffic away
+        // from it — the workload vanishes from its own network.
+        let port_ip = t.ports().iter().find(|p| p.id == a).unwrap().ip.to_string();
+        let err = t
+            .add_load_balancer(lb("clash", &port_ip, vec![]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("address"), "{err}");
+
+        // A member on another network is a tenant-isolation break, not a quirk.
+        t.add_network(network(200, "green", "192.168.60.0/24"))
+            .unwrap();
+        let other = t.create_port(200, "h1", "tap9", None, None).unwrap();
+        let err = t
+            .add_load_balancer(lb("cross", "192.168.50.202", vec![member(&other.id)]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not 100"), "{err}");
+
+        // UDP is fine; ICMP carries no ports, so the datapath cannot balance it.
+        let mut icmp = lb("icmp", "192.168.50.203", vec![]);
+        icmp.proto = ProtoName::Icmp;
+        assert!(t.add_load_balancer(icmp).is_err());
+        let mut zero = lb("zero", "192.168.50.204", vec![]);
+        zero.port = 0;
+        assert!(t.add_load_balancer(zero).is_err());
+    }
+
+    /// The datapath keys a service by the **ingress port's** policy id, which is
+    /// the VNI only for ports with no security group — so a single VNI-scoped
+    /// entry would leave every SG-bound port unable to reach its own VIP.
+    #[test]
+    fn derive_scopes_a_service_to_every_policy_on_the_segment() {
+        let (mut t, a, b) = lb_fixture();
+        t.add_security_group(SecurityGroup {
+            name: "web".into(),
+            default_action: ActionName::Pass,
+            drop_icmp: false,
+            stateful: true,
+            blocklist: Vec::new(),
+            rules: Vec::new(),
+        })
+        .unwrap();
+        let sg_pid = t.security_groups().next().unwrap().policy_id();
+        t.set_port_security_group(&b, Some("web")).unwrap();
+
+        t.add_load_balancer(lb(
+            "web",
+            "192.168.50.200",
+            vec![LbMember {
+                port_id: a.clone(),
+                port: 8080,
+            }],
+        ))
+        .unwrap();
+
+        let cfg = t.derive("h1").unwrap();
+        let mut policies: Vec<u32> = cfg.services.iter().map(|s| s.policy).collect();
+        policies.sort_unstable();
+        assert_eq!(policies, vec![100, sg_pid]);
+        // Same pool under both scopings, resolved to the member port's address.
+        let port_a_ip = t.ports().iter().find(|p| p.id == a).unwrap().ip.to_string();
+        for svc in &cfg.services {
+            assert_eq!(svc.vip, "192.168.50.200");
+            assert_eq!(svc.backends.len(), 1);
+            assert_eq!(svc.backends[0].ip, port_a_ip);
+            assert_eq!(svc.backends[0].port, Some(8080));
+        }
+
+        // Removing a member's port drains it from the pool instead of leaving a
+        // member the derive silently skips.
+        t.remove_port(&a);
+        assert!(t.load_balancers().next().unwrap().members.is_empty());
+
+        // And the whole service survives a cluster failover.
+        let restored = Topology::from_snapshot(&t.to_snapshot());
+        assert_eq!(
+            restored.load_balancers().next().unwrap(),
+            t.load_balancers().next().unwrap()
+        );
+        assert!(t.remove_load_balancer("web").unwrap());
+        assert!(!t.remove_load_balancer("web").unwrap());
+    }
+
     fn vrf(l3_vni: u32, name: &str, networks: Vec<u32>) -> IpVrf {
         IpVrf {
             l3_vni,
@@ -2858,12 +3259,24 @@ mod tests {
         }
     }
 
+    /// A topology with the three tenant segments the IP-VRF tests route over —
+    /// an IP-VRF may only name networks that exist.
+    fn topo_with_segments() -> Topology {
+        let mut t = Topology::new();
+        for (vni, cidr) in [(10100, "10.100.0.0/24"), (10200, "10.200.0.0/24")] {
+            t.add_network(network(vni, "seg", cidr)).unwrap();
+        }
+        t.add_network(network(10300, "seg", "10.30.0.0/24"))
+            .unwrap();
+        t
+    }
+
     /// A network in two routed contexts makes the tenant of a packet ambiguous,
     /// and the datapath would resolve it by whichever map entry landed last — i.e.
     /// arbitrarily, across a tenant boundary. Reject it at configuration instead.
     #[test]
     fn a_network_belongs_to_exactly_one_ip_vrf() {
-        let mut t = Topology::new();
+        let mut t = topo_with_segments();
         t.add_ip_vrf(vrf(50100, "tenant-a", vec![10100, 10200]))
             .unwrap();
 
@@ -2876,6 +3289,25 @@ mod tests {
         t.add_ip_vrf(vrf(50200, "tenant-b", vec![10300])).unwrap();
         assert_eq!(t.ip_vrfs().count(), 2);
         assert_eq!(t.ip_vrf_of_network(10200).unwrap().name, "tenant-a");
+
+        // Routing a segment nobody declared configures a tenant with no gateway:
+        // the derive finds no L2 VNI to expand its learned prefixes over.
+        let err = t
+            .add_ip_vrf(vrf(50300, "ghost", vec![19999]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"), "{err}");
+
+        // Removing a network out from under a VRF would recreate that dangling
+        // reference from the other side, so it is refused too.
+        let err = t.remove_network(10200).unwrap_err().to_string();
+        assert!(err.contains("tenant-a"), "{err}");
+
+        // Dropping the VRF unblocks it, and the segments simply stop being routed.
+        assert!(t.remove_ip_vrf(50100).unwrap());
+        assert!(!t.remove_ip_vrf(50100).unwrap());
+        assert!(t.ip_vrf_of_network(10200).is_none());
+        t.remove_network(10200).unwrap();
     }
 
     #[test]
@@ -2902,7 +3334,7 @@ mod tests {
     /// would come back as an unrouted fabric after a failover.
     #[test]
     fn ip_vrfs_survive_a_snapshot_roundtrip() {
-        let mut t = Topology::new();
+        let mut t = topo_with_segments();
         t.add_ip_vrf(vrf(50100, "tenant-a", vec![10100, 10200]))
             .unwrap();
         let restored = Topology::from_snapshot(&t.to_snapshot());

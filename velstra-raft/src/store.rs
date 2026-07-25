@@ -27,9 +27,10 @@ use openraft::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, watch};
 use velstra_common::{parse_cidr_v4, parse_cidr_v6, parse_mac};
-use velstra_config::{ActionName, EncapName, PortRule};
+use velstra_config::{ActionName, EncapName, PortRule, ProtoName};
 use velstra_orchestrator::{
-    AllocRange, FloatingIp, Host, Network, SecurityGroup, Subnet, SubnetCidr, Topology,
+    AllocRange, FloatingIp, Host, IpVrf, LbMember, LoadBalancer, Network, SecurityGroup, Subnet,
+    SubnetCidr, Topology,
 };
 
 pub type NodeId = u64;
@@ -80,6 +81,40 @@ pub struct SecurityGroupSpec {
     pub stateful: bool,
     pub blocklist: Vec<String>,
     pub rules: Vec<PortRule>,
+}
+
+/// A serializable IP-VRF description carried in [`TopoRequest::AddIpVrf`] (B7):
+/// the routed context a set of L2 segments share. Wire-friendly (the anycast
+/// gateway MAC as a string), validated when applied to the topology — on every
+/// replica, so an invalid tenant is rejected identically everywhere.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpVrfSpec {
+    pub l3_vni: u32,
+    pub name: String,
+    pub gateway_mac: String,
+    pub networks: Vec<u32>,
+}
+
+/// A serializable load-balancer description carried in
+/// [`TopoRequest::AddLoadBalancer`] (D2 LBaaS). The VIP is a string, parsed and
+/// validated when applied — on every replica, so an invalid service is rejected
+/// identically everywhere.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadBalancerSpec {
+    pub id: String,
+    pub vni: u32,
+    pub vip: String,
+    pub port: u16,
+    pub proto: ProtoName,
+    pub members: Vec<LbMemberSpec>,
+}
+
+/// One member of a [`LoadBalancerSpec`]'s pool: a fabric port plus its L4 port.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LbMemberSpec {
+    pub port_id: String,
+    /// Backend port, or `0` to keep the client's original destination port.
+    pub port: u16,
 }
 
 /// A serializable subnet description carried in [`TopoRequest::AddSubnet`] (D2).
@@ -148,6 +183,20 @@ pub enum TopoRequest {
     SetPortSecurityGroup {
         port_id: String,
         group: Option<String>,
+    },
+    // --- Tenant IP-VRFs (B7) ------------------------------------------------
+    /// Define a tenant's routed context over a set of L2 segments.
+    AddIpVrf(IpVrfSpec),
+    /// Remove an IP-VRF by its L3 VNI; its segments stop being routed.
+    RemoveIpVrf {
+        l3_vni: u32,
+    },
+    // --- Load-balanced services (D2 LBaaS) ----------------------------------
+    /// Define a VIP fronting a pool of fabric ports.
+    AddLoadBalancer(LoadBalancerSpec),
+    /// Remove a load-balanced service by id.
+    RemoveLoadBalancer {
+        id: String,
     },
     // --- Subnets + IPAM (D2) ------------------------------------------------
     /// Define a first-class subnet under a network.
@@ -304,6 +353,37 @@ fn sg_from_spec(s: &SecurityGroupSpec) -> SecurityGroup {
     }
 }
 
+fn ip_vrf_from_spec(s: &IpVrfSpec) -> Result<IpVrf> {
+    Ok(IpVrf {
+        l3_vni: s.l3_vni,
+        name: s.name.clone(),
+        gateway_mac: parse_mac(&s.gateway_mac)
+            .map_err(|e| anyhow!("invalid gateway_mac {:?}: {e}", s.gateway_mac))?,
+        networks: s.networks.clone(),
+    })
+}
+
+fn lb_from_spec(s: &LoadBalancerSpec) -> Result<LoadBalancer> {
+    Ok(LoadBalancer {
+        id: s.id.clone(),
+        vni: s.vni,
+        vip: s
+            .vip
+            .parse()
+            .map_err(|_| anyhow!("invalid vip {:?}", s.vip))?,
+        port: s.port,
+        proto: s.proto,
+        members: s
+            .members
+            .iter()
+            .map(|m| LbMember {
+                port_id: m.port_id.clone(),
+                port: m.port,
+            })
+            .collect(),
+    })
+}
+
 /// Parse an optional address string; `None` (auto-allocate) stays `None`.
 fn parse_opt_ip(s: &Option<String>) -> Result<Option<IpAddr>> {
     match s {
@@ -424,6 +504,24 @@ pub fn apply(topo: &mut Topology, req: &TopoRequest) -> TopoResponse {
         TopoRequest::SetPortSecurityGroup { port_id, group } => {
             let p = topo.set_port_security_group(port_id, group.as_deref())?;
             Ok(TopoResponse::ok_port(port_record(&p)))
+        }
+        // --- Tenant IP-VRFs (B7) --------------------------------------------
+        TopoRequest::AddIpVrf(s) => {
+            topo.add_ip_vrf(ip_vrf_from_spec(s)?)?;
+            Ok(TopoResponse::ok())
+        }
+        TopoRequest::RemoveIpVrf { l3_vni } => {
+            topo.remove_ip_vrf(*l3_vni)?;
+            Ok(TopoResponse::ok())
+        }
+        // --- Load-balanced services (D2 LBaaS) ------------------------------
+        TopoRequest::AddLoadBalancer(s) => {
+            topo.add_load_balancer(lb_from_spec(s)?)?;
+            Ok(TopoResponse::ok())
+        }
+        TopoRequest::RemoveLoadBalancer { id } => {
+            topo.remove_load_balancer(id)?;
+            Ok(TopoResponse::ok())
         }
         // --- Subnets + IPAM (D2) --------------------------------------------
         TopoRequest::AddSubnet(s) => {
@@ -1037,6 +1135,62 @@ mod tests {
             )
             .ok
         );
+    }
+
+    /// A tenant's routed context has to survive replication like any other
+    /// entity, and an invalid one must be refused identically on every replica —
+    /// a follower that accepted what the leader rejected diverges the fabric.
+    #[test]
+    fn apply_ip_vrf_add_and_remove_roundtrip() {
+        let mut t = Topology::new();
+        for (vni, name) in [(5000, "blue"), (5001, "green")] {
+            assert!(
+                apply(
+                    &mut t,
+                    &TopoRequest::AddNetwork(NetworkSpec {
+                        vni,
+                        name: name.into(),
+                        subnet: format!("192.168.{}.0/24", vni - 4900),
+                        default_action: ActionName::Pass,
+                        drop_icmp: false,
+                    })
+                )
+                .ok
+            );
+        }
+
+        let spec = |l3_vni: u32, mac: &str, networks: Vec<u32>| IpVrfSpec {
+            l3_vni,
+            name: "tenant-a".into(),
+            gateway_mac: mac.into(),
+            networks,
+        };
+
+        assert!(
+            apply(
+                &mut t,
+                &TopoRequest::AddIpVrf(spec(50100, "02:00:5e:00:00:aa", vec![5000, 5001]))
+            )
+            .ok
+        );
+        assert_eq!(t.ip_vrf_of_network(5001).unwrap().l3_vni, 50100);
+
+        // An unparsable gateway MAC fails in the state machine, not at the API
+        // edge, so every replica reaches the same verdict.
+        let bad = apply(
+            &mut t,
+            &TopoRequest::AddIpVrf(spec(50200, "nonsense", vec![])),
+        );
+        assert!(!bad.ok);
+        assert!(
+            bad.error.unwrap().contains("gateway_mac"),
+            "bad mac message"
+        );
+
+        // Removing the VRF leaves its segments in place, just unrouted.
+        assert!(apply(&mut t, &TopoRequest::RemoveIpVrf { l3_vni: 50100 }).ok);
+        assert!(t.ip_vrf_of_network(5001).is_none());
+        assert_eq!(t.networks().count(), 2);
     }
 
     #[test]

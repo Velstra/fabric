@@ -37,10 +37,11 @@ use serde::{Deserialize, Serialize};
 use velstra_common::{parse_cidr_v4, parse_cidr_v6, parse_mac};
 use velstra_config::{
     ActionName, EncapName, FileConfig, FloodVtepCfg, IrbRouteCfg, MacRouteCfg, Nd6Cfg, NeighborCfg,
-    PortRule, TunnelCfg, file_config_to_proto,
+    PortRule, ProtoName, TunnelCfg, file_config_to_proto,
 };
 use velstra_orchestrator::{
-    AllocRange, Host, IpVrf, Network, SecurityGroup, Subnet, SubnetCidr, Topology,
+    AllocRange, Host, IpVrf, LbMember, LoadBalancer, Network, SecurityGroup, Subnet, SubnetCidr,
+    Topology,
 };
 use velstra_proto::NodeConfig;
 
@@ -68,8 +69,56 @@ struct TopologyFile {
     /// Tenant IP-VRFs (B7): the routed contexts L2 segments are grouped into.
     #[serde(rename = "ip_vrf", default, skip_serializing_if = "Vec::is_empty")]
     ip_vrfs: Vec<IpVrfFile>,
+    /// Load-balanced services (D2 LBaaS). Declared after ports, since a member
+    /// names a port.
+    #[serde(
+        rename = "load_balancer",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    load_balancers: Vec<LoadBalancerFile>,
     #[serde(rename = "port", default)]
     ports: Vec<PortFile>,
+}
+
+/// One `[[load_balancer]]` block: a VIP fronting a pool of fabric ports.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LoadBalancerFile {
+    id: String,
+    vni: u32,
+    vip: String,
+    port: u16,
+    /// `tcp` (default) or `udp`.
+    #[serde(default = "default_lb_proto")]
+    proto: ProtoName,
+    /// Pool members, each naming a port declared in this file.
+    #[serde(default, rename = "member", skip_serializing_if = "Vec::is_empty")]
+    members: Vec<LbMemberFile>,
+}
+
+/// One `[[load_balancer.member]]` entry. A member names its port the way the
+/// file names ports — by `host` + `tap` — not by the generated port id, which an
+/// author cannot know when the address is auto-allocated.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LbMemberFile {
+    host: String,
+    tap: String,
+    /// Backend port, or omitted to keep the client's original destination port.
+    #[serde(default, skip_serializing_if = "is_zero_port")]
+    port: u16,
+}
+
+fn is_zero_port(p: &u16) -> bool {
+    *p == 0
+}
+
+/// A load balancer with no `proto` is TCP. Deliberately local rather than a
+/// `Default` on `ProtoName`: an omitted protocol means different things in
+/// different blocks, and a blanket default would quietly pick one everywhere.
+fn default_lb_proto() -> ProtoName {
+    ProtoName::Tcp
 }
 
 /// One `[[ip_vrf]]` block: a tenant's routed context. Deliberately the same shape
@@ -173,6 +222,33 @@ struct PortFile {
     security_group: Option<String>,
 }
 
+/// Resolve a `[[load_balancer]]` block against the ports already built.
+fn build_load_balancer(topo: &Topology, lb: &LoadBalancerFile) -> Result<LoadBalancer> {
+    let mut members = Vec::with_capacity(lb.members.len());
+    for m in &lb.members {
+        let port = topo
+            .ports()
+            .iter()
+            .find(|p| p.host == m.host && p.tap == m.tap)
+            .ok_or_else(|| anyhow!("member {}/{} names no declared port", m.host, m.tap))?;
+        members.push(LbMember {
+            port_id: port.id.clone(),
+            port: m.port,
+        });
+    }
+    Ok(LoadBalancer {
+        id: lb.id.clone(),
+        vni: lb.vni,
+        vip: lb
+            .vip
+            .parse()
+            .map_err(|_| anyhow!("invalid vip {:?}", lb.vip))?,
+        port: lb.port,
+        proto: lb.proto,
+        members,
+    })
+}
+
 /// Build the orchestrator [`Topology`] from a parsed file (validating addresses,
 /// MACs, subnets, and references as it goes).
 fn build(tf: &TopologyFile) -> Result<Topology> {
@@ -235,21 +311,15 @@ fn build(tf: &TopologyFile) -> Result<Topology> {
                 v.gateway_mac
             )
         })?;
-        for vni in &v.networks {
-            if !topo.networks().any(|n| n.vni == *vni) {
-                return Err(anyhow!(
-                    "ip_vrf {}: network {vni} is not declared; a typo here would leave \
-                     that segment silently unrouted",
-                    v.name
-                ));
-            }
-        }
+        // Membership, VNI range and the gateway MAC are all validated by
+        // `add_ip_vrf` — the single gate every driver goes through, file or API.
         topo.add_ip_vrf(IpVrf {
             l3_vni: v.l3_vni,
             name: v.name.clone(),
             gateway_mac,
             networks: v.networks.clone(),
-        })?;
+        })
+        .with_context(|| format!("ip_vrf {}", v.name))?;
     }
     for p in &tf.ports {
         let ip = match &p.ip {
@@ -271,6 +341,13 @@ fn build(tf: &TopologyFile) -> Result<Topology> {
         if let Some(group) = &p.security_group {
             topo.set_port_security_group(&created.id, Some(group))?;
         }
+    }
+    // Load balancers last: a member names a port, so every port must exist.
+    for lb in &tf.load_balancers {
+        let built =
+            build_load_balancer(&topo, lb).with_context(|| format!("load_balancer {}", lb.id))?;
+        topo.add_load_balancer(built)
+            .with_context(|| format!("load_balancer {}", lb.id))?;
     }
     Ok(topo)
 }
@@ -612,12 +689,40 @@ fn to_file(topo: &Topology) -> TopologyFile {
         .collect();
     ip_vrfs.sort_by_key(|v| v.l3_vni);
 
+    let mut load_balancers: Vec<LoadBalancerFile> = topo
+        .load_balancers()
+        .map(|lb| LoadBalancerFile {
+            id: lb.id.clone(),
+            vni: lb.vni,
+            vip: lb.vip.to_string(),
+            port: lb.port,
+            proto: lb.proto,
+            members: lb
+                .members
+                .iter()
+                .filter_map(|m| {
+                    // Serialise a member back in file terms. A member whose port
+                    // vanished is dropped rather than written as an unresolvable
+                    // reference the next load would reject.
+                    let port = topo.ports().iter().find(|p| p.id == m.port_id)?;
+                    Some(LbMemberFile {
+                        host: port.host.clone(),
+                        tap: port.tap.clone(),
+                        port: m.port,
+                    })
+                })
+                .collect(),
+        })
+        .collect();
+    load_balancers.sort_by(|a, b| a.id.cmp(&b.id));
+
     TopologyFile {
         hosts,
         networks,
         subnets,
         security_groups,
         ip_vrfs,
+        load_balancers,
         ports,
     }
 }
@@ -1026,6 +1131,88 @@ mod tests {
     /// The membership list is the only thing that says which tenant a segment
     /// belongs to, so a typo in it must fail the load rather than leave a segment
     /// quietly unrouted while everything else comes up.
+    /// A file-declared VIP must survive the round-trip through the model, and a
+    /// member has to name a port the file actually declares — the file speaks in
+    /// host/tap, the model in generated port ids.
+    #[test]
+    fn parses_load_balancers_and_round_trips_them() {
+        let toml = r#"
+            [[host]]
+            id = "h1"
+            vtep = "10.10.0.1"
+            underlay_iface = "eth0"
+            underlay_mac = "02:00:00:00:00:11"
+
+            [[network]]
+            vni = 5000
+            name = "blue"
+            subnet = "192.168.100.0/24"
+
+            [[port]]
+            network = 5000
+            host = "h1"
+            tap = "tap0"
+            ip = "192.168.100.10"
+
+            [[load_balancer]]
+            id = "web"
+            vni = 5000
+            vip = "192.168.100.200"
+            port = 80
+            proto = "tcp"
+            [[load_balancer.member]]
+            host = "h1"
+            tap = "tap0"
+            port = 8080
+        "#;
+        let topo = build(&toml::from_str::<TopologyFile>(toml).unwrap()).unwrap();
+        let lb = topo.load_balancers().next().unwrap();
+        assert_eq!(lb.id, "web");
+        assert_eq!(lb.vip.to_string(), "192.168.100.200");
+        assert_eq!(lb.members.len(), 1);
+        assert_eq!(lb.members[0].port, 8080);
+
+        // The derived host config carries the service with its member resolved
+        // to that port's address.
+        let cfg = topo.derive("h1").unwrap();
+        assert_eq!(cfg.services.len(), 1);
+        assert_eq!(cfg.services[0].backends[0].ip, "192.168.100.10");
+
+        let reloaded = build(&to_file(&topo)).unwrap();
+        assert_eq!(reloaded.load_balancers().next().unwrap(), lb);
+    }
+
+    #[test]
+    fn rejects_load_balancer_member_naming_no_port() {
+        let toml = r#"
+            [[host]]
+            id = "h1"
+            vtep = "10.10.0.1"
+            underlay_iface = "eth0"
+            underlay_mac = "02:00:00:00:00:11"
+
+            [[network]]
+            vni = 5000
+            name = "blue"
+            subnet = "192.168.100.0/24"
+
+            [[load_balancer]]
+            id = "web"
+            vni = 5000
+            vip = "192.168.100.200"
+            port = 80
+            [[load_balancer.member]]
+            host = "h1"
+            tap = "ghost"
+        "#;
+        let err = format!(
+            "{:#}",
+            build(&toml::from_str::<TopologyFile>(toml).unwrap()).unwrap_err()
+        );
+        assert!(err.contains("load_balancer web"), "{err}");
+        assert!(err.contains("ghost"), "{err}");
+    }
+
     #[test]
     fn rejects_ip_vrf_naming_an_undeclared_network() {
         let toml = r#"
@@ -1046,8 +1233,14 @@ mod tests {
             gateway_mac = "02:00:5e:00:00:aa"
             networks = [5000, 5002]
         "#;
-        let err = build(&toml::from_str::<TopologyFile>(toml).unwrap()).unwrap_err();
-        assert!(err.to_string().contains("5002"), "{err}");
+        // `{:#}` renders anyhow's whole chain, which is what the operator sees:
+        // the file block that is wrong, then why.
+        let err = format!(
+            "{:#}",
+            build(&toml::from_str::<TopologyFile>(toml).unwrap()).unwrap_err()
+        );
+        assert!(err.contains("ip_vrf tenant-a"), "{err}");
+        assert!(err.contains("5002"), "{err}");
     }
 
     #[test]

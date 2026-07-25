@@ -32,8 +32,8 @@ pub mod store;
 use network::NetworkFactory;
 pub use network::{RaftServiceServer, service};
 pub use store::{
-    FloatingIpRecord, HostSpec, NetworkSpec, NodeId, PortRecord, SecurityGroupSpec, SubnetSpec,
-    TopoRequest, TopoResponse, TypeConfig, apply,
+    FloatingIpRecord, HostSpec, IpVrfSpec, LbMemberSpec, LoadBalancerSpec, NetworkSpec, NodeId,
+    PortRecord, SecurityGroupSpec, SubnetSpec, TopoRequest, TopoResponse, TypeConfig, apply,
 };
 use store::{LogStore, StateMachineStore};
 

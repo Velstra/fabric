@@ -67,6 +67,28 @@ service VelstraOrchestrator {
   // the VNI-as-policy default). Returns the updated port.
   rpc BindPortSecurityGroup(BindPortSecurityGroupRequest) returns (PortInfo);
 
+  // --- Tenant IP-VRFs (B7) --------------------------------------------------
+  // Define a tenant's routed context: the set of L2 segments whose inter-subnet
+  // traffic is routed (symmetric IRB) behind one anycast gateway MAC. Fails on a
+  // duplicate L3 VNI, an undeclared member network, a member already routed by
+  // another VRF, or a non-unicast gateway MAC.
+  rpc AddIpVrf(IpVrfSpec) returns (Ack);
+  // Remove an IP-VRF by its L3 VNI. Its member networks stay, unrouted.
+  rpc RemoveIpVrf(RemoveIpVrfRequest) returns (Ack);
+  // List all tenant IP-VRFs in the fabric.
+  rpc ListIpVrfs(ListIpVrfsRequest) returns (ListIpVrfsResponse);
+
+  // --- Load-balanced services (D2 LBaaS) ------------------------------------
+  // Define a VIP fronting a pool of fabric ports, DNAT-rewritten in XDP at the
+  // ingress host. Fails on a duplicate id, an unknown network or member port, a
+  // member on another network, a VIP that is already fronted or is a port's own
+  // address, or a protocol the datapath cannot balance.
+  rpc AddLoadBalancer(LoadBalancerSpec) returns (Ack);
+  // Remove a load-balanced service by id.
+  rpc RemoveLoadBalancer(RemoveLoadBalancerRequest) returns (Ack);
+  // List all load-balanced services in the fabric.
+  rpc ListLoadBalancers(ListLoadBalancersRequest) returns (ListLoadBalancersResponse);
+
   // --- Subnets + IPAM (D2) --------------------------------------------------
   // Define a first-class subnet under a network. Fails on a duplicate id, an
   // unknown VNI, or a gateway/pool outside the CIDR.
@@ -176,6 +198,61 @@ message RemoveSecurityGroupRequest {
 }
 
 message ListSecurityGroupsRequest {}
+
+// A tenant IP-VRF (B7): one routed context over several bridged segments.
+message IpVrfSpec {
+  // The routed VNI, in its own 24-bit number space.
+  uint32 l3_vni = 1;
+  string name = 2;
+  // The anycast gateway MAC, identical on every host serving the tenant, so a
+  // workload keeps its default-gateway ARP entry when it migrates.
+  string gateway_mac = 3;
+  // The L2 VNIs routed in this context; each belongs to at most one IP-VRF.
+  repeated uint32 networks = 4;
+}
+
+message RemoveIpVrfRequest {
+  uint32 l3_vni = 1;
+}
+
+message ListIpVrfsRequest {}
+
+message ListIpVrfsResponse {
+  repeated IpVrfSpec ip_vrfs = 1;
+}
+
+// One member of a load balancer's pool: a fabric port, not a raw address, so a
+// migrated workload stays in the pool and a member can never point at an
+// address nothing serves.
+message LbMember {
+  string port_id = 1;
+  // Backend port, or 0 to keep the client's original destination port.
+  uint32 port = 2;
+}
+
+// A load-balanced virtual service (D2 LBaaS).
+message LoadBalancerSpec {
+  string id = 1;
+  // The network the VIP lives on; also scopes the service, so two tenants may
+  // front the same VIP:port.
+  uint32 vni = 2;
+  string vip = 3;
+  uint32 port = 4;
+  // TCP or UDP; the datapath balances no others.
+  Proto proto = 5;
+  // The backend pool. May be empty — a drained pool is a legitimate state.
+  repeated LbMember members = 6;
+}
+
+message RemoveLoadBalancerRequest {
+  string id = 1;
+}
+
+message ListLoadBalancersRequest {}
+
+message ListLoadBalancersResponse {
+  repeated LoadBalancerSpec load_balancers = 1;
+}
 
 // A security group as reported by ListSecurityGroups: its spec plus the
 // deterministic policy id the controller assigned it.

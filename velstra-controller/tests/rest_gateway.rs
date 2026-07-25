@@ -273,6 +273,113 @@ async fn rest_gateway_crud_authz_and_audit() {
         .unwrap();
     assert!(sgs.iter().any(|g| g["name"] == "web"));
 
+    // --- Load balancer (D2 LBaaS): create → get → list → delete -------------
+    let lb = admin(http.post(format!("{rest}/v1/load-balancers")))
+        .json(&json!({
+            "id": "web-vip",
+            "vni": 100,
+            "vip": "10.50.0.200",
+            "port": 80,
+            "proto": "tcp",
+            "members": [ { "port_id": port_id, "port": 8080 } ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(lb.status(), 201, "load balancer create should be 201");
+    let lb: Value = lb.json().await.unwrap();
+    assert_eq!(lb["vip"], "10.50.0.200");
+    assert_eq!(lb["port"], 80);
+    assert_eq!(lb["members"][0]["port_id"], port_id.as_str());
+    assert_eq!(lb["members"][0]["port"], 8080);
+
+    // A member on no known port is rejected by the state machine, surfaced as a
+    // 400 through the gateway rather than a 500 or a silently empty pool.
+    let bad_member = admin(http.post(format!("{rest}/v1/load-balancers")))
+        .json(&json!({
+            "id": "ghost-vip",
+            "vni": 100,
+            "vip": "10.50.0.201",
+            "port": 80,
+            "members": [ { "port_id": "port-100-9.9.9.9" } ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_member.status(), 400);
+    assert_eq!(bad_member.json::<Value>().await.unwrap()["status"], 400);
+
+    let lbs: Vec<Value> = http
+        .get(format!("{rest}/v1/load-balancers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(lbs.len(), 1, "the rejected VIP was not created");
+
+    // --- IP-VRF (B7): create → get → delete ---------------------------------
+    let vrf = admin(http.post(format!("{rest}/v1/ip-vrfs")))
+        .json(&json!({
+            "l3_vni": 50100,
+            "name": "tenant-a",
+            "gateway_mac": "02:00:5e:00:00:aa",
+            "networks": [100]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(vrf.status(), 201, "ip-vrf create should be 201");
+    let vrf: Value = vrf.json().await.unwrap();
+    assert_eq!(vrf["gateway_mac"], "02:00:5e:00:00:aa");
+    assert_eq!(vrf["networks"][0], 100);
+
+    // Routing a network nobody declared is refused — a tenant with no gateway.
+    let ghost_vrf = admin(http.post(format!("{rest}/v1/ip-vrfs")))
+        .json(&json!({
+            "l3_vni": 50200,
+            "name": "ghost",
+            "gateway_mac": "02:00:5e:00:00:bb",
+            "networks": [999]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ghost_vrf.status(), 400);
+
+    let got_vrf: Value = http
+        .get(format!("{rest}/v1/ip-vrfs/50100"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(got_vrf["name"], "tenant-a");
+
+    let del_vrf = admin(http.delete(format!("{rest}/v1/ip-vrfs/50100")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del_vrf.status(), 200);
+    assert_eq!(del_vrf.json::<Value>().await.unwrap()["deleted"], true);
+
+    let del_lb = admin(http.delete(format!("{rest}/v1/load-balancers/web-vip")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del_lb.status(), 200);
+    let lbs: Vec<Value> = http
+        .get(format!("{rest}/v1/load-balancers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(lbs.is_empty(), "load balancer list empty after delete");
+
     // --- Floating IP: allocate (from a floating subnet) → get → release ------
     admin(http.post(format!("{rest}/v1/subnets")))
         .json(&json!({ "id": "fip-pool", "vni": 100, "cidr": "192.0.2.0/24" }))
@@ -401,6 +508,16 @@ async fn rest_gateway_crud_authz_and_audit() {
             .any(|e| e["operation"] == "port.create" && e["actor"] == "web-1"),
         "node-created port audited to its CN"
     );
+
+    // The new entities audit like every other one, successes and rejections.
+    for op in ["load-balancer.create", "ip-vrf.create"] {
+        assert!(
+            audit
+                .iter()
+                .any(|e| e["operation"] == op && e["result"] == "ok"),
+            "{op} audited"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }
