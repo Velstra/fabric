@@ -103,7 +103,9 @@ pub enum Counter {
     NonIpv4 = 9,
     /// Forwarded to another interface by a matching route (Phase 2).
     Forwarded = 10,
-    /// Dropped while forwarding because the TTL reached zero (Phase 2).
+    /// Dropped while routing because the TTL could not survive another hop —
+    /// both in local forwarding (Phase 2) and at the B7 anycast gateway, which
+    /// decrements the TTL exactly like any other router.
     ForwardTtlExceeded = 11,
     /// DNAT-rewritten as a **new** load-balanced connection (Phase 3).
     LoadBalanced = 12,
@@ -168,11 +170,18 @@ pub enum Counter {
     /// underlay packet aimed at one of our service SIDs, or a peer whose source is
     /// missing from the trusted set.
     Srv6DropUntrusted = 32,
+    /// **Routed** onto the overlay by a B7 symmetric-IRB entry instead of bridged:
+    /// the frame was addressed to the tenant's anycast gateway MAC, its inner
+    /// Ethernet header was rewritten toward the remote PE's Router's MAC and it
+    /// was encapsulated with the tenant's **L3** VNI. Also bumps
+    /// [`Counter::OverlayEncap`], which counts every encapsulated frame; the
+    /// difference between the two is inter-subnet traffic.
+    IrbRouted = 33,
 }
 
 impl Counter {
     /// Number of distinct counters — the `max_entries` of the `STATS` map.
-    pub const COUNT: u32 = 33;
+    pub const COUNT: u32 = 34;
 
     /// The array index of this counter.
     #[inline]
@@ -217,6 +226,7 @@ impl Counter {
             30 => Counter::OverlayDropVni,
             31 => Counter::MacLearnSpoof,
             32 => Counter::Srv6DropUntrusted,
+            33 => Counter::IrbRouted,
             _ => return None,
         };
         Some(counter)
@@ -266,6 +276,7 @@ impl Counter {
             Counter::OverlayDropVni => "overlay_drop_vni",
             Counter::MacLearnSpoof => "mac_learn_spoof",
             Counter::Srv6DropUntrusted => "srv6_drop_untrusted",
+            Counter::IrbRouted => "irb_routed",
         }
     }
 }

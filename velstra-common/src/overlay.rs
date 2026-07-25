@@ -221,6 +221,143 @@ impl TunnelEndpoint {
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for TunnelEndpoint {}
 
+/// B7 **symmetric IRB** route: where an inter-subnet packet leaving this host
+/// goes, and how its inner Ethernet header must be rewritten on the way out.
+/// The value side of `IRB_ROUTES`, an LPM trie keyed by the very same
+/// [`TunnelKey`] the unicast FDB uses.
+///
+/// That key's `vni` is the **ingress** L2 segment, *not* the tenant's routed L3
+/// VNI: the datapath only ever knows the segment a frame arrived on, while a
+/// BGP EVPN type-5 prefix lives in the L3 VNI. The controller therefore expands
+/// one advertised prefix into one entry per L2 segment of the tenant and carries
+/// the routed VNI here in [`Self::l3_vni`] — which keeps [`TunnelEndpoint`]'s
+/// layout, and every bridging path built on it, untouched.
+///
+/// Deliberately a separate table rather than optional fields on
+/// [`TunnelEndpoint`]: a tunnel forwards the inner frame **untouched**
+/// (bridging), an IRB route **rewrites** it (routing). A consumer that ignored
+/// the extra fields would silently bridge a packet that must be routed —
+/// across the tenant's subnet boundary, with the wrong MACs and an
+/// un-decremented TTL.
+///
+/// Layout: `4 + 4 + 4 + 6 + 6 + 6 + 2 = 32` bytes, 4-aligned, no implicit
+/// padding.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct IrbEndpoint {
+    /// Underlay interface index to redirect the encapsulated packet out of.
+    pub out_ifindex: u32,
+    /// The tenant's **L3 VNI** — what the frame is encapsulated with, replacing
+    /// the ingress segment's VNI (RFC 9136 §4.4.1: the type-5 route's label).
+    pub l3_vni: u32,
+    /// Remote VTEP underlay IPv4 (outer destination IP), network order.
+    pub remote_vtep_ip: [u8; 4],
+    /// Outer destination MAC: the next hop on the underlay toward that VTEP.
+    pub outer_dst_mac: [u8; 6],
+    /// The remote PE's **Router's MAC** (RFC 9135 §4), which becomes the inner
+    /// destination MAC — verbatim, *"the inner MAC DA"*. Without it a VXLAN peer
+    /// cannot route on our behalf, which is why the control plane treats a
+    /// prefix without one as unusable.
+    pub router_mac: [u8; 6],
+    /// This tenant's **anycast gateway MAC**, which becomes the inner source
+    /// MAC. Identical on every host serving the tenant, so a migrated workload
+    /// keeps its default-gateway ARP entry.
+    pub gateway_mac: [u8; 6],
+    /// Explicit padding, always zero.
+    pub _pad: [u8; 2],
+}
+
+impl IrbEndpoint {
+    /// Build an IRB route entry.
+    #[inline]
+    pub const fn new(
+        out_ifindex: u32,
+        l3_vni: u32,
+        remote_vtep_ip: [u8; 4],
+        outer_dst_mac: [u8; 6],
+        router_mac: [u8; 6],
+        gateway_mac: [u8; 6],
+    ) -> Self {
+        Self {
+            out_ifindex,
+            l3_vni,
+            remote_vtep_ip,
+            outer_dst_mac,
+            router_mac,
+            gateway_mac,
+            _pad: [0; 2],
+        }
+    }
+
+    /// The underlay half of this route as a [`TunnelEndpoint`], so the routed
+    /// frame reuses [`build_encap`] unchanged — the outer stack of an IRB packet
+    /// is in no way special.
+    #[inline]
+    pub const fn tunnel_endpoint(&self) -> TunnelEndpoint {
+        TunnelEndpoint::new(self.out_ifindex, self.remote_vtep_ip, self.outer_dst_mac)
+    }
+}
+
+// SAFETY: `#[repr(C)]`, `u32`s + byte arrays, padding explicitly zeroed.
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for IrbEndpoint {}
+
+/// The inner-header edits a symmetric-IRB hit implies, produced by [`plan_irb`].
+/// Every field is written at a constant offset into the *un-grown* packet,
+/// before the outer stack is prepended.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct IrbRewrite {
+    /// New inner destination MAC (the remote PE's Router's MAC).
+    pub inner_dst_mac: [u8; 6],
+    /// New inner source MAC (this tenant's anycast gateway MAC).
+    pub inner_src_mac: [u8; 6],
+    /// Decremented inner IPv4 TTL.
+    pub new_ttl: u8,
+    /// Inner IPv4 header checksum repaired for the new TTL.
+    pub new_checksum: u16,
+}
+
+/// Plan the inner rewrite for a symmetric-IRB hit: address the frame to the
+/// remote PE's Router's MAC, source it from this tenant's anycast gateway MAC,
+/// and take one hop off the TTL.
+///
+/// Returns `None` when the packet cannot survive another hop — a router that
+/// forwards a TTL-1 packet is a router that builds loops, so it is dropped
+/// rather than encapsulated.
+///
+/// The gate on *whether* to route at all (inner destination MAC == the anycast
+/// gateway MAC) belongs to the caller: a frame merely destined for a host behind
+/// a remote prefix, but addressed at L2 to something other than the gateway, is
+/// bridged traffic and must stay bridged.
+///
+/// ```
+/// use velstra_common::{plan_irb, IrbEndpoint};
+///
+/// let gw = [0x02, 0, 0, 0, 0, 0xaa];
+/// let rmac = [0x02, 0, 0x5e, 0, 0, 0x01];
+/// let ep = IrbEndpoint::new(7, 50100, [10, 0, 0, 2], [0x02, 0, 0, 0, 0, 0x02], rmac, gw);
+///
+/// let rw = plan_irb(&ep, 64, 0xb861, 6).unwrap();
+/// assert_eq!(rw.inner_dst_mac, rmac);
+/// assert_eq!(rw.inner_src_mac, gw);
+/// assert_eq!(rw.new_ttl, 63);
+///
+/// // A packet at the end of its life is dropped, not routed onto the overlay.
+/// assert!(plan_irb(&ep, 1, 0xb861, 6).is_none());
+/// ```
+#[inline]
+pub const fn plan_irb(ep: &IrbEndpoint, ttl: u8, checksum: u16, proto: u8) -> Option<IrbRewrite> {
+    let Some((new_ttl, new_checksum)) = crate::decrement_ttl(ttl, checksum, proto) else {
+        return None;
+    };
+    Some(IrbRewrite {
+        inner_dst_mac: ep.router_mac,
+        inner_src_mac: ep.gateway_mac,
+        new_ttl,
+        new_checksum,
+    })
+}
+
 /// Maximum number of remote VTEPs a single VNI's flood set (`FLOOD_LIST`) can
 /// hold. The B2 BUM head-end replication datapath iterates this set with a
 /// **constant** upper bound so the eBPF verifier can bound the loop; picking a
@@ -792,6 +929,70 @@ mod tests {
         assert_eq!(core::mem::size_of::<TunnelKey>(), 8);
         assert_eq!(core::mem::size_of::<TunnelEndpoint>(), 16);
         assert_eq!(OVERLAY_OUTER_LEN, 50);
+    }
+
+    #[test]
+    fn irb_endpoint_layout_and_encap_reuse() {
+        // 4 (ifindex) + 4 (l3_vni) + 4 (vtep) + 6+6+6 (macs) + 2 (pad) = 32.
+        assert_eq!(core::mem::size_of::<IrbEndpoint>(), 32);
+
+        let ep = IrbEndpoint::new(
+            7,
+            50100,
+            [10, 0, 0, 2],
+            NEXTHOP_MAC,
+            [0x02, 0, 0x5e, 0, 0, 0x01],
+            [0x02, 0, 0, 0, 0, 0xaa],
+        );
+        assert_eq!(ep._pad, [0, 0]);
+
+        // The underlay half is exactly a TunnelEndpoint — an IRB packet's outer
+        // stack is in no way special, which is what lets it reuse `build_encap`.
+        assert_eq!(
+            ep.tunnel_endpoint(),
+            TunnelEndpoint::new(7, [10, 0, 0, 2], NEXTHOP_MAC)
+        );
+    }
+
+    #[test]
+    fn irb_rewrite_swaps_macs_and_fixes_the_checksum() {
+        let gw = [0x02, 0, 0, 0, 0, 0xaa];
+        let router_mac = [0x02, 0, 0x5e, 0, 0, 0x01];
+        let ep = IrbEndpoint::new(7, 50100, [10, 0, 0, 2], NEXTHOP_MAC, router_mac, gw);
+
+        // A real inner IPv4 header (TTL 64, proto TCP) with a valid checksum.
+        let mut hdr = [0u8; 20];
+        hdr[0] = 0x45;
+        hdr[2..4].copy_from_slice(&40u16.to_be_bytes());
+        hdr[8] = 64;
+        hdr[9] = ip_proto::TCP;
+        hdr[12..16].copy_from_slice(&[10, 20, 0, 5]);
+        hdr[16..20].copy_from_slice(&[10, 30, 0, 5]);
+        let csum = ipv4_checksum(&hdr);
+        hdr[10..12].copy_from_slice(&csum.to_be_bytes());
+        assert_eq!(ipv4_validate(&hdr), 0);
+
+        let rw = plan_irb(&ep, 64, csum, ip_proto::TCP).expect("routable");
+        // Symmetric IRB addresses the frame to the remote PE's Router's MAC and
+        // sources it from the tenant's anycast gateway (RFC 9135 §4).
+        assert_eq!(rw.inner_dst_mac, router_mac);
+        assert_eq!(rw.inner_src_mac, gw);
+        assert_eq!(rw.new_ttl, 63);
+
+        // The incrementally repaired checksum must match a full recompute.
+        hdr[8] = rw.new_ttl;
+        hdr[10..12].copy_from_slice(&rw.new_checksum.to_be_bytes());
+        assert_eq!(ipv4_validate(&hdr), 0);
+    }
+
+    #[test]
+    fn irb_drops_a_packet_that_cannot_survive_the_hop() {
+        let ep = IrbEndpoint::new(7, 50100, [10, 0, 0, 2], NEXTHOP_MAC, LOCAL_MAC, LOCAL_MAC);
+        // Routing decrements the TTL, so TTL 1 and TTL 0 must never be
+        // encapsulated — forwarding them is how overlays build loops.
+        assert!(plan_irb(&ep, 1, 0, ip_proto::TCP).is_none());
+        assert!(plan_irb(&ep, 0, 0, ip_proto::TCP).is_none());
+        assert!(plan_irb(&ep, 2, 0, ip_proto::TCP).is_some());
     }
 
     #[test]

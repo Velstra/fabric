@@ -20,15 +20,16 @@ use clap::ValueEnum;
 use log::warn;
 use velstra_common::{
     ArpEntry, ArpKey, Backend, Cidr4, Counter, FloodSet, FlowKey, FlowState, GlobalConfig,
-    LocalMac, LocalMacKey, MacFdbKey, NdKey, Npt66, OverlayConfig, PolicyId, PortFwd, RouteEntry,
-    ScopedAddr, ScopedAddr6, ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue, Srv6Config,
-    Srv6Endpoint, Srv6LocalSid, Srv6SidKey, TunnelEndpoint, TunnelKey, parse_mac, port_rule_value,
+    IrbEndpoint, LocalMac, LocalMacKey, MacFdbKey, NdKey, Npt66, OverlayConfig, PolicyId, PortFwd,
+    RouteEntry, ScopedAddr, ScopedAddr6, ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue,
+    Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, TunnelEndpoint, TunnelKey, parse_mac,
+    port_rule_value,
 };
 use velstra_config::{
-    PolicyConfig, ResolvedFloodVtep, ResolvedInterface, ResolvedMacRoute, ResolvedNd6,
-    ResolvedNeighbor, ResolvedNpt66, ResolvedOverlay, ResolvedPortForward, ResolvedRoute,
-    ResolvedService, ResolvedSrv6, ResolvedSrv6LocalSid, ResolvedSrv6Route, ResolvedTunnel,
-    RuntimeConfig,
+    PolicyConfig, ResolvedFloodVtep, ResolvedInterface, ResolvedIrbRoute, ResolvedMacRoute,
+    ResolvedNd6, ResolvedNeighbor, ResolvedNpt66, ResolvedOverlay, ResolvedPortForward,
+    ResolvedRoute, ResolvedService, ResolvedSrv6, ResolvedSrv6LocalSid, ResolvedSrv6Route,
+    ResolvedTunnel, RuntimeConfig,
 };
 
 /// How to attach the XDP program to the interface.
@@ -678,6 +679,23 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
         }
     }
     {
+        // B7 IRB_ROUTES is an LpmTrie keyed exactly like OVERLAY_FDB; drop the old
+        // set so a prefix the control plane withdrew stops being routed, rather
+        // than lingering and sending its traffic to a VTEP that no longer owns it.
+        let mut irb: LpmTrie<_, TunnelKey, IrbEndpoint> = LpmTrie::try_from(
+            ebpf.map_mut("IRB_ROUTES")
+                .ok_or_else(|| anyhow!("IRB_ROUTES map missing"))?,
+        )?;
+        for r in &old.irb_routes {
+            let (_, addr) = r.inner_dst.lpm_key();
+            let key = Key::new(
+                TunnelKey::prefix_len(r.inner_dst.prefix),
+                TunnelKey::new(r.vni, addr),
+            );
+            let _ = irb.remove(&key);
+        }
+    }
+    {
         // B2 flood set: drop every VNI that had a flood set; program_overlay
         // rebuilds each still-current one from the fresh config. Keyed by a bare
         // VNI, so removing by the old flood entries' distinct VNIs clears it.
@@ -702,6 +720,9 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
         }
         for mr in &old.mac_routes {
             let _ = peers.remove(&mr.remote_vtep_ip);
+        }
+        for r in &old.irb_routes {
+            let _ = peers.remove(&r.remote_vtep_ip);
         }
         // Flood VTEPs are trusted decap peers too (they receive our encapped BUM
         // copies and send their own back).
@@ -764,6 +785,7 @@ fn apply_config(ebpf: &mut Ebpf, cfg: &RuntimeConfig, old: Option<&RuntimeConfig
         cfg.overlay.as_ref(),
         &cfg.tunnels,
         &cfg.mac_routes,
+        &cfg.irb_routes,
         &cfg.neighbors,
         &cfg.nd_neighbors,
         &cfg.flood_vteps,
@@ -1117,6 +1139,7 @@ fn program_overlay(
     overlay: Option<&ResolvedOverlay>,
     tunnels: &[ResolvedTunnel],
     mac_routes: &[ResolvedMacRoute],
+    irb_routes: &[ResolvedIrbRoute],
     neighbors: &[ResolvedNeighbor],
     nd_neighbors: &[ResolvedNd6],
     flood_vteps: &[ResolvedFloodVtep],
@@ -1174,7 +1197,11 @@ fn program_overlay(
         }
     }
 
-    if tunnels.is_empty() && mac_routes.is_empty() && flood_vteps.is_empty() {
+    if tunnels.is_empty()
+        && mac_routes.is_empty()
+        && irb_routes.is_empty()
+        && flood_vteps.is_empty()
+    {
         return Ok(());
     }
 
@@ -1221,6 +1248,41 @@ fn program_overlay(
                 log::debug!(
                     "mac_route egress {} not present yet; deferring its MAC-FDB entry",
                     m.out_iface
+                );
+                None
+            }
+        })
+        .collect();
+
+    // B7: resolve every symmetric-IRB route the same way. The LPM key is
+    // `(ingress vni exact, remote tenant prefix)` — the *ingress* segment, not the
+    // routed one, because that is all the datapath knows about an arriving frame;
+    // the routed VNI travels in the value.
+    let prepared_irb: Vec<(Key<TunnelKey>, IrbEndpoint)> = irb_routes
+        .iter()
+        .filter_map(|r| match if_nametoindex(&r.out_iface) {
+            Ok(ifindex) => {
+                let (_, addr) = r.inner_dst.lpm_key();
+                let key = Key::new(
+                    TunnelKey::prefix_len(r.inner_dst.prefix),
+                    TunnelKey::new(r.vni, addr),
+                );
+                Some((
+                    key,
+                    IrbEndpoint::new(
+                        ifindex,
+                        r.l3_vni,
+                        r.remote_vtep_ip,
+                        r.outer_dst_mac,
+                        r.router_mac,
+                        r.gateway_mac,
+                    ),
+                ))
+            }
+            Err(_) => {
+                log::debug!(
+                    "irb_route egress {} not present yet; deferring its IRB entry",
+                    r.out_iface
                 );
                 None
             }
@@ -1278,6 +1340,40 @@ fn program_overlay(
     }
 
     {
+        // B7 IRB_ROUTES: consulted before both bridging FDBs, and only for frames
+        // addressed to the tenant's anycast gateway MAC.
+        let mut irb: LpmTrie<_, TunnelKey, IrbEndpoint> = LpmTrie::try_from(
+            ebpf.map_mut("IRB_ROUTES")
+                .ok_or_else(|| anyhow!("IRB_ROUTES map missing"))?,
+        )?;
+        for (key, endpoint) in &prepared_irb {
+            irb.insert(key, endpoint, 0)
+                .context("inserting IRB route entry")?;
+        }
+    }
+
+    if !irb_routes.is_empty() {
+        // Symmetric IRB is symmetric: whatever we encapsulate into a tenant's L3
+        // VNI, the peer sends back into the same one. So a host that routes into
+        // an L3 VNI must also *admit* decap from it — the decap path drops any
+        // inner VNI absent from `LOCAL_VNIS`, and an L3 VNI belongs to no local
+        // tenant port, so `program_interfaces` never registers it.
+        //
+        // Like the interface VNIs it sits beside, this set is not reconciled on a
+        // live reconfigure: a removed tenant's L3 VNI stays admitted until the
+        // agent restarts.
+        let mut local_vnis: HashMap<_, u32, u32> = HashMap::try_from(
+            ebpf.map_mut("LOCAL_VNIS")
+                .ok_or_else(|| anyhow!("LOCAL_VNIS map missing"))?,
+        )?;
+        for r in irb_routes {
+            local_vnis
+                .insert(r.l3_vni, 0u32, 0)
+                .with_context(|| format!("registering local l3 vni {}", r.l3_vni))?;
+        }
+    }
+
+    {
         // B2 FLOOD_LIST: one FloodSet per VNI, walked by the TC ingress
         // `velstra_bum` classifier to head-end replicate BUM frames.
         let mut flood: HashMap<_, u32, FloodSet> = HashMap::try_from(
@@ -1311,6 +1407,13 @@ fn program_overlay(
                 .insert(m.remote_vtep_ip, 1, 0)
                 .context("inserting trusted VTEP peer (mac route)")?;
         }
+        // B7: an IRB route's remote VTEP is where the routed reply comes back
+        // from, so it must be an authorized decap source as well.
+        for r in irb_routes {
+            peers
+                .insert(r.remote_vtep_ip, 1, 0)
+                .context("inserting trusted VTEP peer (irb route)")?;
+        }
         // B2: flood VTEPs receive our encapped BUM copies (and send their own
         // back), so they are trusted decap peers as well.
         for fv in flood_vteps {
@@ -1333,6 +1436,11 @@ fn program_overlay(
         tx_ports
             .set(endpoint.out_ifindex, endpoint.out_ifindex, None, 0)
             .context("registering overlay redirect device (mac route)")?;
+    }
+    for (_, endpoint) in &prepared_irb {
+        tx_ports
+            .set(endpoint.out_ifindex, endpoint.out_ifindex, None, 0)
+            .context("registering overlay redirect device (irb route)")?;
     }
     // B2: the TC `velstra_bum` classifier `clone_redirect`s each BUM copy onto a
     // flood VTEP's underlay ifindex, so those ifindexes must be in the devmap too.
