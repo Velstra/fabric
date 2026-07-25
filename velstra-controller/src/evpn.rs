@@ -19,6 +19,12 @@
 //! chunks (B1/B2). Holding them now keeps the wire contract stable so those
 //! chunks only add a datapath, not a new feed.
 //!
+//! **Type-5 IP Prefix routes** (B7 symmetric IRB) are parsed and held on the same
+//! terms. Programming them is a routing decision, not a bridging one, so it needs
+//! two things the topology model does not express yet: which L2 VNIs share a
+//! tenant's routed context, and that tenant's anycast gateway. Until it does,
+//! these routes stay in [`EvpnLearned`] and reach no map.
+//!
 //! # Wire format (stable input contract)
 //! ```text
 //! + evpn vni <vni> mac <mac> ip <ipaddr> vtep <ipaddr>   # remote MAC/IP learned
@@ -26,8 +32,16 @@
 //! - evpn vni <vni> mac <mac>                             # remote MAC withdrawn
 //! + evpn vni <vni> flood <ipaddr>                        # BUM flood VTEP added
 //! - evpn vni <vni> flood <ipaddr>                        # BUM flood VTEP removed
+//! + evpn l3vni <vni> prefix <cidr> vtep <ipaddr> [router-mac <mac>] [gw <ipaddr>] [srv6 <sid>]
+//! - evpn l3vni <vni> prefix <cidr>                       # remote subnet withdrawn
 //! % end-of-dump                                          # initial snapshot done
 //! ```
+//!
+//! The prefix lines carry `l3vni`, a distinct keyword from the `vni` of the
+//! bridging lines, and name the **routed** VNI of a tenant IP-VRF — a different
+//! number space from the L2 VNIs above. That distinction is load-bearing: reading
+//! a type-5 route as a bridging update would program a routed prefix into an L2
+//! table.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -65,6 +79,19 @@ pub enum EvpnMonitorEvent {
     FloodUpdate { vni: u32, vtep: IpAddr },
     /// A type-3 IMET BUM flood VTEP was removed.
     FloodWithdraw { vni: u32, vtep: IpAddr },
+    /// A remote tenant subnet (type-5 IP Prefix, RFC 9136) reachable by routing
+    /// through `vtep` in the IP-VRF's L3 VNI. `router_mac` is the egress router's
+    /// IRB MAC (RFC 9135) — the inner destination MAC symmetric IRB writes when it
+    /// encapsulates toward that subnet.
+    PrefixUpdate {
+        l3_vni: u32,
+        prefix: String,
+        vtep: IpAddr,
+        router_mac: Option<[u8; 6]>,
+        gw: Option<IpAddr>,
+    },
+    /// A remote tenant subnet was withdrawn.
+    PrefixWithdraw { l3_vni: u32, prefix: String },
     /// The initial snapshot is complete; later lines are live updates.
     EndOfDump,
 }
@@ -99,12 +126,20 @@ pub fn parse_evpn_event(line: &str) -> Option<EvpnMonitorEvent> {
         return Some(EvpnMonitorEvent::EndOfDump);
     }
 
-    // Every real event is at least `<sign> evpn vni <vni> <kind> ...`.
+    // Every real event is at least `<sign> evpn <vni|l3vni> <n> <kind> ...`.
     if t.len() < 6 {
         return None;
     }
     let sign = t[0];
-    if (sign != "+" && sign != "-") || t[1] != "evpn" || t[2] != "vni" {
+    if (sign != "+" && sign != "-") || t[1] != "evpn" {
+        return None;
+    }
+    // `l3vni` introduces the routed (type-5) lines; `vni` the bridging ones. Any
+    // other keyword is a format we do not know and must skip, not guess at.
+    if t[2] == "l3vni" {
+        return parse_prefix_event(sign, &t);
+    }
+    if t[2] != "vni" {
         return None;
     }
     let vni: u32 = t[3].parse().ok()?;
@@ -162,6 +197,71 @@ pub fn parse_evpn_event(line: &str) -> Option<EvpnMonitorEvent> {
     }
 }
 
+/// Parse a type-5 line, already known to start `<sign> evpn l3vni ...`.
+///
+/// Unlike the bridging lines this cannot be matched on token count: the tail
+/// (`router-mac`, `gw`, `srv6`) is optional and, being append-only by contract,
+/// will grow. So the head is fixed and the tail is read as keyword/value pairs,
+/// with an unknown keyword rejecting the line rather than being skipped — a line
+/// we only half understand is one we would program incompletely.
+fn parse_prefix_event(sign: &str, t: &[&str]) -> Option<EvpnMonitorEvent> {
+    if t[4] != "prefix" {
+        return None;
+    }
+    let l3_vni: u32 = t[3].parse().ok()?;
+    let prefix = validated_cidr(t[5])?;
+
+    if sign == "-" {
+        // Withdraw is exactly `- evpn l3vni <vni> prefix <cidr>`.
+        return (t.len() == 6).then_some(EvpnMonitorEvent::PrefixWithdraw { l3_vni, prefix });
+    }
+    // `+ evpn l3vni V prefix P vtep VT [router-mac M] [gw G] [srv6 S]`
+    if t.len() < 8 || t[6] != "vtep" {
+        return None;
+    }
+    let vtep: IpAddr = t[7].parse().ok()?;
+    let mut router_mac = None;
+    let mut gw = None;
+    let mut rest = &t[8..];
+    while let [key, value, tail @ ..] = rest {
+        match *key {
+            "router-mac" => router_mac = Some(parse_mac(value)?),
+            "gw" => gw = Some(value.parse().ok()?),
+            // The SRv6 service SID is the alternative to VXLAN encapsulation; the
+            // overlay datapath is VXLAN-only here, so it is validated and dropped
+            // rather than carried as state nothing programs.
+            "srv6" => {
+                value.parse::<std::net::Ipv6Addr>().ok()?;
+            }
+            _ => return None,
+        }
+        rest = tail;
+    }
+    // An odd trailing token means a key without its value.
+    if !rest.is_empty() {
+        return None;
+    }
+    Some(EvpnMonitorEvent::PrefixUpdate {
+        l3_vni,
+        prefix,
+        vtep,
+        router_mac,
+        gw,
+    })
+}
+
+/// Accept `addr/len` only if both halves parse and the length fits the address
+/// family. The prefix is the map key a route is later programmed under, so a
+/// malformed one must be rejected at the parser rather than stored as a string
+/// that fails much later.
+fn validated_cidr(s: &str) -> Option<String> {
+    let (addr, len) = s.split_once('/')?;
+    let addr: IpAddr = addr.parse().ok()?;
+    let len: u8 = len.parse().ok()?;
+    let max = if addr.is_ipv4() { 32 } else { 128 };
+    (len <= max).then(|| s.to_string())
+}
+
 /// A single learned type-2 MAC: which `vtep` hosts it and, optionally, the
 /// tenant IP bound to it (present ⇒ programmable as ARP suppression + L3 route).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,6 +277,22 @@ pub struct EvpnLearned {
     macs: BTreeMap<(u32, [u8; 6]), LearnedMac>,
     /// `vni -> {flood VTEPs}` (type-3 IMET). Held for the future BUM datapath.
     floods: BTreeMap<u32, BTreeSet<IpAddr>>,
+    /// `(l3_vni, prefix) -> where to route it`. Keyed on the pair, not the prefix
+    /// alone: two tenants routinely use the same RFC 1918 subnet, and collapsing
+    /// them onto one key would send one tenant's traffic to the other's VTEP.
+    prefixes: BTreeMap<(u32, String), LearnedPrefix>,
+}
+
+/// A single learned type-5 subnet: which `vtep` routes it and the egress router's
+/// IRB MAC to write as the inner destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LearnedPrefix {
+    pub vtep: IpAddr,
+    /// RFC 9135 Router's MAC. `None` when the advertising PE omitted it — such a
+    /// route is held but not programmable over VXLAN, since there is no inner
+    /// destination MAC to encapsulate toward.
+    pub router_mac: Option<[u8; 6]>,
+    pub gw: Option<IpAddr>,
 }
 
 impl EvpnLearned {
@@ -213,6 +329,30 @@ impl EvpnLearned {
                 }
                 removed
             }
+            EvpnMonitorEvent::PrefixUpdate {
+                l3_vni,
+                prefix,
+                vtep,
+                router_mac,
+                gw,
+            } => {
+                let key = (*l3_vni, prefix.clone());
+                let next = LearnedPrefix {
+                    vtep: *vtep,
+                    router_mac: *router_mac,
+                    gw: *gw,
+                };
+                match self.prefixes.get(&key) {
+                    Some(cur) if *cur == next => false,
+                    _ => {
+                        self.prefixes.insert(key, next);
+                        true
+                    }
+                }
+            }
+            EvpnMonitorEvent::PrefixWithdraw { l3_vni, prefix } => {
+                self.prefixes.remove(&(*l3_vni, prefix.clone())).is_some()
+            }
             EvpnMonitorEvent::EndOfDump => false,
         }
     }
@@ -227,6 +367,22 @@ impl EvpnLearned {
     /// datapath (B2); not yet programmed into any map.
     pub fn floods(&self) -> &BTreeMap<u32, BTreeSet<IpAddr>> {
         &self.floods
+    }
+
+    /// Iterate learned type-5 subnets as `(l3_vni, prefix, &LearnedPrefix)`, in a
+    /// deterministic order.
+    ///
+    /// No caller yet, deliberately: folding these into a derived config requires
+    /// the topology to say which L2 VNIs share a tenant's routed context and what
+    /// its anycast gateway is, and it does not model that today. Deriving before
+    /// then would have to guess the tenant a subnet belongs to — and guessing
+    /// wrong routes one tenant's traffic into another's. The `allow` marks that as
+    /// a known seam rather than an oversight.
+    #[allow(dead_code)]
+    pub fn iter_prefixes(&self) -> impl Iterator<Item = (u32, &str, &LearnedPrefix)> {
+        self.prefixes
+            .iter()
+            .map(|((vni, p), v)| (*vni, p.as_str(), v))
     }
 }
 
@@ -384,6 +540,134 @@ mod tests {
                 vtep: "10.0.0.2".parse().unwrap(),
             }
         );
+    }
+
+    /// The full type-5 line, every optional field present. The Router's MAC is the
+    /// inner destination symmetric IRB encapsulates toward, so it must survive the
+    /// parse; the SRv6 SID is validated and dropped (the overlay is VXLAN here).
+    #[test]
+    fn parses_prefix_update_with_full_tail() {
+        let ev = parse_evpn_event(
+            "+ evpn l3vni 50100 prefix 10.20.0.0/24 vtep 10.0.0.1 \
+             router-mac 02:00:5e:00:00:aa gw 10.20.0.1 srv6 fc00:0:1:200:c3b4::",
+        )
+        .unwrap();
+        assert_eq!(
+            ev,
+            EvpnMonitorEvent::PrefixUpdate {
+                l3_vni: 50100,
+                prefix: "10.20.0.0/24".into(),
+                vtep: "10.0.0.1".parse().unwrap(),
+                router_mac: Some([0x02, 0x00, 0x5e, 0x00, 0x00, 0xaa]),
+                gw: Some("10.20.0.1".parse().unwrap()),
+            }
+        );
+    }
+
+    /// The tail is optional and order-independent — it is read as keyword/value
+    /// pairs precisely so a line carrying only some of it still parses.
+    #[test]
+    fn parses_prefix_update_with_partial_and_reordered_tail() {
+        let bare =
+            parse_evpn_event("+ evpn l3vni 7 prefix 2001:db8::/64 vtep 2001:db8::9").unwrap();
+        assert_eq!(
+            bare,
+            EvpnMonitorEvent::PrefixUpdate {
+                l3_vni: 7,
+                prefix: "2001:db8::/64".into(),
+                vtep: "2001:db8::9".parse().unwrap(),
+                router_mac: None,
+                gw: None,
+            }
+        );
+        let a = parse_evpn_event(
+            "+ evpn l3vni 7 prefix 10.0.0.0/8 vtep 10.0.0.1 router-mac aa:bb:cc:dd:ee:ff gw 10.0.0.1",
+        );
+        let b = parse_evpn_event(
+            "+ evpn l3vni 7 prefix 10.0.0.0/8 vtep 10.0.0.1 gw 10.0.0.1 router-mac aa:bb:cc:dd:ee:ff",
+        );
+        assert_eq!(a, b);
+        assert!(a.is_some());
+    }
+
+    #[test]
+    fn parses_prefix_withdraw() {
+        assert_eq!(
+            parse_evpn_event("- evpn l3vni 50100 prefix 10.20.0.0/24").unwrap(),
+            EvpnMonitorEvent::PrefixWithdraw {
+                l3_vni: 50100,
+                prefix: "10.20.0.0/24".into(),
+            }
+        );
+    }
+
+    /// An unknown tail keyword rejects the whole line. Skipping it instead would
+    /// mean programming a route from a line we only half understood — and the
+    /// format is append-only exactly so a future field is a reason to upgrade, not
+    /// to silently misread.
+    #[test]
+    fn rejects_malformed_prefix_lines() {
+        for bad in [
+            "+ evpn l3vni 50100 prefix 10.20.0.0/24 vtep 10.0.0.1 encap vxlan", // unknown key
+            "+ evpn l3vni 50100 prefix 10.20.0.0/24 vtep 10.0.0.1 router-mac",  // key, no value
+            "+ evpn l3vni 50100 prefix 10.20.0.0/24 vtep 10.0.0.1 router-mac zz:bb:cc:dd:ee:ff",
+            "+ evpn l3vni 50100 prefix 10.20.0.0/24 vtep notanip",
+            "+ evpn l3vni 50100 prefix 10.20.0.0/24 10.0.0.1", // missing `vtep`
+            "+ evpn l3vni 50100 prefix 10.20.0.0 vtep 10.0.0.1", // not a cidr
+            "+ evpn l3vni 50100 prefix 10.20.0.0/33 vtep 10.0.0.1", // v4 length overflow
+            "+ evpn l3vni notanumber prefix 10.20.0.0/24 vtep 10.0.0.1",
+            "- evpn l3vni 50100 prefix 10.20.0.0/24 vtep 10.0.0.1", // withdraw with a tail
+            "+ evpn l4vni 50100 prefix 10.20.0.0/24 vtep 10.0.0.1", // unknown keyword
+        ] {
+            assert!(parse_evpn_event(bad).is_none(), "should reject: {bad}");
+        }
+    }
+
+    /// The routed VNI is a separate number space from the bridged one: the same
+    /// number as an L2 VNI must not collide, and the same prefix in two tenants
+    /// must stay two routes.
+    #[test]
+    fn prefixes_are_keyed_per_l3_vni() {
+        let mut learned = EvpnLearned::default();
+        for (vni, vtep) in [(50100u32, "10.0.0.1"), (50200, "10.0.0.2")] {
+            assert!(learned.apply(&EvpnMonitorEvent::PrefixUpdate {
+                l3_vni: vni,
+                prefix: "10.20.0.0/24".into(),
+                vtep: vtep.parse().unwrap(),
+                router_mac: None,
+                gw: None,
+            }));
+        }
+        assert_eq!(learned.iter_prefixes().count(), 2);
+        // A bridging entry on a numerically equal VNI is a different table.
+        assert!(learned.apply(&EvpnMonitorEvent::MacUpdate {
+            vni: 50100,
+            mac: mac("aa:bb:cc:dd:ee:ff"),
+            ip: None,
+            vtep: "10.0.0.1".parse().unwrap(),
+        }));
+        assert_eq!(learned.iter_prefixes().count(), 2);
+
+        // Re-applying the identical route reports no change, so the controller
+        // does not re-derive and re-push every host config for nothing.
+        assert!(!learned.apply(&EvpnMonitorEvent::PrefixUpdate {
+            l3_vni: 50100,
+            prefix: "10.20.0.0/24".into(),
+            vtep: "10.0.0.1".parse().unwrap(),
+            router_mac: None,
+            gw: None,
+        }));
+        // A withdraw removes only its own tenant's route.
+        assert!(learned.apply(&EvpnMonitorEvent::PrefixWithdraw {
+            l3_vni: 50100,
+            prefix: "10.20.0.0/24".into(),
+        }));
+        let rest: Vec<_> = learned.iter_prefixes().map(|(v, p, _)| (v, p)).collect();
+        assert_eq!(rest, vec![(50200, "10.20.0.0/24")]);
+        assert!(!learned.apply(&EvpnMonitorEvent::PrefixWithdraw {
+            l3_vni: 50100,
+            prefix: "10.20.0.0/24".into(),
+        }));
     }
 
     #[test]
