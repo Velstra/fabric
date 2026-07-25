@@ -2,7 +2,10 @@
 //! maps from a [`RuntimeConfig`], attach the XDP hook, and read back per-CPU
 //! statistics.
 
-use std::{collections::HashSet, ffi::CString};
+use std::{
+    collections::{BTreeSet, HashSet},
+    ffi::CString,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use aya::{
@@ -679,6 +682,23 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
         }
     }
     {
+        // The set of segments this host admits a decap into. Drop the old set;
+        // program_interfaces and program_overlay re-add every still-current VNI,
+        // so a segment shared with a surviving port or IRB route is unaffected.
+        //
+        // Reconciled rather than left to accumulate because this map is a
+        // **tenant-isolation** boundary: a VNI that lingers after its last local
+        // port and route are gone lets any trusted peer VTEP keep injecting inner
+        // frames into a segment this host no longer serves.
+        let mut local_vnis: HashMap<_, u32, u32> = HashMap::try_from(
+            ebpf.map_mut("LOCAL_VNIS")
+                .ok_or_else(|| anyhow!("LOCAL_VNIS map missing"))?,
+        )?;
+        for vni in admitted_vnis(old) {
+            let _ = local_vnis.remove(&vni);
+        }
+    }
+    {
         // B7 IRB_ROUTES is an LpmTrie keyed exactly like OVERLAY_FDB; drop the old
         // set so a prefix the control plane withdrew stops being routed, rather
         // than lingering and sending its traffic to a VTEP that no longer owns it.
@@ -886,6 +906,24 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Every VNI a config could have admitted a decap into: each tenant port's
+/// segment, plus the **routed** VNI of every IRB route (B7), which belongs to no
+/// local port and is therefore registered from the routes alone.
+///
+/// Used to *clear* the old set on a reconfigure. The removal side is deliberately
+/// broader than the add side: `program_interfaces` only registers a VNI whose
+/// interface actually exists on the host right now, whereas this must name
+/// everything the previous config might have registered — anything it misses is
+/// a segment that stays decap-admitted after its last local port is gone.
+fn admitted_vnis(cfg: &RuntimeConfig) -> BTreeSet<u32> {
+    cfg.interfaces
+        .iter()
+        .map(|i| i.vni)
+        .chain(cfg.irb_routes.iter().map(|r| r.l3_vni))
+        .filter(|vni| *vni != 0)
+        .collect()
 }
 
 /// Map each configured interface to its policy id (`IFACE_POLICY`) and overlay
@@ -1359,9 +1397,9 @@ fn program_overlay(
         // inner VNI absent from `LOCAL_VNIS`, and an L3 VNI belongs to no local
         // tenant port, so `program_interfaces` never registers it.
         //
-        // Like the interface VNIs it sits beside, this set is not reconciled on a
-        // live reconfigure: a removed tenant's L3 VNI stays admitted until the
-        // agent restarts.
+        // `remove_stale` clears the whole set first, so a tenant dropped from the
+        // config stops being decap-admitted on this live reconfigure instead of
+        // lingering until the agent restarts.
         let mut local_vnis: HashMap<_, u32, u32> = HashMap::try_from(
             ebpf.map_mut("LOCAL_VNIS")
                 .ok_or_else(|| anyhow!("LOCAL_VNIS map missing"))?,
@@ -1806,6 +1844,44 @@ fn is_drop_counter(counter: Counter) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `LOCAL_VNIS` is a tenant-isolation boundary — a VNI left in it lets any
+    /// trusted peer VTEP keep injecting frames into a segment this host no longer
+    /// serves — so the reconcile has to name every VNI the old config could have
+    /// registered, including the routed ones no interface mentions.
+    #[test]
+    fn admitted_vnis_covers_ports_and_routed_vnis() {
+        let mut cfg = RuntimeConfig::passthrough();
+        cfg.interfaces.push(ResolvedInterface {
+            name: "tap0".into(),
+            policy: 100,
+            vni: 100,
+            masquerade: false,
+        });
+        // An uplink with no tenant segment must not register VNI 0.
+        cfg.interfaces.push(ResolvedInterface {
+            name: "eth0".into(),
+            policy: 0,
+            vni: 0,
+            masquerade: true,
+        });
+        cfg.irb_routes.push(ResolvedIrbRoute {
+            vni: 100,
+            inner_dst: velstra_common::parse_cidr_v4("10.20.0.0/24").unwrap(),
+            l3_vni: 50100,
+            remote_vtep_ip: [10, 0, 0, 2],
+            outer_dst_mac: [0x02, 0, 0, 0, 0, 0x02],
+            out_iface: "eth0".into(),
+            router_mac: [0x02, 0, 0x5e, 0, 0, 0x01],
+            gateway_mac: [0x02, 0, 0x5e, 0, 0, 0xaa],
+        });
+
+        let vnis = admitted_vnis(&cfg);
+        assert!(vnis.contains(&100), "the port's segment");
+        assert!(vnis.contains(&50100), "the tenant's routed VNI");
+        assert!(!vnis.contains(&0), "VNI 0 is not a segment");
+        assert_eq!(vnis.len(), 2);
+    }
 
     #[test]
     fn auto_mode_falls_back_driver_then_skb() {
