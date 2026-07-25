@@ -153,8 +153,10 @@ pub struct RouteCfg {
     pub mode: ForwardMode,
 }
 
-/// One real backend behind a [`ServiceCfg`].
-#[derive(Debug, Deserialize)]
+/// One real backend behind a [`ServiceCfg`]. `Clone` because the orchestrator
+/// now *builds* these (one service per policy id in play on the segment), not
+/// only parses them.
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackendCfg {
     /// Backend IP address.

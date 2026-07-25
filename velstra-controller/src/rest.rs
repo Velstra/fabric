@@ -50,13 +50,19 @@ use axum::{
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use velstra_config::{ActionName, EncapName, ProtoName};
-use velstra_orchestrator::{FloatingIp, Host, Network, Port, SecurityGroup, Subnet};
-use velstra_proto::{Action, Encap, PortRule, Proto, SecurityGroupSpec as ProtoSgSpec};
+use velstra_orchestrator::{
+    FloatingIp, Host, IpVrf, LoadBalancer, Network, Port, SecurityGroup, Subnet,
+};
+use velstra_proto::{
+    Action, Encap, LbMember as ProtoLbMember, LoadBalancerSpec as ProtoLbSpec, PortRule, Proto,
+    SecurityGroupSpec as ProtoSgSpec,
+};
 
 use crate::{
     Shared,
     authz::{Authz, Caller},
-    propose, raft_host_spec, raft_network_spec, raft_security_group_spec, raft_subnet_spec,
+    fmt_mac, propose, raft_host_spec, raft_load_balancer_spec, raft_network_spec,
+    raft_security_group_spec, raft_subnet_spec,
 };
 
 // ---------------------------------------------------------------------------
@@ -245,6 +251,16 @@ pub fn router(state: Arc<RestState>) -> Router {
             "/v1/security-groups/:name",
             get(get_security_group).delete(delete_security_group),
         )
+        .route(
+            "/v1/load-balancers",
+            get(list_load_balancers).post(create_load_balancer),
+        )
+        .route(
+            "/v1/load-balancers/:id",
+            get(get_load_balancer).delete(delete_load_balancer),
+        )
+        .route("/v1/ip-vrfs", get(list_ip_vrfs).post(create_ip_vrf))
+        .route("/v1/ip-vrfs/:l3_vni", get(get_ip_vrf).delete(delete_ip_vrf))
         .route(
             "/v1/floating-ips",
             get(list_floating_ips).post(allocate_floating_ip),
@@ -586,6 +602,92 @@ impl From<&SecurityGroup> for SecurityGroupJson {
     }
 }
 
+/// A tenant IP-VRF (B7) as the REST gateway reports it. Every field is
+/// operator-supplied — a VRF has no derived value like a security group's
+/// policy id — so the same shape serves reads and writes.
+#[derive(Debug, Serialize)]
+struct IpVrfJson {
+    l3_vni: u32,
+    name: String,
+    gateway_mac: String,
+    networks: Vec<u32>,
+}
+
+impl From<&IpVrf> for IpVrfJson {
+    fn from(v: &IpVrf) -> Self {
+        Self {
+            l3_vni: v.l3_vni,
+            name: v.name.clone(),
+            gateway_mac: fmt_mac(v.gateway_mac),
+            networks: v.networks.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateIpVrfReq {
+    l3_vni: u32,
+    name: String,
+    gateway_mac: String,
+    #[serde(default)]
+    networks: Vec<u32>,
+}
+
+/// A load-balanced service (D2 LBaaS) as the REST gateway reports it.
+#[derive(Debug, Serialize)]
+struct LoadBalancerJson {
+    id: String,
+    vni: u32,
+    vip: String,
+    port: u16,
+    proto: String,
+    members: Vec<LbMemberJson>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LbMemberJson {
+    port_id: String,
+    /// Backend port, or 0 to keep the client's original destination port.
+    #[serde(default)]
+    port: u16,
+}
+
+impl From<&LoadBalancer> for LoadBalancerJson {
+    fn from(lb: &LoadBalancer) -> Self {
+        Self {
+            id: lb.id.clone(),
+            vni: lb.vni,
+            vip: lb.vip.to_string(),
+            port: lb.port,
+            proto: proto_name_str(lb.proto).to_string(),
+            members: lb
+                .members
+                .iter()
+                .map(|m| LbMemberJson {
+                    port_id: m.port_id.clone(),
+                    port: m.port,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateLoadBalancerReq {
+    id: String,
+    vni: u32,
+    vip: String,
+    port: u16,
+    #[serde(default = "default_lb_proto")]
+    proto: String,
+    #[serde(default)]
+    members: Vec<LbMemberJson>,
+}
+
+fn default_lb_proto() -> String {
+    "tcp".to_string()
+}
+
 #[derive(Debug, Deserialize)]
 struct RuleReq {
     proto: String,
@@ -720,6 +822,14 @@ async fn read_subnets(shared: &Shared) -> Vec<SubnetJson> {
 
 async fn read_security_groups(shared: &Shared) -> Vec<SecurityGroupJson> {
     read_collection!(shared, security_groups, SecurityGroupJson)
+}
+
+async fn read_load_balancers(shared: &Shared) -> Vec<LoadBalancerJson> {
+    read_collection!(shared, load_balancers, LoadBalancerJson)
+}
+
+async fn read_ip_vrfs(shared: &Shared) -> Vec<IpVrfJson> {
+    read_collection!(shared, ip_vrfs, IpVrfJson)
 }
 
 async fn read_floating_ips(shared: &Shared) -> Vec<FloatingIpJson> {
@@ -1213,6 +1323,172 @@ async fn delete_security_group(
         "security-group.delete",
         &name,
         velstra_raft::TopoRequest::RemoveSecurityGroup { name: name.clone() },
+        StatusCode::CONFLICT,
+    )
+    .await?;
+    Ok(Json(DeletedJson { deleted: true }))
+}
+
+// ---------------------------------------------------------------------------
+// Load-balanced services (D2 LBaaS)
+// ---------------------------------------------------------------------------
+
+async fn list_load_balancers(State(state): State<Arc<RestState>>) -> Json<Vec<LoadBalancerJson>> {
+    Json(read_load_balancers(&state.shared).await)
+}
+
+async fn get_load_balancer(
+    State(state): State<Arc<RestState>>,
+    Path(id): Path<String>,
+) -> Result<Json<LoadBalancerJson>, ApiError> {
+    read_load_balancers(&state.shared)
+        .await
+        .into_iter()
+        .find(|lb| lb.id == id)
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found(format!("no load balancer with id {id:?}")))
+}
+
+async fn create_load_balancer(
+    State(state): State<Arc<RestState>>,
+    headers: HeaderMap,
+    Json(body): Json<CreateLoadBalancerReq>,
+) -> Result<(StatusCode, Json<LoadBalancerJson>), ApiError> {
+    let caller = state.caller(&headers);
+    let actor = actor_of(&caller);
+    let id = body.id.clone();
+    if !state.authz.allow_admin(&caller) {
+        state
+            .audit
+            .record(&actor, "load-balancer.create", &id, "denied");
+        return Err(ApiError::forbidden("define load balancers (admin only)"));
+    }
+    let spec = ProtoLbSpec {
+        id: body.id,
+        vni: body.vni,
+        vip: body.vip,
+        port: body.port as u32,
+        proto: parse_proto(&body.proto)? as i32,
+        members: body
+            .members
+            .into_iter()
+            .map(|m| ProtoLbMember {
+                port_id: m.port_id,
+                port: m.port as u32,
+            })
+            .collect(),
+    };
+    propose_audited(
+        &state,
+        &actor,
+        "load-balancer.create",
+        &id,
+        velstra_raft::TopoRequest::AddLoadBalancer(raft_load_balancer_spec(spec)),
+        StatusCode::BAD_REQUEST,
+    )
+    .await?;
+    let created = get_load_balancer(State(state), Path(id)).await?;
+    Ok((StatusCode::CREATED, created))
+}
+
+async fn delete_load_balancer(
+    State(state): State<Arc<RestState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<DeletedJson>, ApiError> {
+    let caller = state.caller(&headers);
+    let actor = actor_of(&caller);
+    if !state.authz.allow_admin(&caller) {
+        state
+            .audit
+            .record(&actor, "load-balancer.delete", &id, "denied");
+        return Err(ApiError::forbidden("remove load balancers (admin only)"));
+    }
+    propose_audited(
+        &state,
+        &actor,
+        "load-balancer.delete",
+        &id,
+        velstra_raft::TopoRequest::RemoveLoadBalancer { id: id.clone() },
+        StatusCode::CONFLICT,
+    )
+    .await?;
+    Ok(Json(DeletedJson { deleted: true }))
+}
+
+// ---------------------------------------------------------------------------
+// Tenant IP-VRFs (B7)
+// ---------------------------------------------------------------------------
+
+async fn list_ip_vrfs(State(state): State<Arc<RestState>>) -> Json<Vec<IpVrfJson>> {
+    Json(read_ip_vrfs(&state.shared).await)
+}
+
+async fn get_ip_vrf(
+    State(state): State<Arc<RestState>>,
+    Path(l3_vni): Path<u32>,
+) -> Result<Json<IpVrfJson>, ApiError> {
+    read_ip_vrfs(&state.shared)
+        .await
+        .into_iter()
+        .find(|v| v.l3_vni == l3_vni)
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found(format!("no ip-vrf with l3 vni {l3_vni}")))
+}
+
+async fn create_ip_vrf(
+    State(state): State<Arc<RestState>>,
+    headers: HeaderMap,
+    Json(body): Json<CreateIpVrfReq>,
+) -> Result<(StatusCode, Json<IpVrfJson>), ApiError> {
+    let caller = state.caller(&headers);
+    let actor = actor_of(&caller);
+    let l3_vni = body.l3_vni;
+    let target = l3_vni.to_string();
+    if !state.authz.allow_admin(&caller) {
+        state
+            .audit
+            .record(&actor, "ip-vrf.create", &target, "denied");
+        return Err(ApiError::forbidden("define IP-VRFs (admin only)"));
+    }
+    propose_audited(
+        &state,
+        &actor,
+        "ip-vrf.create",
+        &target,
+        velstra_raft::TopoRequest::AddIpVrf(velstra_raft::IpVrfSpec {
+            l3_vni,
+            name: body.name,
+            gateway_mac: body.gateway_mac,
+            networks: body.networks,
+        }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await?;
+    let created = get_ip_vrf(State(state), Path(l3_vni)).await?;
+    Ok((StatusCode::CREATED, created))
+}
+
+async fn delete_ip_vrf(
+    State(state): State<Arc<RestState>>,
+    headers: HeaderMap,
+    Path(l3_vni): Path<u32>,
+) -> Result<Json<DeletedJson>, ApiError> {
+    let caller = state.caller(&headers);
+    let actor = actor_of(&caller);
+    let target = l3_vni.to_string();
+    if !state.authz.allow_admin(&caller) {
+        state
+            .audit
+            .record(&actor, "ip-vrf.delete", &target, "denied");
+        return Err(ApiError::forbidden("remove IP-VRFs (admin only)"));
+    }
+    propose_audited(
+        &state,
+        &actor,
+        "ip-vrf.delete",
+        &target,
+        velstra_raft::TopoRequest::RemoveIpVrf { l3_vni },
         StatusCode::CONFLICT,
     )
     .await?;

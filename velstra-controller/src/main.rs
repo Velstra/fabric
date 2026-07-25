@@ -52,12 +52,14 @@ use velstra_orchestrator::Topology;
 use velstra_proto::{
     Ack, Action, AllocateAddressRequest, AllocateAddressResponse, AllocateFloatingIpRequest,
     AssociateFloatingIpRequest, BindPortSecurityGroupRequest, BindPortSubnetRequest,
-    CreatePortRequest, DisassociateFloatingIpRequest, Encap, FloatingIpInfo, HostSpec,
-    ListFloatingIpsRequest, ListFloatingIpsResponse, ListNodesRequest, ListNodesResponse,
-    ListPortsRequest, ListPortsResponse, ListSecurityGroupsRequest, ListSecurityGroupsResponse,
-    ListSubnetsRequest, ListSubnetsResponse, MigratePortRequest, NetworkSpec, NodeConfig,
-    NodeRequest, NodeSummary, PortAddrInfo, PortInfo, PortRule, Proto, ReleaseAddressRequest,
-    ReleaseFloatingIpRequest, RemoveHostRequest, RemoveNetworkRequest, RemovePortRequest,
+    CreatePortRequest, DisassociateFloatingIpRequest, Encap, FloatingIpInfo, HostSpec, IpVrfSpec,
+    LbMember, ListFloatingIpsRequest, ListFloatingIpsResponse, ListIpVrfsRequest,
+    ListIpVrfsResponse, ListLoadBalancersRequest, ListLoadBalancersResponse, ListNodesRequest,
+    ListNodesResponse, ListPortsRequest, ListPortsResponse, ListSecurityGroupsRequest,
+    ListSecurityGroupsResponse, ListSubnetsRequest, ListSubnetsResponse, LoadBalancerSpec,
+    MigratePortRequest, NetworkSpec, NodeConfig, NodeRequest, NodeSummary, PortAddrInfo, PortInfo,
+    PortRule, Proto, ReleaseAddressRequest, ReleaseFloatingIpRequest, RemoveHostRequest,
+    RemoveIpVrfRequest, RemoveLoadBalancerRequest, RemoveNetworkRequest, RemovePortRequest,
     RemoveSecurityGroupRequest, RemoveSubnetRequest, SecurityGroupInfo, SecurityGroupSpec,
     SetConfigRequest, StatsReport, SubnetInfo, SubnetSpec, UnbindPortAddressRequest,
     velstra_admin_client::VelstraAdminClient,
@@ -354,6 +356,52 @@ enum OrchAction {
         #[arg(long)]
         clear: bool,
     },
+    /// Define a tenant IP-VRF (B7): the routed context a set of L2 segments
+    /// share, behind one anycast gateway MAC. Repeat `--network` per segment.
+    AddIpVrf {
+        #[arg(long)]
+        l3_vni: u32,
+        #[arg(long)]
+        name: String,
+        /// The anycast gateway MAC, identical on every host of this tenant.
+        #[arg(long)]
+        gateway_mac: String,
+        /// An L2 VNI routed in this context, repeatable.
+        #[arg(long = "network")]
+        network: Vec<u32>,
+    },
+    /// Remove an IP-VRF by its L3 VNI; its segments stay, unrouted.
+    RemoveIpVrf {
+        #[arg(long)]
+        l3_vni: u32,
+    },
+    /// List all tenant IP-VRFs in the fabric.
+    ListIpVrfs,
+    /// Define a load-balanced service (D2 LBaaS): a VIP fronting a pool of
+    /// fabric ports. Members are `port-id[:backend-port]`, repeatable.
+    AddLoadBalancer {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        vni: u32,
+        #[arg(long)]
+        vip: String,
+        #[arg(long)]
+        port: u16,
+        /// `tcp` (default) or `udp`.
+        #[arg(long, default_value = "tcp")]
+        proto: String,
+        /// A pool member as `port-id` or `port-id:backend-port`, repeatable.
+        #[arg(long = "member")]
+        member: Vec<String>,
+    },
+    /// Remove a load-balanced service by id.
+    RemoveLoadBalancer {
+        #[arg(long)]
+        id: String,
+    },
+    /// List all load-balanced services in the fabric.
+    ListLoadBalancers,
     /// Define a first-class subnet under a network (D2).
     AddSubnet {
         #[arg(long)]
@@ -846,7 +894,7 @@ struct OrchestratorSvc {
     authz: Authz,
 }
 
-fn fmt_mac(mac: [u8; 6]) -> String {
+pub(crate) fn fmt_mac(mac: [u8; 6]) -> String {
     let [a, b, c, d, e, f] = mac;
     format!("{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}")
 }
@@ -945,6 +993,66 @@ fn raft_security_group_spec(s: SecurityGroupSpec) -> velstra_raft::SecurityGroup
         stateful: s.stateful,
         blocklist: s.blocklist.clone(),
         rules: s.rules.iter().map(config_rule_from_proto).collect(),
+    }
+}
+
+fn raft_ip_vrf_spec(s: IpVrfSpec) -> velstra_raft::IpVrfSpec {
+    velstra_raft::IpVrfSpec {
+        l3_vni: s.l3_vni,
+        name: s.name,
+        gateway_mac: s.gateway_mac,
+        networks: s.networks,
+    }
+}
+
+/// An IP-VRF as reported by ListIpVrfs. The spec message doubles as the info
+/// message: unlike a security group, a VRF has no controller-derived field, so a
+/// separate one would only be a copy that can drift.
+fn ip_vrf_to_spec(v: &velstra_orchestrator::IpVrf) -> IpVrfSpec {
+    IpVrfSpec {
+        l3_vni: v.l3_vni,
+        name: v.name.clone(),
+        gateway_mac: fmt_mac(v.gateway_mac),
+        networks: v.networks.clone(),
+    }
+}
+
+pub(crate) fn raft_load_balancer_spec(s: LoadBalancerSpec) -> velstra_raft::LoadBalancerSpec {
+    let proto = proto_from_proto(s.proto());
+    velstra_raft::LoadBalancerSpec {
+        id: s.id,
+        vni: s.vni,
+        vip: s.vip,
+        port: s.port as u16,
+        proto,
+        members: s
+            .members
+            .into_iter()
+            .map(|m| velstra_raft::LbMemberSpec {
+                port_id: m.port_id,
+                port: m.port as u16,
+            })
+            .collect(),
+    }
+}
+
+/// A load balancer as reported by ListLoadBalancers. Like an IP-VRF, every field
+/// is operator-supplied, so the spec message doubles as the info message.
+fn lb_to_spec(lb: &velstra_orchestrator::LoadBalancer) -> LoadBalancerSpec {
+    LoadBalancerSpec {
+        id: lb.id.clone(),
+        vni: lb.vni,
+        vip: lb.vip.to_string(),
+        port: lb.port as u32,
+        proto: proto_to_proto(lb.proto) as i32,
+        members: lb
+            .members
+            .iter()
+            .map(|m| LbMember {
+                port_id: m.port_id.clone(),
+                port: m.port as u32,
+            })
+            .collect(),
     }
 }
 
@@ -1356,6 +1464,137 @@ impl VelstraOrchestrator for OrchestratorSvc {
                 .collect()
         };
         Ok(Response::new(ListSecurityGroupsResponse { groups }))
+    }
+
+    // --- Tenant IP-VRFs (B7) ------------------------------------------------
+
+    async fn add_ip_vrf(&self, request: Request<IpVrfSpec>) -> Result<Response<Ack>, Status> {
+        let caller = caller_of(&request);
+        if !self.authz.allow_admin(&caller) {
+            return Err(deny("define IP-VRFs (admin only)"));
+        }
+        let spec = request.into_inner();
+        info!("AddIpVrf({:?} l3vni {})", spec.name, spec.l3_vni);
+        let resp = propose(
+            &self.shared,
+            velstra_raft::TopoRequest::AddIpVrf(raft_ip_vrf_spec(spec)),
+        )
+        .await?;
+        if !resp.ok {
+            return Err(Status::invalid_argument(resp.error.unwrap_or_default()));
+        }
+        Ok(Response::new(Ack { ok: true }))
+    }
+
+    async fn remove_ip_vrf(
+        &self,
+        request: Request<RemoveIpVrfRequest>,
+    ) -> Result<Response<Ack>, Status> {
+        let caller = caller_of(&request);
+        if !self.authz.allow_admin(&caller) {
+            return Err(deny("remove IP-VRFs (admin only)"));
+        }
+        let l3_vni = request.into_inner().l3_vni;
+        info!("RemoveIpVrf({l3_vni})");
+        let resp = propose(
+            &self.shared,
+            velstra_raft::TopoRequest::RemoveIpVrf { l3_vni },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(Status::failed_precondition(resp.error.unwrap_or_default()));
+        }
+        Ok(Response::new(Ack { ok: true }))
+    }
+
+    async fn list_ip_vrfs(
+        &self,
+        _request: Request<ListIpVrfsRequest>,
+    ) -> Result<Response<ListIpVrfsResponse>, Status> {
+        // Read from the Raft state machine in cluster mode, else the local model.
+        let ip_vrfs = if let Some(raft) = &self.shared.raft {
+            raft.topology()
+                .await
+                .ip_vrfs()
+                .map(ip_vrf_to_spec)
+                .collect()
+        } else {
+            self.shared
+                .topology
+                .read()
+                .await
+                .ip_vrfs()
+                .map(ip_vrf_to_spec)
+                .collect()
+        };
+        Ok(Response::new(ListIpVrfsResponse { ip_vrfs }))
+    }
+
+    // --- Load-balanced services (D2 LBaaS) ----------------------------------
+
+    async fn add_load_balancer(
+        &self,
+        request: Request<LoadBalancerSpec>,
+    ) -> Result<Response<Ack>, Status> {
+        let caller = caller_of(&request);
+        if !self.authz.allow_admin(&caller) {
+            return Err(deny("define load balancers (admin only)"));
+        }
+        let spec = request.into_inner();
+        info!("AddLoadBalancer({:?} {}:{})", spec.id, spec.vip, spec.port);
+        let resp = propose(
+            &self.shared,
+            velstra_raft::TopoRequest::AddLoadBalancer(raft_load_balancer_spec(spec)),
+        )
+        .await?;
+        if !resp.ok {
+            return Err(Status::invalid_argument(resp.error.unwrap_or_default()));
+        }
+        Ok(Response::new(Ack { ok: true }))
+    }
+
+    async fn remove_load_balancer(
+        &self,
+        request: Request<RemoveLoadBalancerRequest>,
+    ) -> Result<Response<Ack>, Status> {
+        let caller = caller_of(&request);
+        if !self.authz.allow_admin(&caller) {
+            return Err(deny("remove load balancers (admin only)"));
+        }
+        let id = request.into_inner().id;
+        info!("RemoveLoadBalancer({id:?})");
+        let resp = propose(
+            &self.shared,
+            velstra_raft::TopoRequest::RemoveLoadBalancer { id },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(Status::failed_precondition(resp.error.unwrap_or_default()));
+        }
+        Ok(Response::new(Ack { ok: true }))
+    }
+
+    async fn list_load_balancers(
+        &self,
+        _request: Request<ListLoadBalancersRequest>,
+    ) -> Result<Response<ListLoadBalancersResponse>, Status> {
+        // Read from the Raft state machine in cluster mode, else the local model.
+        let load_balancers = if let Some(raft) = &self.shared.raft {
+            raft.topology()
+                .await
+                .load_balancers()
+                .map(lb_to_spec)
+                .collect()
+        } else {
+            self.shared
+                .topology
+                .read()
+                .await
+                .load_balancers()
+                .map(lb_to_spec)
+                .collect()
+        };
+        Ok(Response::new(ListLoadBalancersResponse { load_balancers }))
     }
 
     // --- Subnets + IPAM (D2) ------------------------------------------------
@@ -2267,6 +2506,120 @@ async fn orch(args: OrchArgs) -> Result<()> {
             match group {
                 Some(g) => println!("bound port {:?} to security group {g:?}", info.id),
                 None => println!("cleared security group on port {:?}", info.id),
+            }
+        }
+        OrchAction::AddIpVrf {
+            l3_vni,
+            name,
+            gateway_mac,
+            network,
+        } => {
+            client
+                .add_ip_vrf(IpVrfSpec {
+                    l3_vni,
+                    name: name.clone(),
+                    gateway_mac,
+                    networks: network,
+                })
+                .await?;
+            println!("added ip-vrf {name:?} (l3vni {l3_vni})");
+        }
+        OrchAction::RemoveIpVrf { l3_vni } => {
+            let ack = client
+                .remove_ip_vrf(RemoveIpVrfRequest { l3_vni })
+                .await?
+                .into_inner();
+            println!(
+                "{} ip-vrf l3vni {l3_vni}",
+                if ack.ok { "removed" } else { "no such" }
+            );
+        }
+        OrchAction::ListIpVrfs => {
+            let resp = client
+                .list_ip_vrfs(ListIpVrfsRequest {})
+                .await?
+                .into_inner();
+            println!(
+                "{:<24} {:>8}  {:<18} networks",
+                "name", "l3vni", "gateway_mac"
+            );
+            for v in resp.ip_vrfs {
+                let nets: Vec<String> = v.networks.iter().map(|n| n.to_string()).collect();
+                println!(
+                    "{:<24} {:>8}  {:<18} {}",
+                    v.name,
+                    v.l3_vni,
+                    v.gateway_mac,
+                    nets.join(",")
+                );
+            }
+        }
+        OrchAction::AddLoadBalancer {
+            id,
+            vni,
+            vip,
+            port,
+            proto,
+            member,
+        } => {
+            let proto = match proto.as_str() {
+                "tcp" => Proto::Tcp,
+                "udp" => Proto::Udp,
+                other => bail!("unknown proto {other:?} (use tcp or udp)"),
+            };
+            let mut members = Vec::with_capacity(member.len());
+            for m in &member {
+                // `port-id:backend-port`, or a bare port id to keep the client's
+                // original destination port.
+                let (port_id, backend) = match m.split_once(':') {
+                    Some((p, b)) => (
+                        p,
+                        b.parse::<u16>()
+                            .map_err(|_| anyhow!("bad backend port in member {m:?}"))?,
+                    ),
+                    None => (m.as_str(), 0),
+                };
+                members.push(LbMember {
+                    port_id: port_id.to_string(),
+                    port: backend as u32,
+                });
+            }
+            client
+                .add_load_balancer(LoadBalancerSpec {
+                    id: id.clone(),
+                    vni,
+                    vip: vip.clone(),
+                    port: port as u32,
+                    proto: proto as i32,
+                    members,
+                })
+                .await?;
+            println!("added load balancer {id:?} ({vip}:{port})");
+        }
+        OrchAction::RemoveLoadBalancer { id } => {
+            let ack = client
+                .remove_load_balancer(RemoveLoadBalancerRequest { id: id.clone() })
+                .await?
+                .into_inner();
+            println!(
+                "{} load balancer {id:?}",
+                if ack.ok { "removed" } else { "no such" }
+            );
+        }
+        OrchAction::ListLoadBalancers => {
+            let resp = client
+                .list_load_balancers(ListLoadBalancersRequest {})
+                .await?
+                .into_inner();
+            println!("{:<20} {:>8}  {:<22} members", "id", "vni", "vip:port");
+            for lb in resp.load_balancers {
+                println!(
+                    "{:<20} {:>8}  {:<22} {}",
+                    lb.id,
+                    lb.vni,
+                    format!("{}:{}", lb.vip, lb.port),
+                    lb.members.len()
+                );
             }
         }
         OrchAction::AddSubnet {
