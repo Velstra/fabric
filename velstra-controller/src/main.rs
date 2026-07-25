@@ -73,6 +73,7 @@ mod authz;
 mod evpn;
 mod rest;
 mod topology;
+mod webhook;
 
 use authz::{Authz, caller_of};
 use evpn::EvpnLearned;
@@ -212,6 +213,13 @@ struct ServeArgs {
     /// in addition to the in-memory ring exposed at `GET /v1/audit`.
     #[arg(long, requires = "rest_listen")]
     rest_audit_log: Option<PathBuf>,
+
+    /// POST every change event to this URL as JSON (repeatable). The push
+    /// counterpart of the `GET /v1/events` stream, for consumers that cannot
+    /// hold a connection open. Delivery is best-effort with bounded retries;
+    /// reconcile against `GET /v1/audit` if completeness matters.
+    #[arg(long = "webhook", requires = "rest_listen")]
+    webhooks: Vec<String>,
 }
 
 /// Client TLS options for the admin/orchestrator CLIs (use an `https://`
@@ -2214,6 +2222,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
             Authz::new(args.admin_cn.clone(), true)
         };
         let audit = Arc::new(rest::Audit::new(args.rest_audit_log.as_ref()));
+        // One delivery task per webhook URL, each on its own subscription, so a
+        // hung endpoint lags only itself and never the API.
+        webhook::spawn(&audit, &args.webhooks);
         let rest_state = Arc::new(rest::RestState {
             shared: shared.clone(),
             authz: rest_authz,

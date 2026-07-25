@@ -145,7 +145,7 @@ impl Audit {
 
     /// Subscribe to the live record stream. Records emitted before subscribing
     /// are not replayed — `GET /v1/audit` serves the backlog.
-    fn subscribe(&self) -> broadcast::Receiver<AuditEntry> {
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<AuditEntry> {
         self.events.subscribe()
     }
 

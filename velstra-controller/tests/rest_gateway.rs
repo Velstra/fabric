@@ -4,7 +4,8 @@
 //! reqwest: create → list → get → delete for networks, subnets, a security group
 //! and a floating IP; the consistent error envelope; an authz rejection for a
 //! non-admin mutation; that mutations land in the audit log; and that a live
-//! subscriber on the SSE event stream sees one arrive. No root, no eBPF.
+//! subscriber on the SSE event stream sees one arrive, and that a configured
+//! webhook endpoint is POSTed the same record. No root, no eBPF.
 
 use std::{
     process::{Child, Command},
@@ -20,6 +21,21 @@ impl Drop for Controller {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+/// A one-shot HTTP sink: accepts one connection, reads the request, answers 200
+/// and hands the raw bytes back. Enough to prove a webhook was actually
+/// delivered, without pulling in a server framework for the test.
+async fn webhook_sink(listener: tokio::net::TcpListener) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut sock, _) = listener.accept().await.expect("webhook connection");
+    let mut buf = vec![0u8; 4096];
+    let n = sock.read(&mut buf).await.unwrap_or(0);
+    let _ = sock
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        .await;
+    let _ = sock.flush().await;
+    String::from_utf8_lossy(&buf[..n]).to_string()
 }
 
 const ADMIN_TOKEN: &str = "admin-secret-token";
@@ -42,6 +58,13 @@ async fn rest_gateway_crud_authz_and_audit() {
     let rest_port = base + 2;
     let rest = format!("http://127.0.0.1:{rest_port}");
 
+    // Bind the webhook sink first so the controller can be pointed at it.
+    let sink = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind webhook sink");
+    let webhook_url = format!("http://{}/hook", sink.local_addr().unwrap());
+    let sink = tokio::spawn(webhook_sink(sink));
+
     let _controller = Controller(
         Command::new(env!("CARGO_BIN_EXE_velstra-controller"))
             .args([
@@ -60,6 +83,8 @@ async fn rest_gateway_crud_authz_and_audit() {
                 &format!("web-1={NODE_TOKEN}"),
                 "--admin-cn",
                 "ops-admin",
+                "--webhook",
+                &webhook_url,
             ])
             .spawn()
             .expect("spawn controller"),
@@ -143,6 +168,24 @@ async fn rest_gateway_crud_authz_and_audit() {
     assert!(
         env["message"].as_str().unwrap().contains("999"),
         "error envelope carries a message: {env}"
+    );
+
+    // --- Webhook: the same record is pushed to a configured endpoint --------
+    //
+    // The network create above is the first mutation, so it is the record the
+    // sink receives. Bounded wait: a missing delivery must fail the test, not
+    // hang the suite.
+    let delivered = tokio::time::timeout(Duration::from_secs(10), sink)
+        .await
+        .expect("webhook delivered within 10s")
+        .expect("sink task");
+    assert!(
+        delivered.starts_with("POST /hook "),
+        "webhook POSTs to the configured path: {delivered:?}"
+    );
+    assert!(
+        delivered.contains("network.create") && delivered.contains("ops-admin"),
+        "webhook body carries the record: {delivered:?}"
     );
 
     // --- AuthZ: a non-admin (node) token may NOT define a network -----------
