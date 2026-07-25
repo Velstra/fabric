@@ -44,11 +44,18 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, post},
 };
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
+// `tokio_stream::Stream` is a re-export of `futures_core::Stream`, so the SSE
+// handler needs no extra dependency to name its return type.
+use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 use velstra_config::{ActionName, EncapName, ProtoName};
 use velstra_orchestrator::{
     FloatingIp, Host, IpVrf, LoadBalancer, Network, Port, SecurityGroup, Subnet,
@@ -71,6 +78,12 @@ use crate::{
 
 /// How many recent audit records the in-memory ring retains.
 const AUDIT_RING_CAP: usize = 1024;
+
+/// How many records the live event channel buffers per subscriber before it
+/// starts dropping the oldest for that subscriber (and tells it how many it
+/// missed). Bounded on purpose: a stalled consumer must never apply
+/// back-pressure to the fabric's mutations.
+const EVENT_CHANNEL_CAP: usize = 256;
 
 /// One structured audit record for a mutation that reached the gateway.
 #[derive(Debug, Clone, Serialize)]
@@ -96,6 +109,11 @@ pub struct Audit {
     ring: Mutex<VecDeque<AuditEntry>>,
     seq: AtomicU64,
     file: Option<Mutex<std::fs::File>>,
+    /// Live fan-out of the same records, for `/v1/events` subscribers. A
+    /// broadcast channel drops the oldest record for a subscriber that falls
+    /// behind rather than stalling the mutation that produced it: the API must
+    /// not slow down because someone's event consumer did.
+    events: broadcast::Sender<AuditEntry>,
 }
 
 impl Audit {
@@ -121,7 +139,14 @@ impl Audit {
             ring: Mutex::new(VecDeque::with_capacity(AUDIT_RING_CAP)),
             seq: AtomicU64::new(0),
             file,
+            events: broadcast::channel(EVENT_CHANNEL_CAP).0,
         }
+    }
+
+    /// Subscribe to the live record stream. Records emitted before subscribing
+    /// are not replayed — `GET /v1/audit` serves the backlog.
+    fn subscribe(&self) -> broadcast::Receiver<AuditEntry> {
+        self.events.subscribe()
     }
 
     /// Record one mutation. `result` is `ok`, `denied`, or `error: …`.
@@ -143,6 +168,9 @@ impl Audit {
                 }
             }
         }
+        // Fan out before the ring so a subscriber sees the record even if the
+        // ring lock is contended. `send` errors only when nobody is listening.
+        let _ = self.events.send(entry.clone());
         if let Ok(mut ring) = self.ring.lock() {
             if ring.len() == AUDIT_RING_CAP {
                 ring.pop_front();
@@ -235,6 +263,7 @@ pub fn router(state: Arc<RestState>) -> Router {
         .route("/healthz", get(healthz))
         .route("/version", get(version))
         .route("/v1/audit", get(list_audit))
+        .route("/v1/events", get(events))
         .route("/v1/hosts", get(list_hosts).post(create_host))
         .route("/v1/hosts/:id", get(get_host).delete(delete_host))
         .route("/v1/networks", get(list_networks).post(create_network))
@@ -1327,6 +1356,38 @@ async fn delete_security_group(
     )
     .await?;
     Ok(Json(DeletedJson { deleted: true }))
+}
+
+/// `GET /v1/events` — the live change stream, as Server-Sent Events.
+///
+/// Each event carries one [`AuditEntry`]: which operation touched which target,
+/// by whom, and whether it succeeded. That is enough for a consuming product to
+/// react — re-read the affected resource — without polling the whole fabric.
+///
+/// Only records emitted *after* subscribing are delivered; `GET /v1/audit`
+/// serves the backlog, so a consumer that wants both reads the backlog first and
+/// de-duplicates on `seq`.
+///
+/// A subscriber that cannot keep up is **lagged**, not blocked: it receives a
+/// `lagged` event naming how many records it missed and the stream continues.
+/// The alternative — back-pressure — would let a slow consumer stall the API.
+async fn events(
+    State(state): State<Arc<RestState>>,
+) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let stream = BroadcastStream::new(state.audit.subscribe()).map(|item| {
+        let event = match item {
+            Ok(entry) => Event::default()
+                .event("audit")
+                .id(entry.seq.to_string())
+                .json_data(&entry)
+                .unwrap_or_else(|_| Event::default().event("error").data("serialisation failed")),
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                Event::default().event("lagged").data(n.to_string())
+            }
+        };
+        Ok(event)
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 // ---------------------------------------------------------------------------

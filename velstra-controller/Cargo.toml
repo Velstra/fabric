@@ -25,7 +25,9 @@ prost = { workspace = true }
 x509-parser = "0.16"
 toml = { workspace = true, features = ["display"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "signal", "fs", "net", "io-util"] }
-tokio-stream = { workspace = true }
+# `sync` brings BroadcastStream, which turns the audit broadcast into the
+# /v1/events SSE stream.
+tokio-stream = { workspace = true, features = ["sync"] }
 # REST/JSON northbound gateway (D1). axum 0.7 shares hyper 1 / http 1
 # with the tonic gRPC stack already in the tree, so no duplicate HTTP runtime.
 axum = { version = "0.7", default-features = true }

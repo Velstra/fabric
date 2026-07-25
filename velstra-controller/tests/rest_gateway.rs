@@ -3,7 +3,8 @@
 //! enabled and a bearer-token authz policy, then drives it over real HTTP with
 //! reqwest: create → list → get → delete for networks, subnets, a security group
 //! and a floating IP; the consistent error envelope; an authz rejection for a
-//! non-admin mutation; and that mutations land in the audit log. No root, no eBPF.
+//! non-admin mutation; that mutations land in the audit log; and that a live
+//! subscriber on the SSE event stream sees one arrive. No root, no eBPF.
 
 use std::{
     process::{Child, Command},
@@ -272,6 +273,71 @@ async fn rest_gateway_crud_authz_and_audit() {
         .await
         .unwrap();
     assert!(sgs.iter().any(|g| g["name"] == "web"));
+
+    // --- Live event stream (D1): a mutation reaches a subscriber ------------
+    //
+    // Subscribe first, then mutate, and read until the event arrives. Only
+    // records emitted *after* subscribing are delivered, which is exactly the
+    // ordering a consuming product has to get right.
+    let events = http
+        .get(format!("{rest}/v1/events"))
+        .send()
+        .await
+        .expect("event stream opens");
+    assert_eq!(events.status(), 200);
+    assert!(
+        events
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream"),
+        "the event stream must be SSE"
+    );
+
+    // Drive one mutation while the stream is open.
+    admin(http.post(format!("{rest}/v1/networks")))
+        .json(&json!({ "vni": 101, "name": "evented", "subnet": "10.51.0.0/24" }))
+        .send()
+        .await
+        .unwrap();
+
+    // Read chunks until the network.create record shows up (or time out rather
+    // than hang the suite forever).
+    let mut stream = events;
+    let mut seen = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(2), stream.chunk()).await {
+            Ok(Ok(Some(chunk))) => seen.push_str(&String::from_utf8_lossy(&chunk)),
+            _ => break,
+        }
+        if seen.contains("network.create") {
+            break;
+        }
+    }
+    assert!(
+        seen.contains("event: audit"),
+        "stream carries named audit events: {seen:?}"
+    );
+    assert!(
+        seen.contains("network.create") && seen.contains("vni=101"),
+        "the mutation reached the subscriber, naming its target: {seen:?}"
+    );
+    // The record carries the actor, so a consumer can attribute the change.
+    assert!(
+        seen.contains("ops-admin"),
+        "event names the actor: {seen:?}"
+    );
+    drop(stream);
+
+    // Clean up the network this section created, so the later "list is empty
+    // after delete" assertions still describe an emptied fabric.
+    admin(http.delete(format!("{rest}/v1/networks/101")))
+        .send()
+        .await
+        .unwrap();
 
     // --- Load balancer (D2 LBaaS): create → get → list → delete -------------
     let lb = admin(http.post(format!("{rest}/v1/load-balancers")))
