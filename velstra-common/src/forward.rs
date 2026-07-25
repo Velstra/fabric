@@ -145,15 +145,9 @@ pub fn plan_forward(
     }
 
     // L3 router: a packet that cannot survive another hop is dropped.
-    if ttl <= 1 {
+    let Some((new_ttl, new_checksum)) = decrement_ttl(ttl, checksum, proto) else {
         return ForwardOutcome::TtlExceeded;
-    }
-    let new_ttl = ttl - 1;
-
-    // The TTL is the high byte of the 16-bit word {ttl, proto} at IPv4 offset 8.
-    let old_word = ((ttl as u16) << 8) | proto as u16;
-    let new_word = ((new_ttl as u16) << 8) | proto as u16;
-    let new_checksum = csum_replace_u16(checksum, old_word, new_word);
+    };
 
     ForwardOutcome::Redirect(Rewrite {
         out_ifindex: route.out_ifindex,
@@ -162,6 +156,34 @@ pub fn plan_forward(
         new_ttl: Some(new_ttl),
         new_checksum,
     })
+}
+
+/// Decrement an IPv4 TTL and repair the header checksum, or `None` when the
+/// packet cannot survive another hop (`ttl <= 1`) and must be dropped instead of
+/// forwarded.
+///
+/// Shared by every path that routes rather than bridges — [`plan_forward`] and
+/// the B7 symmetric-IRB rewrite ([`crate::plan_irb`]) — so the incremental
+/// checksum arithmetic exists exactly once.
+///
+/// ```
+/// use velstra_common::decrement_ttl;
+///
+/// let (ttl, checksum) = decrement_ttl(64, 0xb861, 6).unwrap();
+/// assert_eq!(ttl, 63);
+/// // A packet at the end of its life is not forwarded at all.
+/// assert_eq!(decrement_ttl(1, 0, 6), None);
+/// ```
+#[inline]
+pub const fn decrement_ttl(ttl: u8, checksum: u16, proto: u8) -> Option<(u8, u16)> {
+    if ttl <= 1 {
+        return None;
+    }
+    let new_ttl = ttl - 1;
+    // The TTL is the high byte of the 16-bit word {ttl, proto} at IPv4 offset 8.
+    let old_word = ((ttl as u16) << 8) | proto as u16;
+    let new_word = ((new_ttl as u16) << 8) | proto as u16;
+    Some((new_ttl, csum_replace_u16(checksum, old_word, new_word)))
 }
 
 /// Incrementally update a 16-bit one's-complement (IP/TCP/UDP) checksum when a

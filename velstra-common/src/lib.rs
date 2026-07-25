@@ -46,7 +46,8 @@ pub mod srv6;
 pub use cidr::{Cidr4, Cidr6, CidrError, mask_v4, mask_v6, parse_cidr_v4, parse_cidr_v6};
 pub use config::{ConfigFlags, GlobalConfig};
 pub use forward::{
-    ForwardOutcome, Rewrite, RouteEntry, csum_replace_u16, ipv4_checksum, plan_forward,
+    ForwardOutcome, Rewrite, RouteEntry, csum_replace_u16, decrement_ttl, ipv4_checksum,
+    plan_forward,
 };
 pub use lb::{
     Backend, FlowKey, FlowState, Nat, PortFwd, ServiceKey, ServiceValue, plan_dnat, plan_nat,
@@ -56,10 +57,11 @@ pub use mac::{MacError, parse_mac};
 pub use npt::{Npt66, npt66_rewrite, oc_add};
 pub use overlay::{
     ARP_REPLY, ARP_REQUEST, ArpEntry, ArpKey, ArpReply, ETHERTYPE_ARP, Encap, FloodSet,
-    GENEVE_PORT, ICMPV6_NEIGHBOR_ADVERT, ICMPV6_NEIGHBOR_SOLICIT, LocalMac, LocalMacKey,
-    MAX_FLOOD_VTEPS, MacFdbKey, ND_NA_MSG_LEN, NaReply, NdKey, OVERLAY_OUTER_LEN, OverlayConfig,
-    TunnelEndpoint, TunnelKey, VXLAN_PORT, build_encap, decode_vni, encap_kind, icmpv6_checksum,
-    is_overlay_dport, overlay_src_port, plan_arp_reply, plan_na_reply,
+    GENEVE_PORT, ICMPV6_NEIGHBOR_ADVERT, ICMPV6_NEIGHBOR_SOLICIT, IrbEndpoint, IrbRewrite,
+    LocalMac, LocalMacKey, MAX_FLOOD_VTEPS, MacFdbKey, ND_NA_MSG_LEN, NaReply, NdKey,
+    OVERLAY_OUTER_LEN, OverlayConfig, TunnelEndpoint, TunnelKey, VXLAN_PORT, build_encap,
+    decode_vni, encap_kind, icmpv6_checksum, is_overlay_dport, overlay_src_port, plan_arp_reply,
+    plan_irb, plan_na_reply,
 };
 pub use packet::{
     ETHERTYPE_IPV4, ETHERTYPE_IPV6, PacketMeta, PolicyId, PortKey, ScopedAddr, ScopedAddr6,

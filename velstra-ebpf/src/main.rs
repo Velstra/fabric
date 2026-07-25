@@ -64,14 +64,15 @@ use network_types::{
 use velstra_common::{
     ARP_REPLY, ARP_REQUEST, Action, ArpEntry, ArpKey, Backend, ConfigFlags, Counter, ETHERTYPE_ARP,
     ETHERTYPE_IPV4, ETHERTYPE_IPV6, FloodSet, FlowKey, FlowState, ForwardOutcome, GlobalConfig,
-    ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, ICMPV6_NEIGHBOR_SOLICIT, LocalMac, LocalMacKey,
-    MAX_FLOOD_VTEPS, MacFdbKey, ND_NA_MSG_LEN, Nat, NdKey, Npt66, OVERLAY_OUTER_LEN, OverlayConfig,
-    PacketMeta, PolicyId, PortFwd, Rewrite, RouteEntry, SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6,
-    ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue, Srv6Config, Srv6Endpoint,
-    Srv6LocalSid, Srv6SidKey, TunnelEndpoint, TunnelKey, build_encap, build_srv6_encap, decide,
-    decode_vni, icmp, icmp_checksum, ip_proto, ipv6_ext_len, is_ipv6_ext, is_overlay_dport,
-    lpm_key_addr, plan_arp_reply, plan_forward, plan_icmp_unreachable, plan_na_reply, plan_nat,
-    plan_tcp_rst, port_rule_action, port_rule_logs, select_backend, session_hash, tcp_flags,
+    ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, ICMPV6_NEIGHBOR_SOLICIT, IrbEndpoint, IrbRewrite,
+    LocalMac, LocalMacKey, MAX_FLOOD_VTEPS, MacFdbKey, ND_NA_MSG_LEN, Nat, NdKey, Npt66,
+    OVERLAY_OUTER_LEN, OverlayConfig, PacketMeta, PolicyId, PortFwd, Rewrite, RouteEntry,
+    SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6, ScopedPortKey, ScopedSrcPortKey, ServiceKey,
+    ServiceValue, Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, TunnelEndpoint, TunnelKey,
+    build_encap, build_srv6_encap, decide, decode_vni, icmp, icmp_checksum, ip_proto, ipv6_ext_len,
+    is_ipv6_ext, is_overlay_dport, lpm_key_addr, plan_arp_reply, plan_forward,
+    plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_tcp_rst, port_rule_action,
+    port_rule_logs, select_backend, session_hash, tcp_flags,
 };
 
 /// Maps an ingress interface index to its policy id, so one XDP program can
@@ -236,6 +237,17 @@ static OVERLAY_FDB: LpmTrie<TunnelKey, TunnelEndpoint> = LpmTrie::with_max_entri
 /// overlay bridges by destination MAC; a miss falls through to the L3 path.
 #[map]
 static MAC_FDB: HashMap<MacFdbKey, TunnelEndpoint> = HashMap::with_max_entries(8192, 0);
+
+/// B7 **symmetric IRB** routing table: an LPM trie keyed by the *ingress* segment
+/// plus an inner-destination prefix → the [`IrbEndpoint`] that says which remote
+/// PE owns it, how to rewrite the inner Ethernet header and which **L3** VNI to
+/// encapsulate with. Populated from the BGP EVPN type-5 (IP Prefix) routes the
+/// controller learned, expanded to one entry per L2 segment of the tenant.
+///
+/// Consulted **before** the bridging FDBs and only for frames addressed to the
+/// tenant's anycast gateway MAC: an IRB entry routes, the FDBs bridge.
+#[map]
+static IRB_ROUTES: LpmTrie<TunnelKey, IrbEndpoint> = LpmTrie::with_max_entries(8192, 0);
 
 /// B9 per-host **SRv6** configuration: this node's tunnel-source identity (its
 /// SRv6 source address + underlay MAC + MTU). One entry (index `0`); absent /
@@ -1367,7 +1379,8 @@ fn try_velstra_forward(ctx: &XdpContext) -> Result<u32, ()> {
     // and redirect it onto the underlay. A miss means "local" — fall through to
     // ordinary switching/routing.
     if let Some(action) = try_encap(
-        ctx, &ocfg, s.vni, s.src_addr, s.dst_addr, s.src_port, s.dst_port, s.proto, log,
+        ctx, &ocfg, s.vni, s.src_addr, s.dst_addr, s.src_port, s.dst_port, s.proto, s.ttl,
+        s.checksum, log,
     )? {
         return Ok(action);
     }
@@ -2008,6 +2021,11 @@ fn try_decap(ctx: &XdpContext, ihl_bytes: usize) -> Result<u32, ()> {
 /// a remote VTEP, prepend the VXLAN/Geneve outer stack and redirect it onto the
 /// underlay.
 ///
+/// B7: a frame a tenant addressed to its **anycast gateway MAC** is *routed*
+/// here rather than bridged — the inner Ethernet header is rewritten toward the
+/// remote PE's Router's MAC, the TTL is decremented and the frame is
+/// encapsulated with the tenant's **L3** VNI (symmetric IRB).
+///
 /// Returns `Ok(Some(action))` when it took over the packet (redirected, or passed
 /// after a failed head-grow), or `Ok(None)` to fall through (no FDB entry / the
 /// overlay is disabled — the destination is treated as local).
@@ -2022,29 +2040,64 @@ fn try_encap(
     src_port: u16,
     dst_port: u16,
     proto: u8,
+    ttl: u8,
+    ip_checksum: u16,
     log: bool,
 ) -> Result<Option<u32>, ()> {
     // No overlay configured, or the ingress port is not on a tenant segment.
     if !ocfg.is_enabled() || vni == 0 {
         return Ok(None);
     }
-    // B1: a true L2 overlay bridges by the inner destination MAC. Try the MAC
-    // FDB first; on a miss fall through to the L3 (inner-IP) FDB unchanged. Read
-    // the inner dst MAC now, before any `bpf_xdp_adjust_head` grows the head.
+    // Read the inner dst MAC now, before any `bpf_xdp_adjust_head` grows the
+    // head: both the IRB gate and the MAC FDB need it, and after the head grows
+    // its offset moves.
     let inner_dst_mac = unsafe { *ptr_at::<[u8; 6]>(ctx, O_ETH_DST)? };
-    let ep = match unsafe { MAC_FDB.get(&MacFdbKey::new(vni, inner_dst_mac)) } {
-        Some(ep) => *ep,
+
+    // B7 symmetric IRB, ahead of both bridging FDBs: an inner destination that
+    // matches a routed prefix of this tenant **and** is addressed at L2 to the
+    // tenant's anycast gateway is inter-subnet traffic. The gateway-MAC gate is
+    // what keeps ordinary bridged traffic that merely happens to match a remote
+    // prefix on the bridging path — without it a frame between two hosts of the
+    // same segment could be routed, arriving with the wrong MACs.
+    let irb = match IRB_ROUTES.get(&Key::new(
+        TunnelKey::FULL_PREFIX,
+        TunnelKey::new(vni, lpm_key_addr(dst_addr)),
+    )) {
+        Some(irb) if irb.gateway_mac == inner_dst_mac => Some(*irb),
+        _ => None,
+    };
+
+    // Either route (IRB) or bridge (MAC FDB, then the L3 FDB) — and in the routed
+    // case encapsulate with the tenant's L3 VNI instead of the ingress segment's.
+    let (ep, encap_vni, rewrite): (TunnelEndpoint, u32, Option<IrbRewrite>) = match irb {
+        Some(irb) => {
+            // Routing decrements the TTL, so a packet that cannot survive the hop
+            // is dropped here — before anything is rewritten or encapsulated.
+            let Some(rw) = plan_irb(&irb, ttl, ip_checksum, proto) else {
+                bump(Counter::ForwardTtlExceeded);
+                return Ok(Some(xdp_action::XDP_DROP));
+            };
+            (irb.tunnel_endpoint(), irb.l3_vni, Some(rw))
+        }
         None => {
-            // Longest-prefix match on `(vni, inner dst)`: one entry can cover a
-            // whole remote subnet. A miss means the destination is local.
-            let key = Key::new(
-                TunnelKey::FULL_PREFIX,
-                TunnelKey::new(vni, lpm_key_addr(dst_addr)),
-            );
-            match OVERLAY_FDB.get(&key) {
+            // B1: a true L2 overlay bridges by the inner destination MAC. Try the
+            // MAC FDB first; on a miss fall through to the L3 (inner-IP) FDB.
+            let ep = match unsafe { MAC_FDB.get(&MacFdbKey::new(vni, inner_dst_mac)) } {
                 Some(ep) => *ep,
-                None => return Ok(None),
-            }
+                None => {
+                    // Longest-prefix match on `(vni, inner dst)`: one entry can
+                    // cover a whole remote subnet. A miss means it is local.
+                    let key = Key::new(
+                        TunnelKey::FULL_PREFIX,
+                        TunnelKey::new(vni, lpm_key_addr(dst_addr)),
+                    );
+                    match OVERLAY_FDB.get(&key) {
+                        Some(ep) => *ep,
+                        None => return Ok(None),
+                    }
+                }
+            };
+            (ep, vni, None)
         }
     };
 
@@ -2062,7 +2115,7 @@ fn try_encap(
         return Ok(Some(xdp_action::XDP_DROP));
     }
 
-    let encap = build_encap(ocfg, &ep, vni, inner_len, entropy);
+    let encap = build_encap(ocfg, &ep, encap_vni, inner_len, entropy);
 
     // Grow the head by exactly the outer stack length.
     // SAFETY: negative delta adds headroom; checked for failure below.
@@ -2084,9 +2137,37 @@ fn try_encap(
         *(data as *mut [u8; OVERLAY_OUTER_LEN]) = encap.headers;
     }
 
+    // B7: apply the routed rewrite to the *inner* frame, which the head grow just
+    // shifted `OVERLAY_OUTER_LEN` bytes further in — the offsets stay compile-time
+    // constants, which is what the verifier needs to accept the writes. Doing it
+    // here rather than before the grow means a refused grow (handled above) never
+    // leaves a locally-passed frame with a half-applied rewrite.
+    if let Some(rw) = rewrite {
+        const I_ETH_DST: usize = OVERLAY_OUTER_LEN + O_ETH_DST;
+        const I_ETH_SRC: usize = OVERLAY_OUTER_LEN + O_ETH_SRC;
+        const I_IP_TTL: usize = OVERLAY_OUTER_LEN + O_IP_TTL;
+        const I_IP_CSUM: usize = OVERLAY_OUTER_LEN + O_IP_CSUM;
+        // Furthest byte touched is the inner IPv4 checksum at I_IP_CSUM..+2.
+        if data + I_IP_CSUM + 2 > data_end {
+            return Err(());
+        }
+        // SAFETY: the bounds check above proves every byte written below is
+        // inside the packet; all four offsets are compile-time constants.
+        unsafe {
+            *((data + I_ETH_DST) as *mut [u8; 6]) = rw.inner_dst_mac;
+            *((data + I_ETH_SRC) as *mut [u8; 6]) = rw.inner_src_mac;
+            *((data + I_IP_TTL) as *mut u8) = rw.new_ttl;
+            *((data + I_IP_CSUM) as *mut [u8; 2]) = rw.new_checksum.to_be_bytes();
+        }
+        bump(Counter::IrbRouted);
+    }
+
     bump(Counter::OverlayEncap);
     if log {
-        info!(ctx, "ENCAP vni={} -> ifindex {}", vni, encap.out_ifindex);
+        info!(
+            ctx,
+            "ENCAP vni={} -> ifindex {}", encap_vni, encap.out_ifindex
+        );
     }
     // Redirect onto the underlay; an absent devmap entry aborts (the control
     // plane mirrors every overlay egress ifindex into `TX_PORTS`).
