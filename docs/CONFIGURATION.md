@@ -274,6 +274,18 @@ blocked — it gets an `event: lagged` naming how many records it missed and the
 stream continues. Back-pressure is deliberately not an option here: a slow
 consumer must never stall the fabric's mutations.
 
+#### Webhooks
+
+`--webhook <url>` (repeatable) POSTs each record to an endpoint as JSON — the
+push counterpart of the stream, for consumers that cannot hold a connection open.
+
+Each URL gets its own delivery task and its own subscription, so endpoints lag,
+retry and fail independently: one hung endpoint neither silences the others nor
+slows the API. Delivery is **best-effort with bounded retries** (3 attempts,
+exponential backoff, 5s timeout), not exactly-once — a consumer that needs
+completeness reconciles against `GET /v1/audit`, which is what the monotonic
+`seq` is for.
+
 Errors use one envelope throughout:
 
 ```json

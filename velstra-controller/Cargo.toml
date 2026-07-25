@@ -33,6 +33,11 @@ tokio-stream = { workspace = true, features = ["sync"] }
 axum = { version = "0.7", default-features = true }
 serde_json = { workspace = true }
 
-[dev-dependencies]
-# HTTP client for the REST integration tests (plain HTTP, no TLS backend).
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# HTTP client for webhook delivery (D1) and the REST integration tests. rustls
+# rather than native TLS: the tonic stack already brings rustls, so an https
+# webhook endpoint costs no second TLS implementation.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "http2",
+] }
