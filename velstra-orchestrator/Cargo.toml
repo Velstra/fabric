@@ -17,3 +17,8 @@ velstra-config = { path = "../velstra-config", version = "0.3" }
 
 anyhow = { workspace = true, default-features = true }
 serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+# Only for the snapshot-compatibility test: it must deserialize a snapshot with a
+# field removed, which needs a real format rather than a constructed struct.
+serde_json = { workspace = true }

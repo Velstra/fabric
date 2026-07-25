@@ -40,7 +40,7 @@ use velstra_config::{
     TunnelCfg, file_config_to_proto,
 };
 use velstra_orchestrator::{
-    AllocRange, Host, Network, SecurityGroup, Subnet, SubnetCidr, Topology,
+    AllocRange, Host, IpVrf, Network, SecurityGroup, Subnet, SubnetCidr, Topology,
 };
 use velstra_proto::NodeConfig;
 
@@ -65,8 +65,26 @@ struct TopologyFile {
         skip_serializing_if = "Vec::is_empty"
     )]
     security_groups: Vec<SecurityGroupFile>,
+    /// Tenant IP-VRFs (B7): the routed contexts L2 segments are grouped into.
+    #[serde(rename = "ip_vrf", default, skip_serializing_if = "Vec::is_empty")]
+    ip_vrfs: Vec<IpVrfFile>,
     #[serde(rename = "port", default)]
     ports: Vec<PortFile>,
+}
+
+/// One `[[ip_vrf]]` block: a tenant's routed context. Deliberately the same shape
+/// as wren's `[[bgp.evpn.ip-vrf]]`, since an operator configures the two sides of
+/// the same tenant.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct IpVrfFile {
+    l3_vni: u32,
+    name: String,
+    /// The anycast gateway MAC, identical on every host.
+    gateway_mac: String,
+    /// The L2 VNIs routed in this context.
+    #[serde(default)]
+    networks: Vec<u32>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -205,6 +223,32 @@ fn build(tf: &TopologyFile) -> Result<Topology> {
             stateful: g.stateful,
             blocklist: g.blocklist.clone(),
             rules: g.rules.clone(),
+        })?;
+    }
+    // IP-VRFs (B7). After networks, so a membership list can only name a VNI that
+    // exists.
+    for v in &tf.ip_vrfs {
+        let gateway_mac = parse_mac(&v.gateway_mac).map_err(|e| {
+            anyhow!(
+                "ip_vrf {}: invalid gateway_mac {:?}: {e}",
+                v.name,
+                v.gateway_mac
+            )
+        })?;
+        for vni in &v.networks {
+            if !topo.networks().any(|n| n.vni == *vni) {
+                return Err(anyhow!(
+                    "ip_vrf {}: network {vni} is not declared; a typo here would leave \
+                     that segment silently unrouted",
+                    v.name
+                ));
+            }
+        }
+        topo.add_ip_vrf(IpVrf {
+            l3_vni: v.l3_vni,
+            name: v.name.clone(),
+            gateway_mac,
+            networks: v.networks.clone(),
         })?;
     }
     for p in &tf.ports {
@@ -509,11 +553,23 @@ fn to_file(topo: &Topology) -> TopologyFile {
         })
         .collect();
 
+    let mut ip_vrfs: Vec<IpVrfFile> = topo
+        .ip_vrfs()
+        .map(|v| IpVrfFile {
+            l3_vni: v.l3_vni,
+            name: v.name.clone(),
+            gateway_mac: fmt_mac(v.gateway_mac),
+            networks: v.networks.clone(),
+        })
+        .collect();
+    ip_vrfs.sort_by_key(|v| v.l3_vni);
+
     TopologyFile {
         hosts,
         networks,
         subnets,
         security_groups,
+        ip_vrfs,
         ports,
     }
 }
@@ -796,6 +852,74 @@ mod tests {
         assert_eq!(fv.remote_vtep, "10.10.0.2");
         assert_eq!(fv.via_mac, "02:00:00:00:00:22");
         assert_eq!(fv.out_iface, "eth0");
+    }
+
+    #[test]
+    fn parses_ip_vrfs_and_round_trips_them() {
+        let toml = r#"
+            [[host]]
+            id = "h1"
+            vtep = "10.10.0.1"
+            underlay_iface = "eth0"
+            underlay_mac = "02:00:00:00:00:11"
+
+            [[network]]
+            vni = 5000
+            name = "blue"
+            subnet = "192.168.100.0/24"
+
+            [[network]]
+            vni = 5001
+            name = "green"
+            subnet = "192.168.101.0/24"
+
+            [[ip_vrf]]
+            l3_vni = 50100
+            name = "tenant-a"
+            gateway_mac = "02:00:5e:00:00:aa"
+            networks = [5000, 5001]
+        "#;
+        let topo = build(&toml::from_str::<TopologyFile>(toml).unwrap()).unwrap();
+        let vrf = topo.ip_vrfs().next().unwrap();
+        assert_eq!(vrf.l3_vni, 50100);
+        assert_eq!(vrf.gateway_mac, [0x02, 0x00, 0x5e, 0x00, 0x00, 0xaa]);
+        // Several bridged segments share one routed context — the reason this is
+        // its own entity and not a field on each network.
+        assert_eq!(vrf.networks, vec![5000, 5001]);
+        assert_eq!(topo.ip_vrf_of_network(5001).unwrap().l3_vni, 50100);
+        assert!(topo.ip_vrf_of_network(9999).is_none());
+
+        // Serialising back and re-reading yields the same tenant, so a controller
+        // that rewrites the topology file does not drop it.
+        let reloaded = build(&to_file(&topo)).unwrap();
+        assert_eq!(reloaded.ip_vrfs().next().unwrap(), vrf);
+    }
+
+    /// The membership list is the only thing that says which tenant a segment
+    /// belongs to, so a typo in it must fail the load rather than leave a segment
+    /// quietly unrouted while everything else comes up.
+    #[test]
+    fn rejects_ip_vrf_naming_an_undeclared_network() {
+        let toml = r#"
+            [[host]]
+            id = "h1"
+            vtep = "10.10.0.1"
+            underlay_iface = "eth0"
+            underlay_mac = "02:00:00:00:00:11"
+
+            [[network]]
+            vni = 5000
+            name = "blue"
+            subnet = "192.168.100.0/24"
+
+            [[ip_vrf]]
+            l3_vni = 50100
+            name = "tenant-a"
+            gateway_mac = "02:00:5e:00:00:aa"
+            networks = [5000, 5002]
+        "#;
+        let err = build(&toml::from_str::<TopologyFile>(toml).unwrap()).unwrap_err();
+        assert!(err.to_string().contains("5002"), "{err}");
     }
 
     #[test]
