@@ -327,6 +327,32 @@ impl SecurityGroup {
     }
 }
 
+/// A tenant **IP-VRF** (roadmap B7): the routed context a set of L2 segments share,
+/// so traffic between them is routed rather than bridged (symmetric IRB, RFC 9136).
+///
+/// Modelled as its own entity, matching the `[[bgp.evpn.ip-vrf]]` block an operator
+/// configures on the wren side, because the relationship is genuinely many-to-one:
+/// several bridged VNIs share one routed VNI. Putting `l3_vni` on each [`Network`]
+/// instead would spread one tenant's identity across its segments, leaving nowhere
+/// to state the gateway MAC once and no way to tell an unconfigured segment from a
+/// mistyped one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpVrf {
+    /// The routed VNI. Its own number space — an L3 VNI numerically equal to some
+    /// L2 VNI is a different context, not the same one.
+    pub l3_vni: u32,
+    /// Human-readable tenant name, for diagnostics.
+    pub name: String,
+    /// The **anycast** gateway MAC: identical on every host, so a VM keeps its
+    /// default-gateway ARP entry when it migrates. Frames addressed to it are
+    /// routed rather than bridged, and it is the inner source MAC of an
+    /// encapsulated routed packet.
+    pub gateway_mac: [u8; 6],
+    /// The L2 VNIs routed in this context. A VNI belongs to at most one IP-VRF —
+    /// two would make the tenant of a packet ambiguous.
+    pub networks: Vec<u32>,
+}
+
 /// A 1:1 association of a [`FloatingIp`] to a port's fixed address (roadmap B6).
 /// The datapath will DNAT inbound traffic destined to the floating address onto
 /// `fixed_addr` and SNAT the return path; that enforcement is **deferred** to the
@@ -376,6 +402,8 @@ pub struct Topology {
     /// Named security groups (B5), keyed by name. A port references one by
     /// `policy_id` (stored in [`Port::policy`]).
     security_groups: HashMap<String, SecurityGroup>,
+    /// Tenant IP-VRFs (B7), keyed by L3 VNI.
+    ip_vrfs: HashMap<u32, IpVrf>,
     /// First-class subnets (D2), keyed by subnet id; each is tagged with its VNI.
     subnets: HashMap<String, Subnet>,
     /// IPAM allocations: subnet id -> (numeric address -> owner). The durable
@@ -557,6 +585,62 @@ impl Topology {
     /// Look up a security group by name.
     pub fn security_group(&self, name: &str) -> Option<&SecurityGroup> {
         self.security_groups.get(name)
+    }
+
+    /// Register a tenant IP-VRF (B7).
+    ///
+    /// Rejects a duplicate L3 VNI, an empty name, an all-zero or multicast gateway
+    /// MAC, and — the one that matters for correctness — a network already routed
+    /// by another IP-VRF. A VNI in two routed contexts makes the tenant of a packet
+    /// ambiguous, and the datapath would resolve it by map-insertion order, i.e.
+    /// arbitrarily, sending one tenant's traffic to another's VTEP.
+    pub fn add_ip_vrf(&mut self, vrf: IpVrf) -> Result<()> {
+        if vrf.name.is_empty() {
+            bail!("ip-vrf name must not be empty");
+        }
+        if vrf.l3_vni == 0 || vrf.l3_vni > 0xFF_FFFF {
+            bail!(
+                "ip-vrf {:?} l3_vni {} must be a non-zero 24-bit VNI",
+                vrf.name,
+                vrf.l3_vni
+            );
+        }
+        if let Some(existing) = self.ip_vrfs.get(&vrf.l3_vni) {
+            bail!(
+                "ip-vrf {:?} reuses l3_vni {} already held by {:?}",
+                vrf.name,
+                vrf.l3_vni,
+                existing.name
+            );
+        }
+        // A multicast (group-bit) or all-zero gateway MAC can never be a unicast
+        // inner source address, so a frame built from it is unroutable.
+        if vrf.gateway_mac == [0; 6] || vrf.gateway_mac[0] & 1 != 0 {
+            bail!(
+                "ip-vrf {:?} gateway_mac must be a non-zero unicast address",
+                vrf.name
+            );
+        }
+        for vni in &vrf.networks {
+            if let Some(other) = self.ip_vrfs.values().find(|v| v.networks.contains(vni)) {
+                bail!(
+                    "network {vni} is already routed by ip-vrf {:?}; a network belongs to one",
+                    other.name
+                );
+            }
+        }
+        self.ip_vrfs.insert(vrf.l3_vni, vrf);
+        Ok(())
+    }
+
+    /// All tenant IP-VRFs, in no particular order.
+    pub fn ip_vrfs(&self) -> impl Iterator<Item = &IpVrf> {
+        self.ip_vrfs.values()
+    }
+
+    /// The IP-VRF routing a given L2 VNI, if any.
+    pub fn ip_vrf_of_network(&self, vni: u32) -> Option<&IpVrf> {
+        self.ip_vrfs.values().find(|v| v.networks.contains(&vni))
     }
 
     /// Remove a security group by name. Fails while any port is still bound to it
@@ -1265,6 +1349,11 @@ pub struct FabricSnapshot {
     /// B5 deserialize as an empty set (no groups).
     #[serde(default)]
     pub security_groups: Vec<SecurityGroupRec>,
+    /// All tenant IP-VRFs (B7). `#[serde(default)]` so snapshots written before
+    /// B7 restore with no routed contexts — every network stays purely bridged,
+    /// which is exactly what those fabrics were doing.
+    #[serde(default)]
+    pub ip_vrfs: Vec<IpVrfRec>,
     /// All subnets (D2). `#[serde(default)]` so pre-D2 snapshots restore with no
     /// subnets.
     #[serde(default)]
@@ -1314,6 +1403,15 @@ pub struct SecurityGroupRec {
     pub stateful: bool,
     pub blocklist: Vec<String>,
     pub rules: Vec<PortRule>,
+}
+
+/// Serializable mirror of an [`IpVrf`] (B7).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IpVrfRec {
+    pub l3_vni: u32,
+    pub name: String,
+    pub gateway_mac: [u8; 6],
+    pub networks: Vec<u32>,
 }
 
 /// Serializable mirror of a [`Subnet`] (D2). The CIDR, gateway, and pool are
@@ -1444,6 +1542,16 @@ impl Topology {
                     rules: g.rules.clone(),
                 })
                 .collect(),
+            ip_vrfs: self
+                .ip_vrfs
+                .values()
+                .map(|v| IpVrfRec {
+                    l3_vni: v.l3_vni,
+                    name: v.name.clone(),
+                    gateway_mac: v.gateway_mac,
+                    networks: v.networks.clone(),
+                })
+                .collect(),
             subnets: self
                 .subnets
                 .values()
@@ -1568,6 +1676,17 @@ impl Topology {
                     stateful: g.stateful,
                     blocklist: g.blocklist.clone(),
                     rules: g.rules.clone(),
+                },
+            );
+        }
+        for v in &snap.ip_vrfs {
+            t.ip_vrfs.insert(
+                v.l3_vni,
+                IpVrf {
+                    l3_vni: v.l3_vni,
+                    name: v.name.clone(),
+                    gateway_mac: v.gateway_mac,
+                    networks: v.networks.clone(),
                 },
             );
         }
@@ -2728,5 +2847,76 @@ mod tests {
         assert!(restored.clone().allocate("ext", Some(f_free.addr)).is_err());
         // And port_floating_ips still resolves the association post-restore.
         assert_eq!(restored.port_floating_ips(&p.id).len(), 1);
+    }
+
+    fn vrf(l3_vni: u32, name: &str, networks: Vec<u32>) -> IpVrf {
+        IpVrf {
+            l3_vni,
+            name: name.into(),
+            gateway_mac: [0x02, 0x00, 0x5e, 0x00, 0x00, 0xaa],
+            networks,
+        }
+    }
+
+    /// A network in two routed contexts makes the tenant of a packet ambiguous,
+    /// and the datapath would resolve it by whichever map entry landed last — i.e.
+    /// arbitrarily, across a tenant boundary. Reject it at configuration instead.
+    #[test]
+    fn a_network_belongs_to_exactly_one_ip_vrf() {
+        let mut t = Topology::new();
+        t.add_ip_vrf(vrf(50100, "tenant-a", vec![10100, 10200]))
+            .unwrap();
+
+        let err = t
+            .add_ip_vrf(vrf(50200, "tenant-b", vec![10200]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tenant-a"), "{err}");
+        // A disjoint tenant is fine.
+        t.add_ip_vrf(vrf(50200, "tenant-b", vec![10300])).unwrap();
+        assert_eq!(t.ip_vrfs().count(), 2);
+        assert_eq!(t.ip_vrf_of_network(10200).unwrap().name, "tenant-a");
+    }
+
+    #[test]
+    fn ip_vrf_rejects_a_duplicate_l3_vni_and_a_bad_gateway_mac() {
+        let mut t = Topology::new();
+        t.add_ip_vrf(vrf(50100, "tenant-a", vec![])).unwrap();
+        assert!(t.add_ip_vrf(vrf(50100, "other", vec![])).is_err());
+
+        // An all-zero or multicast MAC can never be a unicast inner source, so a
+        // frame built from it would be unroutable.
+        let mut bad = vrf(50300, "zero", vec![]);
+        bad.gateway_mac = [0; 6];
+        assert!(t.clone().add_ip_vrf(bad).is_err());
+        let mut mcast = vrf(50300, "mcast", vec![]);
+        mcast.gateway_mac = [0x01, 0, 0, 0, 0, 1];
+        assert!(t.clone().add_ip_vrf(mcast).is_err());
+
+        // The L3 VNI shares VXLAN's 24-bit space.
+        assert!(t.clone().add_ip_vrf(vrf(0, "zero-vni", vec![])).is_err());
+        assert!(t.add_ip_vrf(vrf(0x100_0000, "too-big", vec![])).is_err());
+    }
+
+    /// Cluster mode restores from the snapshot, so a tenant that did not survive it
+    /// would come back as an unrouted fabric after a failover.
+    #[test]
+    fn ip_vrfs_survive_a_snapshot_roundtrip() {
+        let mut t = Topology::new();
+        t.add_ip_vrf(vrf(50100, "tenant-a", vec![10100, 10200]))
+            .unwrap();
+        let restored = Topology::from_snapshot(&t.to_snapshot());
+        assert_eq!(
+            restored.ip_vrfs().next().unwrap(),
+            t.ip_vrfs().next().unwrap()
+        );
+        assert_eq!(restored.ip_vrf_of_network(10100).unwrap().l3_vni, 50100);
+
+        // A snapshot written before B7 has no ip_vrfs field at all; it must restore
+        // as a purely bridged fabric rather than failing the whole restore.
+        let mut json: serde_json::Value = serde_json::to_value(t.to_snapshot()).unwrap();
+        json.as_object_mut().unwrap().remove("ip_vrfs");
+        let old: FabricSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(Topology::from_snapshot(&old).ip_vrfs().count(), 0);
     }
 }
