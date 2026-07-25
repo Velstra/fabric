@@ -19,11 +19,12 @@
 //! chunks (B1/B2). Holding them now keeps the wire contract stable so those
 //! chunks only add a datapath, not a new feed.
 //!
-//! **Type-5 IP Prefix routes** (B7 symmetric IRB) are parsed and held on the same
-//! terms. Programming them is a routing decision, not a bridging one, so it needs
-//! two things the topology model does not express yet: which L2 VNIs share a
-//! tenant's routed context, and that tenant's anycast gateway. Until it does,
-//! these routes stay in [`EvpnLearned`] and reach no map.
+//! **Type-5 IP Prefix routes** (B7 symmetric IRB) become `IrbRoute` entries. A
+//! route names its tenant only by L3 VNI, so `topology::derive_configs` joins it
+//! against the fabric's IP-VRFs — which supply the L2 segments allowed to reach it
+//! and the anycast gateway MAC to route it from — and expands it across those
+//! segments. A route whose tenant this fabric does not host, or that arrived
+//! without a Router's MAC, is held but not programmed.
 //!
 //! # Wire format (stable input contract)
 //! ```text
@@ -372,13 +373,11 @@ impl EvpnLearned {
     /// Iterate learned type-5 subnets as `(l3_vni, prefix, &LearnedPrefix)`, in a
     /// deterministic order.
     ///
-    /// No caller yet, deliberately: folding these into a derived config requires
-    /// the topology to say which L2 VNIs share a tenant's routed context and what
-    /// its anycast gateway is, and it does not model that today. Deriving before
-    /// then would have to guess the tenant a subnet belongs to — and guessing
-    /// wrong routes one tenant's traffic into another's. The `allow` marks that as
-    /// a known seam rather than an oversight.
-    #[allow(dead_code)]
+    /// Joined against the topology's IP-VRFs to derive symmetric-IRB routes: a
+    /// route names its tenant only by L3 VNI, and the IP-VRF supplies the segments
+    /// that may reach it plus the gateway MAC to route it from. Without that join
+    /// the derive would have to guess the tenant a subnet belongs to — and guessing
+    /// wrong routes one tenant's traffic into another's.
     pub fn iter_prefixes(&self) -> impl Iterator<Item = (u32, &str, &LearnedPrefix)> {
         self.prefixes
             .iter()

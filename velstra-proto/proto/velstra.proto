@@ -381,6 +381,7 @@ message NodeConfig {
   // Drop a packet the data plane cannot parse instead of passing it. Host-wide
   // (the parse fails before any policy is known), so it is not a Policy field.
   // Absent/false = fail open, the historical behaviour.
+  repeated IrbRoute irb_routes = 19; // B7 symmetric-IRB routed subnets
   bool fail_closed = 18;
 }
 
@@ -422,6 +423,22 @@ message Tunnel {
   string remote_vtep = 3;  // remote VTEP underlay IPv4 (outer destination)
   string via_mac = 4;      // next-hop MAC on the underlay
   string out_iface = 5;    // underlay egress interface
+}
+
+// One symmetric-IRB route (B7): a remote tenant subnet reached by ROUTING, not
+// bridging. Keyed on the ingress VNI -- the segment a packet arrives on, which is
+// what the datapath knows -- with the tenant's routed VNI carried in the value.
+// Distinct from Tunnel because a Tunnel forwards the inner frame untouched, while
+// this rewrites the inner Ethernet header and decrements the TTL.
+message IrbRoute {
+  uint32 vni = 1;          // ingress tenant segment this route applies on
+  string inner_dst = 2;    // remote tenant subnet (longest-prefix match)
+  uint32 l3_vni = 3;       // routed VNI to encapsulate with
+  string remote_vtep = 4;  // remote VTEP underlay IPv4 (outer destination)
+  string via_mac = 5;      // next-hop MAC on the underlay
+  string out_iface = 6;    // underlay egress interface
+  string router_mac = 7;   // egress router's IRB MAC: rewritten inner destination
+  string gateway_mac = 8;  // this tenant's anycast gateway: rewritten inner source
 }
 
 // One L2 forwarding entry (B1): bridge a tenant destination MAC to a remote
