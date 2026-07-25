@@ -45,3 +45,60 @@ network = 5000
 host    = "host-2"
 tap     = "tap-blue-2"
 ip      = "192.168.100.20"
+
+# --- Beyond the basics -------------------------------------------------------
+#
+# Everything below is optional. See docs/CONFIGURATION.md for the full reference.
+
+# A reusable rule set. Ports bind it by name; it gets a stable policy id of its
+# own, decoupled from the VNI.
+[[security_group]]
+name           = "web"
+default_action = "drop"
+stateful       = true
+
+[[security_group.rule]]
+proto  = "tcp"
+port   = 443
+action = "pass"
+
+# A second segment for the same tenant, so there is something to route between.
+[[network]]
+vni    = 5001
+name   = "blue-db"
+subnet = "192.168.101.0/24"
+
+[[port]]
+network        = 5001
+host           = "host-1"
+tap            = "tap-db-1"
+ip             = "192.168.101.10"
+security_group = "web"
+
+# The tenant's routed context (B7): traffic between 5000 and 5001 is *routed*
+# behind one anycast gateway, not bridged. The remote prefixes themselves are
+# learned over BGP EVPN — only the context is declared here.
+[[ip_vrf]]
+l3_vni      = 50100
+name        = "tenant-a"
+gateway_mac = "02:00:5e:00:00:aa"     # identical on every host of this tenant
+networks    = [5000, 5001]
+
+# A VIP fronting a pool of ports, DNAT-rewritten in XDP at the ingress host.
+# A member names its port by host+tap — the way this file names ports.
+[[load_balancer]]
+id    = "web-vip"
+vni   = 5000
+vip   = "192.168.100.200"
+port  = 80
+proto = "tcp"
+
+[[load_balancer.member]]
+host = "host-1"
+tap  = "tap-blue-1"
+port = 8080
+
+[[load_balancer.member]]
+host = "host-2"
+tap  = "tap-blue-2"
+port = 8080

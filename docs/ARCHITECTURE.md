@@ -1,7 +1,8 @@
 # Velstra architecture
 
 This document explains *how* Velstra is built and *why* it is split the way it
-is. For usage, see the [README](../README.md).
+is. For usage, see the [README](../README.md); for every configuration block and
+API endpoint, see [CONFIGURATION.md](CONFIGURATION.md).
 
 ## Design goals
 
