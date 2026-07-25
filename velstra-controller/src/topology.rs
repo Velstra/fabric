@@ -36,8 +36,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use velstra_common::{parse_cidr_v4, parse_cidr_v6, parse_mac};
 use velstra_config::{
-    ActionName, EncapName, FileConfig, FloodVtepCfg, MacRouteCfg, Nd6Cfg, NeighborCfg, PortRule,
-    TunnelCfg, file_config_to_proto,
+    ActionName, EncapName, FileConfig, FloodVtepCfg, IrbRouteCfg, MacRouteCfg, Nd6Cfg, NeighborCfg,
+    PortRule, TunnelCfg, file_config_to_proto,
 };
 use velstra_orchestrator::{
     AllocRange, Host, IpVrf, Network, SecurityGroup, Subnet, SubnetCidr, Topology,
@@ -361,6 +361,10 @@ pub fn derive_configs(
 /// `NeighborCfg` + `TunnelCfg`; a v6 MAC/IP entry yields `MacRouteCfg` +
 /// `Nd6Cfg`.
 ///
+/// **Type-5 IP Prefix routes** (`evpn.iter_prefixes()`, B7) become `IrbRouteCfg`
+/// entries — see that type for why they are keyed on the ingress VNI and kept
+/// separate from a bridged tunnel.
+///
 /// **Type-3 IMET flood VTEPs** (`evpn.floods()`) are now folded too (roadmap
 /// B2): each v4 flood VTEP that is a known fabric host becomes a `FloodVtepCfg`
 /// programming that VNI's `FLOOD_LIST` head-end replication set, and the agent
@@ -434,6 +438,50 @@ fn append_evpn_entries(file: &mut FileConfig, host: &Host, topo: &Topology, evpn
                 });
             }
             None => {}
+        }
+    }
+
+    // B7: fold type-5 IP Prefix routes into symmetric-IRB routes. A learned route
+    // names the tenant only by its L3 VNI, so it is joined to the IP-VRF holding
+    // that VNI and then expanded across the tenant's L2 segments — one entry per
+    // ingress VNI, since the datapath keys on the segment a packet arrives from.
+    for (l3_vni, prefix, learned) in evpn.iter_prefixes() {
+        let Some(vrf) = topo.ip_vrfs().find(|v| v.l3_vni == l3_vni) else {
+            // A route for a tenant this fabric does not host. Held, not programmed:
+            // without the IP-VRF we know neither which segments may reach it nor
+            // which gateway MAC to route it from.
+            continue;
+        };
+        // Without the Router's MAC there is no inner destination to encapsulate
+        // toward, so the route is unusable over VXLAN (RFC 9136 §4.4.1 requires it
+        // for exactly this reason).
+        let Some(router_mac) = learned.router_mac else {
+            continue;
+        };
+        let IpAddr::V4(vtep) = learned.vtep else {
+            continue;
+        };
+        if vtep == host.vtep_ip {
+            continue;
+        }
+        let Some(remote) = topo.hosts().find(|h| h.vtep_ip == vtep) else {
+            continue;
+        };
+        // The L3 overlay FDB is v4-only, so a v6 tenant prefix has no map to go in.
+        if !prefix.contains('.') {
+            continue;
+        }
+        for &vni in &vrf.networks {
+            file.irb_routes.push(IrbRouteCfg {
+                vni,
+                inner_dst: prefix.to_string(),
+                l3_vni,
+                remote_vtep: vtep.to_string(),
+                via_mac: fmt_mac(remote.underlay_mac),
+                out_iface: host.underlay_iface.clone(),
+                router_mac: fmt_mac(router_mac),
+                gateway_mac: fmt_mac(vrf.gateway_mac),
+            });
         }
     }
 
@@ -852,6 +900,86 @@ mod tests {
         assert_eq!(fv.remote_vtep, "10.10.0.2");
         assert_eq!(fv.via_mac, "02:00:00:00:00:22");
         assert_eq!(fv.out_iface, "eth0");
+    }
+
+    /// One type-5 route becomes one entry per L2 segment of its tenant, because the
+    /// datapath keys on the segment a packet arrives from. Routes for an unhosted
+    /// tenant, or without a Router's MAC to address the inner frame to, are held
+    /// but never programmed.
+    #[test]
+    fn derives_irb_routes_from_type5_across_the_tenants_segments() {
+        use crate::evpn::{EvpnLearned, EvpnMonitorEvent};
+
+        let toml = r#"
+            [[host]]
+            id = "h1"
+            vtep = "10.10.0.1"
+            underlay_iface = "eth0"
+            underlay_mac = "02:00:00:00:00:11"
+
+            [[host]]
+            id = "h2"
+            vtep = "10.10.0.2"
+            underlay_iface = "eth0"
+            underlay_mac = "02:00:00:00:00:22"
+
+            [[network]]
+            vni = 5000
+            name = "blue"
+            subnet = "192.168.100.0/24"
+
+            [[network]]
+            vni = 5001
+            name = "green"
+            subnet = "192.168.101.0/24"
+
+            [[ip_vrf]]
+            l3_vni = 50100
+            name = "tenant-a"
+            gateway_mac = "02:00:5e:00:00:aa"
+            networks = [5000, 5001]
+        "#;
+        let topo = build(&toml::from_str::<TopologyFile>(toml).unwrap()).unwrap();
+
+        let mut evpn = EvpnLearned::default();
+        let learn = |vni, prefix: &str, mac| EvpnMonitorEvent::PrefixUpdate {
+            l3_vni: vni,
+            prefix: prefix.into(),
+            vtep: "10.10.0.2".parse().unwrap(),
+            router_mac: mac,
+            gw: None,
+        };
+        let rmac = [0x02, 0x00, 0x5e, 0x00, 0x00, 0xbb];
+        evpn.apply(&learn(50100, "10.20.0.0/24", Some(rmac)));
+        // No Router's MAC: nothing to write as the inner destination.
+        evpn.apply(&learn(50100, "10.21.0.0/24", None));
+        // A tenant this fabric does not host.
+        evpn.apply(&learn(50999, "10.22.0.0/24", Some(rmac)));
+
+        let cfgs = derive_configs(&topo, Some(&evpn)).unwrap();
+        let h1 = &cfgs["h1"];
+        let mut got: Vec<_> = h1
+            .irb_routes
+            .iter()
+            .map(|r| (r.vni, r.inner_dst.as_str(), r.l3_vni))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![(5000, "10.20.0.0/24", 50100), (5001, "10.20.0.0/24", 50100)]
+        );
+        let r = &h1.irb_routes[0];
+        // The inner rewrite: destination the egress router, source our anycast
+        // gateway. Getting these backwards would send the frame back to us.
+        assert_eq!(r.router_mac, "02:00:5e:00:00:bb");
+        assert_eq!(r.gateway_mac, "02:00:5e:00:00:aa");
+        // The underlay next hop is the remote VTEP host's MAC, our own egress iface.
+        assert_eq!(r.remote_vtep, "10.10.0.2");
+        assert_eq!(r.via_mac, "02:00:00:00:00:22");
+        assert_eq!(r.out_iface, "eth0");
+
+        // h2 originates that subnet, so it must not tunnel to itself.
+        assert!(cfgs["h2"].irb_routes.is_empty());
     }
 
     #[test]

@@ -284,6 +284,43 @@ pub struct TunnelCfg {
     pub out_iface: String,
 }
 
+/// One symmetric-IRB route (`[[irb_route]]`, B7): a remote tenant subnet reached by
+/// **routing** rather than bridging.
+///
+/// Keyed on the **ingress** VNI, not the tenant's L3 VNI, because that is what the
+/// datapath knows when the packet arrives — it sees the segment the frame came from.
+/// The controller therefore emits one entry per L2 VNI in the tenant, and `l3_vni`
+/// travels in the value as the VNI to encapsulate with.
+///
+/// Unlike a `[[tunnel]]`, which forwards the inner frame untouched, this entry says
+/// the packet is routed: the inner Ethernet header is rewritten (destination
+/// `router_mac`, source the tenant's anycast `gateway_mac`) and its TTL decremented.
+/// That is why it is a separate table rather than two more optional fields on
+/// `TunnelCfg` — a consumer that ignored those fields would silently bridge a packet
+/// that must be routed.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IrbRouteCfg {
+    /// The tenant segment a packet must arrive on for this route to apply.
+    pub vni: u32,
+    /// Remote tenant subnet this entry matches (longest-prefix, so a whole subnet
+    /// is one entry).
+    pub inner_dst: String,
+    /// The tenant's routed VNI, stamped on the encapsulated packet.
+    pub l3_vni: u32,
+    /// Remote VTEP underlay IPv4 (outer destination address).
+    pub remote_vtep: String,
+    /// Next-hop MAC on the underlay toward the remote VTEP.
+    pub via_mac: String,
+    /// Underlay egress interface name.
+    pub out_iface: String,
+    /// The egress router's IRB MAC (RFC 9135) — the rewritten inner destination.
+    pub router_mac: String,
+    /// This tenant's anycast gateway MAC — the rewritten inner source, and the
+    /// destination a local VM addresses to have its packet routed at all.
+    pub gateway_mac: String,
+}
+
 /// One L2 forwarding entry (`[[mac_route]]`, B1): which remote VTEP hosts a
 /// given tenant destination MAC. Consulted before the L3 `[[tunnel]]` table, so
 /// a true L2 overlay bridges by MAC. The controller pushes one per remote MAC.
@@ -488,6 +525,9 @@ pub struct FileConfig {
     /// B1 per-MAC L2 forwarding entries. Spelled `[[mac_route]]` in TOML.
     #[serde(rename = "mac_route")]
     pub mac_routes: Vec<MacRouteCfg>,
+    /// B7 symmetric-IRB routes: remote tenant subnets reached by routing.
+    #[serde(default, rename = "irb_route")]
+    pub irb_routes: Vec<IrbRouteCfg>,
     /// Phase 4 ARP-suppression neighbours. Spelled `[[neighbor]]` in TOML.
     #[serde(rename = "neighbor")]
     pub neighbors: Vec<NeighborCfg>,
@@ -766,6 +806,28 @@ pub struct ResolvedMacRoute {
     pub out_iface: String,
 }
 
+/// A resolved symmetric-IRB route (B7). See [`IrbRouteCfg`] for why it is keyed on
+/// the ingress VNI and separate from a tunnel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedIrbRoute {
+    /// Tenant segment a packet must arrive on.
+    pub vni: u32,
+    /// Remote tenant subnet, as a longest-prefix match key.
+    pub inner_dst: Cidr4,
+    /// The routed VNI to encapsulate with.
+    pub l3_vni: u32,
+    /// Remote VTEP underlay IPv4 (outer destination address).
+    pub remote_vtep_ip: [u8; 4],
+    /// Next-hop MAC on the underlay toward the remote VTEP.
+    pub outer_dst_mac: [u8; 6],
+    /// Underlay egress interface name.
+    pub out_iface: String,
+    /// Rewritten inner destination MAC (the egress router).
+    pub router_mac: [u8; 6],
+    /// Rewritten inner source MAC (this tenant's anycast gateway).
+    pub gateway_mac: [u8; 6],
+}
+
 /// A resolved BUM head-end replication entry (B2): the tenant segment and the
 /// remote endpoint a broadcast/unknown-unicast/multicast frame on it must be
 /// flooded to. The agent groups every entry sharing a `vni` into one `FloodSet`
@@ -853,6 +915,8 @@ pub struct RuntimeConfig {
     pub tunnels: Vec<ResolvedTunnel>,
     /// Per-MAC L2 forwarding entries for the `MAC_FDB` map (B1).
     pub mac_routes: Vec<ResolvedMacRoute>,
+    /// B7 resolved symmetric-IRB routes.
+    pub irb_routes: Vec<ResolvedIrbRoute>,
     /// ARP-suppression neighbours for the `ARP_TABLE` map (Phase 4).
     pub neighbors: Vec<ResolvedNeighbor>,
     /// IPv6 ND-suppression neighbours for the `ND_TABLE` map (B3).
@@ -898,6 +962,7 @@ impl RuntimeConfig {
             overlay: None,
             tunnels: Vec::new(),
             mac_routes: Vec::new(),
+            irb_routes: Vec::new(),
             neighbors: Vec::new(),
             nd_neighbors: Vec::new(),
             flood_vteps: Vec::new(),
@@ -1283,6 +1348,43 @@ impl FileConfig {
             });
         }
 
+        if !self.irb_routes.is_empty() && overlay.is_none() {
+            bail!("`[[irb_route]]` entries require an `[overlay]` section");
+        }
+        let mut irb_routes = Vec::with_capacity(self.irb_routes.len());
+        for r in &self.irb_routes {
+            for (label, vni) in [("vni", r.vni), ("l3_vni", r.l3_vni)] {
+                if vni > 0xFF_FFFF {
+                    bail!("irb_route {label} {vni} exceeds 24 bits");
+                }
+            }
+            let inner_dst = parse_cidr_v4(&r.inner_dst).map_err(|e| {
+                anyhow::anyhow!("invalid irb_route inner_dst {:?}: {e}", r.inner_dst)
+            })?;
+            let remote_vtep: Ipv4Addr = r.remote_vtep.parse().map_err(|_| {
+                anyhow::anyhow!("invalid irb_route remote_vtep {:?}", r.remote_vtep)
+            })?;
+            let mut macs = [[0u8; 6]; 3];
+            for (slot, (label, text)) in macs.iter_mut().zip([
+                ("via_mac", &r.via_mac),
+                ("router_mac", &r.router_mac),
+                ("gateway_mac", &r.gateway_mac),
+            ]) {
+                *slot = parse_mac(text)
+                    .map_err(|e| anyhow::anyhow!("invalid irb_route {label} {text:?}: {e}"))?;
+            }
+            irb_routes.push(ResolvedIrbRoute {
+                vni: r.vni,
+                inner_dst,
+                l3_vni: r.l3_vni,
+                remote_vtep_ip: remote_vtep.octets(),
+                outer_dst_mac: macs[0],
+                out_iface: r.out_iface.clone(),
+                router_mac: macs[1],
+                gateway_mac: macs[2],
+            });
+        }
+
         if !self.neighbors.is_empty() && overlay.is_none() {
             bail!("`[[neighbor]]` entries require an `[overlay]` section");
         }
@@ -1440,6 +1542,7 @@ impl FileConfig {
             overlay,
             tunnels,
             mac_routes,
+            irb_routes,
             neighbors,
             nd_neighbors,
             flood_vteps,

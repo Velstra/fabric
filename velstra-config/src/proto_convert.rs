@@ -11,8 +11,8 @@ use velstra_proto as proto;
 
 use crate::config::{
     ActionName, BackendCfg, EncapName, FileConfig, FloodVtepCfg, ForwardMode, InterfaceFile,
-    MacRouteCfg, Nd6Cfg, NeighborCfg, OverlayCfg, PolicyFile, PortRule, ProtoName, RouteCfg,
-    RuntimeConfig, ServiceCfg, TunnelCfg,
+    IrbRouteCfg, MacRouteCfg, Nd6Cfg, NeighborCfg, OverlayCfg, PolicyFile, PortRule, ProtoName,
+    RouteCfg, RuntimeConfig, ServiceCfg, TunnelCfg,
 };
 
 fn port_rule_to_proto(r: &PortRule) -> proto::PortRule {
@@ -198,6 +198,20 @@ pub fn file_config_to_proto(cfg: &FileConfig, version: u64) -> proto::NodeConfig
                 out_iface: m.out_iface.clone(),
             })
             .collect(),
+        irb_routes: cfg
+            .irb_routes
+            .iter()
+            .map(|r| proto::IrbRoute {
+                vni: r.vni,
+                inner_dst: r.inner_dst.clone(),
+                l3_vni: r.l3_vni,
+                remote_vtep: r.remote_vtep.clone(),
+                via_mac: r.via_mac.clone(),
+                out_iface: r.out_iface.clone(),
+                router_mac: r.router_mac.clone(),
+                gateway_mac: r.gateway_mac.clone(),
+            })
+            .collect(),
         neighbors: cfg
             .neighbors
             .iter()
@@ -351,6 +365,20 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
                 remote_vtep: m.remote_vtep.clone(),
                 via_mac: m.via_mac.clone(),
                 out_iface: m.out_iface.clone(),
+            })
+            .collect(),
+        irb_routes: cfg
+            .irb_routes
+            .iter()
+            .map(|r| IrbRouteCfg {
+                vni: r.vni,
+                inner_dst: r.inner_dst.clone(),
+                l3_vni: r.l3_vni,
+                remote_vtep: r.remote_vtep.clone(),
+                via_mac: r.via_mac.clone(),
+                out_iface: r.out_iface.clone(),
+                router_mac: r.router_mac.clone(),
+                gateway_mac: r.gateway_mac.clone(),
             })
             .collect(),
         neighbors: cfg
