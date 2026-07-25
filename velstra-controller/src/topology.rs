@@ -1131,6 +1131,30 @@ mod tests {
     /// The membership list is the only thing that says which tenant a segment
     /// belongs to, so a typo in it must fail the load rather than leave a segment
     /// quietly unrouted while everything else comes up.
+    /// The shipped example is the first thing a new operator copies, so it has
+    /// to load — and to derive — rather than merely look plausible.
+    #[test]
+    fn the_shipped_example_topology_loads_and_derives() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/topology.toml");
+        let topo = load_model(&path).expect("examples/topology.toml must load");
+
+        assert_eq!(topo.hosts().count(), 2);
+        assert_eq!(topo.networks().count(), 2);
+        assert_eq!(topo.security_groups().count(), 1);
+        assert_eq!(topo.ip_vrfs().count(), 1);
+        assert_eq!(topo.load_balancers().count(), 1);
+
+        // Every host's derived config must be *valid*, not just present: resolve()
+        // is what the agent applies, so an example that derives garbage would fail
+        // on a real node instead of here.
+        for host in topo.hosts() {
+            let cfg = topo.derive(&host.id).expect("derives");
+            cfg.resolve()
+                .unwrap_or_else(|e| panic!("host {} derives an invalid config: {e}", host.id));
+        }
+    }
+
     /// A file-declared VIP must survive the round-trip through the model, and a
     /// member has to name a port the file actually declares — the file speaks in
     /// host/tap, the model in generated port ids.

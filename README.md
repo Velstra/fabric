@@ -424,7 +424,10 @@ runtime changes survive a restart — an empty appliance just creates it on the
 first `create-port`. Admin overrides still win, then derived configs, then static
 files. `velstra-orchestrator` holds the pure model + deriver (IPAM, tunnel/ARP
 derivation); the controller wraps it with the `VelstraOrchestrator` gRPC service
-and the `orch` CLI. `examples/topology.toml` is a worked seed.
+and the `orch` CLI. `examples/topology.toml` is a worked seed;
+[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) is the full reference for every
+topology block and for the gRPC/CLI/REST surface that drives the same entities at
+runtime.
 
 ### High availability (controller cluster)
 
