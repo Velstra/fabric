@@ -69,9 +69,9 @@ use velstra_common::{
     PacketMeta, PolicyId, PortFwd, Rewrite, RouteEntry, SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6,
     ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue, Srv6Config, Srv6Endpoint,
     Srv6LocalSid, Srv6SidKey, TunnelEndpoint, TunnelKey, build_encap, build_srv6_encap, decide,
-    decode_vni, icmp, icmp_checksum, ip_proto, is_overlay_dport, lpm_key_addr, plan_arp_reply,
-    plan_forward, plan_icmp_unreachable, plan_na_reply, plan_nat, plan_tcp_rst, port_rule_action,
-    port_rule_logs, select_backend, session_hash, tcp_flags,
+    decode_vni, icmp, icmp_checksum, ip_proto, ipv6_ext_len, is_ipv6_ext, is_overlay_dport,
+    lpm_key_addr, plan_arp_reply, plan_forward, plan_icmp_unreachable, plan_na_reply, plan_nat,
+    plan_tcp_rst, port_rule_action, port_rule_logs, select_backend, session_hash, tcp_flags,
 };
 
 /// Maps an ingress interface index to its policy id, so one XDP program can
@@ -1429,16 +1429,79 @@ fn try_velstra_forward(ctx: &XdpContext) -> Result<u32, ()> {
     Ok(xdp_action::XDP_PASS)
 }
 
+/// How many IPv6 extension headers the firewall walks before giving up. RFC 8200
+/// §4.1 expects each header to occur once (Destination Options at most twice), so a
+/// legitimate packet needs a handful — and the cap is what makes this a *bounded*
+/// loop the eBPF verifier will accept.
+const MAX_IPV6_EXT_HDRS: usize = 8;
+
+/// Where an IPv6 extension-header walk ended up.
+struct Ipv6Upper {
+    /// The upper-layer protocol the chain resolves to — or, if the walk could not
+    /// finish, the extension header it stopped on.
+    proto: u8,
+    /// Offset of that header within the frame.
+    off: usize,
+    /// Whether an L4 header really sits at `off`. False behind a non-first fragment,
+    /// where those bytes are payload rather than ports.
+    l4_present: bool,
+}
+
+/// Walk the extension-header chain from the fixed header's `first` next-header to
+/// the upper-layer protocol.
+///
+/// This is what keeps extension headers from being a firewall bypass. Classifying a
+/// packet by the *fixed* header's next-header means a Hop-by-Hop or
+/// Destination-Options header placed in front of TCP reads as an unknown protocol
+/// with no ports — so no port rule and no ICMPv6 rule matches, and under a
+/// `default-action accept` policy the packet is passed on that basis alone.
+///
+/// A chain this cannot resolve — deeper than [`MAX_IPV6_EXT_HDRS`], or truncated —
+/// returns the extension header the walk stopped on. That matches no rule, so the
+/// packet falls to the policy's **default action** rather than being classified as
+/// something harmless: a drop under `default-action drop`, and under
+/// `default-action accept` a pass, which is that posture's own choice.
+#[inline(always)]
+fn walk_ipv6_ext(ctx: &XdpContext, first: u8) -> Ipv6Upper {
+    let mut proto = first;
+    let mut off = EthHdr::LEN + Ipv6Hdr::LEN;
+    let mut l4_present = true;
+    for _ in 0..MAX_IPV6_EXT_HDRS {
+        if !is_ipv6_ext(proto) {
+            break;
+        }
+        // Every walkable header starts with its next-header and length bytes; for the
+        // Fragment header the two after those hold the fragment offset.
+        let Ok(h) = (unsafe { ptr_at::<[u8; 4]>(ctx, off) }) else {
+            break;
+        };
+        let h = unsafe { *h };
+        // The offset is the top 13 bits of that field; a non-zero one means this is
+        // not the first fragment, so it carries no L4 header. Keep resolving the
+        // protocol — a proto rule still applies — but never read ports out of
+        // payload. This is the IPv6 twin of the IPv4 path's `frag_offset()` guard.
+        if proto == ip_proto::FRAGMENT && u16::from_be_bytes([h[2], h[3]]) & 0xFFF8 != 0 {
+            l4_present = false;
+        }
+        off += ipv6_ext_len(proto, h[1]);
+        proto = h[0];
+    }
+    Ipv6Upper {
+        proto,
+        off,
+        l4_present,
+    }
+}
+
 /// IPv6 firewall path: a dual-stack mirror of the IPv4 firewall in
 /// [`try_velstra`], covering the **blocklist, ICMPv6 filter, port rules and
 /// default policy** — scoped by the same per-interface `policy_id`.
 ///
 /// It is deliberately **stateless** and never routes or load-balances: Phase 2/3
 /// stay IPv4-only for now, so any IPv6 packet the firewall allows is `XDP_PASS`ed
-/// to the kernel stack. Extension headers are not walked — if the fixed header's
-/// next-header is not TCP/UDP the L4 ports stay zero (no port rule can match),
-/// which is the safe default. ICMPv6 (next-header 58) is still recognised by
-/// [`decide`] for the ICMP filter.
+/// to the kernel stack. The extension-header chain **is** walked
+/// ([`walk_ipv6_ext`]), so rules see the real upper-layer protocol rather than
+/// whatever header happens to come first.
 #[inline(always)]
 fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
     // The fixed 40-byte IPv6 header, copied out in one bounds-checked read. We
@@ -1472,10 +1535,14 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
         hdr[18], hdr[19], hdr[20], hdr[21], hdr[22], hdr[23],
     ];
 
-    // --- L4 ports (TCP/UDP directly after the fixed header, best effort) -----
+    // --- Upper layer: walk the extension-header chain, then read L4 ports ----
+    // `proto` from here on is the RESOLVED upper-layer protocol, not the fixed
+    // header's next-header — that distinction is the whole point of the walk.
+    let upper = walk_ipv6_ext(ctx, next_hdr);
+    let proto = upper.proto;
     let (mut src_port, mut dst_port) = (0u16, 0u16);
-    if next_hdr == ip_proto::TCP || next_hdr == ip_proto::UDP {
-        if let Ok(ports) = unsafe { ptr_at::<[u8; 4]>(ctx, EthHdr::LEN + Ipv6Hdr::LEN) } {
+    if upper.l4_present && (proto == ip_proto::TCP || proto == ip_proto::UDP) {
+        if let Ok(ports) = unsafe { ptr_at::<[u8; 4]>(ctx, upper.off) } {
             let ports = unsafe { *ports };
             src_port = u16::from_be_bytes([ports[0], ports[1]]);
             dst_port = u16::from_be_bytes([ports[2], ports[3]]);
@@ -1497,13 +1564,13 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
     // The rule map's source match is IPv4-only, so an IPv4 source-CIDR rule can
     // never apply to a v6 packet; look up with `src = 0` to match only the
     // source-less (`/0`, from-any) rules for this `(policy, proto, dport)`.
-    let rule = lookup_port_rule(policy_id, next_hdr, dst_port, 0);
+    let rule = lookup_port_rule(policy_id, proto, dst_port, 0);
 
     // IPv6 addresses do not fit `PacketMeta`'s IPv4 fields, but `decide` only
     // reads `proto`/`dst_port` plus the `blocklisted`/`rule` inputs we computed,
     // so zero placeholders are harmless. The blocklist verdict already came from
     // the real IPv6 source above.
-    let meta = PacketMeta::new([0; 4], [0; 4], next_hdr, src_port, dst_port, payload_len);
+    let meta = PacketMeta::new([0; 4], [0; 4], proto, src_port, dst_port, payload_len);
     let verdict = decide(&meta, &cfg, blocklisted, rule.map(port_rule_action));
 
     bump(verdict.counter);
@@ -1514,7 +1581,7 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
             info!(
                 ctx,
                 "DROP6 proto={} dport={} reason={}",
-                next_hdr,
+                proto,
                 dst_port,
                 verdict.counter.label(),
             );
