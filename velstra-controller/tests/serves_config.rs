@@ -168,6 +168,7 @@ async fn controller_serves_and_updates_config() {
             }],
             policy: 0,
             router_nat: false,
+            reply_policy: 0,
         }],
         ..Default::default()
     };

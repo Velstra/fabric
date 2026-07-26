@@ -92,6 +92,11 @@ pub struct ServiceValue {
     pub backend_count: u32,
     /// [`service_flags`] bits.
     pub flags: u32,
+    /// The policy a backend's **reply** will arrive under — the zone that owns the
+    /// pool's segment. Only meaningful with [`service_flags::ROUTER_NAT`], since a
+    /// tenant service's reply already returns under the ingress policy. `0` = not
+    /// derived; the reply then depends on the internal zone's outbound posture.
+    pub reply_policy: PolicyId,
 }
 
 impl ServiceValue {
@@ -103,18 +108,25 @@ impl ServiceValue {
             backend_start,
             backend_count,
             flags: 0,
+            reply_policy: 0,
         }
     }
 
     /// Build a service whose flows are tracked in the router-NAT namespace, for a
     /// pool that answers through a different zone than the VIP is reached from.
-    /// See [`service_flags::ROUTER_NAT`].
+    /// `reply_policy` is the policy that reply arrives under (`0` if unknown). See
+    /// [`service_flags::ROUTER_NAT`].
     #[inline]
-    pub const fn new_router_nat(backend_start: u32, backend_count: u32) -> Self {
+    pub const fn new_router_nat(
+        backend_start: u32,
+        backend_count: u32,
+        reply_policy: PolicyId,
+    ) -> Self {
         Self {
             backend_start,
             backend_count,
             flags: service_flags::ROUTER_NAT,
+            reply_policy,
         }
     }
 
@@ -467,6 +479,13 @@ pub struct PortFwd {
     /// address (the box's IP on the client's segment) so the internal server's
     /// reply routes back through the box. `[0; 4]` = no SNAT (plain DNAT).
     pub snat_ip: [u8; 4],
+    /// The policy the internal host's **reply** will arrive under — the zone that
+    /// owns `ip`'s segment. The data plane cannot derive this (it knows the zone a
+    /// packet came from, not the one an address lives on), so the control plane,
+    /// which has the interface subnets, supplies it. `0` = not derived; the reply
+    /// then depends on the internal zone's own outbound posture. See
+    /// [`reply_policy`](Self::reply_policy) usage in the firewall path.
+    pub reply_policy: PolicyId,
     /// Internal port (`0` keeps the original destination port).
     pub port: u16,
     /// Explicit padding, always zero.
@@ -474,13 +493,15 @@ pub struct PortFwd {
 }
 
 impl PortFwd {
-    /// Build a plain port-forward target (match any destination, no hairpin SNAT).
+    /// Build a plain port-forward target (match any destination, no hairpin SNAT,
+    /// no derived reply policy).
     #[inline]
     pub const fn new(ip: [u8; 4], port: u16) -> Self {
         Self {
             ip,
             match_dst: [0; 4],
             snat_ip: [0; 4],
+            reply_policy: 0,
             port,
             _pad: 0,
         }
@@ -494,8 +515,19 @@ impl PortFwd {
             ip,
             match_dst,
             snat_ip,
+            reply_policy: 0,
             port,
             _pad: 0,
+        }
+    }
+
+    /// The same target with the policy its reply will arrive under. See
+    /// [`PortFwd::reply_policy`].
+    #[inline]
+    pub const fn with_reply_policy(self, reply_policy: PolicyId) -> Self {
+        Self {
+            reply_policy,
+            ..self
         }
     }
 }
@@ -795,30 +827,38 @@ mod tests {
     #[test]
     fn only_a_router_service_shares_the_conntrack_namespace() {
         assert!(!ServiceValue::new(0, 3).is_router_nat());
-        assert!(ServiceValue::new_router_nat(0, 3).is_router_nat());
+        assert!(ServiceValue::new_router_nat(0, 3, 2).is_router_nat());
         // Both spell the same pool — the flag is the only difference, so a service
         // cannot change namespace and pool in one silent step.
         let tenant = ServiceValue::new(7, 2);
-        let router = ServiceValue::new_router_nat(7, 2);
+        let router = ServiceValue::new_router_nat(7, 2, 5);
         assert_eq!(
             (tenant.backend_start, tenant.backend_count),
             (router.backend_start, router.backend_count)
         );
         assert_ne!(tenant, router);
+        // A tenant service carries no reply policy: its reply returns under the
+        // ingress policy, so there is no second zone to name.
+        assert_eq!(tenant.reply_policy, 0);
+        assert_eq!(router.reply_policy, 5);
+        // `0` is "not derived", which the data plane must treat as "write no state
+        // entry" rather than as policy 0 (the default policy, a real target).
+        assert_eq!(ServiceValue::new_router_nat(0, 1, 0).reply_policy, 0);
     }
 
     #[test]
     fn map_types_are_pod_sized() {
         // Both keys carry a leading u32 `policy` scope (C3): +4 bytes each.
         assert_eq!(core::mem::size_of::<ServiceKey>(), 12);
-        // ServiceValue: backend window (2×u32) + flags = 12 bytes.
-        assert_eq!(core::mem::size_of::<ServiceValue>(), 12);
+        // ServiceValue: backend window (2×u32) + flags + reply policy = 16 bytes.
+        assert_eq!(core::mem::size_of::<ServiceValue>(), 16);
         assert_eq!(core::mem::size_of::<Backend>(), 8);
         assert_eq!(core::mem::size_of::<FlowKey>(), 20);
         // FlowState carries a second (hairpin) rewrite: 2×(ip[4]+port) + flags +
         // pad = 16 bytes.
         assert_eq!(core::mem::size_of::<FlowState>(), 16);
-        // PortFwd: target ip + match_dst + snat_ip (3×4) + port + pad = 16 bytes.
-        assert_eq!(core::mem::size_of::<PortFwd>(), 16);
+        // PortFwd: target ip + match_dst + snat_ip (3×4) + reply policy + port +
+        // pad = 20 bytes.
+        assert_eq!(core::mem::size_of::<PortFwd>(), 20);
     }
 }

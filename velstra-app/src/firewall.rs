@@ -840,8 +840,8 @@ fn apply_config(ebpf: &mut Ebpf, cfg: &RuntimeConfig, old: Option<&RuntimeConfig
     program_policies(ebpf, &cfg.policies)?;
     program_interfaces(ebpf, &cfg.interfaces)?;
     program_routes(ebpf, &cfg.routes)?;
-    program_services(ebpf, &cfg.services)?;
-    program_port_forwards(ebpf, &cfg.port_forwards)?;
+    program_services(ebpf, &cfg.services, &cfg.interfaces)?;
+    program_port_forwards(ebpf, &cfg.port_forwards, &cfg.interfaces)?;
     program_masquerade(ebpf, &cfg.interfaces)?;
     program_npt66(ebpf, &cfg.npt66)?;
     program_overlay(
@@ -1039,7 +1039,11 @@ fn program_interfaces(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Resu
 /// Program the Phase 3 load-balancer maps: `BACKENDS` (a flat pool) and
 /// `SERVICES` (`(VIP, port, proto)` → a window into that pool). No-op without
 /// services.
-fn program_services(ebpf: &mut Ebpf, services: &[ResolvedService]) -> Result<()> {
+fn program_services(
+    ebpf: &mut Ebpf,
+    services: &[ResolvedService],
+    interfaces: &[ResolvedInterface],
+) -> Result<()> {
     if services.is_empty() {
         return Ok(());
     }
@@ -1055,7 +1059,16 @@ fn program_services(ebpf: &mut Ebpf, services: &[ResolvedService]) -> Result<()>
         entries.push((
             service.key,
             if service.router_nat {
-                ServiceValue::new_router_nat(start, count)
+                // The pool's reply policy, explicit config first. Resolved from the
+                // pool rather than from one member so a pool spread across zones
+                // yields none: one entry cannot name two zones, and naming either
+                // would leave the other's replies unadmitted.
+                let reply = if service.reply_policy != 0 {
+                    service.reply_policy
+                } else {
+                    pool_reply_policy(&service.backends, interfaces)
+                };
+                ServiceValue::new_router_nat(start, count, reply)
             } else {
                 ServiceValue::new(start, count)
             },
@@ -1088,21 +1101,39 @@ fn program_services(ebpf: &mut Ebpf, services: &[ResolvedService]) -> Result<()>
 /// Write the Phase 4 `PORT_FORWARDS` map: `(policy, proto, dport)` →
 /// internal `(ip, port)`. Keyed by [`ScopedPortKey`] like the firewall's port
 /// rules, so the data plane looks it up the same way.
-fn program_port_forwards(ebpf: &mut Ebpf, forwards: &[ResolvedPortForward]) -> Result<()> {
+fn program_port_forwards(
+    ebpf: &mut Ebpf,
+    forwards: &[ResolvedPortForward],
+    interfaces: &[ResolvedInterface],
+) -> Result<()> {
     if forwards.is_empty() {
         return Ok(());
     }
+    // Resolve each target's reply policy before borrowing the map (the lookup reads
+    // the OS). A config that states one explicitly wins: it can name a zone reached
+    // over a route, which no interface subnet contains.
+    let prepared: Vec<(ScopedPortKey, PortFwd)> = forwards
+        .iter()
+        .map(|pf| {
+            let reply = if pf.reply_policy != 0 {
+                pf.reply_policy
+            } else {
+                resolve_reply_policy(pf.dst_ip, interfaces)
+            };
+            (
+                ScopedPortKey::new(pf.policy, pf.proto, pf.port),
+                PortFwd::new_hairpin(pf.dst_ip, pf.dst_port, pf.match_dst, pf.snat_ip)
+                    .with_reply_policy(reply),
+            )
+        })
+        .collect();
     let mut map: HashMap<_, ScopedPortKey, PortFwd> = HashMap::try_from(
         ebpf.map_mut("PORT_FORWARDS")
             .ok_or_else(|| anyhow!("PORT_FORWARDS map missing"))?,
     )?;
-    for pf in forwards {
-        map.insert(
-            ScopedPortKey::new(pf.policy, pf.proto, pf.port),
-            PortFwd::new_hairpin(pf.dst_ip, pf.dst_port, pf.match_dst, pf.snat_ip),
-            0,
-        )
-        .context("inserting port-forward")?;
+    for (key, value) in &prepared {
+        map.insert(key, value, 0)
+            .context("inserting port-forward")?;
     }
     Ok(())
 }
@@ -1176,6 +1207,91 @@ fn program_npt66(ebpf: &mut Ebpf, rules: &[ResolvedNpt66]) -> Result<()> {
 
 /// Read an interface's first IPv4 address via `getifaddrs(3)`. Returns an error
 /// if the interface has no IPv4 assigned (e.g. DHCP not up yet).
+/// The policy a reply from `target` will arrive under: the policy bound to the
+/// interface whose live IPv4 subnet contains it. `0` when no interface's subnet
+/// does (the host is reached over a route, or its segment has no address yet) — or
+/// when two interfaces on *different* policies both match, since one entry cannot
+/// name two zones and picking either would admit nothing while looking resolved.
+///
+/// Read from the live OS rather than derived from the config on purpose: an
+/// interface may be DHCP-addressed, in which case its subnet is not in the config
+/// at all, and a compile-time guess would also go stale when the address moves.
+fn resolve_reply_policy(target: [u8; 4], interfaces: &[ResolvedInterface]) -> PolicyId {
+    let want = u32::from_be_bytes(target);
+    let mut found: Option<PolicyId> = None;
+    for iface in interfaces {
+        let Ok((addr, mask)) = read_iface_ipv4_net(&iface.name) else {
+            continue;
+        };
+        let mask = u32::from_be_bytes(mask);
+        if (want & mask) != (u32::from_be_bytes(addr) & mask) {
+            continue;
+        }
+        match found {
+            None => found = Some(iface.policy),
+            Some(p) if p == iface.policy => {}
+            Some(_) => return 0,
+        }
+    }
+    found.unwrap_or(0)
+}
+
+/// The one policy every member of `backends` answers under, or `0` if they do not
+/// all agree (or none resolves). See [`resolve_reply_policy`].
+fn pool_reply_policy(backends: &[Backend], interfaces: &[ResolvedInterface]) -> PolicyId {
+    let mut agreed: Option<PolicyId> = None;
+    for backend in backends {
+        let policy = resolve_reply_policy(backend.ip, interfaces);
+        if policy == 0 {
+            return 0;
+        }
+        match agreed {
+            None => agreed = Some(policy),
+            Some(p) if p == policy => {}
+            Some(_) => return 0,
+        }
+    }
+    agreed.unwrap_or(0)
+}
+
+/// An interface's live IPv4 address **and netmask**, both as network-order octets.
+/// The netmask is what makes subnet containment answerable; [`read_iface_ipv4`]
+/// keeps returning the address alone for callers that only need that.
+fn read_iface_ipv4_net(iface: &str) -> Result<([u8; 4], [u8; 4])> {
+    use std::os::raw::c_int;
+    let mut ifap: *mut libc::ifaddrs = core::ptr::null_mut();
+    // SAFETY: `getifaddrs` fills `ifap` with an owned linked list we free below.
+    if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
+        bail!("getifaddrs failed for {iface}");
+    }
+    let mut result: Option<([u8; 4], [u8; 4])> = None;
+    let mut cur = ifap;
+    while !cur.is_null() {
+        // SAFETY: `cur` is a valid node for the duration of this iteration.
+        let node = unsafe { &*cur };
+        if !node.ifa_addr.is_null() && !node.ifa_netmask.is_null() {
+            // SAFETY: both point at kernel-owned sockaddrs; we read sa_family
+            // first and only reinterpret as sockaddr_in when it is AF_INET.
+            let family = unsafe { (*node.ifa_addr).sa_family } as c_int;
+            let name = unsafe { std::ffi::CStr::from_ptr(node.ifa_name) };
+            if family == libc::AF_INET && name.to_bytes() == iface.as_bytes() {
+                let sin = node.ifa_addr as *const libc::sockaddr_in;
+                let mask = node.ifa_netmask as *const libc::sockaddr_in;
+                // s_addr is network byte order — its native bytes are the octets.
+                result = Some((
+                    unsafe { (*sin).sin_addr.s_addr }.to_ne_bytes(),
+                    unsafe { (*mask).sin_addr.s_addr }.to_ne_bytes(),
+                ));
+                break;
+            }
+        }
+        cur = node.ifa_next;
+    }
+    // SAFETY: frees the list `getifaddrs` allocated; `ifap` is not used after.
+    unsafe { libc::freeifaddrs(ifap) };
+    result.ok_or_else(|| anyhow!("interface {iface} has no IPv4 address"))
+}
+
 fn read_iface_ipv4(iface: &str) -> Result<[u8; 4]> {
     use std::os::raw::c_int;
     let mut ifap: *mut libc::ifaddrs = core::ptr::null_mut();

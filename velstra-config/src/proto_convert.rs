@@ -167,6 +167,7 @@ pub fn file_config_to_proto(cfg: &FileConfig, version: u64) -> proto::NodeConfig
                     .collect(),
                 policy: s.policy,
                 router_nat: s.router_nat,
+                reply_policy: s.reply_policy,
             })
             .collect(),
         overlay: cfg.overlay.as_ref().map(|o| proto::Overlay {
@@ -322,6 +323,7 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
                     })
                     .collect(),
                 router_nat: s.router_nat,
+                reply_policy: s.reply_policy,
             })
             .collect(),
         // Port-forwards are a file-config-only (appliance) feature; the gRPC
@@ -650,6 +652,7 @@ mod tests {
                 }],
                 policy: 0,
                 router_nat: false,
+                reply_policy: 0,
             }],
             ..Default::default()
         };

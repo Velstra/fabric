@@ -590,6 +590,10 @@ message Service {
   // policy, never matches its conntrack entry and keeps the backend's address.
   // Off for a multi-tenant service, where per-policy scoping is the isolation.
   bool router_nat = 6;
+  // Policy a backend's reply arrives under — the zone owning the pool's segment,
+  // which only the config layer can know. Clears that reply through a
+  // deny-by-default internal zone. Meaningful only with router_nat; 0 = not derived.
+  uint32 reply_policy = 7;
 }
 
 message Backend {

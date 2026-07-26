@@ -1537,6 +1537,9 @@ impl Topology {
                     // conntrack state. Only an appliance service, whose pool sits
                     // in another zone, needs the shared namespace.
                     router_nat: false,
+                    // Nothing to name: with the flow tenant-scoped, the reply
+                    // already arrives under the policy that admitted the request.
+                    reply_policy: 0,
                 });
             }
         }
