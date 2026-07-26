@@ -24,11 +24,11 @@ use clap::ValueEnum;
 use log::warn;
 use tokio::sync::Mutex;
 use velstra_common::{
-    ArpEntry, ArpKey, Backend, Cidr4, Counter, FloodSet, FlowKey, FlowState, GlobalConfig,
-    IrbEndpoint, LocalMac, LocalMacKey, MAX_RULE_LIMITS, MacFdbKey, NdKey, Npt66, OverlayConfig,
-    PolicyId, PortFwd, RateBucket, RouteEntry, ScopedAddr, ScopedAddr6, ScopedDstPortKey,
-    ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue, Srv6Config, Srv6Endpoint,
-    Srv6LocalSid, Srv6SidKey, TunnelEndpoint, TunnelKey, parse_mac, port_rule_value,
+    ArpEntry, ArpKey, Backend, CgnatLayout, Cidr4, Counter, FloodSet, FlowKey, FlowState,
+    GlobalConfig, IrbEndpoint, LocalMac, LocalMacKey, MAX_RULE_LIMITS, MacFdbKey, NdKey, Npt66,
+    OverlayConfig, PolicyId, PortFwd, RateBucket, RouteEntry, ScopedAddr, ScopedAddr6,
+    ScopedDstPortKey, ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue, Srv6Config,
+    Srv6Endpoint, Srv6LocalSid, Srv6SidKey, TunnelEndpoint, TunnelKey, parse_mac, port_rule_value,
     port_rule_with_limit,
 };
 use velstra_config::{
@@ -412,6 +412,33 @@ impl Firewall {
         apply_config(&mut self.ebpf, cfg, Some(&self.applied))?;
         self.applied = cfg.clone();
         Ok(())
+    }
+
+    /// The WAN port block `addr` is assigned on each CGNAT-configured egress, as
+    /// `(interface, first_port, last_port)`.
+    ///
+    /// Read from the live map and computed with [`CgnatLayout::range_of`] — the
+    /// same call the data plane makes — so the answer an operator reports and the
+    /// ports actually handed out cannot disagree. That is the whole point of a
+    /// deterministic layout: attribution without a translation log.
+    pub fn cgnat_blocks(&self, addr: [u8; 4]) -> Result<Vec<(String, u16, u16)>> {
+        let map: HashMap<_, u32, CgnatLayout> = HashMap::try_from(
+            self.ebpf
+                .map("CGNAT")
+                .ok_or_else(|| anyhow!("CGNAT map missing"))?,
+        )?;
+        let mut out = Vec::new();
+        for key in map.keys() {
+            let ifindex = key?;
+            let Ok(layout) = map.get(&ifindex, 0) else {
+                continue;
+            };
+            if let Some((first, last)) = layout.range_of(addr) {
+                out.push((if_indextoname(ifindex), first, last));
+            }
+        }
+        out.sort();
+        Ok(out)
     }
 
     /// Read and sum the per-CPU statistics into a flat [`Stats`] snapshot.
@@ -877,6 +904,7 @@ fn apply_config(ebpf: &mut Ebpf, cfg: &RuntimeConfig, old: Option<&RuntimeConfig
     program_services(ebpf, &cfg.services, &cfg.interfaces)?;
     program_port_forwards(ebpf, &cfg.port_forwards, &cfg.interfaces)?;
     program_masquerade(ebpf, &cfg.interfaces)?;
+    program_cgnat(ebpf, &cfg.interfaces)?;
     program_npt66(ebpf, &cfg.npt66)?;
     program_overlay(
         ebpf,
@@ -1159,6 +1187,23 @@ fn program_interfaces(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Resu
     Ok(())
 }
 
+/// An interface's name from its index, falling back to `if<N>` so a NIC that has
+/// gone away still produces a readable line rather than an error.
+fn if_indextoname(ifindex: u32) -> String {
+    let mut buf = [0i8; libc::IF_NAMESIZE];
+    // SAFETY: `buf` is IF_NAMESIZE bytes, which is what the call is documented to
+    // write at most; a null return means the index is gone and we fall back.
+    let ok = unsafe { !libc::if_indextoname(ifindex, buf.as_mut_ptr()).is_null() };
+    if ok {
+        // SAFETY: on success the kernel wrote a NUL-terminated name into `buf`.
+        let name = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+        if let Ok(s) = name.to_str() {
+            return s.to_string();
+        }
+    }
+    format!("if{ifindex}")
+}
+
 /// Program the Phase 3 load-balancer maps: `BACKENDS` (a flat pool) and
 /// `SERVICES` (`(VIP, port, proto)` → a window into that pool). No-op without
 /// services.
@@ -1300,6 +1345,38 @@ fn program_masquerade(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Resu
 /// translation. The interface name resolves to the live ifindex here (the data
 /// plane keys on ifindex); an absent interface is skipped with a warning, so a
 /// later reconfigure picks it up once the NIC appears.
+/// Write the C16 `CGNAT` map: egress ifindex → its deterministic port-block
+/// layout, for every masquerade interface that configures one. No entry means the
+/// plain hash-spread NAPT, so a box that is not a carrier NAT is untouched.
+fn program_cgnat(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Result<()> {
+    let prepared: Vec<(u32, CgnatLayout)> = interfaces
+        .iter()
+        .filter(|i| i.masquerade && i.cgnat.is_enabled())
+        .filter_map(|i| match if_nametoindex(&i.name) {
+            Ok(ifindex) => Some((ifindex, i.cgnat)),
+            Err(_) => {
+                warn!(
+                    "cgnat interface {} not present yet; deferring its port blocks",
+                    i.name
+                );
+                None
+            }
+        })
+        .collect();
+    if prepared.is_empty() {
+        return Ok(());
+    }
+    let mut map: HashMap<_, u32, CgnatLayout> = HashMap::try_from(
+        ebpf.map_mut("CGNAT")
+            .ok_or_else(|| anyhow!("CGNAT map missing"))?,
+    )?;
+    for (ifindex, layout) in prepared {
+        map.insert(ifindex, layout, 0)
+            .with_context(|| format!("inserting cgnat layout for ifindex {ifindex}"))?;
+    }
+    Ok(())
+}
+
 fn program_npt66(ebpf: &mut Ebpf, rules: &[ResolvedNpt66]) -> Result<()> {
     let prepared: Vec<(u32, Npt66)> = rules
         .iter()
@@ -2145,6 +2222,7 @@ mod tests {
             policy: 100,
             vni: 100,
             masquerade: false,
+            cgnat: CgnatLayout::default(),
         });
         // An uplink with no tenant segment must not register VNI 0.
         cfg.interfaces.push(ResolvedInterface {
@@ -2152,6 +2230,7 @@ mod tests {
             policy: 0,
             vni: 0,
             masquerade: true,
+            cgnat: CgnatLayout::default(),
         });
         cfg.irb_routes.push(ResolvedIrbRoute {
             vni: 100,

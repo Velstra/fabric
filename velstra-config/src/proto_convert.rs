@@ -292,8 +292,11 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
                 policy: i.policy,
                 vni: i.vni,
                 // The gRPC interface message has no masquerade field (NAT is a
-                // file-config / appliance concept); default it off.
+                // file-config / appliance concept); default it off, and with it the
+                // CGNAT port-block layout that only means anything under it.
                 masquerade: false,
+                cgnat_base_port: 0,
+                cgnat_block_size: 0,
             })
             .collect(),
         routes: cfg

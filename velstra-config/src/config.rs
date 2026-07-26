@@ -31,8 +31,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use velstra_common::{
-    Action, Backend, Cidr4, Cidr6, ConfigFlags, GENEVE_PORT, GlobalConfig, Npt66, PolicyId,
-    PortKey, RouteEntry, ServiceKey, VXLAN_PORT, encap_kind, ip_proto, parse_cidr_v4,
+    Action, Backend, CgnatLayout, Cidr4, Cidr6, ConfigFlags, GENEVE_PORT, GlobalConfig, Npt66,
+    PolicyId, PortKey, RouteEntry, ServiceKey, VXLAN_PORT, encap_kind, ip_proto, parse_cidr_v4,
     parse_cidr_v6, parse_mac,
 };
 
@@ -515,6 +515,16 @@ pub struct InterfaceFile {
     /// hook; the reply is un-NAT'd on ingress via connection tracking.
     #[serde(default)]
     pub masquerade: bool,
+    /// Deterministic CGNAT (roadmap C16): the first WAN port handed out and how
+    /// many each internal address gets. Both set ⇒ every masqueraded flow from one
+    /// address takes a port from that address's fixed block, so a WAN port can be
+    /// attributed to a subscriber by arithmetic instead of by logging every
+    /// translation. Unset (or `0`) keeps the plain hash-spread NAPT.
+    #[serde(default)]
+    pub cgnat_base_port: u16,
+    /// Ports per internal address. See `cgnat_base_port`.
+    #[serde(default)]
+    pub cgnat_block_size: u16,
 }
 
 /// The raw, deserialised TOML document. The top-level firewall fields define
@@ -842,6 +852,8 @@ pub struct ResolvedInterface {
     pub vni: u32,
     /// Masquerade (source NAT) traffic leaving this interface (`MASQUERADE`).
     pub masquerade: bool,
+    /// Deterministic CGNAT port-block layout for this egress, or a disabled layout.
+    pub cgnat: CgnatLayout,
 }
 
 /// A resolved overlay forwarding entry: the tenant segment, the inner-destination
@@ -1233,6 +1245,7 @@ impl FileConfig {
                 policy: iface.policy,
                 vni,
                 masquerade: iface.masquerade,
+                cgnat: CgnatLayout::new(iface.cgnat_base_port, iface.cgnat_block_size),
             });
         }
 
@@ -2212,12 +2225,14 @@ mod tests {
                     policy: 7,
                     vni: 7, // defaults to the policy id
                     masquerade: false,
+                    cgnat: CgnatLayout::default(),
                 },
                 ResolvedInterface {
                     name: "tap1".into(),
                     policy: 0,
                     vni: 0,
                     masquerade: false,
+                    cgnat: CgnatLayout::default(),
                 },
             ]
         );
