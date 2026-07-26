@@ -1241,6 +1241,7 @@ mod tests {
                         action: ActionName::Pass,
                         log: false,
                         src: None,
+                        dst: None,
                     }],
                 })
             )

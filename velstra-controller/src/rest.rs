@@ -726,6 +726,10 @@ struct RuleReq {
     log: bool,
     #[serde(default)]
     src: Option<String>,
+    /// Destination-CIDR constraint. Mutually exclusive with `src`; the agent
+    /// refuses a rule carrying both rather than enforcing one of them.
+    #[serde(default)]
+    dst: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1310,6 +1314,7 @@ async fn create_security_group(
             action: parse_action(&r.action)? as i32,
             log: r.log,
             src: r.src.clone().unwrap_or_default(),
+            dst: r.dst.clone().unwrap_or_default(),
         });
     }
     let spec = ProtoSgSpec {

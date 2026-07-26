@@ -67,12 +67,12 @@ use velstra_common::{
     ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, ICMPV6_NEIGHBOR_SOLICIT, IrbEndpoint, IrbRewrite,
     LocalMac, LocalMacKey, MAX_FLOOD_VTEPS, MacFdbKey, ND_NA_MSG_LEN, Nat, NdKey, Npt66,
     OVERLAY_OUTER_LEN, OverlayConfig, PacketMeta, PolicyId, PortFwd, Rewrite, RouteEntry,
-    SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6, ScopedPortKey, ScopedSrcPortKey, ServiceKey,
-    ServiceValue, Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, TunnelEndpoint, TunnelKey,
-    build_encap, build_srv6_encap, decide, decode_vni, icmp, icmp_checksum, ip_proto, ipv6_ext_len,
-    is_ipv6_ext, is_overlay_dport, lpm_key_addr, plan_arp_reply, plan_forward,
+    SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6, ScopedDstPortKey, ScopedPortKey, ScopedSrcPortKey,
+    ServiceKey, ServiceValue, Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, TunnelEndpoint,
+    TunnelKey, build_encap, build_srv6_encap, decide, decode_vni, icmp, icmp_checksum, ip_proto,
+    ipv6_ext_len, is_ipv6_ext, is_overlay_dport, lpm_key_addr, plan_arp_reply, plan_forward,
     plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_tcp_rst, port_rule_action,
-    port_rule_logs, select_backend, session_hash, tcp_flags,
+    port_rule_logs, port_rule_present, port_rule_winner, select_backend, session_hash, tcp_flags,
 };
 
 /// Maps an ingress interface index to its policy id, so one XDP program can
@@ -130,6 +130,13 @@ static BLOCKLIST6: LpmTrie<ScopedAddr6, u32> = LpmTrie::with_max_entries(8192, 0
 /// across address families: a port rule applies to IPv4 *and* IPv6 alike.
 #[map]
 static PORT_RULES: LpmTrie<ScopedSrcPortKey, u32> = LpmTrie::with_max_entries(8192, 0);
+
+/// The destination-address counterpart of [`PORT_RULES`]: per-policy
+/// `(proto, destination port, destination CIDR)` → [`Action`]. IPv4 only, exactly
+/// like the source constraint. See [`ScopedDstPortKey`] for why this is a second
+/// trie rather than a second dimension of the first.
+#[map]
+static DST_RULES: LpmTrie<ScopedDstPortKey, u32> = LpmTrie::with_max_entries(8192, 0);
 
 /// Per-policy 1:1 DNAT port-forwards: `(policy, proto, destination port)` → the
 /// internal `(ip, port)` an inbound connection is rewritten to. Empty by default
@@ -718,7 +725,17 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
             ScopedAddr::new(policy_id, lpm_key_addr(dst_addr)),
         ))
         .is_some();
-    let rule = lookup_port_rule(policy_id, proto, dst_port, lpm_key_addr(src_addr));
+    // Both address dimensions, each collapsed to a scalar at the call — see
+    // `lookup_port_rule` for why an `Option` must not survive to this merge.
+    let rule = port_rule_winner(
+        lookup_port_rule(policy_id, proto, dst_port, lpm_key_addr(src_addr)),
+        lookup_dst_rule(policy_id, proto, dst_port, lpm_key_addr(dst_addr)),
+    );
+    let rule_action = if port_rule_present(rule) {
+        Some(port_rule_action(rule))
+    } else {
+        None
+    };
     let meta = PacketMeta::new(
         src_addr,
         dst_addr,
@@ -727,14 +744,14 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
         dst_port,
         ipv4.tot_len(),
     );
-    let verdict = decide(&meta, &cfg, blocklisted, rule.map(port_rule_action));
+    let verdict = decide(&meta, &cfg, blocklisted, rule_action);
 
     // On egress we can't bounce a RST back the way the XDP ingress path does, so
     // an active reject degrades to a silent drop here.
     if verdict.action != Action::Pass {
         bump(Counter::EgressDropped);
         // The policy-wide log flag, or this rule's own per-rule log bit.
-        let want_log = cfg.has_flag(ConfigFlags::LOG) || rule.map_or(false, port_rule_logs);
+        let want_log = cfg.has_flag(ConfigFlags::LOG) || port_rule_logs(rule);
         if want_log {
             info!(
                 ctx,
@@ -1152,7 +1169,15 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
             ScopedAddr::new(policy_id, lpm_key_addr(src_addr)),
         ))
         .is_some();
-    let rule = lookup_port_rule(policy_id, proto, dst_port, lpm_key_addr(src_addr));
+    let rule = port_rule_winner(
+        lookup_port_rule(policy_id, proto, dst_port, lpm_key_addr(src_addr)),
+        lookup_dst_rule(policy_id, proto, dst_port, lpm_key_addr(dst_addr)),
+    );
+    let rule_action = if port_rule_present(rule) {
+        Some(port_rule_action(rule))
+    } else {
+        None
+    };
     // A configured port-forward for this destination port implicitly opens the
     // firewall (the DNAT + reply SNAT run in `velstra_forward` / the conntrack
     // path). The main program only needs to know one *exists* — a bare `bool`,
@@ -1166,11 +1191,11 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     // `try_port_forward` re-looks-up the target with a fresh stack downstream.
     let has_port_forward = port_forward_exists(policy_id, proto, dst_port);
 
-    let verdict = decide(&meta, &cfg, blocklisted, rule.map(port_rule_action));
+    let verdict = decide(&meta, &cfg, blocklisted, rule_action);
     // Per-rule logging: this rule's own log bit, and the effective flag combining
     // it with the policy-wide log. `rule_log` alone gates logging of *allowed*
     // traffic so a globally-logging policy doesn't start logging every pass.
-    let rule_log = rule.map_or(false, port_rule_logs);
+    let rule_log = port_rule_logs(rule);
     let want_log = cfg.has_flag(ConfigFlags::LOG) || rule_log;
 
     // Stateful firewall: track allowed TCP/UDP flows so replies are permitted in
@@ -1590,22 +1615,31 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
             ScopedAddr6::new(policy_id, src_addr),
         ))
         .is_some();
-    // The rule map's source match is IPv4-only, so an IPv4 source-CIDR rule can
-    // never apply to a v6 packet; look up with `src = 0` to match only the
-    // source-less (`/0`, from-any) rules for this `(policy, proto, dport)`.
-    let rule = lookup_port_rule(policy_id, proto, dst_port, 0);
+    // The rule tries' address matches are IPv4-only, so an IPv4 source- or
+    // destination-CIDR rule can never apply to a v6 packet; look up with the
+    // address as `0` to match only the unconstrained (`/0`) rules for this
+    // `(policy, proto, dport)`.
+    let rule = port_rule_winner(
+        lookup_port_rule(policy_id, proto, dst_port, 0),
+        lookup_dst_rule(policy_id, proto, dst_port, 0),
+    );
+    let rule_action = if port_rule_present(rule) {
+        Some(port_rule_action(rule))
+    } else {
+        None
+    };
 
     // IPv6 addresses do not fit `PacketMeta`'s IPv4 fields, but `decide` only
     // reads `proto`/`dst_port` plus the `blocklisted`/`rule` inputs we computed,
     // so zero placeholders are harmless. The blocklist verdict already came from
     // the real IPv6 source above.
     let meta = PacketMeta::new([0; 4], [0; 4], proto, src_port, dst_port, payload_len);
-    let verdict = decide(&meta, &cfg, blocklisted, rule.map(port_rule_action));
+    let verdict = decide(&meta, &cfg, blocklisted, rule_action);
 
     bump(verdict.counter);
     // Reject has no IPv6 RST path yet, so it drops here like Drop.
     if verdict.action != Action::Pass {
-        let want_log = cfg.has_flag(ConfigFlags::LOG) || rule.map_or(false, port_rule_logs);
+        let want_log = cfg.has_flag(ConfigFlags::LOG) || port_rule_logs(rule);
         if want_log {
             info!(
                 ctx,
@@ -2792,24 +2826,41 @@ fn forward(ctx: &XdpContext, rewrite: Rewrite, log: bool) -> Result<u32, ()> {
         .unwrap_or(xdp_action::XDP_ABORTED))
 }
 
-/// Look up an explicit `(policy, proto, dst_port)` rule, decoding the stored
-/// `u32` into an [`Action`].
 /// Look up the packed `PORT_RULES` value for `(policy, proto, dst_port)` and the
 /// packet's `src` address ([`lpm_key_addr`] form). The trie matches the fixed
 /// `(policy, proto, dport)` head exactly and the source longest-prefix, so a rule
 /// with a specific source outranks a `from any` rule on the same port; pass `src`
-/// as `0` to match only source-less (`/0`) rules. The low byte of the value is the
-/// [`Action`] (`port_rule_action`); bit 8 is the per-rule log flag
-/// (`port_rule_logs`). Returns `None` when no rule matches.
+/// as `0` to match only source-less (`/0`) rules. Decode with `port_rule_action`
+/// (low byte), `port_rule_logs` (bit 8) and `port_rule_bits`.
 ///
+/// Returns `0` — not `Option` — for a miss, which `port_rule_present` distinguishes
+/// from a real all-zero rule. A plain scalar is what makes it safe to consult this
+/// **and** [`lookup_dst_rule`] for the same packet: two `Option`s carried from two
+/// map lookups to a merge point let LLVM fold their map-value pointers into one
+/// and null-check once, which the verifier rejects (see [`lookup_port_forward`]).
 #[inline(always)]
-fn lookup_port_rule(policy_id: PolicyId, proto: u8, dst_port: u16, src: u32) -> Option<u32> {
+fn lookup_port_rule(policy_id: PolicyId, proto: u8, dst_port: u16, src: u32) -> u32 {
     match PORT_RULES.get(Key::new(
         ScopedSrcPortKey::FULL_PREFIX,
         ScopedSrcPortKey::new(policy_id, proto, dst_port, src),
     )) {
-        Some(value) => Some(*value),
-        None => None,
+        Some(value) => *value,
+        None => 0,
+    }
+}
+
+/// The destination-address counterpart of [`lookup_port_rule`]: the packed
+/// `DST_RULES` value for `(policy, proto, dst_port)` and the packet's `dst`
+/// address. Pass `dst` as `0` on a non-IPv4 packet to match only rules with no
+/// destination constraint. `0` for a miss, for the reason given above.
+#[inline(always)]
+fn lookup_dst_rule(policy_id: PolicyId, proto: u8, dst_port: u16, dst: u32) -> u32 {
+    match DST_RULES.get(Key::new(
+        ScopedDstPortKey::FULL_PREFIX,
+        ScopedDstPortKey::new(policy_id, proto, dst_port, dst),
+    )) {
+        Some(value) => *value,
+        None => 0,
     }
 }
 

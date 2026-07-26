@@ -55,10 +55,70 @@ impl Action {
 /// value keeps the map ABI (and key/value sizes) unchanged.
 pub const PORT_RULE_LOG: u32 = 1 << 8;
 
-/// Pack a port rule's `(action, log)` into its `PORT_RULES` map value.
+/// Set on **every** value a writer stores, so a read-back of `0` unambiguously
+/// means "no rule". [`Action::Pass`] encodes as `0` itself, so the action bits
+/// cannot carry that distinction — and the data plane needs it as a plain scalar,
+/// because carrying an `Option` out of a map lookup is what the verifier rejects
+/// (see `lookup_port_forward`).
+pub const PORT_RULE_PRESENT: u32 = 1 << 31;
+
+/// Where the matched prefix length lives in a packed value.
+const PORT_RULE_BITS_SHIFT: u32 = 16;
+
+/// Pack a port rule's `(action, log, prefix bits)` into its map value.
+///
+/// `cidr_bits` is the length of the address prefix this rule constrains (`0` for
+/// an unconstrained rule). Within one map the LPM trie already ranks rules by it;
+/// it is stored because a **source**-scoped and a **destination**-scoped rule live
+/// in *different* tries and still have to be ranked against each other.
 #[inline]
-pub const fn port_rule_value(action: Action, log: bool) -> u32 {
-    action.as_u32() | if log { PORT_RULE_LOG } else { 0 }
+pub const fn port_rule_value(action: Action, log: bool, cidr_bits: u8) -> u32 {
+    action.as_u32()
+        | if log { PORT_RULE_LOG } else { 0 }
+        | ((cidr_bits as u32) << PORT_RULE_BITS_SHIFT)
+        | PORT_RULE_PRESENT
+}
+
+/// Whether a packed value came from a real rule rather than from a lookup miss.
+#[inline]
+pub const fn port_rule_present(value: u32) -> bool {
+    value & PORT_RULE_PRESENT != 0
+}
+
+/// The prefix length a packed rule matched on — how specific it is. `0` for a rule
+/// with no address constraint.
+#[inline]
+pub const fn port_rule_bits(value: u32) -> u32 {
+    (value >> PORT_RULE_BITS_SHIFT) & 0xff
+}
+
+/// Pick the effective rule when a **source**-scoped and a **destination**-scoped
+/// rule both match the same packet. Each argument is a packed value or `0` for a
+/// miss; the result is one of them (or `0` if neither matched).
+///
+/// The rule is the one an LPM trie already applies within a dimension — **the more
+/// specific match wins** — extended across the two tries using the prefix length
+/// stored in the value. On an equal prefix the denying rule wins, and between two
+/// denials the explicit refusal does, so the outcome never depends on which trie
+/// happened to be consulted first. Without that last step a `dst 10.0.0.0/8 drop`
+/// and a `src 10.0.0.0/8 pass` would resolve by map layout, i.e. unpredictably.
+#[inline]
+pub const fn port_rule_winner(src_value: u32, dst_value: u32) -> u32 {
+    if !port_rule_present(src_value) {
+        return dst_value;
+    }
+    if !port_rule_present(dst_value) {
+        return src_value;
+    }
+    let (sb, db) = (port_rule_bits(src_value), port_rule_bits(dst_value));
+    // More specific wins; on an equal prefix the stricter action does
+    // (pass < drop < reject), which is what makes the result independent of which
+    // trie was consulted.
+    if sb > db || (sb == db && (src_value & 0xff) >= (dst_value & 0xff)) {
+        src_value
+    } else {
+        dst_value
+    }
 }
 
 /// The [`Action`] of a packed `PORT_RULES` value (its low byte; unknown values
@@ -377,18 +437,67 @@ mod tests {
     }
 
     #[test]
-    fn port_rule_value_packs_action_and_log() {
+    fn port_rule_value_packs_action_log_and_specificity() {
         for action in [Action::Pass, Action::Drop, Action::Reject] {
             for log in [false, true] {
-                let v = port_rule_value(action, log);
-                assert_eq!(port_rule_action(v), action);
-                assert_eq!(port_rule_logs(v), log);
+                for bits in [0u8, 8, 24, 32] {
+                    let v = port_rule_value(action, log, bits);
+                    assert_eq!(port_rule_action(v), action);
+                    assert_eq!(port_rule_logs(v), log);
+                    assert_eq!(port_rule_bits(v), u32::from(bits));
+                    // Every stored value is marked present, including the one whose
+                    // every other field is zero — `pass, no log, no prefix` packs to
+                    // the same bits a lookup miss returns unless the flag says so.
+                    assert!(port_rule_present(v));
+                }
             }
         }
-        // A bare action value (no log bit) decodes as log-off — backward
-        // compatible with values written before per-rule logging existed.
-        assert_eq!(port_rule_action(Action::Drop.as_u32()), Action::Drop);
-        assert!(!port_rule_logs(Action::Drop.as_u32()));
+        // …and a miss is the only value that is absent.
+        assert!(!port_rule_present(0));
+        assert_eq!(
+            port_rule_value(Action::Pass, false, 0) & !PORT_RULE_PRESENT,
+            0,
+            "the all-zero rule must be distinguishable from a miss by the flag alone"
+        );
+    }
+
+    #[test]
+    fn the_more_specific_of_a_source_and_destination_rule_wins() {
+        let miss = 0;
+        let src_any = port_rule_value(Action::Pass, false, 0);
+        let src_24 = port_rule_value(Action::Pass, false, 24);
+        let dst_8 = port_rule_value(Action::Drop, false, 8);
+        let dst_24 = port_rule_value(Action::Drop, false, 24);
+
+        // One-sided matches pass through untouched, including a miss on both.
+        assert_eq!(port_rule_winner(src_24, miss), src_24);
+        assert_eq!(port_rule_winner(miss, dst_8), dst_8);
+        assert_eq!(port_rule_winner(miss, miss), miss);
+
+        // A /24 source beats a /8 destination and vice versa: specificity decides,
+        // not which dimension the rule constrains.
+        assert_eq!(port_rule_winner(src_24, dst_8), src_24);
+        assert_eq!(port_rule_winner(src_any, dst_8), dst_8);
+
+        // Equal specificity: the denial wins, whichever side it is on — so the
+        // result cannot depend on trie layout.
+        assert_eq!(port_rule_winner(src_24, dst_24), dst_24);
+        assert_eq!(
+            port_rule_action(port_rule_winner(src_24, dst_24)),
+            Action::Drop
+        );
+        // …and between two denials the explicit refusal, again symmetrically.
+        let src_reject = port_rule_value(Action::Reject, false, 24);
+        assert_eq!(
+            port_rule_action(port_rule_winner(src_reject, dst_24)),
+            Action::Reject
+        );
+        let dst_reject = port_rule_value(Action::Reject, false, 24);
+        let src_drop = port_rule_value(Action::Drop, false, 24);
+        assert_eq!(
+            port_rule_action(port_rule_winner(src_drop, dst_reject)),
+            Action::Reject
+        );
     }
 
     #[test]

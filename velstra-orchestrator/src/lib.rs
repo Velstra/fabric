@@ -2400,6 +2400,7 @@ mod tests {
             port,
             action,
             log: false,
+            dst: None,
             src: None,
         }
     }
@@ -2519,13 +2520,13 @@ mod tests {
         // tcp/22 drop) — plus the network's own policy (id == vni).
         let gp = rt.policies.iter().find(|pl| pl.id == pid).unwrap();
         assert!(gp.global.has_flag(velstra_common::ConfigFlags::STATEFUL));
-        assert!(gp.port_rules.iter().any(|(k, _, a, _)| {
-            *k == velstra_common::PortKey::new(ip_proto::TCP, 80)
-                && *a == velstra_common::Action::Pass
+        assert!(gp.port_rules.iter().any(|r| {
+            r.key == velstra_common::PortKey::new(ip_proto::TCP, 80)
+                && r.action == velstra_common::Action::Pass
         }));
-        assert!(gp.port_rules.iter().any(|(k, _, a, _)| {
-            *k == velstra_common::PortKey::new(ip_proto::TCP, 22)
-                && *a == velstra_common::Action::Drop
+        assert!(gp.port_rules.iter().any(|r| {
+            r.key == velstra_common::PortKey::new(ip_proto::TCP, 22)
+                && r.action == velstra_common::Action::Drop
         }));
         assert!(rt.policies.iter().any(|pl| pl.id == 5000));
     }

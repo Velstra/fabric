@@ -567,6 +567,10 @@ message PortRule {
   Action action = 3;
   bool log = 4;  // log packets matching this rule (independent of policy log)
   string src = 5;  // optional source CIDR ("10.0.0.0/24"); empty = from any
+  // Optional destination CIDR; empty = to any. Mutually exclusive with src — the
+  // data plane ranks one address dimension per rule, so a rule carrying both is
+  // refused rather than half-enforced.
+  string dst = 6;
 }
 
 message Route {
