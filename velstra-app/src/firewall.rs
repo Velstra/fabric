@@ -25,10 +25,11 @@ use log::warn;
 use tokio::sync::Mutex;
 use velstra_common::{
     ArpEntry, ArpKey, Backend, Cidr4, Counter, FloodSet, FlowKey, FlowState, GlobalConfig,
-    IrbEndpoint, LocalMac, LocalMacKey, MacFdbKey, NdKey, Npt66, OverlayConfig, PolicyId, PortFwd,
-    RouteEntry, ScopedAddr, ScopedAddr6, ScopedDstPortKey, ScopedPortKey, ScopedSrcPortKey,
-    ServiceKey, ServiceValue, Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, TunnelEndpoint,
-    TunnelKey, parse_mac, port_rule_value,
+    IrbEndpoint, LocalMac, LocalMacKey, MAX_RULE_LIMITS, MacFdbKey, NdKey, Npt66, OverlayConfig,
+    PolicyId, PortFwd, RateBucket, RouteEntry, ScopedAddr, ScopedAddr6, ScopedDstPortKey,
+    ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue, Srv6Config, Srv6Endpoint,
+    Srv6LocalSid, Srv6SidKey, TunnelEndpoint, TunnelKey, parse_mac, port_rule_value,
+    port_rule_with_limit,
 };
 use velstra_config::{
     PolicyConfig, ResolvedFloodVtep, ResolvedInterface, ResolvedIrbRoute, ResolvedMacRoute,
@@ -913,7 +914,55 @@ fn program_fail_closed(ebpf: &mut Ebpf, fail_closed: bool) -> Result<()> {
 
 /// Write every policy's firewall maps (`CONFIG`, `BLOCKLIST`, `PORT_RULES`),
 /// scoped by policy id.
+/// Assign each rate-limited rule a `RULE_LIMITS` slot and write its bucket.
+///
+/// Slots are handed out in iteration order and are 1-based, since `0` is what a
+/// rule's packed value carries for "unlimited". Returns the slot for each
+/// `(policy id, rule index)` so the trie writers can stamp it into the value.
+///
+/// A config with more limited rules than the value's 7 bits can name gets the
+/// excess **left unlimited and logged**, rather than wrapping into another rule's
+/// bucket — sharing a limiter with an unrelated rule is a silent, very confusing
+/// failure.
+fn program_rate_limits(
+    ebpf: &mut Ebpf,
+    policies: &[PolicyConfig],
+) -> Result<std::collections::HashMap<(PolicyId, usize), u32>> {
+    let mut slots = std::collections::HashMap::new();
+    let mut buckets: Vec<(u32, RateBucket)> = Vec::new();
+    for policy in policies {
+        for (index, rule) in policy.port_rules.iter().enumerate() {
+            let Some((rate, burst)) = rule.limit else {
+                continue;
+            };
+            let slot = buckets.len() as u32 + 1;
+            if slot > MAX_RULE_LIMITS {
+                warn!(
+                    "policy {}: more than {MAX_RULE_LIMITS} rate-limited rules;                      the rule on port {} stays unlimited",
+                    policy.id, rule.key.port
+                );
+                continue;
+            }
+            slots.insert((policy.id, index), slot);
+            buckets.push((slot, RateBucket::new(rate, burst)));
+        }
+    }
+    if buckets.is_empty() {
+        return Ok(slots);
+    }
+    let mut map: Array<_, RateBucket> = Array::try_from(
+        ebpf.map_mut("RULE_LIMITS")
+            .ok_or_else(|| anyhow!("RULE_LIMITS map missing"))?,
+    )?;
+    for (slot, bucket) in &buckets {
+        map.set(*slot, bucket, 0)
+            .with_context(|| format!("inserting rate limit slot {slot}"))?;
+    }
+    Ok(slots)
+}
+
 fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
+    let limit_slots = program_rate_limits(ebpf, policies)?;
     {
         let mut config: HashMap<_, PolicyId, GlobalConfig> = HashMap::try_from(
             ebpf.map_mut("CONFIG")
@@ -967,15 +1016,24 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
                 .ok_or_else(|| anyhow!("PORT_RULES map missing"))?,
         )?;
         for policy in policies {
-            for rule in policy.port_rules.iter().filter(|r| r.dst.is_none()) {
+            for (index, rule) in policy
+                .port_rules
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.dst.is_none())
+            {
                 let (prefix, addr) = port_rule_src_lpm(&rule.src);
+                let slot = limit_slots.get(&(policy.id, index)).copied().unwrap_or(0);
                 rules
                     .insert(
                         &Key::new(
                             prefix,
                             ScopedSrcPortKey::new(policy.id, rule.key.proto, rule.key.port, addr),
                         ),
-                        port_rule_value(rule.action, rule.log, cidr_bits(&rule.src)),
+                        port_rule_with_limit(
+                            port_rule_value(rule.action, rule.log, cidr_bits(&rule.src)),
+                            slot,
+                        ),
                         0,
                     )
                     .context("inserting port rule")?;
@@ -990,15 +1048,24 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
                 .ok_or_else(|| anyhow!("DST_RULES map missing"))?,
         )?;
         for policy in policies {
-            for rule in policy.port_rules.iter().filter(|r| r.dst.is_some()) {
+            for (index, rule) in policy
+                .port_rules
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.dst.is_some())
+            {
                 let (prefix, addr) = port_rule_dst_lpm(&rule.dst);
+                let slot = limit_slots.get(&(policy.id, index)).copied().unwrap_or(0);
                 rules
                     .insert(
                         &Key::new(
                             prefix,
                             ScopedDstPortKey::new(policy.id, rule.key.proto, rule.key.port, addr),
                         ),
-                        port_rule_value(rule.action, rule.log, cidr_bits(&rule.dst)),
+                        port_rule_with_limit(
+                            port_rule_value(rule.action, rule.log, cidr_bits(&rule.dst)),
+                            slot,
+                        ),
                         0,
                     )
                     .context("inserting destination rule")?;

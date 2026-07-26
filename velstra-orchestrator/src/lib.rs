@@ -2401,6 +2401,8 @@ mod tests {
             action,
             log: false,
             dst: None,
+            limit: None,
+            burst: None,
             src: None,
         }
     }

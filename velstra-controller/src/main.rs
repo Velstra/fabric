@@ -978,6 +978,8 @@ fn config_rule_from_proto(r: &PortRule) -> ConfigPortRule {
         log: r.log,
         src: (!r.src.is_empty()).then(|| r.src.clone()),
         dst: (!r.dst.is_empty()).then(|| r.dst.clone()),
+        limit: (r.limit != 0).then_some(r.limit),
+        burst: (r.burst != 0).then_some(r.burst),
     }
 }
 
@@ -989,6 +991,8 @@ fn proto_rule_from_config(r: &ConfigPortRule) -> PortRule {
         log: r.log,
         src: r.src.clone().unwrap_or_default(),
         dst: r.dst.clone().unwrap_or_default(),
+        limit: r.limit.unwrap_or(0),
+        burst: r.burst.unwrap_or(0),
     }
 }
 
@@ -2825,5 +2829,7 @@ fn parse_cli_rule(spec: &str, action: Action) -> Result<PortRule> {
         log: false,
         src: String::new(),
         dst: String::new(),
+        limit: 0,
+        burst: 0,
     })
 }

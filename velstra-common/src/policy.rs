@@ -65,6 +65,16 @@ pub const PORT_RULE_PRESENT: u32 = 1 << 31;
 /// Where the matched prefix length lives in a packed value.
 const PORT_RULE_BITS_SHIFT: u32 = 16;
 
+/// Where a rule's rate-limit slot lives in a packed value: a 1-based index into
+/// the `RULE_LIMITS` array, or `0` for a rule with no limit. Packed into the value
+/// rather than looked up separately so an unlimited rule — the overwhelming
+/// majority — costs no map access at all.
+const PORT_RULE_LIMIT_SHIFT: u32 = 24;
+
+/// Highest rate-limit slot the 7 bits at [`PORT_RULE_LIMIT_SHIFT`] can name.
+/// Slot `0` means "no limit", so a config may carry this many limited rules.
+pub const MAX_RULE_LIMITS: u32 = 127;
+
 /// Pack a port rule's `(action, log, prefix bits)` into its map value.
 ///
 /// `cidr_bits` is the length of the address prefix this rule constrains (`0` for
@@ -77,6 +87,24 @@ pub const fn port_rule_value(action: Action, log: bool, cidr_bits: u8) -> u32 {
         | if log { PORT_RULE_LOG } else { 0 }
         | ((cidr_bits as u32) << PORT_RULE_BITS_SHIFT)
         | PORT_RULE_PRESENT
+}
+
+/// The same value with a rate-limit slot attached (1-based; `0` leaves it
+/// unlimited). Slots past [`MAX_RULE_LIMITS`] are dropped rather than wrapped into
+/// another rule's bucket.
+#[inline]
+pub const fn port_rule_with_limit(value: u32, slot: u32) -> u32 {
+    if slot == 0 || slot > MAX_RULE_LIMITS {
+        value
+    } else {
+        value | (slot << PORT_RULE_LIMIT_SHIFT)
+    }
+}
+
+/// The rate-limit slot a packed rule carries, or `0` when it is unlimited.
+#[inline]
+pub const fn port_rule_limit(value: u32) -> u32 {
+    (value >> PORT_RULE_LIMIT_SHIFT) & 0x7f
 }
 
 /// Whether a packed value came from a real rule rather than from a lookup miss.
@@ -237,11 +265,15 @@ pub enum Counter {
     /// [`Counter::OverlayEncap`], which counts every encapsulated frame; the
     /// difference between the two is inter-subnet traffic.
     IrbRouted = 33,
+    /// Dropped for exceeding its rule's **rate limit** (C15). Distinct from
+    /// [`Counter::DroppedRule`]: the rule matched and would have passed the packet,
+    /// so a rising count here means a limit is biting, not that a rule denies.
+    DroppedRateLimit = 34,
 }
 
 impl Counter {
     /// Number of distinct counters — the `max_entries` of the `STATS` map.
-    pub const COUNT: u32 = 34;
+    pub const COUNT: u32 = 35;
 
     /// The array index of this counter.
     #[inline]
@@ -287,6 +319,7 @@ impl Counter {
             31 => Counter::MacLearnSpoof,
             32 => Counter::Srv6DropUntrusted,
             33 => Counter::IrbRouted,
+            34 => Counter::DroppedRateLimit,
             _ => return None,
         };
         Some(counter)
@@ -337,6 +370,7 @@ impl Counter {
             Counter::MacLearnSpoof => "mac_learn_spoof",
             Counter::Srv6DropUntrusted => "srv6_drop_untrusted",
             Counter::IrbRouted => "irb_routed",
+            Counter::DroppedRateLimit => "dropped_rate_limit",
         }
     }
 }

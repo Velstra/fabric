@@ -112,6 +112,16 @@ pub struct PortRule {
     /// one silently — a rule that matches more than it says is worse than no rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dst: Option<String>,
+    /// Rate limit for **new** flows this rule admits, in packets per second. Absent
+    /// (or `0`) leaves the rule unlimited. Only meaningful on a rule that passes —
+    /// a limit on a drop rule would throttle nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// How much idle time the limit may bank, in packets. Defaults to one second's
+    /// worth of `limit`, which is what makes a burst-less limit behave the way an
+    /// operator expects rather than admitting exactly one packet at a time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst: Option<u32>,
 }
 
 fn default_rule_action() -> ActionName {
@@ -771,6 +781,9 @@ pub struct ResolvedRule {
     pub action: Action,
     /// Log packets this rule matches, regardless of the policy-wide flag.
     pub log: bool,
+    /// `(rate, burst)` in packets per second and packets, or `None` when the rule
+    /// is unlimited.
+    pub limit: Option<(u32, u32)>,
 }
 
 /// This host's resolved overlay endpoint. The underlay MAC and egress ifindex
@@ -1126,12 +1139,33 @@ fn resolve_firewall(
             })?),
             None => None,
         };
+        // A limit is only meaningful where the rule would let traffic through;
+        // attaching one to a drop rule reads as "throttle these" and does nothing,
+        // so refuse it rather than accept a rule that cannot behave as written.
+        let limit = match rule.limit.filter(|r| *r > 0) {
+            Some(rate) => {
+                if rule.action != ActionName::Pass {
+                    bail!(
+                        "policy {id}: rule on {}/{} sets a rate limit on a non-pass action; \
+                         a limit throttles traffic a rule admits",
+                        rule.proto.number(),
+                        rule.port
+                    );
+                }
+                // Default the burst to one second of the rate: a bucket of one
+                // would admit a single packet and then meter every following one,
+                // which no operator means by "limit 100/s".
+                Some((rate, rule.burst.filter(|b| *b > 0).unwrap_or(rate)))
+            }
+            None => None,
+        };
         rules.push(ResolvedRule {
             key: PortKey::new(rule.proto.number(), rule.port),
             src,
             dst,
             action: rule.action.into(),
             log: rule.log,
+            limit,
         });
     }
 
@@ -2009,6 +2043,7 @@ mod tests {
                 dst: None,
                 action: Action::Pass,
                 log: false,
+                limit: None,
             }
         );
         // udp/53 defaults to drop.
@@ -2020,6 +2055,7 @@ mod tests {
                 dst: None,
                 action: Action::Drop,
                 log: false,
+                limit: None,
             }
         );
     }
