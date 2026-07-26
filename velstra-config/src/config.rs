@@ -183,6 +183,18 @@ pub struct ServiceCfg {
     pub proto: ProtoName,
     /// The pool of backends to spread connections across.
     pub backends: Vec<BackendCfg>,
+    /// Track this service's flows in the policy-independent (router-NAT)
+    /// namespace instead of the ingress policy's.
+    ///
+    /// Set this on a **router/firewall** service, where the VIP is reached from one
+    /// zone and the pool lives in another: the reply then arrives under a different
+    /// policy than the request, and a policy-scoped conntrack entry would never
+    /// match it, so the backend's address is never rewritten back to the VIP.
+    /// Leave it off for a **multi-tenant** service whose pool is on the tenant's own
+    /// network — there the per-policy scoping is what keeps two tenants' identical
+    /// 5-tuples apart.
+    #[serde(default)]
+    pub router_nat: bool,
 }
 
 /// Tunnel encapsulation as written in TOML (`"vxlan"` / `"geneve"`).
@@ -625,6 +637,9 @@ pub struct ResolvedService {
     pub key: ServiceKey,
     /// The backend pool (at least one entry).
     pub backends: Vec<Backend>,
+    /// Track flows in the policy-independent namespace, for a pool reached from
+    /// another zone than the VIP. See [`ServiceCfg::router_nat`].
+    pub router_nat: bool,
 }
 
 /// A resolved forwarding rule. The egress interface is kept as a name here and
@@ -1191,6 +1206,7 @@ impl FileConfig {
             services.push(ResolvedService {
                 key: ServiceKey::new(service.policy, vip.octets(), service.port, proto),
                 backends,
+                router_nat: service.router_nat,
             });
         }
 

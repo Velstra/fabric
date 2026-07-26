@@ -584,6 +584,12 @@ message Service {
   Proto proto = 3;
   repeated Backend backends = 4;
   uint32 policy = 5;     // owning tenant policy (0 = default service table)
+  // Track this service's flows in the policy-independent (router-NAT) namespace.
+  // Set for a router/firewall service whose pool answers through a different zone
+  // than the VIP is reached from — otherwise the reply, arriving under another
+  // policy, never matches its conntrack entry and keeps the backend's address.
+  // Off for a multi-tenant service, where per-policy scoping is the isolation.
+  bool router_nat = 6;
 }
 
 message Backend {
