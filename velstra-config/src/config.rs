@@ -195,6 +195,12 @@ pub struct ServiceCfg {
     /// 5-tuples apart.
     #[serde(default)]
     pub router_nat: bool,
+    /// Policy id the pool's replies arrive under — the zone owning the backends'
+    /// segment. Only meaningful together with `router_nat`. Omitted (`0`) means the
+    /// emitter could not derive it, and the reply then depends on that zone's own
+    /// outbound firewall posture instead of on a state entry.
+    #[serde(default)]
+    pub reply_policy: PolicyId,
 }
 
 /// Tunnel encapsulation as written in TOML (`"vxlan"` / `"geneve"`).
@@ -640,6 +646,8 @@ pub struct ResolvedService {
     /// Track flows in the policy-independent namespace, for a pool reached from
     /// another zone than the VIP. See [`ServiceCfg::router_nat`].
     pub router_nat: bool,
+    /// Policy a backend's reply arrives under; `0` ⇒ not derived.
+    pub reply_policy: PolicyId,
 }
 
 /// A resolved forwarding rule. The egress interface is kept as a name here and
@@ -690,6 +698,12 @@ pub struct PortForwardCfg {
     /// the box. Unset ⇒ plain DNAT, no source rewrite.
     #[serde(default)]
     pub snat_ip: Option<String>,
+    /// Policy id the internal host's replies arrive under — the zone owning
+    /// `dst_ip`'s segment. Omitted (`0`) means the emitter could not derive it, and
+    /// the reply then depends on that zone's own outbound firewall posture instead
+    /// of on a state entry.
+    #[serde(default)]
+    pub reply_policy: PolicyId,
 }
 
 /// A resolved port-forward, ready for the `PORT_FORWARDS` map.
@@ -709,6 +723,8 @@ pub struct ResolvedPortForward {
     pub match_dst: [u8; 4],
     /// Hairpin source-NAT address (network-order octets); `[0; 4]` ⇒ no SNAT.
     pub snat_ip: [u8; 4],
+    /// Policy the internal host's reply arrives under; `0` ⇒ not derived.
+    pub reply_policy: PolicyId,
 }
 
 /// A resolved tenant policy: the firewall map contents for one `policy_id`.
@@ -1207,6 +1223,7 @@ impl FileConfig {
                 key: ServiceKey::new(service.policy, vip.octets(), service.port, proto),
                 backends,
                 router_nat: service.router_nat,
+                reply_policy: service.reply_policy,
             });
         }
 
@@ -1248,6 +1265,7 @@ impl FileConfig {
                 dst_port: pf.dst_port,
                 match_dst,
                 snat_ip,
+                reply_policy: pf.reply_policy,
             });
         }
 

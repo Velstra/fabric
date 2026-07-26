@@ -2381,11 +2381,19 @@ fn try_load_balance(
         fwd_key.policy = ct_policy;
         let _ = CONNTRACK.insert(&fwd_key, &FlowState::forward(backend.ip, backend.port), 0);
     }
-    // No `FW_FLOWS` entry is written for the reply. `try_port_forward` writes one
-    // under this same namespace, but the firewall path cannot read it (see the
-    // comment on `established` in `try_velstra`), so it would be a per-flow map
-    // write that admits nothing. The reply is admitted by the internal zone's
-    // outbound posture instead.
+    // Clear the backend's reply through its own zone's stateful firewall, which on
+    // a deny-by-default internal zone would otherwise drop it before the rewrite
+    // above is ever reached. The entry goes under the policy that reply *arrives*
+    // on — supplied by the control plane, which knows which zone owns the pool's
+    // segment — because "is this flow admitted" is a per-policy question, unlike
+    // the direction-agnostic "what rewrite does it need" that conntrack answers.
+    // `0` means the control plane could not derive it; the reply then depends on the
+    // internal zone's outbound posture, which an ordinary configuration permits.
+    if router_nat && service.reply_policy != 0 {
+        let mut akey = rkey;
+        akey.policy = service.reply_policy;
+        let _ = FW_FLOWS.insert(&akey, &1u8, 0);
+    }
 
     // DNAT this first packet to the chosen backend.
     let nat = plan_nat(
@@ -2523,11 +2531,19 @@ fn try_port_forward(
         // Forward: rewrite subsequent packets of this flow.
         let _ = CONNTRACK.insert(&fkey, &fwd_state, 0);
     }
-    // Record the reply in FW_FLOWS under the same router-NAT namespace. The reply
-    // leaves the internal host outbound (internal zone -> WAN), which a normal
-    // config already permits; this entry additionally clears a deny-by-default
-    // internal zone once the firewall path consults the router-NAT namespace.
-    let _ = FW_FLOWS.insert(&rkey, &1u8, 0);
+    // Clear the reply through the internal zone's stateful firewall. The entry goes
+    // under the policy that reply *arrives* on, not the router-NAT namespace the
+    // conntrack entries use: the firewall asks a per-policy question ("is this flow
+    // admitted here"), so it looks the flow up under the arriving packet's own
+    // policy and cannot search a second namespace — see the comment on
+    // `established` in `try_velstra`. `0` means the control plane could not derive
+    // the zone owning `target.ip`; the reply then relies on the internal zone's
+    // outbound posture, which an ordinary configuration permits.
+    if target.reply_policy != 0 {
+        let mut akey = rkey;
+        akey.policy = target.reply_policy;
+        let _ = FW_FLOWS.insert(&akey, &1u8, 0);
+    }
 
     // DNAT this first packet; a hairpin flow additionally SNATs the source, its
     // checksum chained onto the DNAT's repaired checksums.
