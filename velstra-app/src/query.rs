@@ -110,9 +110,47 @@ async fn respond(line: &str, firewall: &Arc<Mutex<Firewall>>) -> String {
                 Err(e) => format!("error: reading the flow table: {e:#}\n"),
             }
         }
-        "" => "usage: stats | flows [limit] | top [limit]\n".to_string(),
-        other => format!("error: unknown query {other:?}; try: stats | flows | top\n"),
+        // Deterministic CGNAT (C16): which WAN ports an internal address holds.
+        // Answered by the agent rather than by the CLI so the reply comes from the
+        // *same* arithmetic the data plane hands ports out with — a second
+        // implementation would eventually name the wrong subscriber.
+        "cgnat" => {
+            let Some(addr) = tokens_addr(line) else {
+                return "usage: cgnat <internal-ipv4>\n".to_string();
+            };
+            let fw = firewall.lock().await;
+            match fw.cgnat_blocks(addr) {
+                Ok(blocks) if blocks.is_empty() => {
+                    "no interface is configured with cgnat port blocks\n".to_string()
+                }
+                Ok(blocks) => {
+                    let mut out = String::new();
+                    for (iface, first, last) in blocks {
+                        let a = addr;
+                        out.push_str(&format!(
+                            "{}.{}.{}.{} -> ports {first}-{last} on {iface}\n",
+                            a[0], a[1], a[2], a[3]
+                        ));
+                    }
+                    out
+                }
+                Err(e) => format!("error: reading the cgnat layout: {e:#}\n"),
+            }
+        }
+        "" => "usage: stats | flows [limit] | top [limit] | cgnat <ip>\n".to_string(),
+        other => {
+            format!("error: unknown query {other:?}; try: stats | flows | top | cgnat\n")
+        }
     }
+}
+
+/// The IPv4 argument of a `cgnat <ip>` query, as network-order octets.
+fn tokens_addr(line: &str) -> Option<[u8; 4]> {
+    line.split_whitespace()
+        .nth(1)?
+        .parse::<std::net::Ipv4Addr>()
+        .ok()
+        .map(|ip| ip.octets())
 }
 
 /// Parse an optional limit argument. An unparseable one yields `None` (the

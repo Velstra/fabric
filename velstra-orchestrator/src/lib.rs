@@ -1463,6 +1463,10 @@ impl Topology {
                     // Orchestrator-managed tap ports are tenant overlay endpoints,
                     // never a WAN uplink, so they are not masqueraded.
                     masquerade: false,
+                    // Fabric interfaces are tenant taps, not WAN uplinks: no
+                    // masquerade, so no CGNAT port blocks under it either.
+                    cgnat_base_port: 0,
+                    cgnat_block_size: 0,
                 });
             } else if local_vnis.contains(&port.vni) {
                 // Skip a remote port whose host is absent (corrupted/partial

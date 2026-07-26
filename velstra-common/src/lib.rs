@@ -30,6 +30,7 @@
 //!   control-plane crate turns this on; the eBPF crate does not need it.
 #![cfg_attr(not(test), no_std)]
 
+mod cgnat;
 mod cidr;
 mod config;
 mod forward;
@@ -44,6 +45,7 @@ mod ratelimit;
 mod reject;
 pub mod srv6;
 
+pub use cgnat::CgnatLayout;
 pub use cidr::{Cidr4, Cidr6, CidrError, mask_v4, mask_v6, parse_cidr_v4, parse_cidr_v6};
 pub use config::{ConfigFlags, GlobalConfig};
 pub use forward::{

@@ -62,18 +62,18 @@ use network_types::{
     ip::{Ipv4Hdr, Ipv6Hdr},
 };
 use velstra_common::{
-    ARP_REPLY, ARP_REQUEST, Action, ArpEntry, ArpKey, Backend, ConfigFlags, Counter, ETHERTYPE_ARP,
-    ETHERTYPE_IPV4, ETHERTYPE_IPV6, FloodSet, FlowKey, FlowState, ForwardOutcome, GlobalConfig,
-    ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, ICMPV6_NEIGHBOR_SOLICIT, IrbEndpoint, IrbRewrite,
-    LocalMac, LocalMacKey, MAX_FLOOD_VTEPS, MAX_RULE_LIMITS, MacFdbKey, ND_NA_MSG_LEN, Nat, NdKey,
-    Npt66, OVERLAY_OUTER_LEN, OverlayConfig, PacketMeta, PolicyId, PortFwd, RateBucket, Rewrite,
-    RouteEntry, SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6, ScopedDstPortKey, ScopedPortKey,
-    ScopedSrcPortKey, ServiceKey, ServiceValue, Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey,
-    TunnelEndpoint, TunnelKey, build_encap, build_srv6_encap, decide, decode_vni, icmp,
-    icmp_checksum, ip_proto, ipv6_ext_len, is_ipv6_ext, is_overlay_dport, lpm_key_addr,
-    plan_arp_reply, plan_forward, plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat,
-    plan_tcp_rst, port_rule_action, port_rule_limit, port_rule_logs, port_rule_present,
-    port_rule_winner, select_backend, session_hash, tcp_flags,
+    ARP_REPLY, ARP_REQUEST, Action, ArpEntry, ArpKey, Backend, CgnatLayout, ConfigFlags, Counter,
+    ETHERTYPE_ARP, ETHERTYPE_IPV4, ETHERTYPE_IPV6, FloodSet, FlowKey, FlowState, ForwardOutcome,
+    GlobalConfig, ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, ICMPV6_NEIGHBOR_SOLICIT,
+    IrbEndpoint, IrbRewrite, LocalMac, LocalMacKey, MAX_FLOOD_VTEPS, MAX_RULE_LIMITS, MacFdbKey,
+    ND_NA_MSG_LEN, Nat, NdKey, Npt66, OVERLAY_OUTER_LEN, OverlayConfig, PacketMeta, PolicyId,
+    PortFwd, RateBucket, Rewrite, RouteEntry, SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6,
+    ScopedDstPortKey, ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue, Srv6Config,
+    Srv6Endpoint, Srv6LocalSid, Srv6SidKey, TunnelEndpoint, TunnelKey, build_encap,
+    build_srv6_encap, decide, decode_vni, icmp, icmp_checksum, ip_proto, ipv6_ext_len, is_ipv6_ext,
+    is_overlay_dport, lpm_key_addr, plan_arp_reply, plan_forward, plan_icmp_unreachable, plan_irb,
+    plan_na_reply, plan_nat, plan_tcp_rst, port_rule_action, port_rule_limit, port_rule_logs,
+    port_rule_present, port_rule_winner, select_backend, session_hash, tcp_flags,
 };
 
 /// Maps an ingress interface index to its policy id, so one XDP program can
@@ -144,6 +144,12 @@ static DST_RULES: LpmTrie<ScopedDstPortKey, u32> = LpmTrie::with_max_entries(819
 /// of them — costs no lookup here at all.
 #[map]
 static RULE_LIMITS: Array<RateBucket> = Array::with_max_entries(MAX_RULE_LIMITS + 1, 0);
+
+/// Deterministic CGNAT port blocks (roadmap C16), per masquerade egress ifindex.
+/// Absent (or a disabled layout) leaves the plain hash-spread NAPT in place, so a
+/// box that is not a carrier NAT pays nothing.
+#[map]
+static CGNAT: HashMap<u32, CgnatLayout> = HashMap::with_max_entries(64, 0);
 
 /// Per-policy 1:1 DNAT port-forwards: `(policy, proto, destination port)` → the
 /// internal `(ip, port)` an inbound connection is rewritten to. Empty by default
@@ -717,6 +723,7 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
         let wan_policy = unsafe { IFACE_POLICY.get(&ifindex) }.copied().unwrap_or(0);
         return masquerade_egress(
             ctx, ihl_bytes, wan_policy, src_addr, dst_addr, src_port, dst_port, proto, wan_ip,
+            ifindex,
         );
     }
 
@@ -836,6 +843,7 @@ fn masquerade_egress(
     dst_port: u16,
     proto: u8,
     wan_ip: [u8; 4],
+    egress_ifindex: u32,
 ) -> Result<i32, ()> {
     // `try_egress` already counted this packet in TxPackets before dispatching
     // here; the masquerade path reports its own outcome via EgressMasqueraded, so
@@ -858,9 +866,21 @@ fn masquerade_egress(
     // the client's own port (the pre-NAPT behaviour) on exhaustion.
     let fwd = FlowState::forward(src_addr, src_port);
     let seed = napt_seed(src_addr, dst_addr, src_port, dst_port);
+    // Deterministic CGNAT: when this egress carries a port-block layout, every
+    // candidate stays inside the block that belongs to `src_addr`. That is what
+    // lets an operator attribute a WAN port to an internal address by arithmetic
+    // instead of by logging every translation. Copied out of the map immediately —
+    // a disabled default keeps the plain spread.
+    let layout = match unsafe { CGNAT.get(&egress_ifindex) } {
+        Some(l) => *l,
+        None => CgnatLayout::default(),
+    };
     let mut wan_port = src_port;
     for i in 0..NAPT_PROBES {
-        let cand = napt_port(seed, i);
+        let cand = match layout.candidate(src_addr, seed, i) {
+            Some(p) => p,
+            None => napt_port(seed, i),
+        };
         let pkey = FlowKey::new(policy_id, dst_addr, wan_ip, dst_port, cand, proto);
         match unsafe { CONNTRACK.get(&pkey) }.copied() {
             None => {
