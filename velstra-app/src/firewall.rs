@@ -3,9 +3,10 @@
 //! statistics.
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     ffi::CString,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -28,8 +29,8 @@ use velstra_common::{
     GlobalConfig, IrbEndpoint, LocalMac, LocalMacKey, MAX_RULE_LIMITS, MacFdbKey, NdKey, Npt66,
     OverlayConfig, PolicyId, PortFwd, RateBucket, RouteEntry, ScopedAddr, ScopedAddr6,
     ScopedDstPortKey, ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue, Srv6Config,
-    Srv6Endpoint, Srv6LocalSid, Srv6SidKey, TunnelEndpoint, TunnelKey, parse_mac, port_rule_value,
-    port_rule_with_limit,
+    Srv6Endpoint, Srv6LocalSid, Srv6SidKey, TunnelEndpoint, TunnelKey, parse_cidr_v4,
+    parse_cidr_v6, parse_mac, port_rule_value, port_rule_with_limit,
 };
 use velstra_config::{
     PolicyConfig, ResolvedFloodVtep, ResolvedInterface, ResolvedIrbRoute, ResolvedMacRoute,
@@ -93,6 +94,16 @@ pub struct Firewall {
     /// query path read it. Keeping it here is what stops enabling HA from taking
     /// the flow table away from every other reader.
     conntrack: Option<Arc<Mutex<HashMap<MapData, FlowKey, FlowState>>>>,
+    /// Sources blocked at **run time** rather than by configuration, each with the
+    /// moment it stops being blocked (roadmap C11: a detector acting on what it
+    /// saw).
+    ///
+    /// Held here so `show`, expiry and the config reconcile all agree on which
+    /// entries in `BLOCKLIST` the configuration did *not* put there. Deliberately
+    /// **not persisted**: a block nobody wrote down must not outlive the process
+    /// that decided on it, or an appliance ends up enforcing a reason no one can
+    /// reconstruct. Restarting the agent is therefore always a way out.
+    runtime_blocks: BTreeMap<String, Instant>,
 }
 
 impl Firewall {
@@ -225,6 +236,7 @@ impl Firewall {
             auto_attached: HashSet::new(),
             config_attached: HashSet::new(),
             conntrack: None,
+            runtime_blocks: BTreeMap::new(),
         })
     }
 
@@ -411,6 +423,128 @@ impl Firewall {
     pub fn reconfigure(&mut self, cfg: &RuntimeConfig) -> Result<()> {
         apply_config(&mut self.ebpf, cfg, Some(&self.applied))?;
         self.applied = cfg.clone();
+        Ok(())
+    }
+
+    /// Block `cidr` as a source across every policy, until `ttl` has passed.
+    ///
+    /// The blocklist the data plane consults is per-policy, but a source blocked
+    /// because of what it *did* is not blocked "in zone lan" — it is blocked. So
+    /// the entry goes into every policy, and `unblock` takes it out of every one.
+    ///
+    /// A CIDR the **configuration** already blocks is left alone and reported as
+    /// such: adding it here would mean the expiry later removed a permanent entry
+    /// the operator wrote, quietly turning their block off.
+    ///
+    /// Returns `false` when the address was already blocked by configuration.
+    pub fn block_source(&mut self, cidr: &str, ttl: Duration) -> Result<bool> {
+        if self.blocked_by_config(cidr) {
+            return Ok(false);
+        }
+        self.write_block(cidr, true)?;
+        self.runtime_blocks
+            .insert(cidr.to_string(), Instant::now() + ttl);
+        Ok(true)
+    }
+
+    /// Drop a run-time block early. Returns whether there was one.
+    pub fn unblock_source(&mut self, cidr: &str) -> Result<bool> {
+        if self.runtime_blocks.remove(cidr).is_none() {
+            return Ok(false);
+        }
+        self.write_block(cidr, false)?;
+        Ok(true)
+    }
+
+    /// Remove every run-time block whose time is up. Returns how many went.
+    ///
+    /// This is what makes an automatic block safe to switch on: whatever a
+    /// detector decides, it undoes itself. An appliance that could permanently
+    /// lock out an address on its own reading of a packet is one nobody should
+    /// run.
+    pub fn expire_blocks(&mut self) -> usize {
+        let now = Instant::now();
+        let due: Vec<String> = self
+            .runtime_blocks
+            .iter()
+            .filter(|(_, expiry)| **expiry <= now)
+            .map(|(cidr, _)| cidr.clone())
+            .collect();
+        for cidr in &due {
+            self.runtime_blocks.remove(cidr);
+            if let Err(e) = self.write_block(cidr, false) {
+                warn!("could not lift the expired block on {cidr}: {e:#}");
+            }
+        }
+        due.len()
+    }
+
+    /// The live run-time blocks as `(cidr, seconds remaining)`.
+    pub fn runtime_blocks(&self) -> Vec<(String, u64)> {
+        let now = Instant::now();
+        self.runtime_blocks
+            .iter()
+            .map(|(cidr, &expiry)| {
+                (
+                    cidr.clone(),
+                    expiry.saturating_duration_since(now).as_secs(),
+                )
+            })
+            .collect()
+    }
+
+    /// Whether the applied configuration already blocks this exact CIDR.
+    fn blocked_by_config(&self, cidr: &str) -> bool {
+        self.applied.policies.iter().any(|p| {
+            p.blocklist.iter().any(|c| c.to_string() == cidr)
+                || p.blocklist6.iter().any(|c| c.to_string() == cidr)
+        })
+    }
+
+    /// Insert or remove `cidr` in the blocklist trie of every policy.
+    ///
+    /// Accepts a bare address as well as a CIDR — a detector reports the host it
+    /// saw, not a prefix — and picks the v4 or v6 trie from what parses.
+    fn write_block(&mut self, cidr: &str, insert: bool) -> Result<()> {
+        let policies: Vec<PolicyId> = self.applied.policies.iter().map(|p| p.id).collect();
+        if let Ok(v4) = parse_cidr_v4(cidr) {
+            let (prefix, addr) = v4.lpm_key();
+            let mut trie: LpmTrie<_, ScopedAddr, u32> = LpmTrie::try_from(
+                self.ebpf
+                    .map_mut("BLOCKLIST")
+                    .ok_or_else(|| anyhow!("BLOCKLIST map missing"))?,
+            )?;
+            for id in policies {
+                let key = Key::new(ScopedAddr::POLICY_BITS + prefix, ScopedAddr::new(id, addr));
+                if insert {
+                    trie.insert(&key, 1u32, 0)
+                        .with_context(|| format!("blocking {cidr} in policy {id}"))?;
+                } else {
+                    let _ = trie.remove(&key);
+                }
+            }
+            return Ok(());
+        }
+        let v6 =
+            parse_cidr_v6(cidr).map_err(|e| anyhow!("{cidr:?} is not an address or CIDR: {e}"))?;
+        let (prefix, addr) = v6.lpm_key();
+        let mut trie: LpmTrie<_, ScopedAddr6, u32> = LpmTrie::try_from(
+            self.ebpf
+                .map_mut("BLOCKLIST6")
+                .ok_or_else(|| anyhow!("BLOCKLIST6 map missing"))?,
+        )?;
+        for id in policies {
+            let key = Key::new(
+                ScopedAddr6::POLICY_BITS + prefix,
+                ScopedAddr6::new(id, addr),
+            );
+            if insert {
+                trie.insert(&key, 1u32, 0)
+                    .with_context(|| format!("blocking {cidr} in policy {id}"))?;
+            } else {
+                let _ = trie.remove(&key);
+            }
+        }
         Ok(())
     }
 

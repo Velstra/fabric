@@ -261,6 +261,9 @@ async fn run(args: RunArgs) -> Result<()> {
     // only process that can answer what the data plane is currently doing.
     if let Some(path) = args.query_socket.clone() {
         tokio::spawn(query::serve(path, firewall.clone()));
+        // A run-time block carries a deadline; this is what makes the deadline
+        // real rather than something only honoured when someone asks.
+        tokio::spawn(query::expire_blocks_loop(firewall.clone()));
     }
 
     // Auto-attach: pick up matching interfaces (VM taps, pod veths) as they appear.
