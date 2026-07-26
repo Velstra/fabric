@@ -52,11 +52,11 @@
 //! [`decode_datagram`]) is pure and allocation-only so it is unit-tested without
 //! a socket or a kernel map.
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 
 use aya::maps::{HashMap, MapData};
 use log::{info, warn};
-use tokio::net::UdpSocket;
+use tokio::{net::UdpSocket, sync::Mutex};
 use velstra_common::{FlowKey, FlowState};
 
 /// Datagram magic + version tag (`VCS1` = Velstra Conntrack Sync v1).
@@ -249,7 +249,7 @@ fn read_fw_flows(map: &HashMap<MapData, FlowKey, u8>) -> Vec<FlowKey> {
 /// insert error is logged and the rest of the batch still applies. Nothing in the
 /// loop can panic the agent.
 pub async fn run(
-    mut conntrack: HashMap<MapData, FlowKey, FlowState>,
+    conntrack: Arc<Mutex<HashMap<MapData, FlowKey, FlowState>>>,
     mut fw_flows: HashMap<MapData, FlowKey, u8>,
     listen: SocketAddr,
     peers: Vec<SocketAddr>,
@@ -277,7 +277,7 @@ pub async fn run(
                 if peers.is_empty() {
                     continue;
                 }
-                let ct = read_conntrack(&conntrack);
+                let ct = read_conntrack(&*conntrack.lock().await);
                 let fw = read_fw_flows(&fw_flows);
                 if ct.is_empty() && fw.is_empty() {
                     continue;
@@ -308,7 +308,7 @@ pub async fn run(
                     Some(Datagram::Conntrack(records)) => {
                         let mut applied = 0usize;
                         for (k, v) in &records {
-                            match conntrack.insert(k, v, 0) {
+                            match conntrack.lock().await.insert(k, v, 0) {
                                 Ok(()) => applied += 1,
                                 Err(e) => warn!("conntrack-sync: apply conntrack entry from {from} failed: {e}"),
                             }
