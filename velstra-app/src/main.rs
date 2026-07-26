@@ -15,6 +15,8 @@
 mod conntrack_sync;
 mod controller_client;
 mod firewall;
+mod flows;
+mod query;
 mod wren;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -67,6 +69,12 @@ struct RunArgs {
     /// Policy id assigned to auto-attached interfaces not named in the config.
     #[arg(long, default_value_t = 0)]
     auto_policy: u32,
+
+    /// Serve a read-only query socket at this path (`stats`, `flows`, `top`), so
+    /// an operator or a product CLI can ask the live data plane what it is doing
+    /// instead of scraping the agent's log. Unset ⇒ no socket.
+    #[arg(long)]
+    query_socket: Option<PathBuf>,
 
     /// Path to a local TOML config. Mutually exclusive with `--controller`.
     #[arg(short, long, conflicts_with = "controllers")]
@@ -249,6 +257,12 @@ async fn run(args: RunArgs) -> Result<()> {
     }
     println!("Velstra is live. Press Ctrl-C to detach.");
 
+    // Read-only diagnostics socket (C23): the agent owns the maps, so it is the
+    // only process that can answer what the data plane is currently doing.
+    if let Some(path) = args.query_socket.clone() {
+        tokio::spawn(query::serve(path, firewall.clone()));
+    }
+
     // Auto-attach: pick up matching interfaces (VM taps, pod veths) as they appear.
     if let Some(pattern) = args.auto_attach.clone() {
         info!("auto-attach watching for interfaces matching {pattern:?}");
@@ -325,7 +339,7 @@ async fn run(args: RunArgs) -> Result<()> {
         // drops established connections.
         let handles = {
             let mut fw = firewall.lock().await;
-            match (fw.take_conntrack(), fw.take_fw_flows()) {
+            match (fw.conntrack_handle(), fw.take_fw_flows()) {
                 (Ok(ct), Ok(ff)) => Ok((ct, ff)),
                 (Err(e), _) | (_, Err(e)) => Err(e),
             }

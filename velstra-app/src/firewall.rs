@@ -5,6 +5,7 @@
 use std::{
     collections::{BTreeSet, HashSet},
     ffi::CString,
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -21,6 +22,7 @@ use aya::{
 };
 use clap::ValueEnum;
 use log::warn;
+use tokio::sync::Mutex;
 use velstra_common::{
     ArpEntry, ArpKey, Backend, Cidr4, Counter, FloodSet, FlowKey, FlowState, GlobalConfig,
     IrbEndpoint, LocalMac, LocalMacKey, MacFdbKey, NdKey, Npt66, OverlayConfig, PolicyId, PortFwd,
@@ -85,6 +87,11 @@ pub struct Firewall {
     /// controller declared). Tracked separately from auto-attach so each is
     /// forgotten when its netdev disappears.
     config_attached: HashSet<String>,
+    /// The `CONNTRACK` handle once it has been moved out of [`Self::ebpf`],
+    /// **shared** rather than given away: both the C9 sync task and the flow
+    /// query path read it. Keeping it here is what stops enabling HA from taking
+    /// the flow table away from every other reader.
+    conntrack: Option<Arc<Mutex<HashMap<MapData, FlowKey, FlowState>>>>,
 }
 
 impl Firewall {
@@ -216,6 +223,7 @@ impl Firewall {
             applied: cfg.clone(),
             auto_attached: HashSet::new(),
             config_attached: HashSet::new(),
+            conntrack: None,
         })
     }
 
@@ -453,14 +461,50 @@ impl Firewall {
     /// **writes** it (apply a peer's entries) through this one handle. (aya reads
     /// and writes an LRU hash map through the same userspace `HashMap` type.)
     ///
+    /// The handle is **shared**, not surrendered: the first call moves the map out
+    /// of the eBPF object and every later call clones the same `Arc`. aya allows
+    /// only one owner of a taken map, so handing it to the sync task outright would
+    /// mean that turning HA on silently takes the flow table away from everything
+    /// else that wants to read it — the diagnostics view included.
+    ///
     /// [`take_local_macs`]: Firewall::take_local_macs
     /// [`reconfigure`]: Firewall::reconfigure
-    pub fn take_conntrack(&mut self) -> Result<HashMap<MapData, FlowKey, FlowState>> {
+    pub fn conntrack_handle(&mut self) -> Result<Arc<Mutex<HashMap<MapData, FlowKey, FlowState>>>> {
+        if let Some(handle) = &self.conntrack {
+            return Ok(handle.clone());
+        }
         let map = self
             .ebpf
             .take_map("CONNTRACK")
             .ok_or_else(|| anyhow!("CONNTRACK map missing"))?;
-        HashMap::try_from(map).context("CONNTRACK as a HashMap")
+        let handle = Arc::new(Mutex::new(
+            HashMap::try_from(map).context("CONNTRACK as a HashMap")?,
+        ));
+        self.conntrack = Some(handle.clone());
+        Ok(handle)
+    }
+
+    /// A snapshot of the live NAT flow table (`CONNTRACK`), for the diagnostics
+    /// view. Shares the handle with the C9 sync task via [`conntrack_handle`],
+    /// so it works whether or not HA is enabled.
+    ///
+    /// A miss on an individual key is skipped rather than failing the snapshot: the
+    /// map is an LRU the data plane mutates constantly, so an entry can be evicted
+    /// between listing the keys and reading its value. A diagnostics view that
+    /// errored out on that race would be unusable under load — exactly when it
+    /// matters.
+    ///
+    /// [`conntrack_handle`]: Firewall::conntrack_handle
+    pub async fn read_flows(&mut self) -> Result<Vec<(FlowKey, FlowState)>> {
+        let handle = self.conntrack_handle()?;
+        let map = handle.lock().await;
+        let mut out = Vec::new();
+        for key in map.keys().flatten() {
+            if let Ok(state) = map.get(&key, 0) {
+                out.push((key, state));
+            }
+        }
+        Ok(out)
     }
 
     /// Take ownership of the `FW_FLOWS` map handle for the same C9 conntrack-sync
