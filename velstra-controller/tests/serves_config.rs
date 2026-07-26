@@ -167,6 +167,7 @@ async fn controller_serves_and_updates_config() {
                 port: 8443,
             }],
             policy: 0,
+            router_nat: false,
         }],
         ..Default::default()
     };

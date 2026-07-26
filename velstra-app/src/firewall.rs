@@ -1051,9 +1051,14 @@ fn program_services(ebpf: &mut Ebpf, services: &[ResolvedService]) -> Result<()>
     for service in services {
         let start = flat.len() as u32;
         flat.extend_from_slice(&service.backends);
+        let count = service.backends.len() as u32;
         entries.push((
             service.key,
-            ServiceValue::new(start, service.backends.len() as u32),
+            if service.router_nat {
+                ServiceValue::new_router_nat(start, count)
+            } else {
+                ServiceValue::new(start, count)
+            },
         ));
     }
 

@@ -1530,6 +1530,13 @@ impl Topology {
                     port: lb.port,
                     proto: lb.proto,
                     backends: backends.clone(),
+                    // A fabric service's members are validated to live on the
+                    // VIP's own network, so the backend's reply comes back under
+                    // the same policy and the flow stays tenant-scoped — which is
+                    // what keeps two tenants' identical 5-tuples from sharing
+                    // conntrack state. Only an appliance service, whose pool sits
+                    // in another zone, needs the shared namespace.
+                    router_nat: false,
                 });
             }
         }

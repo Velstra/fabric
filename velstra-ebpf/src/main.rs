@@ -1179,6 +1179,22 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
         && (proto == ip_proto::TCP || proto == ip_proto::UDP)
         && ihl_bytes == Ipv4Hdr::LEN;
     let fkey = FlowKey::new(policy_id, src_addr, dst_addr, src_port, dst_port, proto);
+    // Only the tenant-scoped namespace is consulted here, and that is a deliberate
+    // limit rather than an oversight. A router-NAT reply — from a port-forward's
+    // internal host or a cross-zone load-balanced backend — arrives under a
+    // different policy than the request did, so the entry the NAT path wrote in the
+    // policy-independent namespace is invisible to this lookup. Consulting both was
+    // tried and **cannot be compiled for the verifier**: with a 1-byte map value
+    // LLVM folds two lookups of the *same* map into one pointer (`r1 |= r0`) and
+    // null-checks once, which is rejected as arithmetic on a `map_value_or_null` —
+    // three formulations (borrowed, value-read, owned `Option<u8>`) all fold. The
+    // fix without a second lookup is for the NAT path to record its reply under the
+    // policy that reply will actually arrive on, which the *config* knows (the zone
+    // owning the target's subnet) and the data plane does not.
+    //
+    // Until then, a NAT'd reply is admitted by the internal zone's own outbound
+    // posture, which every ordinary configuration permits. Only an internal zone
+    // that denies by default drops it.
     let established = stateful && unsafe { FW_FLOWS.get(&fkey) }.is_some();
 
     // The firewall's final action, and the counter explaining it.
@@ -2333,8 +2349,21 @@ fn try_load_balance(
     } else {
         backend.port
     };
+    // Which conntrack namespace this flow is tracked in. A router service's pool
+    // answers through a different zone than the VIP was reached from, so its reply
+    // arrives under another policy and would never find a policy-scoped entry; it
+    // uses the policy-independent namespace port-forwards already use. A
+    // multi-tenant service keeps the ingress policy, which is what stops two
+    // tenants' identical 5-tuples from sharing state. See
+    // [`service_flags::ROUTER_NAT`].
+    let router_nat = service.is_router_nat();
+    let ct_policy = if router_nat {
+        ROUTER_NAT_POLICY
+    } else {
+        policy_id
+    };
     let rkey = FlowKey::new(
-        policy_id,
+        ct_policy,
         backend.ip,
         src_addr,
         backend_port,
@@ -2345,8 +2374,18 @@ fn try_load_balance(
         .insert(&rkey, &FlowState::reverse(dst_addr, dst_port), 0)
         .is_ok()
     {
-        let _ = CONNTRACK.insert(&fkey, &FlowState::forward(backend.ip, backend.port), 0);
+        // The forward key differs from the lookup key at the top of this function
+        // only in its namespace (that lookup already falls back to the router-NAT
+        // one, so it finds this entry on the next packet either way).
+        let mut fwd_key = fkey;
+        fwd_key.policy = ct_policy;
+        let _ = CONNTRACK.insert(&fwd_key, &FlowState::forward(backend.ip, backend.port), 0);
     }
+    // No `FW_FLOWS` entry is written for the reply. `try_port_forward` writes one
+    // under this same namespace, but the firewall path cannot read it (see the
+    // comment on `established` in `try_velstra`), so it would be a per-flow map
+    // write that admits nothing. The reply is admitted by the internal zone's
+    // outbound posture instead.
 
     // DNAT this first packet to the chosen backend.
     let nat = plan_nat(

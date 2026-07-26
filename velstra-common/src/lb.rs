@@ -66,8 +66,23 @@ impl ServiceKey {
     }
 }
 
+/// [`ServiceValue::flags`] bits.
+pub mod service_flags {
+    /// Track this service's flows in the **policy-independent** conntrack
+    /// namespace instead of the ingress policy's, and clear the backend's reply
+    /// through a deny-by-default internal zone.
+    ///
+    /// Set for a **router** (firewall appliance) service, where the VIP is reached
+    /// from one zone and the pool lives in another, so the request and its reply
+    /// arrive under two different policies. Left clear for a **multi-tenant**
+    /// service, where the pool is on the tenant's own network and the reply comes
+    /// back under the same policy — there the per-policy scoping is what keeps two
+    /// tenants' identical 5-tuples apart, and must not be given up.
+    pub const ROUTER_NAT: u32 = 1 << 0;
+}
+
 /// Value for `SERVICES`: a contiguous window `[start, start+count)` into the
-/// flat `BACKENDS` array.
+/// flat `BACKENDS` array, plus how this service's flows are tracked.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ServiceValue {
@@ -75,16 +90,38 @@ pub struct ServiceValue {
     pub backend_start: u32,
     /// Number of backends in this service's pool.
     pub backend_count: u32,
+    /// [`service_flags`] bits.
+    pub flags: u32,
 }
 
 impl ServiceValue {
-    /// Build a service value.
+    /// Build a service value tracked under the ingress policy (the tenant-scoped
+    /// default).
     #[inline]
     pub const fn new(backend_start: u32, backend_count: u32) -> Self {
         Self {
             backend_start,
             backend_count,
+            flags: 0,
         }
+    }
+
+    /// Build a service whose flows are tracked in the router-NAT namespace, for a
+    /// pool that answers through a different zone than the VIP is reached from.
+    /// See [`service_flags::ROUTER_NAT`].
+    #[inline]
+    pub const fn new_router_nat(backend_start: u32, backend_count: u32) -> Self {
+        Self {
+            backend_start,
+            backend_count,
+            flags: service_flags::ROUTER_NAT,
+        }
+    }
+
+    /// Whether this service's flows live in the router-NAT namespace.
+    #[inline]
+    pub const fn is_router_nat(&self) -> bool {
+        self.flags & service_flags::ROUTER_NAT != 0
     }
 }
 
@@ -751,11 +788,31 @@ mod tests {
         assert_ne!(sa, sb);
     }
 
+    /// The router-NAT namespace is opt-in per service. A tenant service must not
+    /// get it by default: sharing the conntrack namespace is exactly what lets two
+    /// tenants' identical 5-tuples collide, so the safe value has to be the one you
+    /// get by saying nothing.
+    #[test]
+    fn only_a_router_service_shares_the_conntrack_namespace() {
+        assert!(!ServiceValue::new(0, 3).is_router_nat());
+        assert!(ServiceValue::new_router_nat(0, 3).is_router_nat());
+        // Both spell the same pool — the flag is the only difference, so a service
+        // cannot change namespace and pool in one silent step.
+        let tenant = ServiceValue::new(7, 2);
+        let router = ServiceValue::new_router_nat(7, 2);
+        assert_eq!(
+            (tenant.backend_start, tenant.backend_count),
+            (router.backend_start, router.backend_count)
+        );
+        assert_ne!(tenant, router);
+    }
+
     #[test]
     fn map_types_are_pod_sized() {
         // Both keys carry a leading u32 `policy` scope (C3): +4 bytes each.
         assert_eq!(core::mem::size_of::<ServiceKey>(), 12);
-        assert_eq!(core::mem::size_of::<ServiceValue>(), 8);
+        // ServiceValue: backend window (2×u32) + flags = 12 bytes.
+        assert_eq!(core::mem::size_of::<ServiceValue>(), 12);
         assert_eq!(core::mem::size_of::<Backend>(), 8);
         assert_eq!(core::mem::size_of::<FlowKey>(), 20);
         // FlowState carries a second (hairpin) rewrite: 2×(ip[4]+port) + flags +
