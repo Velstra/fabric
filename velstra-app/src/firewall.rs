@@ -26,9 +26,9 @@ use tokio::sync::Mutex;
 use velstra_common::{
     ArpEntry, ArpKey, Backend, Cidr4, Counter, FloodSet, FlowKey, FlowState, GlobalConfig,
     IrbEndpoint, LocalMac, LocalMacKey, MacFdbKey, NdKey, Npt66, OverlayConfig, PolicyId, PortFwd,
-    RouteEntry, ScopedAddr, ScopedAddr6, ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue,
-    Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, TunnelEndpoint, TunnelKey, parse_mac,
-    port_rule_value,
+    RouteEntry, ScopedAddr, ScopedAddr6, ScopedDstPortKey, ScopedPortKey, ScopedSrcPortKey,
+    ServiceKey, ServiceValue, Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, TunnelEndpoint,
+    TunnelKey, parse_mac, port_rule_value,
 };
 use velstra_config::{
     PolicyConfig, ResolvedFloodVtep, ResolvedInterface, ResolvedIrbRoute, ResolvedMacRoute,
@@ -532,6 +532,24 @@ impl Firewall {
 /// ("from any") becomes a `/0` source — prefix == `FIXED_BITS`, address `0` —
 /// which the trie matches for every packet; a `Some` CIDR extends the prefix by
 /// the block's bits so a specific source outranks a `from any` rule.
+/// The prefix length an address constraint matches on, for the specificity byte
+/// packed into the rule value. `None` (any) is `0`.
+fn cidr_bits(cidr: &Option<Cidr4>) -> u8 {
+    cidr.as_ref().map_or(0, |c| c.prefix)
+}
+
+/// The `DST_RULES` LPM prefix + key tail for a destination constraint. Only called
+/// for a rule that has one, so the `None` arm is the unreachable-but-total case.
+fn port_rule_dst_lpm(dst: &Option<Cidr4>) -> (u32, u32) {
+    match dst {
+        Some(c) => {
+            let (bits, addr) = c.lpm_key();
+            (ScopedDstPortKey::FIXED_BITS + bits, addr)
+        }
+        None => (ScopedDstPortKey::prefix_len(0), 0),
+    }
+}
+
 fn port_rule_src_lpm(src: &Option<Cidr4>) -> (u32, u32) {
     match src {
         Some(c) => {
@@ -634,11 +652,26 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
                 .ok_or_else(|| anyhow!("PORT_RULES map missing"))?,
         )?;
         for policy in &old.policies {
-            for (key, src, _, _) in &policy.port_rules {
-                let (prefix, addr) = port_rule_src_lpm(src);
+            for rule in policy.port_rules.iter().filter(|r| r.dst.is_none()) {
+                let (prefix, addr) = port_rule_src_lpm(&rule.src);
                 let _ = rules.remove(&Key::new(
                     prefix,
-                    ScopedSrcPortKey::new(policy.id, key.proto, key.port, addr),
+                    ScopedSrcPortKey::new(policy.id, rule.key.proto, rule.key.port, addr),
+                ));
+            }
+        }
+    }
+    {
+        let mut rules: LpmTrie<_, ScopedDstPortKey, u32> = LpmTrie::try_from(
+            ebpf.map_mut("DST_RULES")
+                .ok_or_else(|| anyhow!("DST_RULES map missing"))?,
+        )?;
+        for policy in &old.policies {
+            for rule in policy.port_rules.iter().filter(|r| r.dst.is_some()) {
+                let (prefix, addr) = port_rule_dst_lpm(&rule.dst);
+                let _ = rules.remove(&Key::new(
+                    prefix,
+                    ScopedDstPortKey::new(policy.id, rule.key.proto, rule.key.port, addr),
                 ));
             }
         }
@@ -934,18 +967,41 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
                 .ok_or_else(|| anyhow!("PORT_RULES map missing"))?,
         )?;
         for policy in policies {
-            for (key, src, action, log) in &policy.port_rules {
-                let (prefix, addr) = port_rule_src_lpm(src);
+            for rule in policy.port_rules.iter().filter(|r| r.dst.is_none()) {
+                let (prefix, addr) = port_rule_src_lpm(&rule.src);
                 rules
                     .insert(
                         &Key::new(
                             prefix,
-                            ScopedSrcPortKey::new(policy.id, key.proto, key.port, addr),
+                            ScopedSrcPortKey::new(policy.id, rule.key.proto, rule.key.port, addr),
                         ),
-                        port_rule_value(*action, *log),
+                        port_rule_value(rule.action, rule.log, cidr_bits(&rule.src)),
                         0,
                     )
                     .context("inserting port rule")?;
+            }
+        }
+    }
+    {
+        // Destination-constrained rules live in their own trie: a longest-prefix
+        // match ranks one address field, and it is the *last* one in the key.
+        let mut rules: LpmTrie<_, ScopedDstPortKey, u32> = LpmTrie::try_from(
+            ebpf.map_mut("DST_RULES")
+                .ok_or_else(|| anyhow!("DST_RULES map missing"))?,
+        )?;
+        for policy in policies {
+            for rule in policy.port_rules.iter().filter(|r| r.dst.is_some()) {
+                let (prefix, addr) = port_rule_dst_lpm(&rule.dst);
+                rules
+                    .insert(
+                        &Key::new(
+                            prefix,
+                            ScopedDstPortKey::new(policy.id, rule.key.proto, rule.key.port, addr),
+                        ),
+                        port_rule_value(rule.action, rule.log, cidr_bits(&rule.dst)),
+                        0,
+                    )
+                    .context("inserting destination rule")?;
             }
         }
     }

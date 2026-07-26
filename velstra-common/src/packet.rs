@@ -265,6 +265,62 @@ impl ScopedSrcPortKey {
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for ScopedSrcPortKey {}
 
+/// Key for the `DST_RULES` LPM trie: the mirror of [`ScopedSrcPortKey`] with the
+/// **destination** address as the longest-prefix-matched tail.
+///
+/// A second trie rather than a second dimension of the first: an LPM prefix is
+/// contiguous from the front of the key, so one trie can rank exactly one address
+/// field. Constraining a destination in the source trie would require every
+/// source bit to be fixed first, which would break every existing `from any` rule.
+/// A rule therefore constrains a source or a destination, never both, and the two
+/// tries hold disjoint rule sets ranked against each other by the prefix length
+/// packed into the value (`port_rule_bits`).
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct ScopedDstPortKey {
+    /// Policy id, matched exactly.
+    pub policy_id: PolicyId,
+    /// IP protocol number.
+    pub proto: u8,
+    /// Explicit padding, always zero.
+    pub _pad: u8,
+    /// Destination port, host byte order.
+    pub port: u16,
+    /// Destination address in [`lpm_key_addr`] form, matched longest-prefix.
+    pub dst: u32,
+}
+
+impl ScopedDstPortKey {
+    /// Prefix bits covering the exactly-matched head (`policy_id` + `proto` +
+    /// `_pad` + `port` = 32 + 8 + 8 + 16).
+    pub const FIXED_BITS: u32 = 64;
+
+    /// Build a scoped destination/port key.
+    #[inline]
+    pub const fn new(policy_id: PolicyId, proto: u8, port: u16, dst: u32) -> Self {
+        Self {
+            policy_id,
+            proto,
+            _pad: 0,
+            port,
+            dst,
+        }
+    }
+
+    /// The LPM prefix length for a rule whose destination is a `/cidr_bits` block.
+    #[inline]
+    pub const fn prefix_len(cidr_bits: u8) -> u32 {
+        Self::FIXED_BITS + cidr_bits as u32
+    }
+
+    /// The LPM prefix length for a lookup (all destination bits known).
+    pub const FULL_PREFIX: u32 = Self::FIXED_BITS + 32;
+}
+
+// SAFETY: `#[repr(C)]`, integer fields, padding zeroed — POD.
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ScopedDstPortKey {}
+
 /// Per-policy IPv6 blocklist LPM key: a policy id (matched exactly) followed by
 /// an IPv6 address prefix. IPv6 octets are already network-order (most
 /// significant first), so they need no `lpm_key_addr`-style transform.

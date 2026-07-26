@@ -977,6 +977,7 @@ fn config_rule_from_proto(r: &PortRule) -> ConfigPortRule {
         action: action_from_proto(r.action()),
         log: r.log,
         src: (!r.src.is_empty()).then(|| r.src.clone()),
+        dst: (!r.dst.is_empty()).then(|| r.dst.clone()),
     }
 }
 
@@ -987,6 +988,7 @@ fn proto_rule_from_config(r: &ConfigPortRule) -> PortRule {
         action: action_to_proto(r.action) as i32,
         log: r.log,
         src: r.src.clone().unwrap_or_default(),
+        dst: r.dst.clone().unwrap_or_default(),
     }
 }
 
@@ -2822,5 +2824,6 @@ fn parse_cli_rule(spec: &str, action: Action) -> Result<PortRule> {
         action: action as i32,
         log: false,
         src: String::new(),
+        dst: String::new(),
     })
 }

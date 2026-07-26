@@ -101,6 +101,17 @@ pub struct PortRule {
     /// more specific source wins over a `from any` rule on the same port.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub src: Option<String>,
+    /// Optional **destination**-address constraint, same forms as `src`. Absent
+    /// means "to any destination", and a more specific destination wins over a
+    /// less specific rule on the same port — across both dimensions, so a `/24`
+    /// destination outranks a `/8` source.
+    ///
+    /// Mutually exclusive with `src`: the data plane ranks each dimension in its
+    /// own longest-prefix trie, and a prefix is contiguous from the front of the
+    /// key, so no single entry can constrain both. Refused rather than honouring
+    /// one silently — a rule that matches more than it says is worse than no rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dst: Option<String>,
 }
 
 fn default_rule_action() -> ActionName {
@@ -740,10 +751,26 @@ pub struct PolicyConfig {
     /// Filled from the same TOML `blocklist` list — entries containing a `:` are
     /// parsed as IPv6.
     pub blocklist6: Vec<Cidr6>,
-    /// `(key, src, action, log)` entries for this policy's `PORT_RULES`. `src` is
-    /// the optional source-CIDR constraint (`None` == from any); `log` asks the
-    /// data plane to log packets matching this rule.
-    pub port_rules: Vec<(PortKey, Option<Cidr4>, Action, bool)>,
+    /// This policy's resolved firewall rules, for the `PORT_RULES` and `DST_RULES`
+    /// tries.
+    pub port_rules: Vec<ResolvedRule>,
+}
+
+/// One resolved firewall rule. `src` and `dst` are the optional address
+/// constraints (`None` == any) and are mutually exclusive — the parser refuses a
+/// rule carrying both, since the two live in different longest-prefix tries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRule {
+    /// `(proto, destination port)`.
+    pub key: PortKey,
+    /// Source-CIDR constraint, or `None` for "from any".
+    pub src: Option<Cidr4>,
+    /// Destination-CIDR constraint, or `None` for "to any".
+    pub dst: Option<Cidr4>,
+    /// What to do on a match.
+    pub action: Action,
+    /// Log packets this rule matches, regardless of the policy-wide flag.
+    pub log: bool,
 }
 
 /// This host's resolved overlay endpoint. The underlay MAC and egress ifindex
@@ -1078,6 +1105,14 @@ fn resolve_firewall(
                 "policy {id}: port rule on ICMP is invalid (ICMP has no ports); use `drop_icmp = true`"
             );
         }
+        if rule.src.is_some() && rule.dst.is_some() {
+            bail!(
+                "policy {id}: rule on {}/{} sets both src and dst; the data plane \
+                 ranks one address dimension per rule, so split it into two rules",
+                rule.proto.number(),
+                rule.port
+            );
+        }
         let src =
             match &rule.src {
                 Some(cidr) => Some(parse_cidr_v4(cidr).map_err(|e| {
@@ -1085,12 +1120,19 @@ fn resolve_firewall(
                 })?),
                 None => None,
             };
-        rules.push((
-            PortKey::new(rule.proto.number(), rule.port),
+        let dst = match &rule.dst {
+            Some(cidr) => Some(parse_cidr_v4(cidr).map_err(|e| {
+                anyhow::anyhow!("policy {id}: invalid rule destination {cidr:?}: {e}")
+            })?),
+            None => None,
+        };
+        rules.push(ResolvedRule {
+            key: PortKey::new(rule.proto.number(), rule.port),
             src,
-            rule.action.into(),
-            rule.log,
-        ));
+            dst,
+            action: rule.action.into(),
+            log: rule.log,
+        });
     }
 
     Ok(PolicyConfig {
@@ -1628,14 +1670,15 @@ impl fmt::Display for RuntimeConfig {
             for cidr in &policy.blocklist6 {
                 writeln!(f, "      block6 {cidr}")?;
             }
-            for (key, src, action, _log) in &policy.port_rules {
-                let from = match src {
-                    Some(c) => format!(
-                        " from {}/{}",
-                        c.octets.map(|o| o.to_string()).join("."),
-                        c.prefix
-                    ),
-                    None => String::new(),
+            for rule in &policy.port_rules {
+                let (key, action) = (rule.key, rule.action);
+                let show = |c: &Cidr4| {
+                    format!("{}/{}", c.octets.map(|o| o.to_string()).join("."), c.prefix)
+                };
+                let from = match (&rule.src, &rule.dst) {
+                    (Some(c), _) => format!(" from {}", show(c)),
+                    (_, Some(c)) => format!(" to {}", show(c)),
+                    _ => String::new(),
                 };
                 let proto = match key.proto {
                     ip_proto::TCP => "tcp",
@@ -1960,13 +2003,81 @@ mod tests {
         // Explicit pass rule on tcp/443.
         assert_eq!(
             p0.port_rules[0],
-            (PortKey::new(ip_proto::TCP, 443), None, Action::Pass, false)
+            ResolvedRule {
+                key: PortKey::new(ip_proto::TCP, 443),
+                src: None,
+                dst: None,
+                action: Action::Pass,
+                log: false,
+            }
         );
         // udp/53 defaults to drop.
         assert_eq!(
             p0.port_rules[1],
-            (PortKey::new(ip_proto::UDP, 53), None, Action::Drop, false)
+            ResolvedRule {
+                key: PortKey::new(ip_proto::UDP, 53),
+                src: None,
+                dst: None,
+                action: Action::Drop,
+                log: false,
+            }
         );
+    }
+
+    /// A rule constraining both ends is refused, not half-enforced. The data plane
+    /// ranks one address dimension per rule (an LPM prefix is contiguous from the
+    /// front of the key), so honouring whichever one happened to be programmed
+    /// would give a rule that matches more traffic than it says it does.
+    #[test]
+    fn a_rule_cannot_constrain_both_ends() {
+        let toml = r#"
+            [[policy]]
+            id = 7
+            [[policy.port_rule]]
+            proto = "tcp"
+            port = 22
+            action = "drop"
+            src = "10.0.0.0/8"
+            dst = "192.168.0.0/16"
+        "#;
+        let err = toml::from_str::<FileConfig>(toml)
+            .unwrap()
+            .resolve()
+            .expect_err("a rule with both ends must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("both src and dst"), "{msg}");
+        // The message has to say what to do instead, or the operator is stuck.
+        assert!(msg.contains("two rules"), "{msg}");
+    }
+
+    /// Each constraint lands in the trie for its own dimension, and the resolver
+    /// keeps them apart so the agent can route them there.
+    #[test]
+    fn a_destination_constraint_resolves_alongside_a_source_one() {
+        let toml = r#"
+            [[policy]]
+            id = 7
+            [[policy.port_rule]]
+            proto = "tcp"
+            port = 443
+            action = "pass"
+            src = "10.0.0.0/8"
+            [[policy.port_rule]]
+            proto = "tcp"
+            port = 443
+            action = "drop"
+            dst = "192.168.4.0/24"
+        "#;
+        let rt = toml::from_str::<FileConfig>(toml)
+            .unwrap()
+            .resolve()
+            .unwrap();
+        let rules = &rt.policies.iter().find(|p| p.id == 7).unwrap().port_rules;
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].src.unwrap().prefix, 8);
+        assert!(rules[0].dst.is_none());
+        assert!(rules[1].src.is_none());
+        assert_eq!(rules[1].dst.unwrap().prefix, 24);
     }
 
     #[test]

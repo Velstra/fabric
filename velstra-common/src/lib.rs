@@ -65,12 +65,13 @@ pub use overlay::{
 };
 pub use packet::{
     ETHERTYPE_IPV4, ETHERTYPE_IPV6, PacketMeta, PolicyId, PortKey, ScopedAddr, ScopedAddr6,
-    ScopedPortKey, ScopedSrcPortKey, ip_proto, ipv6_ext_len, is_ipv6_ext, lpm_key_addr,
+    ScopedDstPortKey, ScopedPortKey, ScopedSrcPortKey, ip_proto, ipv6_ext_len, is_ipv6_ext,
+    lpm_key_addr,
 };
 pub use parse::{ParseResult, parse_frame};
 pub use policy::{
-    Action, Counter, PORT_RULE_LOG, Verdict, decide, port_rule_action, port_rule_logs,
-    port_rule_value,
+    Action, Counter, PORT_RULE_LOG, PORT_RULE_PRESENT, Verdict, decide, port_rule_action,
+    port_rule_bits, port_rule_logs, port_rule_present, port_rule_value, port_rule_winner,
 };
 pub use reject::{
     ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, IcmpUnreach, TcpRst, icmp, icmp_checksum,
