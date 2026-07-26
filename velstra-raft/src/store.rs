@@ -1242,6 +1242,8 @@ mod tests {
                         log: false,
                         src: None,
                         dst: None,
+                        limit: None,
+                        burst: None,
                     }],
                 })
             )

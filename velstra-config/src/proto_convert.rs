@@ -23,6 +23,8 @@ fn port_rule_to_proto(r: &PortRule) -> proto::PortRule {
         log: r.log,
         src: r.src.clone().unwrap_or_default(),
         dst: r.dst.clone().unwrap_or_default(),
+        limit: r.limit.unwrap_or(0),
+        burst: r.burst.unwrap_or(0),
     }
 }
 
@@ -45,6 +47,8 @@ fn port_rule_from_proto(r: &proto::PortRule) -> PortRule {
         } else {
             Some(r.dst.clone())
         },
+        limit: (r.limit != 0).then_some(r.limit),
+        burst: (r.burst != 0).then_some(r.burst),
     }
 }
 

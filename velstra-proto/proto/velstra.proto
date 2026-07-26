@@ -571,6 +571,11 @@ message PortRule {
   // data plane ranks one address dimension per rule, so a rule carrying both is
   // refused rather than half-enforced.
   string dst = 6;
+  // Rate limit for NEW flows this rule admits, packets/s; 0 = unlimited. Only
+  // meaningful on a pass rule — a limit on a drop throttles nothing.
+  uint32 limit = 7;
+  // Burst capacity in packets; 0 = one second's worth of `limit`.
+  uint32 burst = 8;
 }
 
 message Route {

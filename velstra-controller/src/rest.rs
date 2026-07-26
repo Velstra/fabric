@@ -730,6 +730,12 @@ struct RuleReq {
     /// refuses a rule carrying both rather than enforcing one of them.
     #[serde(default)]
     dst: Option<String>,
+    /// New-flow rate limit in packets/s; only meaningful on a pass rule.
+    #[serde(default)]
+    limit: Option<u32>,
+    /// Burst capacity in packets; defaults to one second of `limit`.
+    #[serde(default)]
+    burst: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1315,6 +1321,8 @@ async fn create_security_group(
             log: r.log,
             src: r.src.clone().unwrap_or_default(),
             dst: r.dst.clone().unwrap_or_default(),
+            limit: r.limit.unwrap_or(0),
+            burst: r.burst.unwrap_or(0),
         });
     }
     let spec = ProtoSgSpec {

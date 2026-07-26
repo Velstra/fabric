@@ -51,7 +51,7 @@ use aya_ebpf::{
     bindings::{
         BPF_F_PSEUDO_HDR, TC_ACT_OK, TC_ACT_SHOT, bpf_adj_room_mode::BPF_ADJ_ROOM_MAC, xdp_action,
     },
-    helpers::bpf_xdp_adjust_head,
+    helpers::{bpf_ktime_get_ns, bpf_xdp_adjust_head},
     macros::{classifier, map, xdp},
     maps::{Array, DevMap, HashMap, LpmTrie, LruHashMap, PerCpuArray, ProgramArray, lpm_trie::Key},
     programs::{TcContext, XdpContext},
@@ -65,14 +65,15 @@ use velstra_common::{
     ARP_REPLY, ARP_REQUEST, Action, ArpEntry, ArpKey, Backend, ConfigFlags, Counter, ETHERTYPE_ARP,
     ETHERTYPE_IPV4, ETHERTYPE_IPV6, FloodSet, FlowKey, FlowState, ForwardOutcome, GlobalConfig,
     ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, ICMPV6_NEIGHBOR_SOLICIT, IrbEndpoint, IrbRewrite,
-    LocalMac, LocalMacKey, MAX_FLOOD_VTEPS, MacFdbKey, ND_NA_MSG_LEN, Nat, NdKey, Npt66,
-    OVERLAY_OUTER_LEN, OverlayConfig, PacketMeta, PolicyId, PortFwd, Rewrite, RouteEntry,
-    SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6, ScopedDstPortKey, ScopedPortKey, ScopedSrcPortKey,
-    ServiceKey, ServiceValue, Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, TunnelEndpoint,
-    TunnelKey, build_encap, build_srv6_encap, decide, decode_vni, icmp, icmp_checksum, ip_proto,
-    ipv6_ext_len, is_ipv6_ext, is_overlay_dport, lpm_key_addr, plan_arp_reply, plan_forward,
-    plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_tcp_rst, port_rule_action,
-    port_rule_logs, port_rule_present, port_rule_winner, select_backend, session_hash, tcp_flags,
+    LocalMac, LocalMacKey, MAX_FLOOD_VTEPS, MAX_RULE_LIMITS, MacFdbKey, ND_NA_MSG_LEN, Nat, NdKey,
+    Npt66, OVERLAY_OUTER_LEN, OverlayConfig, PacketMeta, PolicyId, PortFwd, RateBucket, Rewrite,
+    RouteEntry, SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6, ScopedDstPortKey, ScopedPortKey,
+    ScopedSrcPortKey, ServiceKey, ServiceValue, Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey,
+    TunnelEndpoint, TunnelKey, build_encap, build_srv6_encap, decide, decode_vni, icmp,
+    icmp_checksum, ip_proto, ipv6_ext_len, is_ipv6_ext, is_overlay_dport, lpm_key_addr,
+    plan_arp_reply, plan_forward, plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat,
+    plan_tcp_rst, port_rule_action, port_rule_limit, port_rule_logs, port_rule_present,
+    port_rule_winner, select_backend, session_hash, tcp_flags,
 };
 
 /// Maps an ingress interface index to its policy id, so one XDP program can
@@ -137,6 +138,12 @@ static PORT_RULES: LpmTrie<ScopedSrcPortKey, u32> = LpmTrie::with_max_entries(81
 /// trie rather than a second dimension of the first.
 #[map]
 static DST_RULES: LpmTrie<ScopedDstPortKey, u32> = LpmTrie::with_max_entries(8192, 0);
+
+/// Per-rule token buckets (roadmap C15), indexed by the 1-based slot a rule's
+/// packed value carries. Slot 0 is never used, so an unlimited rule — nearly all
+/// of them — costs no lookup here at all.
+#[map]
+static RULE_LIMITS: Array<RateBucket> = Array::with_max_entries(MAX_RULE_LIMITS + 1, 0);
 
 /// Per-policy 1:1 DNAT port-forwards: `(policy, proto, destination port)` → the
 /// internal `(ip, port)` an inbound connection is rewritten to. Empty by default
@@ -1222,9 +1229,27 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     // that denies by default drops it.
     let established = stateful && unsafe { FW_FLOWS.get(&fkey) }.is_some();
 
+    // Per-rule rate limit (C15). Consulted only for a rule that carries a slot and
+    // only for a NEW flow: an established connection whose packets each cost a
+    // token would stall mid-transfer, which is throttling the wrong thing — the
+    // limit exists to bound how fast new connections are *accepted*. A blocklisted
+    // or already-denied packet never reaches the bucket, so a flood of traffic the
+    // firewall drops anyway cannot spend another rule's budget.
+    let limit_slot = port_rule_limit(rule);
+    let rate_limited = limit_slot != 0
+        && !established
+        && !blocklisted
+        && verdict.action == Action::Pass
+        && !rate_limits_allow(limit_slot);
+
     // The firewall's final action, and the counter explaining it.
     let (action, fw_counter) = if blocklisted {
         (Action::Drop, Counter::DroppedBlocklist)
+    } else if rate_limited {
+        // Over its rule's budget. Dropped rather than rejected: a reject answers
+        // every excess packet with one of our own, which turns a flood aimed at us
+        // into a flood aimed at whoever the source claims to be.
+        (Action::Drop, Counter::DroppedRateLimit)
     } else if established {
         (Action::Pass, Counter::EstablishedAllowed)
     } else if has_port_forward {
@@ -2847,6 +2872,31 @@ fn lookup_port_rule(policy_id: PolicyId, proto: u8, dst_port: u16, src: u32) -> 
         Some(value) => *value,
         None => 0,
     }
+}
+
+/// Spend one token from the rule's rate bucket, returning whether the packet may
+/// proceed. `slot` is the 1-based index from the rule's packed value; `0` (no
+/// limit) must not reach here.
+///
+/// All the arithmetic lives in [`RateBucket::take`], which is unit-tested on the
+/// host — this only turns the map slot into a `&mut` and reads the clock. A slot
+/// the control plane never programmed reads as all-zero, whose `rate == 0` allows,
+/// so a half-applied config cannot black-hole traffic.
+#[inline(always)]
+fn rate_limits_allow(slot: u32) -> bool {
+    let Some(ptr) = RULE_LIMITS.get_ptr_mut(slot) else {
+        return true;
+    };
+    // SAFETY: `get_ptr_mut` returned a valid, exclusive pointer to this array
+    // slot's value for the duration of this program run. The bucket is shared
+    // across CPUs and updated without synchronisation: two packets racing may
+    // each spend the same token, which costs a small overshoot of the configured
+    // rate and never an under-count. A per-CPU map would remove the race at the
+    // price of multiplying every limit by the core count — i.e. a limit that
+    // silently means something else on every machine.
+    let bucket = unsafe { &mut *ptr };
+    let now = unsafe { bpf_ktime_get_ns() };
+    bucket.take(now)
 }
 
 /// The destination-address counterpart of [`lookup_port_rule`]: the packed
