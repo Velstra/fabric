@@ -75,6 +75,20 @@ const PORT_RULE_LIMIT_SHIFT: u32 = 24;
 /// Slot `0` means "no limit", so a config may carry this many limited rules.
 pub const MAX_RULE_LIMITS: u32 = 127;
 
+/// How many CIDRs the source blocklist holds, per address family, across **all**
+/// policies together (`BLOCKLIST` / `BLOCKLIST6` are one map each, scoped by
+/// policy id in the key).
+///
+/// The number is set by whole-country blocking and threat feeds rather than by
+/// hand-typed addresses: one country is thousands of prefixes, so a ceiling in
+/// the hundreds would rule the feature out instead of bounding it. An LPM trie
+/// allocates nodes on insert, so this costs nothing until it is used.
+///
+/// This is the source of truth. A product that refuses an over-large config at
+/// commit time — Sentinel does — has to carry the same number, because the
+/// alternative is discovering the ceiling as a partially-programmed firewall.
+pub const MAX_BLOCKLIST: u32 = 262_144;
+
 /// Pack a port rule's `(action, log, prefix bits)` into its map value.
 ///
 /// `cidr_bits` is the length of the address prefix this rule constrains (`0` for
