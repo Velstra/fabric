@@ -269,11 +269,21 @@ pub enum Counter {
     /// [`Counter::DroppedRule`]: the rule matched and would have passed the packet,
     /// so a rising count here means a limit is biting, not that a rule denies.
     DroppedRateLimit = 34,
+    /// Dropped because the packet's **source address** failed validation (uRPF,
+    /// RFC 3704): either no route back to it exists at all, or — under strict
+    /// validation — the route back leaves by a different interface than the one
+    /// it arrived on. Also counts the sources that can never be legitimate
+    /// (loopback, multicast, broadcast).
+    ///
+    /// A rising count on an edge interface is someone spoofing; a rising count
+    /// on an internal one is usually asymmetric routing meeting strict mode, and
+    /// the answer there is loose.
+    DroppedSpoofed = 35,
 }
 
 impl Counter {
     /// Number of distinct counters — the `max_entries` of the `STATS` map.
-    pub const COUNT: u32 = 35;
+    pub const COUNT: u32 = 36;
 
     /// The array index of this counter.
     #[inline]
@@ -320,6 +330,7 @@ impl Counter {
             32 => Counter::Srv6DropUntrusted,
             33 => Counter::IrbRouted,
             34 => Counter::DroppedRateLimit,
+            35 => Counter::DroppedSpoofed,
             _ => return None,
         };
         Some(counter)
@@ -371,6 +382,7 @@ impl Counter {
             Counter::Srv6DropUntrusted => "srv6_drop_untrusted",
             Counter::IrbRouted => "irb_routed",
             Counter::DroppedRateLimit => "dropped_rate_limit",
+            Counter::DroppedSpoofed => "dropped_spoofed",
         }
     }
 }

@@ -416,6 +416,15 @@ enum Action {
   ACTION_DROP = 1;
 }
 
+// Source-address validation (uRPF, RFC 3704). Default (0) is off: uRPF drops
+// traffic, and which traffic depends on the routing table, so a config that
+// does not ask for it never gets it.
+enum SourceValidation {
+  SOURCE_VALIDATION_DISABLE = 0;
+  SOURCE_VALIDATION_LOOSE = 1;  // the source must be routable somewhere
+  SOURCE_VALIDATION_STRICT = 2; // ...and by the interface it arrived on
+}
+
 // Transport protocol.
 enum Proto {
   PROTO_TCP = 0;
@@ -460,6 +469,8 @@ message NodeConfig {
   // Absent/false = fail open, the historical behaviour.
   repeated IrbRoute irb_routes = 19; // B7 symmetric-IRB routed subnets
   bool fail_closed = 18;
+
+  SourceValidation source_validation = 20; // uRPF for policy 0
 }
 
 // Encapsulation format for the overlay.
@@ -549,6 +560,7 @@ message Policy {
   repeated string blocklist = 6;
   repeated PortRule port_rules = 7;
   bool stateful = 8;
+  SourceValidation source_validation = 9;
 }
 
 // Maps an interface to a policy id and (optionally) an overlay segment (VNI).

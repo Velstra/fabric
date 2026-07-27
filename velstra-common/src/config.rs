@@ -20,9 +20,24 @@ impl ConfigFlags {
     /// direction, so replies are permitted even under a deny-by-default policy —
     /// a stateful gateway firewall. The blocklist still wins.
     pub const STATEFUL: u32 = 1 << 2;
+    /// **Loose** source validation (uRPF, RFC 3704 §3.2): a packet is dropped
+    /// unless *some* route back to its source address exists. Catches addresses
+    /// that could never answer — bogons, unrouted space — while tolerating the
+    /// asymmetric paths that a multi-homed edge produces.
+    pub const RPF_LOOSE: u32 = 1 << 3;
+    /// **Strict** source validation (uRPF, RFC 3704 §2): the route back to the
+    /// source must leave by the interface the packet arrived on. This is the
+    /// BCP 38 rule — it stops a neighbour on one link from claiming an address
+    /// that belongs to another — but it drops legitimate traffic wherever
+    /// routing is asymmetric, so it is opt-in per policy.
+    ///
+    /// Set together with [`Self::RPF_LOOSE`], strict wins; the data plane reads
+    /// this bit first.
+    pub const RPF_STRICT: u32 = 1 << 4;
 
     /// Mask of all defined flags; used to reject unknown bits.
-    pub const ALL: u32 = Self::DROP_ICMP | Self::LOG | Self::STATEFUL;
+    pub const ALL: u32 =
+        Self::DROP_ICMP | Self::LOG | Self::STATEFUL | Self::RPF_LOOSE | Self::RPF_STRICT;
 }
 
 /// Global firewall configuration shared kernel <-> user space.
@@ -67,6 +82,32 @@ impl GlobalConfig {
     pub const fn has_flag(&self, flag: u32) -> bool {
         self.flags & flag != 0
     }
+
+    /// How this policy validates a packet's source address.
+    #[inline]
+    pub const fn source_validation(&self) -> SourceValidation {
+        // Strict is checked first so a config carrying both bits enforces the
+        // stronger rule rather than silently relaxing to loose.
+        if self.has_flag(ConfigFlags::RPF_STRICT) {
+            SourceValidation::Strict
+        } else if self.has_flag(ConfigFlags::RPF_LOOSE) {
+            SourceValidation::Loose
+        } else {
+            SourceValidation::Disabled
+        }
+    }
+}
+
+/// Source-address validation mode (uRPF, RFC 3704) for one policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceValidation {
+    /// Accept any source address. The default — uRPF drops traffic, and which
+    /// traffic depends on the routing table, so it is never turned on for you.
+    Disabled,
+    /// The source must be routable somewhere.
+    Loose,
+    /// The route back to the source must leave by the ingress interface.
+    Strict,
 }
 
 impl Default for GlobalConfig {

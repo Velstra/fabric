@@ -49,9 +49,11 @@
 
 use aya_ebpf::{
     bindings::{
-        BPF_F_PSEUDO_HDR, TC_ACT_OK, TC_ACT_SHOT, bpf_adj_room_mode::BPF_ADJ_ROOM_MAC, xdp_action,
+        BPF_F_PSEUDO_HDR, BPF_FIB_LKUP_RET_FWD_DISABLED, BPF_FIB_LKUP_RET_NO_NEIGH,
+        BPF_FIB_LKUP_RET_SUCCESS, TC_ACT_OK, TC_ACT_SHOT, bpf_adj_room_mode::BPF_ADJ_ROOM_MAC,
+        bpf_fib_lookup, xdp_action,
     },
-    helpers::{bpf_ktime_get_ns, bpf_xdp_adjust_head},
+    helpers::{bpf_fib_lookup as fib_lookup, bpf_ktime_get_ns, bpf_xdp_adjust_head},
     macros::{classifier, map, xdp},
     maps::{Array, DevMap, HashMap, LpmTrie, LruHashMap, PerCpuArray, ProgramArray, lpm_trie::Key},
     programs::{TcContext, XdpContext},
@@ -68,8 +70,8 @@ use velstra_common::{
     IrbEndpoint, IrbRewrite, LocalMac, LocalMacKey, MAX_FLOOD_VTEPS, MAX_RULE_LIMITS, MacFdbKey,
     ND_NA_MSG_LEN, Nat, NdKey, Npt66, OVERLAY_OUTER_LEN, OverlayConfig, PacketMeta, PolicyId,
     PortFwd, RateBucket, Rewrite, RouteEntry, SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6,
-    ScopedDstPortKey, ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue, Srv6Config,
-    Srv6Endpoint, Srv6LocalSid, Srv6SidKey, TunnelEndpoint, TunnelKey, build_encap,
+    ScopedDstPortKey, ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue, SourceValidation,
+    Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, TunnelEndpoint, TunnelKey, build_encap,
     build_srv6_encap, decide, decode_vni, icmp, icmp_checksum, ip_proto, ipv6_ext_len, is_ipv6_ext,
     is_overlay_dport, lpm_key_addr, plan_arp_reply, plan_forward, plan_icmp_unreachable, plan_irb,
     plan_na_reply, plan_nat, plan_tcp_rst, port_rule_action, port_rule_limit, port_rule_logs,
@@ -335,6 +337,27 @@ static VTEP_PEERS: HashMap<[u8; 4], u8> = HashMap::with_max_entries(8192, 0);
 /// Per-CPU statistics, one slot per [`Counter`] variant.
 #[map]
 static STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(Counter::COUNT, 0);
+
+/// Scratch space for the reverse-path [`bpf_fib_lookup`] parameter block.
+///
+/// The struct is 64 bytes, and holding it on the stack pushed the XDP program
+/// past the verifier's 512-byte combined-frame limit — the program simply
+/// stopped loading. A per-CPU slot costs no stack at all and is safe without
+/// locking: an XDP program runs to completion on one CPU without preemption, so
+/// the slot is filled and read within a single run.
+#[map]
+static FIB_SCRATCH: PerCpuArray<bpf_fib_lookup> = PerCpuArray::with_max_entries(1, 0);
+
+/// This CPU's zeroed [`bpf_fib_lookup`] slot, or `None` if the map is somehow
+/// missing (in which case the caller must not claim the packet is spoofed).
+#[inline(always)]
+fn fib_scratch() -> Option<*mut bpf_fib_lookup> {
+    let params = FIB_SCRATCH.get_ptr_mut(0)?;
+    // The slot is reused every packet, so stale fields would leak from the last
+    // lookup into this one.
+    unsafe { core::ptr::write_bytes(params, 0, 1) };
+    Some(params)
+}
 
 /// Everything the tail-called [`velstra_forward`] program needs from
 /// [`try_velstra`]'s post-firewall state. A tail call replaces the running
@@ -1190,6 +1213,22 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     let cfg = unsafe { CONFIG.get(&policy_id) }
         .copied()
         .unwrap_or(GlobalConfig::DEFAULT);
+
+    // --- Source validation (uRPF, RFC 3704) ---------------------------------
+    // Runs ahead of every other verdict: a packet whose source cannot be the
+    // sender is not worth matching rules against, and the answer does not depend
+    // on any of them.
+    let rpf = cfg.source_validation();
+    if rpf != SourceValidation::Disabled
+        && source_is_spoofed(ctx, &meta, ifindex, rpf == SourceValidation::Strict)
+    {
+        bump(Counter::DroppedSpoofed);
+        if cfg.has_flag(ConfigFlags::LOG) {
+            info!(ctx, "DROP spoofed source proto={}", proto);
+        }
+        return Ok(xdp_action::XDP_DROP);
+    }
+
     let blocklisted = BLOCKLIST
         .get(Key::new(
             ScopedAddr::FULL_PREFIX,
@@ -1648,12 +1687,30 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
         }
     }
 
+    // IPv6 addresses do not fit `PacketMeta`'s IPv4 fields, but `decide` only
+    // reads `proto`/`dst_port` plus the `blocklisted`/`rule` inputs computed
+    // below, so zero placeholders are harmless. The blocklist verdict comes from
+    // the real IPv6 source, and source validation reads the real header.
+    let meta = PacketMeta::new([0; 4], [0; 4], proto, src_port, dst_port, payload_len);
+
     // --- Per-policy firewall lookups (same policy space as IPv4) -------------
     let ifindex = ctx.ingress_ifindex() as u32;
     let policy_id = unsafe { IFACE_POLICY.get(&ifindex) }.copied().unwrap_or(0);
     let cfg = unsafe { CONFIG.get(&policy_id) }
         .copied()
         .unwrap_or(GlobalConfig::DEFAULT);
+    // Source validation, ahead of every other verdict (see the IPv4 path).
+    let rpf = cfg.source_validation();
+    if rpf != SourceValidation::Disabled
+        && source_is_spoofed_v6(ctx, &hdr, &meta, ifindex, rpf == SourceValidation::Strict)
+    {
+        bump(Counter::DroppedSpoofed);
+        if cfg.has_flag(ConfigFlags::LOG) {
+            info!(ctx, "DROP6 spoofed source proto={}", proto);
+        }
+        return Ok(xdp_action::XDP_DROP);
+    }
+
     let blocklisted = BLOCKLIST6
         .get(Key::new(
             ScopedAddr6::FULL_PREFIX,
@@ -1674,11 +1731,6 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
         None
     };
 
-    // IPv6 addresses do not fit `PacketMeta`'s IPv4 fields, but `decide` only
-    // reads `proto`/`dst_port` plus the `blocklisted`/`rule` inputs we computed,
-    // so zero placeholders are harmless. The blocklist verdict already came from
-    // the real IPv6 source above.
-    let meta = PacketMeta::new([0; 4], [0; 4], proto, src_port, dst_port, payload_len);
     let verdict = decide(&meta, &cfg, blocklisted, rule_action);
 
     bump(verdict.counter);
@@ -1732,6 +1784,176 @@ fn npt66_ingress_v6(ctx: &XdpContext, ifindex: u32) -> Result<(), ()> {
         *((data + off) as *mut [u8; 16]) = new_dst;
     }
     Ok(())
+}
+
+/// `family` values for [`bpf_fib_lookup`] (`AF_INET` / `AF_INET6` — the kernel's
+/// own numbers, which no header exports to a BPF program).
+const AF_INET: u8 = 2;
+const AF_INET6: u8 = 10;
+
+/// Source-address validation (uRPF, RFC 3704) for IPv4. Returns `true` when the
+/// packet should be dropped as spoofed.
+///
+/// The question is answered by the **kernel's own FIB**, not a table of our own:
+/// `bpf_fib_lookup` is handed the packet's addresses swapped, so its answer is
+/// "if we replied to this sender, which interface would the reply leave by?".
+/// Strict validation requires that to be the interface the packet arrived on —
+/// the BCP 38 rule, which stops a neighbour on one link from claiming an address
+/// that belongs to another. Loose validation only requires that an answer exists.
+///
+/// Two things are deliberately *not* treated as spoofed:
+///
+/// * **A `0.0.0.0` source**, which is how a DHCP client asks for its first
+///   address. Linux's own `rp_filter` exempts it, and validating it here would
+///   make a DHCP server unreachable the moment an operator turned this on — the
+///   sort of breakage that gets a security feature switched back off. Nothing is
+///   lost: a source that cannot be replied to cannot be used to reflect anything.
+/// * **A packet the helper could not answer for** (a negative return). Failing
+///   closed on a question we failed to *ask* would drop traffic for a reason no
+///   counter could explain.
+///
+/// Kept out of line so the 64-byte `bpf_fib_lookup` parameter block gets its own
+/// BPF stack frame rather than inflating the main program's, which is already
+/// close to the verifier's 512-byte limit.
+#[inline(never)]
+fn source_is_spoofed(ctx: &XdpContext, meta: &PacketMeta, ifindex: u32, strict: bool) -> bool {
+    let src = meta.src_addr;
+    if src == [0, 0, 0, 0] {
+        return false;
+    }
+    // Addresses that can never legitimately *send*: loopback, multicast
+    // (224.0.0.0/4) and the limited broadcast. A route back to them may well
+    // exist, so the FIB alone would let them through.
+    if src[0] == 127 || src[0] & 0xf0 == 0xe0 || src == [255, 255, 255, 255] {
+        return true;
+    }
+
+    let Some(params) = fib_scratch() else {
+        return false;
+    };
+    unsafe {
+        (*params).family = AF_INET;
+        (*params).l4_protocol = meta.proto;
+        // Ports are swapped with the addresses: policy routing rules and
+        // multipath hashing both look at them, and we are asking about the
+        // *reply*.
+        (*params).sport = meta.dst_port.to_be();
+        (*params).dport = meta.src_port.to_be();
+        (*params).__bindgen_anon_1.tot_len = meta.total_len;
+        (*params).ifindex = ifindex;
+        (*params).__bindgen_anon_3.ipv4_src = u32::from_ne_bytes(meta.dst_addr);
+        (*params).__bindgen_anon_4.ipv4_dst = u32::from_ne_bytes(src);
+    }
+
+    fib_says_spoofed(ctx, params, ifindex, strict)
+}
+
+/// Source-address validation for IPv6 — the mirror of [`source_is_spoofed`],
+/// reading the addresses straight out of the fixed header (`src` at 8, `dst` at
+/// 24) so the caller need not lift two 16-byte addresses into its own frame.
+///
+/// **Link-local sources (`fe80::/10`) are exempt.** They are not routable by
+/// definition, so uRPF has nothing to say about them, and Neighbor Discovery,
+/// Router Advertisement and DHCPv6 all speak from one — validating them would
+/// take the interface down rather than protect it. The unspecified address
+/// (`::`) is exempt for the same reason `0.0.0.0` is: duplicate-address
+/// detection sends from it.
+///
+/// Takes the `PacketMeta` the IPv6 path already builds purely for its
+/// `proto`/port fields — its address fields are zero there and unused here. A
+/// BPF function may take at most five arguments, which is exactly what is left
+/// once the header and the context are passed.
+#[inline(never)]
+fn source_is_spoofed_v6(
+    ctx: &XdpContext,
+    hdr: &[u8; Ipv6Hdr::LEN],
+    meta: &PacketMeta,
+    ifindex: u32,
+    strict: bool,
+) -> bool {
+    // The packet's source address, as the four words the helper wants.
+    let src = [
+        u32::from_ne_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]),
+        u32::from_ne_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]),
+        u32::from_ne_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]),
+        u32::from_ne_bytes([hdr[20], hdr[21], hdr[22], hdr[23]]),
+    ];
+    // fe80::/10 — link-local, exempt (see above).
+    if hdr[8] == 0xfe && hdr[9] & 0xc0 == 0x80 {
+        return false;
+    }
+    if src[0] == 0 && src[1] == 0 && src[2] == 0 {
+        // `::` is duplicate-address detection and passes; `::1` is loopback and
+        // can never legitimately send.
+        return src[3] != 0;
+    }
+    // ff00::/8 — multicast is a destination, never a source.
+    if hdr[8] == 0xff {
+        return true;
+    }
+
+    let Some(params) = fib_scratch() else {
+        return false;
+    };
+    unsafe {
+        (*params).family = AF_INET6;
+        (*params).l4_protocol = meta.proto;
+        (*params).sport = meta.dst_port.to_be();
+        (*params).dport = meta.src_port.to_be();
+        (*params).ifindex = ifindex;
+        // Swapped: the lookup's source is the packet's destination (offset 24)
+        // and its destination is the packet's source (offset 8).
+        (*params).__bindgen_anon_3.ipv6_src = [
+            u32::from_ne_bytes([hdr[24], hdr[25], hdr[26], hdr[27]]),
+            u32::from_ne_bytes([hdr[28], hdr[29], hdr[30], hdr[31]]),
+            u32::from_ne_bytes([hdr[32], hdr[33], hdr[34], hdr[35]]),
+            u32::from_ne_bytes([hdr[36], hdr[37], hdr[38], hdr[39]]),
+        ];
+        (*params).__bindgen_anon_4.ipv6_dst = src;
+    }
+
+    fib_says_spoofed(ctx, params, ifindex, strict)
+}
+
+/// Run a prepared reverse-path [`bpf_fib_lookup`] and turn its answer into a
+/// verdict. Shared by both address families so the "what counts as routable"
+/// rule is written down once.
+#[inline(always)]
+fn fib_says_spoofed(
+    ctx: &XdpContext,
+    params: *mut bpf_fib_lookup,
+    ifindex: u32,
+    strict: bool,
+) -> bool {
+    let rc = unsafe {
+        fib_lookup(
+            ctx.ctx as *mut _,
+            params,
+            core::mem::size_of::<bpf_fib_lookup>() as i32,
+            0,
+        )
+    };
+    // Negative means the helper itself refused the question (unsupported family,
+    // bad length). Fail open — see the note on [`source_is_spoofed`].
+    if rc < 0 {
+        return false;
+    }
+    // `FWD_DISABLED` is the FIB declining the question, not answering it: the
+    // helper does a *forwarding* lookup and refuses one on an interface where IP
+    // forwarding is off. Reading that as "spoofed" would black-hole every packet
+    // on a box that only terminates traffic — the worst possible way for a
+    // security feature to fail, so it fails open like any other refusal.
+    if rc as u32 == BPF_FIB_LKUP_RET_FWD_DISABLED {
+        return false;
+    }
+    // `NO_NEIGH` means the route was found but its next hop has no resolved
+    // neighbour yet. An unresolved ARP/ND entry says nothing about whether the
+    // source is routable, and the egress interface is filled in either way.
+    let ret = rc as u32;
+    if ret != BPF_FIB_LKUP_RET_SUCCESS && ret != BPF_FIB_LKUP_RET_NO_NEIGH {
+        return true;
+    }
+    strict && unsafe { (*params).ifindex } != ifindex
 }
 
 /// Phase 4 **ARP suppression**: answer a tenant's ARP request locally from

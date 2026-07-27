@@ -12,6 +12,7 @@
 //! default_action = "pass"   # "pass" or "drop"
 //! drop_icmp      = true      # block all ping traffic
 //! log      = false     # emit an aya-log line per drop (costly)
+//! source_validation = "strict"  # uRPF: "disable" (default), "loose", "strict"
 //!
 //! # Dual-stack: IPv4 and IPv6 CIDRs share one list (`:` ⇒ IPv6).
 //! blocklist = ["10.0.0.0/8", "203.0.113.7", "2001:db8::/32"]
@@ -32,8 +33,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use velstra_common::{
     Action, Backend, CgnatLayout, Cidr4, Cidr6, ConfigFlags, GENEVE_PORT, GlobalConfig, Npt66,
-    PolicyId, PortKey, RouteEntry, ServiceKey, VXLAN_PORT, encap_kind, ip_proto, parse_cidr_v4,
-    parse_cidr_v6, parse_mac,
+    PolicyId, PortKey, RouteEntry, ServiceKey, SourceValidation, VXLAN_PORT, encap_kind, ip_proto,
+    parse_cidr_v4, parse_cidr_v6, parse_mac,
 };
 
 /// A firewall verdict as written in TOML (`"pass"` / `"drop"`).
@@ -55,6 +56,32 @@ impl From<ActionName> for Action {
             ActionName::Pass => Action::Pass,
             ActionName::Drop => Action::Drop,
             ActionName::Reject => Action::Reject,
+        }
+    }
+}
+
+/// Source-address validation (uRPF, RFC 3704) as written in TOML.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceValidationName {
+    /// Accept any source address — the default. uRPF drops traffic, and *which*
+    /// traffic depends on the routing table, so it is never enabled implicitly.
+    #[default]
+    Disable,
+    /// The source must be routable somewhere. Survives asymmetric routing.
+    Loose,
+    /// The route back to the source must leave by the interface it arrived on
+    /// (BCP 38). Drops legitimate traffic wherever routing is asymmetric.
+    Strict,
+}
+
+impl SourceValidationName {
+    /// The [`ConfigFlags`] bits this mode sets.
+    fn flags(self) -> u32 {
+        match self {
+            Self::Disable => 0,
+            Self::Loose => ConfigFlags::RPF_LOOSE,
+            Self::Strict => ConfigFlags::RPF_STRICT,
         }
     }
 }
@@ -486,6 +513,9 @@ pub struct PolicyFile {
     pub log: bool,
     #[serde(default)]
     pub stateful: bool,
+    /// Source-address validation (uRPF) for this policy's interfaces.
+    #[serde(default)]
+    pub source_validation: SourceValidationName,
     #[serde(default)]
     pub blocklist: Vec<String>,
     #[serde(default, rename = "port_rule")]
@@ -540,6 +570,10 @@ pub struct FileConfig {
     pub log: bool,
     /// Track connections and allow established flows (stateful firewall).
     pub stateful: bool,
+    /// Source-address validation (uRPF, RFC 3704): `disable` (default), `loose`
+    /// or `strict`. Applies to the default policy; `[[policy]]` blocks set their
+    /// own.
+    pub source_validation: SourceValidationName,
     /// Drop a packet the data plane cannot parse instead of passing it. Off by
     /// default: a firewall should not black-hole traffic because of its own
     /// parsing limits. Turn it on under a deny-by-default posture, where a packet
@@ -1089,10 +1123,11 @@ fn resolve_firewall(
     drop_icmp: bool,
     log: bool,
     stateful: bool,
+    source_validation: SourceValidationName,
     blocklist: &[String],
     port_rules: &[PortRule],
 ) -> Result<PolicyConfig> {
-    let mut flags = 0;
+    let mut flags = source_validation.flags();
     if drop_icmp {
         flags |= ConfigFlags::DROP_ICMP;
     }
@@ -1203,6 +1238,7 @@ impl FileConfig {
             self.drop_icmp,
             self.log,
             self.stateful,
+            self.source_validation,
             &self.blocklist,
             &self.port_rules,
         )?];
@@ -1219,6 +1255,7 @@ impl FileConfig {
                 policy.drop_icmp,
                 policy.log,
                 policy.stateful,
+                policy.source_validation,
                 &policy.blocklist,
                 &policy.port_rules,
             )?);
@@ -1705,11 +1742,17 @@ impl fmt::Display for RuntimeConfig {
             };
             writeln!(
                 f,
-                "  policy {} : default={default}, drop_icmp={}, stateful={}, log={}",
+                "  policy {} : default={default}, drop_icmp={}, stateful={}, log={}, \
+                 source_validation={}",
                 policy.id,
                 policy.global.has_flag(ConfigFlags::DROP_ICMP),
                 policy.global.has_flag(ConfigFlags::STATEFUL),
                 policy.global.has_flag(ConfigFlags::LOG),
+                match policy.global.source_validation() {
+                    SourceValidation::Disabled => "disable",
+                    SourceValidation::Loose => "loose",
+                    SourceValidation::Strict => "strict",
+                },
             )?;
             for cidr in &policy.blocklist {
                 writeln!(f, "      block {cidr}")?;
@@ -2352,6 +2395,73 @@ mod tests {
         "#;
         let err = toml::from_str::<FileConfig>(bad).unwrap().resolve();
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn source_validation_is_off_unless_asked_for() {
+        let cfg = toml::from_str::<FileConfig>("").unwrap().resolve().unwrap();
+        assert_eq!(
+            cfg.policies[0].global.source_validation(),
+            SourceValidation::Disabled,
+            "uRPF drops traffic; a config that never mentions it must not get it"
+        );
+    }
+
+    #[test]
+    fn each_policy_carries_its_own_source_validation() {
+        // The realistic shape: strict at the untrusted edge, off inside, where a
+        // second path in or out would make strict drop legitimate traffic.
+        let toml = r#"
+            source_validation = "strict"
+
+            [[policy]]
+            id = 7
+            source_validation = "loose"
+
+            [[policy]]
+            id = 8
+        "#;
+        let cfg = toml::from_str::<FileConfig>(toml)
+            .unwrap()
+            .resolve()
+            .unwrap();
+        let mode = |id| {
+            cfg.policies
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap()
+                .global
+                .source_validation()
+        };
+        assert_eq!(mode(0), SourceValidation::Strict);
+        assert_eq!(mode(7), SourceValidation::Loose);
+        assert_eq!(mode(8), SourceValidation::Disabled);
+    }
+
+    #[test]
+    fn source_validation_leaves_the_other_flags_alone() {
+        let toml = r#"
+            source_validation = "loose"
+            stateful = true
+            drop_icmp = true
+        "#;
+        let global = toml::from_str::<FileConfig>(toml)
+            .unwrap()
+            .resolve()
+            .unwrap()
+            .policies[0]
+            .global;
+        assert!(global.has_flag(ConfigFlags::STATEFUL));
+        assert!(global.has_flag(ConfigFlags::DROP_ICMP));
+        assert_eq!(global.source_validation(), SourceValidation::Loose);
+    }
+
+    #[test]
+    fn an_unknown_source_validation_mode_is_refused() {
+        // Silently falling back to `disable` would leave an operator believing a
+        // typo'd config validates sources when it does not.
+        let err = toml::from_str::<FileConfig>(r#"source_validation = "rpf""#).unwrap_err();
+        assert!(err.to_string().contains("source_validation"), "{err}");
     }
 
     #[test]
