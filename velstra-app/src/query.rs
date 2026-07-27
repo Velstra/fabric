@@ -17,7 +17,7 @@
 //! cgnat <ip>        → the WAN port block an internal address holds
 //! blocks            → sources blocked at run time, and for how much longer
 //! block <cidr> [s]  → block a source for a while (roadmap C11)
-//! unblock <cidr>    → lift one early
+//! unblock <cidr>    → lift one early (`all` lifts every one)
 //! ```
 //!
 //! Mostly read-only, and **nothing here can open anything**. `block` is the only
@@ -222,13 +222,24 @@ async fn respond(line: &str, firewall: &Arc<Mutex<Firewall>>) -> String {
         }
         "unblock" => {
             let Some(cidr) = args.first() else {
-                return "usage: unblock <cidr>\n".to_string();
+                return "usage: unblock <cidr|all>\n".to_string();
             };
             let mut fw = firewall.lock().await;
-            match fw.unblock_source(cidr) {
-                Ok(true) => format!("unblocked {cidr}\n"),
-                Ok(false) => format!("{cidr} is not blocked at run time\n"),
-                Err(e) => format!("error: unblocking {cidr}: {e:#}\n"),
+            // `all` exists for the false-positive storm: a rule that was too broad
+            // blocks a dozen addresses in a minute, and lifting them one at a time
+            // is exactly the wrong thing to be doing at that moment.
+            if *cidr == "all" {
+                match fw.unblock_all() {
+                    Ok(0) => "no run-time blocks to lift\n".to_string(),
+                    Ok(n) => format!("lifted {n} run-time block(s)\n"),
+                    Err(e) => format!("error: lifting run-time blocks: {e:#}\n"),
+                }
+            } else {
+                match fw.unblock_source(cidr) {
+                    Ok(true) => format!("unblocked {cidr}\n"),
+                    Ok(false) => format!("{cidr} is not blocked at run time\n"),
+                    Err(e) => format!("error: unblocking {cidr}: {e:#}\n"),
+                }
             }
         }
         "" => "usage: stats | flows [limit] | top [limit] | cgnat <ip> | blocks | \
