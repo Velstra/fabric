@@ -456,6 +456,21 @@ impl Firewall {
         Ok(true)
     }
 
+    /// Lift every run-time block. Returns how many there were.
+    ///
+    /// For the false-positive storm: a rule that turned out too broad blocks a
+    /// dozen sources in a minute, and undoing that one address at a time is the
+    /// wrong thing to be doing while it is happening.
+    pub fn unblock_all(&mut self) -> Result<usize> {
+        let all: Vec<String> = self.runtime_blocks.keys().cloned().collect();
+        for cidr in &all {
+            self.runtime_blocks.remove(cidr);
+            self.write_block(cidr, false)
+                .with_context(|| format!("lifting the block on {cidr}"))?;
+        }
+        Ok(all.len())
+    }
+
     /// Remove every run-time block whose time is up. Returns how many went.
     ///
     /// This is what makes an automatic block safe to switch on: whatever a
