@@ -47,7 +47,7 @@ pub mod srv6;
 
 pub use cgnat::CgnatLayout;
 pub use cidr::{Cidr4, Cidr6, CidrError, mask_v4, mask_v6, parse_cidr_v4, parse_cidr_v6};
-pub use config::{ConfigFlags, GlobalConfig};
+pub use config::{ConfigFlags, GlobalConfig, SourceValidation};
 pub use forward::{
     ForwardOutcome, Rewrite, RouteEntry, csum_replace_u16, decrement_ttl, ipv4_checksum,
     plan_forward,

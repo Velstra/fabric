@@ -34,7 +34,7 @@ use anyhow::{Result, bail};
 use velstra_common::{Cidr4, Cidr6, PolicyId, mask_v4, mask_v6};
 use velstra_config::{
     ActionName, BackendCfg, EncapName, FileConfig, InterfaceFile, NeighborCfg, OverlayCfg,
-    PolicyFile, PortRule, ProtoName, ServiceCfg, TunnelCfg,
+    PolicyFile, PortRule, ProtoName, ServiceCfg, SourceValidationName, TunnelCfg,
 };
 
 /// A physical host that terminates tunnels (a VTEP).
@@ -1416,6 +1416,10 @@ impl Topology {
                 drop_icmp: net.drop_icmp,
                 log: false,
                 stateful: false,
+                // A tenant network's own uRPF is B12's per-port MAC/IP binding,
+                // not a routing-table question — the orchestrator has no FIB to
+                // validate against, so it leaves this off.
+                source_validation: SourceValidationName::Disable,
                 blocklist: Vec::new(),
                 port_rules: Vec::new(),
             });
@@ -1445,6 +1449,7 @@ impl Topology {
                     drop_icmp: sg.drop_icmp,
                     log: false,
                     stateful: sg.stateful,
+                    source_validation: SourceValidationName::Disable,
                     blocklist: sg.blocklist.clone(),
                     port_rules: sg.rules.clone(),
                 });

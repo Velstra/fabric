@@ -12,7 +12,7 @@ use velstra_proto as proto;
 use crate::config::{
     ActionName, BackendCfg, EncapName, FileConfig, FloodVtepCfg, ForwardMode, InterfaceFile,
     IrbRouteCfg, MacRouteCfg, Nd6Cfg, NeighborCfg, OverlayCfg, PolicyFile, PortRule, ProtoName,
-    RouteCfg, RuntimeConfig, ServiceCfg, TunnelCfg,
+    RouteCfg, RuntimeConfig, ServiceCfg, SourceValidationName, TunnelCfg,
 };
 
 fn port_rule_to_proto(r: &PortRule) -> proto::PortRule {
@@ -69,6 +69,22 @@ fn action_from_proto(a: proto::Action) -> ActionName {
     }
 }
 
+fn rpf_to_proto(v: SourceValidationName) -> proto::SourceValidation {
+    match v {
+        SourceValidationName::Disable => proto::SourceValidation::Disable,
+        SourceValidationName::Loose => proto::SourceValidation::Loose,
+        SourceValidationName::Strict => proto::SourceValidation::Strict,
+    }
+}
+
+fn rpf_from_proto(v: proto::SourceValidation) -> SourceValidationName {
+    match v {
+        proto::SourceValidation::Disable => SourceValidationName::Disable,
+        proto::SourceValidation::Loose => SourceValidationName::Loose,
+        proto::SourceValidation::Strict => SourceValidationName::Strict,
+    }
+}
+
 fn proto_to_proto(p: ProtoName) -> proto::Proto {
     match p {
         ProtoName::Tcp => proto::Proto::Tcp,
@@ -122,6 +138,7 @@ pub fn file_config_to_proto(cfg: &FileConfig, version: u64) -> proto::NodeConfig
         drop_icmp: cfg.drop_icmp,
         log: cfg.log,
         stateful: cfg.stateful,
+        source_validation: rpf_to_proto(cfg.source_validation) as i32,
         fail_closed: cfg.fail_closed,
         blocklist: cfg.blocklist.clone(),
         port_rules: cfg.port_rules.iter().map(port_rule_to_proto).collect(),
@@ -135,6 +152,7 @@ pub fn file_config_to_proto(cfg: &FileConfig, version: u64) -> proto::NodeConfig
                 drop_icmp: p.drop_icmp,
                 log: p.log,
                 stateful: p.stateful,
+                source_validation: rpf_to_proto(p.source_validation) as i32,
                 blocklist: p.blocklist.clone(),
                 port_rules: p.port_rules.iter().map(port_rule_to_proto).collect(),
             })
@@ -263,6 +281,7 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
         drop_icmp: cfg.drop_icmp,
         log: cfg.log,
         stateful: cfg.stateful,
+        source_validation: rpf_from_proto(cfg.source_validation()),
         fail_closed: cfg.fail_closed,
         blocklist: cfg.blocklist.clone(),
         port_rules: cfg.port_rules.iter().map(port_rule_from_proto).collect(),
@@ -280,6 +299,7 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
                 drop_icmp: p.drop_icmp,
                 log: p.log,
                 stateful: p.stateful,
+                source_validation: rpf_from_proto(p.source_validation()),
                 blocklist: p.blocklist.clone(),
                 port_rules: p.port_rules.iter().map(port_rule_from_proto).collect(),
             })
@@ -493,6 +513,47 @@ mod tests {
         assert_eq!(a.services[0].backends, b.services[0].backends);
         assert_eq!(a.routes.len(), b.routes.len());
         assert_eq!(a.routes[0].flags, b.routes[0].flags);
+    }
+
+    #[test]
+    fn source_validation_survives_the_wire_per_policy() {
+        // The controller pushes configs as protobuf; a mode that silently reset
+        // to `disable` in transit would leave the edge unvalidated while every
+        // `show` still claimed otherwise.
+        let toml = r#"
+            source_validation = "strict"
+
+            [[policy]]
+            id = 3
+            source_validation = "loose"
+        "#;
+        let original: FileConfig = toml::from_str(toml).unwrap();
+        let wire = file_config_to_proto(&original, 1);
+        assert_eq!(wire.source_validation(), proto::SourceValidation::Strict);
+        assert_eq!(
+            wire.policies[0].source_validation(),
+            proto::SourceValidation::Loose
+        );
+
+        let back = file_config_from_proto(&wire);
+        assert_eq!(back.source_validation, SourceValidationName::Strict);
+        assert_eq!(
+            back.policies[0].source_validation,
+            SourceValidationName::Loose
+        );
+
+        let resolved = runtime_from_proto(&wire).unwrap();
+        let mode = |id| {
+            resolved
+                .policies
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap()
+                .global
+                .source_validation()
+        };
+        assert_eq!(mode(0), velstra_common::SourceValidation::Strict);
+        assert_eq!(mode(3), velstra_common::SourceValidation::Loose);
     }
 
     #[test]

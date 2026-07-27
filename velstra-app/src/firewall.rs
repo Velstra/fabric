@@ -2350,6 +2350,8 @@ fn is_drop_counter(counter: Counter) -> bool {
             | Counter::DroppedBlocklist
             | Counter::DroppedRule
             | Counter::DroppedIcmp
+            | Counter::DroppedRateLimit
+            | Counter::DroppedSpoofed
             | Counter::ForwardTtlExceeded
             | Counter::EgressDropped
     )
