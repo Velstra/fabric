@@ -67,15 +67,16 @@ use velstra_common::{
     ARP_REPLY, ARP_REQUEST, Action, ArpEntry, ArpKey, Backend, CgnatLayout, ConfigFlags, Counter,
     ETHERTYPE_ARP, ETHERTYPE_IPV4, ETHERTYPE_IPV6, FloodSet, FlowKey, FlowState, ForwardOutcome,
     GlobalConfig, ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, ICMPV6_NEIGHBOR_SOLICIT,
-    IrbEndpoint, IrbRewrite, LocalMac, LocalMacKey, MAX_FLOOD_VTEPS, MAX_RULE_LIMITS, MacFdbKey,
-    ND_NA_MSG_LEN, Nat, NdKey, Npt66, OVERLAY_OUTER_LEN, OverlayConfig, PacketMeta, PolicyId,
-    PortFwd, RateBucket, Rewrite, RouteEntry, SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6,
-    ScopedDstPortKey, ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue, SourceValidation,
-    Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, TunnelEndpoint, TunnelKey, build_encap,
-    build_srv6_encap, decide, decode_vni, icmp, icmp_checksum, ip_proto, ipv6_ext_len, is_ipv6_ext,
-    is_overlay_dport, lpm_key_addr, plan_arp_reply, plan_forward, plan_icmp_unreachable, plan_irb,
-    plan_na_reply, plan_nat, plan_tcp_rst, port_rule_action, port_rule_limit, port_rule_logs,
-    port_rule_present, port_rule_winner, select_backend, session_hash, tcp_flags,
+    IrbEndpoint, IrbRewrite, LocalMac, LocalMacKey, MAX_BLOCKLIST, MAX_FLOOD_VTEPS,
+    MAX_RULE_LIMITS, MacFdbKey, ND_NA_MSG_LEN, Nat, NdKey, Npt66, OVERLAY_OUTER_LEN, OverlayConfig,
+    PacketMeta, PolicyId, PortFwd, RateBucket, Rewrite, RouteEntry, SRV6_L2_OUTER_LEN, ScopedAddr,
+    ScopedAddr6, ScopedDstPortKey, ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue,
+    SourceValidation, Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, TunnelEndpoint,
+    TunnelKey, build_encap, build_srv6_encap, decide, decode_vni, icmp, icmp_checksum, ip_proto,
+    ipv6_ext_len, is_ipv6_ext, is_overlay_dport, lpm_key_addr, plan_arp_reply, plan_forward,
+    plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_tcp_rst, port_rule_action,
+    port_rule_limit, port_rule_logs, port_rule_present, port_rule_winner, select_backend,
+    session_hash, tcp_flags,
 };
 
 /// Maps an ingress interface index to its policy id, so one XDP program can
@@ -119,15 +120,22 @@ static FAIL_CLOSED: Array<u32> = Array::with_max_entries(1, 0);
 
 /// Per-policy source-IP CIDR blocklist, keyed by [`ScopedAddr`] (policy id +
 /// address prefix).
+///
+/// Sized for **whole-country blocking** and threat feeds, not just the handful of
+/// addresses an operator types: one country is thousands of prefixes (China is
+/// ~8k, Russia ~13k), and a list capped in the hundreds would make the feature
+/// impossible rather than merely limited. An LPM trie allocates its nodes on
+/// insert, so a large `max_entries` costs nothing until it is used — it is a
+/// ceiling, not a reservation.
 #[map]
-static BLOCKLIST: LpmTrie<ScopedAddr, u32> = LpmTrie::with_max_entries(8192, 0);
+static BLOCKLIST: LpmTrie<ScopedAddr, u32> = LpmTrie::with_max_entries(MAX_BLOCKLIST, 0);
 
 /// Per-policy source-IPv6 CIDR blocklist, keyed by [`ScopedAddr6`] (policy id +
 /// IPv6 address prefix). The IPv4 ([`BLOCKLIST`]) and IPv6 lists are separate
 /// maps because the LPM key widths differ, but they share the same `policy_id`
 /// space and the same `[[policy]]` config — one blocklist, two address families.
 #[map]
-static BLOCKLIST6: LpmTrie<ScopedAddr6, u32> = LpmTrie::with_max_entries(8192, 0);
+static BLOCKLIST6: LpmTrie<ScopedAddr6, u32> = LpmTrie::with_max_entries(MAX_BLOCKLIST, 0);
 
 /// Per-policy `(proto, destination port)` → [`Action`] allow/deny rules. Shared
 /// across address families: a port rule applies to IPv4 *and* IPv6 alike.

@@ -32,9 +32,9 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use velstra_common::{
-    Action, Backend, CgnatLayout, Cidr4, Cidr6, ConfigFlags, GENEVE_PORT, GlobalConfig, Npt66,
-    PolicyId, PortKey, RouteEntry, ServiceKey, SourceValidation, VXLAN_PORT, encap_kind, ip_proto,
-    parse_cidr_v4, parse_cidr_v6, parse_mac,
+    Action, Backend, CgnatLayout, Cidr4, Cidr6, ConfigFlags, GENEVE_PORT, GlobalConfig,
+    MAX_BLOCKLIST, Npt66, PolicyId, PortKey, RouteEntry, ServiceKey, SourceValidation, VXLAN_PORT,
+    encap_kind, ip_proto, parse_cidr_v4, parse_cidr_v6, parse_mac,
 };
 
 /// A firewall verdict as written in TOML (`"pass"` / `"drop"`).
@@ -1259,6 +1259,28 @@ impl FileConfig {
                 &policy.blocklist,
                 &policy.port_rules,
             )?);
+        }
+
+        // The blocklist tries are one map each across every policy, so the limit
+        // is a total. Refusing here beats discovering it as a half-programmed
+        // firewall: the insert that hits the ceiling fails, and the entries after
+        // it are simply never written.
+        for (family, count) in [
+            (
+                "IPv4",
+                policies.iter().map(|p| p.blocklist.len()).sum::<usize>(),
+            ),
+            (
+                "IPv6",
+                policies.iter().map(|p| p.blocklist6.len()).sum::<usize>(),
+            ),
+        ] {
+            if count > MAX_BLOCKLIST as usize {
+                bail!(
+                    "blocklist: {count} {family} entries across all policies exceeds the \
+                     data plane's {MAX_BLOCKLIST}"
+                );
+            }
         }
 
         let overlay_present = self.overlay.is_some();
