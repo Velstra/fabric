@@ -13,7 +13,7 @@
 //! ```text
 //! stats             → the per-CPU counter table, summed
 //! flows [limit]     → the live NAT flow table (0 = all; default 100)
-//! top [limit]       → source addresses ranked by live connection count
+//! top [limit]       → hosts ranked by the traffic volume attributed to them
 //! cgnat <ip>        → the WAN port block an internal address holds
 //! blocks            → sources blocked at run time, and for how much longer
 //! block <cidr> [s]  → block a source for a while (roadmap C11)

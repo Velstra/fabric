@@ -357,6 +357,25 @@ impl FlowKey {
 /// address rewritten in the same packet, so an optional **secondary** rewrite
 /// (`nat2_ip`/`nat2_port`, applied to the opposite field) is carried alongside;
 /// `nat2_ip == [0; 4]` means "no second rewrite" — the common (single-NAT) case.
+///
+/// # Accounting
+///
+/// The entry also **counts the traffic it accounted for** (`packets`/`bytes`),
+/// which is what lets an operator rank talkers by volume rather than by their
+/// number of open connections, and is the raw material any future flow export
+/// needs. Two properties of the counters are worth stating, because both are
+/// visible in the output:
+///
+/// * They are **not replicated** by conntrack sync (C9). A byte crossed *this*
+///   node or it did not; copying the number to the peer would make any sum of
+///   the pair count it twice, and a backup that has never forwarded the flow
+///   should say so. Failover therefore restores the NAT state and restarts the
+///   accounting from zero — deliberately.
+/// * They are incremented **without an atomic**, on the grounds that a NIC
+///   steers one flow to one receive queue, hence one CPU, so an entry has a
+///   single writer. Where that does not hold (software receive steering, a
+///   queue-less device) the loser of a race costs one packet — an undercount in
+///   a statistic, never a wrong forwarding decision.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FlowState {
@@ -375,12 +394,31 @@ pub struct FlowState {
     pub flags: u16,
     /// Explicit padding, always zero.
     pub _pad: u16,
+    /// Packets this entry accounted for; see the type's *Accounting* section.
+    pub packets: u64,
+    /// Bytes this entry accounted for, counted as the frame arrived on the wire
+    /// (L2 header included) — that is the number an operator compares against a
+    /// link's capacity.
+    pub bytes: u64,
 }
 
 impl FlowState {
     /// This entry rewrites the packet's **source** (SNAT a reply) rather than
     /// its destination (DNAT a request).
     pub const REVERSE: u16 = 1 << 0;
+
+    /// The NAT target is the host that **originated** this connection, rather
+    /// than just an address to restore.
+    ///
+    /// A masquerade's single conntrack entry is keyed on the *reply* — its
+    /// source is the remote server — while the internal client whose traffic
+    /// this actually is appears only as the entry's NAT target. It is also a
+    /// destination-rewriting (so [`Self::REVERSE`]-less) entry, exactly like a
+    /// load balancer's forward entry, whose NAT target is a *backend* and
+    /// emphatically not the originator. Nothing in the addresses tells the two
+    /// apart, so the path that knows says so here; without it, accounting can
+    /// only ever name the remote end of a masqueraded flow.
+    pub const ORIGIN: u16 = 1 << 1;
 
     /// A forward (DNAT) entry: rewrite the destination to `nat_ip:nat_port`.
     #[inline]
@@ -392,6 +430,8 @@ impl FlowState {
             nat2_port: 0,
             flags: 0,
             _pad: 0,
+            packets: 0,
+            bytes: 0,
         }
     }
 
@@ -405,6 +445,8 @@ impl FlowState {
             nat2_port: 0,
             flags: Self::REVERSE,
             _pad: 0,
+            packets: 0,
+            bytes: 0,
         }
     }
 
@@ -424,6 +466,8 @@ impl FlowState {
             nat2_port,
             flags: 0,
             _pad: 0,
+            packets: 0,
+            bytes: 0,
         }
     }
 
@@ -443,6 +487,25 @@ impl FlowState {
             nat2_port,
             flags: Self::REVERSE,
             _pad: 0,
+            packets: 0,
+            bytes: 0,
+        }
+    }
+
+    /// A **masquerade** entry: rewrite the destination back to `nat_ip:nat_port`
+    /// on the reply, and record that this address is the connection's
+    /// originator (see [`Self::ORIGIN`]).
+    #[inline]
+    pub const fn masquerade(nat_ip: [u8; 4], nat_port: u16) -> Self {
+        Self {
+            nat_ip,
+            nat2_ip: [0; 4],
+            nat_port,
+            nat2_port: 0,
+            flags: Self::ORIGIN,
+            _pad: 0,
+            packets: 0,
+            bytes: 0,
         }
     }
 
@@ -452,11 +515,29 @@ impl FlowState {
         self.flags & Self::REVERSE != 0
     }
 
+    /// Whether the NAT target names the host that originated the connection.
+    #[inline]
+    pub const fn is_origin(&self) -> bool {
+        self.flags & Self::ORIGIN != 0
+    }
+
     /// Whether a secondary (hairpin) rewrite is present on the opposite field.
     #[inline]
     pub const fn has_second(&self) -> bool {
         let [a, b, c, d] = self.nat2_ip;
         (a | b | c | d) != 0
+    }
+
+    /// Account one packet of `bytes` to this entry.
+    ///
+    /// Saturating rather than wrapping: a counter that rolls over turns a busy
+    /// flow into an idle-looking one, and an operator reading a statistic is
+    /// better served by a number that sticks at the maximum than by one that
+    /// silently restarts.
+    #[inline]
+    pub fn account(&mut self, bytes: u64) {
+        self.packets = self.packets.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes);
     }
 }
 
@@ -854,9 +935,17 @@ mod tests {
         assert_eq!(core::mem::size_of::<ServiceValue>(), 16);
         assert_eq!(core::mem::size_of::<Backend>(), 8);
         assert_eq!(core::mem::size_of::<FlowKey>(), 20);
-        // FlowState carries a second (hairpin) rewrite: 2×(ip[4]+port) + flags +
-        // pad = 16 bytes.
-        assert_eq!(core::mem::size_of::<FlowState>(), 16);
+        // FlowState carries a second (hairpin) rewrite — 2×(ip[4]+port) + flags +
+        // pad = 16 bytes — plus the two accounting counters = 32. The size is
+        // asserted because it is the conntrack map's value: it is multiplied by
+        // 65536 entries, and the conntrack-sync codec is written against the
+        // layout by hand.
+        assert_eq!(core::mem::size_of::<FlowState>(), 32);
+        // The counters must sit *after* the NAT fields and the alignment must not
+        // have inserted padding among them, or the wire format's 16-byte record
+        // would no longer be the NAT prefix it claims to be.
+        assert_eq!(core::mem::offset_of!(FlowState, packets), 16);
+        assert_eq!(core::mem::offset_of!(FlowState, bytes), 24);
         // PortFwd: target ip + match_dst + snat_ip (3×4) + reply policy + port +
         // pad = 20 bytes.
         assert_eq!(core::mem::size_of::<PortFwd>(), 20);

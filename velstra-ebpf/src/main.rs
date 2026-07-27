@@ -229,6 +229,29 @@ static CONNTRACK: LruHashMap<FlowKey, FlowState> = LruHashMap::with_max_entries(
 /// it after the policy-scoped miss. LB tenant isolation is untouched.
 const ROUTER_NAT_POLICY: PolicyId = 0;
 
+/// Look a flow up in `CONNTRACK` and, on a hit, **account this packet to it**.
+///
+/// Accounting has to happen here rather than in a pass of its own: the value is
+/// already being fetched, and the packet's size is knowledge only the data plane
+/// holds — by the time user space reads the table, the traffic it wants to
+/// measure has been gone for a while.
+///
+/// The update goes through `get_ptr_mut` and is plain (non-atomic) 64-bit
+/// arithmetic; [`FlowState`]'s *Accounting* section states why an entry has a
+/// single writer in practice and what it costs when it does not. The value is
+/// copied out afterwards, so every caller keeps working on a snapshot exactly as
+/// it did when this was a bare `get`.
+#[inline(always)]
+fn account_flow(key: &FlowKey, bytes: u64) -> Option<FlowState> {
+    let entry = CONNTRACK.get_ptr_mut(key)?;
+    // SAFETY: `get_ptr_mut` yields a pointer to this CPU's view of the map value,
+    // valid until the next map operation on it; we write and copy immediately.
+    unsafe {
+        (*entry).account(bytes);
+        Some(*entry)
+    }
+}
+
 /// Stateful-firewall connection table: a flow (both directions) that the
 /// firewall allowed, so replies are permitted even under deny-by-default. An LRU
 /// map, populated and read entirely by the data plane.
@@ -895,7 +918,11 @@ fn masquerade_egress(
     // seeded by the flow hash — reuse the slot already recording THIS flow (a
     // retransmit reuses the same port), take the first free slot, else fall back to
     // the client's own port (the pre-NAPT behaviour) on exhaustion.
-    let fwd = FlowState::forward(src_addr, src_port);
+    // `masquerade` rather than `forward`: the rewrite is identical (restore the
+    // destination on the reply), but the entry additionally records that its NAT
+    // target is the client that *originated* the connection — the only place that
+    // fact exists, since the entry is keyed on the reply's addresses.
+    let fwd = FlowState::masquerade(src_addr, src_port);
     let seed = napt_seed(src_addr, dst_addr, src_port, dst_port);
     // Deterministic CGNAT: when this egress carries a port-block layout, every
     // candidate stays inside the block that belongs to `src_addr`. That is what
@@ -931,7 +958,26 @@ fn masquerade_egress(
     // that reply 5-tuple (keyed on the allocated wan_port); the stored forward
     // state carries the client address+port the reply is restored to.
     let rkey = FlowKey::new(policy_id, dst_addr, wan_ip, dst_port, wan_port, proto);
-    let _ = CONNTRACK.insert(&rkey, &fwd, 0);
+    // A masqueraded connection has exactly one conntrack entry — this one — so it
+    // is also the only place its *outbound* traffic can be accounted. Rewriting
+    // the entry is now conditional on it not already being this flow's: the old
+    // unconditional insert would have reset the counters on every packet, and a
+    // lookup refreshes the LRU just as an insert did.
+    let bytes = (ctx.data_end() - ctx.data()) as u64;
+    match CONNTRACK.get_ptr_mut(&rkey) {
+        // SAFETY: as in `account_flow` — a pointer into this CPU's map value,
+        // read and written before any other operation on the map.
+        Some(entry) if unsafe { (*entry).nat_ip == src_addr && (*entry).nat_port == src_port } => unsafe {
+            (*entry).account(bytes)
+        },
+        // No entry, or a slot the port probe had to take from another flow on
+        // exhaustion: this flow starts the accounting over, as it must.
+        _ => {
+            let mut first = fwd;
+            first.account(bytes);
+            let _ = CONNTRACK.insert(&rkey, &first, 0);
+        }
+    }
     // …and let that reply pass the WAN zone's deny-by-default stateful firewall.
     let _ = FW_FLOWS.insert(&rkey, &1u8, 0);
 
@@ -2545,9 +2591,12 @@ fn try_load_balance(
     };
 
     // 1. Established flow? Conntrack tells us the NAT target and direction.
-    // SAFETY: see `lookup_port_rule`; we copy the value out immediately.
+    // The lookup also *accounts* the packet to the entry it hit, which is the
+    // only place that can: by the time userspace reads the table the packet is
+    // long gone. See `account_flow`.
+    let bytes = (ctx.data_end() - ctx.data()) as u64;
     let fkey = FlowKey::new(policy_id, src_addr, dst_addr, src_port, dst_port, proto);
-    let mut ct_state = (unsafe { CONNTRACK.get(&fkey) }).copied();
+    let mut ct_state = account_flow(&fkey, bytes);
     // Router NAT (port-forward) records its conntrack under the policy-independent
     // namespace, since its forward and reply enter through different zones' policies
     // (see [`ROUTER_NAT_POLICY`]). Fall back to it after the tenant-scoped miss —
@@ -2561,7 +2610,7 @@ fn try_load_balance(
             dst_port,
             proto,
         );
-        ct_state = (unsafe { CONNTRACK.get(&gkey) }).copied();
+        ct_state = account_flow(&gkey, bytes);
     }
     if let Some(state) = ct_state {
         let reverse = state.is_reverse();
@@ -2688,7 +2737,13 @@ fn try_load_balance(
         // one, so it finds this entry on the next packet either way).
         let mut fwd_key = fkey;
         fwd_key.policy = ct_policy;
-        let _ = CONNTRACK.insert(&fwd_key, &FlowState::forward(backend.ip, backend.port), 0);
+        // The packet in hand is this flow's first, and it is a forward one — so
+        // the forward entry starts at one packet rather than at zero. Without
+        // this every flow's count is short by its own opening packet, which is
+        // exactly the packet an operator looks for when a connection fails.
+        let mut fwd_state = FlowState::forward(backend.ip, backend.port);
+        fwd_state.account(bytes);
+        let _ = CONNTRACK.insert(&fwd_key, &fwd_state, 0);
     }
     // Clear the backend's reply through its own zone's stateful firewall, which on
     // a deny-by-default internal zone would otherwise drop it before the rewrite
@@ -2837,7 +2892,11 @@ fn try_port_forward(
         )
     };
     if CONNTRACK.insert(&rkey, &rev_state, 0).is_ok() {
-        // Forward: rewrite subsequent packets of this flow.
+        // Forward: rewrite subsequent packets of this flow. The packet in hand is
+        // this flow's first and travels forward, so the entry opens with it
+        // already accounted rather than losing it.
+        let mut fwd_state = fwd_state;
+        fwd_state.account((ctx.data_end() - ctx.data()) as u64);
         let _ = CONNTRACK.insert(&fkey, &fwd_state, 0);
     }
     // Clear the reply through the internal zone's stateful firewall. The entry goes
