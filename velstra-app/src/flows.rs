@@ -7,13 +7,20 @@
 //!
 //! ## What this can and cannot report
 //!
-//! [`FlowState`] holds NAT targets and flags — **no byte or packet counters**. So
-//! "top talkers" here ranks hosts by their number of live connections, which is
-//! what the table can actually answer. Ranking by traffic volume would need
-//! per-flow counters in the map value, i.e. a data-plane change (and a new
-//! conntrack-sync wire format, since C9 replicates that value). Calling a
-//! connection count "top talkers by bytes" would be a lie an operator acts on,
-//! so the output labels the unit it means.
+//! [`FlowState`] now carries per-flow packet and byte counters, so "top talkers"
+//! ranks by **traffic volume** — the question an operator actually has when a
+//! link is full. Two things about that ranking are not obvious from the numbers
+//! themselves:
+//!
+//! * A talker is named by the host the traffic **belongs to**, not by the
+//!   address in the key. For a masqueraded flow the key's source is the remote
+//!   server (the entry describes the reply), while the internal client that
+//!   caused the traffic sits in the value's NAT target — so a reverse entry is
+//!   attributed to `nat_ip`. Ranking on the key would answer "which server sent
+//!   us the most", never "which of my machines is eating the line".
+//! * The counters are per node and are not replicated by conntrack sync, so
+//!   after a failover a flow's volume restarts. `velstra_common::FlowState`
+//!   says why.
 //!
 //! Everything here is pure so it is unit-tested without a kernel.
 
@@ -49,8 +56,8 @@ pub fn render_flows(flows: &[(FlowKey, FlowState)], limit: usize) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "  {:<8} {:<5} {:<21} {:<21} nat",
-        "policy", "proto", "source", "destination"
+        "  {:<6} {:<5} {:<21} {:<21} {:<22} {:>8} {:>8}",
+        "policy", "proto", "source", "destination", "nat", "packets", "bytes"
     );
     let shown: Vec<&&(FlowKey, FlowState)> = if limit == 0 {
         sorted.iter().collect()
@@ -70,12 +77,14 @@ pub fn render_flows(flows: &[(FlowKey, FlowState)], limit: usize) -> String {
         let nat = format!("{dir}→{}:{}", Ipv4Addr::from(state.nat_ip), state.nat_port);
         let _ = writeln!(
             out,
-            "  {:<8} {:<5} {:<21} {:<21} {}",
+            "  {:<6} {:<5} {:<21} {:<21} {:<22} {:>8} {:>8}",
             key.policy,
             proto_name(key.proto),
             src,
             dst,
-            nat
+            nat,
+            state.packets,
+            human_bytes(state.bytes),
         );
     }
     if limit != 0 && sorted.len() > limit {
@@ -91,36 +100,116 @@ pub fn render_flows(flows: &[(FlowKey, FlowState)], limit: usize) -> String {
     out
 }
 
-/// Rank source addresses by how many live connections they hold, descending.
+/// The host an entry's traffic should be attributed to.
 ///
-/// Ties break on the address so the output is deterministic — an operator
-/// comparing two dumps should not see rows shuffle for no reason.
-pub fn top_talkers(flows: &[(FlowKey, FlowState)], limit: usize) -> Vec<(Ipv4Addr, usize)> {
-    let mut counts: HashMap<Ipv4Addr, usize> = HashMap::new();
-    for (key, _) in flows {
-        *counts.entry(Ipv4Addr::from(key.src_ip)).or_insert(0) += 1;
+/// Normally that is the key's source, as one would expect. A masqueraded flow is
+/// the exception: its single entry is keyed on the *reply*, so the source there
+/// is the remote server, and the internal client that caused the traffic appears
+/// only as the NAT target. The data plane marks those entries
+/// ([`FlowState::ORIGIN`]) precisely because nothing in the addresses reveals it
+/// — a load balancer's entry has the same shape and its NAT target is a backend,
+/// not an originator. Guessing from the shape produces a ranking of other
+/// people's servers, which is never the question being asked.
+fn talker(key: &FlowKey, state: &FlowState) -> Ipv4Addr {
+    if state.is_origin() {
+        Ipv4Addr::from(state.nat_ip)
+    } else {
+        Ipv4Addr::from(key.src_ip)
     }
-    let mut ranked: Vec<(Ipv4Addr, usize)> = counts.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+}
+
+/// What one host accounts for across its live flows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Talker {
+    /// Bytes across every flow attributed to this host.
+    pub bytes: u64,
+    /// Packets across those flows.
+    pub packets: u64,
+    /// How many of them are live.
+    pub connections: usize,
+}
+
+/// Rank hosts by the traffic volume attributed to them, descending.
+///
+/// Volume rather than connection count: a host holding four hundred idle
+/// keep-alives is not the reason a link is saturated, and the table can now
+/// answer the question that is actually being asked. The connection count is
+/// still carried alongside, because "one flow, ten gigabytes" and "ten thousand
+/// flows, ten gigabytes" are very different problems.
+///
+/// Ties break on bytes, then packets, then the address, so the output is
+/// deterministic — an operator comparing two dumps should not see rows shuffle
+/// for no reason.
+pub fn top_talkers(flows: &[(FlowKey, FlowState)], limit: usize) -> Vec<(Ipv4Addr, Talker)> {
+    let mut totals: HashMap<Ipv4Addr, Talker> = HashMap::new();
+    for (key, state) in flows {
+        let entry = totals.entry(talker(key, state)).or_default();
+        entry.bytes = entry.bytes.saturating_add(state.bytes);
+        entry.packets = entry.packets.saturating_add(state.packets);
+        entry.connections += 1;
+    }
+    let mut ranked: Vec<(Ipv4Addr, Talker)> = totals.into_iter().collect();
+    ranked.sort_by(|a, b| {
+        b.1.bytes
+            .cmp(&a.1.bytes)
+            .then_with(|| b.1.packets.cmp(&a.1.packets))
+            .then_with(|| a.0.cmp(&b.0))
+    });
     if limit != 0 {
         ranked.truncate(limit);
     }
     ranked
 }
 
-/// Render [`top_talkers`], naming the unit explicitly.
+/// Render [`top_talkers`], naming every unit explicitly.
 pub fn render_top_talkers(flows: &[(FlowKey, FlowState)], limit: usize) -> String {
     let ranked = top_talkers(flows, limit);
     let mut out = String::new();
-    let _ = writeln!(out, "  {:<21} {:>12}", "source", "connections");
-    let _ = writeln!(out, "  {:-<21} {:->12}", "", "");
-    for (addr, count) in &ranked {
-        let _ = writeln!(out, "  {:<21} {:>12}", addr.to_string(), count);
+    let _ = writeln!(
+        out,
+        "  {:<21} {:>10} {:>12} {:>12}",
+        "host", "bytes", "packets", "connections"
+    );
+    let _ = writeln!(out, "  {:-<21} {:->10} {:->12} {:->12}", "", "", "", "");
+    for (addr, t) in &ranked {
+        let _ = writeln!(
+            out,
+            "  {:<21} {:>10} {:>12} {:>12}",
+            addr.to_string(),
+            human_bytes(t.bytes),
+            t.packets,
+            t.connections
+        );
     }
     if ranked.is_empty() {
         let _ = writeln!(out, "  (no flows)");
     }
     out
+}
+
+/// A byte count an operator can read at a glance.
+///
+/// Binary multiples (1 K = 1024 B), the convention every interface counter on
+/// the box already uses; the exact figure is one `show firewall flows` away when
+/// it matters. Under 1 K prints as a plain number — rounding 900 bytes to "0 K"
+/// would hide the difference between a silent flow and an idle one.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["K", "M", "G", "T", "P"];
+    if bytes < 1024 {
+        return bytes.to_string();
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    // One decimal below 10 (4.7M reads better than 4M), none above it.
+    if value < 10.0 {
+        format!("{value:.1}{}", UNITS[unit])
+    } else {
+        format!("{value:.0}{}", UNITS[unit])
+    }
 }
 
 #[cfg(test)]
@@ -142,33 +231,110 @@ mod tests {
         )
     }
 
-    #[test]
-    fn top_talkers_ranks_by_connection_count_and_breaks_ties_stably() {
-        let noisy = [192, 168, 0, 5];
-        let quiet = [192, 168, 0, 6];
-        let mut flows = vec![
-            flow(quiet, [1, 1, 1, 1], 1000, ip_proto::TCP),
-            flow(noisy, [1, 1, 1, 1], 1001, ip_proto::TCP),
-            flow(noisy, [1, 1, 1, 1], 1002, ip_proto::TCP),
-            flow(noisy, [1, 1, 1, 1], 1003, ip_proto::TCP),
-        ];
-        let ranked = top_talkers(&flows, 0);
-        assert_eq!(ranked[0], (Ipv4Addr::from(noisy), 3));
-        assert_eq!(ranked[1], (Ipv4Addr::from(quiet), 1));
+    /// A flow carrying `bytes` bytes over `packets` packets.
+    fn busy(
+        src: [u8; 4],
+        dst: [u8; 4],
+        sport: u16,
+        packets: u64,
+        bytes: u64,
+    ) -> (FlowKey, FlowState) {
+        let (key, mut state) = flow(src, dst, sport, ip_proto::TCP);
+        state.packets = packets;
+        state.bytes = bytes;
+        (key, state)
+    }
 
-        // A tie must resolve on the address, not on hash-map order — two dumps of
-        // the same table have to look the same.
-        flows.push(flow(quiet, [2, 2, 2, 2], 1004, ip_proto::TCP));
-        flows.push(flow(quiet, [2, 2, 2, 2], 1005, ip_proto::TCP));
-        let a = top_talkers(&flows, 0);
-        let b = top_talkers(&flows, 0);
-        assert_eq!(a, b);
-        assert_eq!(a[0].1, 3);
-        assert_eq!(a[1].1, 3);
-        assert!(a[0].0 < a[1].0, "the tie broke on the address: {a:?}");
+    /// The whole point of the counters: the host to look at is the one moving
+    /// the traffic, not the one holding the most sockets. A ranking by
+    /// connection count puts a host with four hundred idle keep-alives above the
+    /// one actually filling the link.
+    #[test]
+    fn top_talkers_ranks_by_volume_not_by_connection_count() {
+        let heavy = [192, 168, 0, 5];
+        let chatty = [192, 168, 0, 6];
+        let mut flows = vec![busy(heavy, [1, 1, 1, 1], 1000, 900, 9_000_000)];
+        // Three times the connections, a thousandth of the traffic.
+        flows.extend((0..3).map(|i| busy(chatty, [1, 1, 1, 1], 2000 + i, 4, 400)));
+
+        let ranked = top_talkers(&flows, 0);
+        assert_eq!(ranked[0].0, Ipv4Addr::from(heavy));
+        assert_eq!(ranked[0].1.bytes, 9_000_000);
+        assert_eq!(ranked[0].1.connections, 1);
+        assert_eq!(ranked[1].0, Ipv4Addr::from(chatty));
+        assert_eq!(ranked[1].1.connections, 3, "connections are still reported");
+        assert_eq!(ranked[1].1.bytes, 1200);
 
         assert_eq!(top_talkers(&flows, 1).len(), 1);
         assert!(top_talkers(&[], 0).is_empty());
+    }
+
+    /// Two dumps of one table have to look the same; hash-map order must never
+    /// reach the output.
+    #[test]
+    fn a_tie_breaks_on_the_address_so_two_dumps_match() {
+        let a_host = [192, 168, 0, 5];
+        let b_host = [192, 168, 0, 6];
+        let flows = vec![
+            busy(b_host, [1, 1, 1, 1], 1000, 10, 5000),
+            busy(a_host, [1, 1, 1, 1], 1001, 10, 5000),
+        ];
+        let first = top_talkers(&flows, 0);
+        assert_eq!(first, top_talkers(&flows, 0));
+        assert!(
+            first[0].0 < first[1].0,
+            "the tie broke on the address: {first:?}"
+        );
+    }
+
+    /// A masqueraded flow's conntrack entry describes the *reply*, so its key's
+    /// source is the remote server. Ranking on the key would answer "which
+    /// server sent us the most" — never "which of my machines is eating the
+    /// line", which is the question being asked.
+    #[test]
+    fn a_masqueraded_flow_is_attributed_to_the_internal_client() {
+        let client = [10, 0, 0, 7];
+        let server = [203, 0, 113, 9];
+        // The reply entry: remote → our WAN address, restoring the client.
+        let (key, _) = flow(server, [198, 51, 100, 1], 443, ip_proto::TCP);
+        let mut state = FlowState::masquerade(client, 51000);
+        state.packets = 100;
+        state.bytes = 1_000_000;
+
+        let ranked = top_talkers(&[(key, state)], 0);
+        assert_eq!(
+            ranked[0].0,
+            Ipv4Addr::from(client),
+            "the download was attributed to the server, not the host that asked for it"
+        );
+    }
+
+    /// The counterexample that makes the flag necessary rather than a guess: a
+    /// load balancer's forward entry has the identical shape — destination
+    /// rewrite, an address in the NAT target — but that address is a *backend*.
+    /// Attributing to it would credit the pool member with its clients' traffic.
+    #[test]
+    fn a_load_balanced_flow_is_attributed_to_its_client_not_the_backend() {
+        let client = [198, 51, 100, 4];
+        let backend = [10, 0, 0, 9];
+        let (key, mut state) = flow(client, [203, 0, 113, 10], 40000, ip_proto::TCP);
+        state = FlowState::forward(backend, 8443);
+        state.bytes = 500_000;
+
+        let ranked = top_talkers(&[(key, state)], 0);
+        assert_eq!(ranked[0].0, Ipv4Addr::from(client));
+    }
+
+    /// Rounding a real number down to "0" would make a live flow look idle.
+    #[test]
+    fn byte_counts_stay_readable_without_hiding_small_ones() {
+        assert_eq!(human_bytes(0), "0");
+        assert_eq!(human_bytes(900), "900");
+        assert_eq!(human_bytes(1024), "1.0K");
+        assert_eq!(human_bytes(1536), "1.5K");
+        assert_eq!(human_bytes(20 * 1024), "20K");
+        assert_eq!(human_bytes(5 * 1024 * 1024), "5.0M");
+        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0G");
     }
 
     /// Showing the first N rows of a bigger table without saying so would let an
@@ -201,6 +367,16 @@ mod tests {
         reverse_state.flags |= FlowState::REVERSE;
         let out = render_flows(&[(key, reverse_state)], 0);
         assert!(out.contains("src→203.0.113.1:443"), "{out}");
+    }
+
+    /// A flow row without its volume is a row an operator has to correlate by
+    /// hand against an interface counter.
+    #[test]
+    fn a_flow_row_carries_its_own_counters() {
+        let out = render_flows(&[busy([10, 0, 0, 1], [1, 1, 1, 1], 1000, 12, 3 * 1024)], 0);
+        assert!(out.contains("packets"), "no counter column: {out}");
+        assert!(out.contains("12"), "{out}");
+        assert!(out.contains("3.0K"), "{out}");
     }
 
     #[test]

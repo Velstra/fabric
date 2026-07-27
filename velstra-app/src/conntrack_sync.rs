@@ -30,9 +30,12 @@
 //!
 //! ```text
 //! header : "VCS1" (4) | count u16-le (2) | kind u16-le (2)      = 8 bytes
-//! kind 0 (CONNTRACK) record : FlowKey (20) | FlowState (16)     = 36 bytes
+//! kind 0 (CONNTRACK) record : FlowKey (20) | NAT state (16)     = 36 bytes
 //! kind 1 (FW_FLOWS)  record : FlowKey (20)                      = 20 bytes
 //! ```
+//!
+//! "NAT state" rather than "`FlowState`": the value also carries this node's
+//! traffic counters, which deliberately stay at home — see [`encode_val`].
 //!
 //! `kind == 0` is the original v1 CONNTRACK layout — the field was a reserved
 //! zero before, so CONNTRACK datagrams are byte-identical to the pre-`FW_FLOWS`
@@ -104,7 +107,15 @@ fn encode_key(k: &FlowKey, out: &mut Vec<u8>) {
     out.extend_from_slice(&[0u8; 3]); // pad
 }
 
-/// Encode one `CONNTRACK` value into 16 little-endian bytes.
+/// Encode a [`FlowState`] into 16 little-endian bytes — the NAT fields only.
+///
+/// The value's traffic counters are **not** sent, and the record stays at its
+/// original 16 bytes, so an appliance running this still interoperates with one
+/// that predates the counters. That is a consequence rather than the reason: a
+/// byte was carried by one node or the other, so replicating the number would
+/// make any sum over an HA pair count it twice, and a backup that has forwarded
+/// nothing has honestly forwarded nothing. What must survive a failover is the
+/// NAT state — that is what keeps connections alive — and it does.
 fn encode_val(v: &FlowState, out: &mut Vec<u8>) {
     out.extend_from_slice(&v.nat_ip);
     out.extend_from_slice(&v.nat2_ip);
@@ -135,6 +146,9 @@ fn decode_val(b: &[u8]) -> FlowState {
         nat2_port: u16::from_le_bytes([b[10], b[11]]),
         flags: u16::from_le_bytes([b[12], b[13]]),
         _pad: 0,
+        // Counters deliberately do not cross the wire; see `encode_val`.
+        packets: 0,
+        bytes: 0,
     }
 }
 
@@ -308,7 +322,18 @@ pub async fn run(
                     Some(Datagram::Conntrack(records)) => {
                         let mut applied = 0usize;
                         for (k, v) in &records {
-                            match conntrack.lock().await.insert(k, v, 0) {
+                            let mut map = conntrack.lock().await;
+                            // A peer's record carries no counters (see `encode_val`), so
+                            // applying it verbatim would zero this node's own accounting
+                            // for a flow it is actively forwarding. In an N-way mesh every
+                            // node pushes, so that would happen every interval — the
+                            // counters would never get past one tick's worth of traffic.
+                            let mut v = *v;
+                            if let Ok(local) = map.get(k, 0) {
+                                v.packets = local.packets;
+                                v.bytes = local.bytes;
+                            }
+                            match map.insert(k, v, 0) {
                                 Ok(()) => applied += 1,
                                 Err(e) => warn!("conntrack-sync: apply conntrack entry from {from} failed: {e}"),
                             }
@@ -370,6 +395,31 @@ mod tests {
         assert_eq!(dgs.len(), 1);
         assert_eq!(dgs[0].len(), HEADER_LEN + RECORD_LEN);
         assert_eq!(decode_datagram(&dgs[0]), Some(Datagram::Conntrack(entries)));
+    }
+
+    /// Counters are per node, so they must not cross: a byte was carried here or
+    /// on the peer, and a record that replicated the number would make any sum
+    /// over an HA pair count it twice. Keeping the record at 16 bytes also keeps
+    /// an un-upgraded peer interoperable, which is a welcome consequence.
+    #[test]
+    fn a_record_carries_the_nat_state_but_not_the_accounting() {
+        let (key, mut state) = sample_entry(3);
+        state.packets = 4242;
+        state.bytes = 9_000_000;
+
+        let dgs = encode_conntrack_batch(&[(key, state)]);
+        assert_eq!(dgs[0].len(), HEADER_LEN + RECORD_LEN, "the record grew");
+
+        let Some(Datagram::Conntrack(decoded)) = decode_datagram(&dgs[0]) else {
+            panic!("did not decode as a conntrack batch");
+        };
+        assert_eq!(
+            decoded[0].1.nat_ip, state.nat_ip,
+            "the NAT state must cross"
+        );
+        assert_eq!(decoded[0].1.nat_port, state.nat_port);
+        assert_eq!(decoded[0].1.packets, 0, "the counters must not cross");
+        assert_eq!(decoded[0].1.bytes, 0);
     }
 
     #[test]
