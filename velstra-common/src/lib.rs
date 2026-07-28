@@ -44,6 +44,7 @@ mod policy;
 mod ratelimit;
 mod reject;
 pub mod srv6;
+mod synproxy;
 
 pub use cgnat::CgnatLayout;
 pub use cidr::{Cidr4, Cidr6, CidrError, mask_v4, mask_v6, parse_cidr_v4, parse_cidr_v6};
@@ -85,4 +86,9 @@ pub use reject::{
 pub use srv6::{
     SRV6_L2_OUTER_LEN, Srv6Config, Srv6Encap, Srv6Endpoint, Srv6LocalSid, Srv6Sid, Srv6SidKey,
     build_service_sid, build_srv6_encap, decode_service_sid,
+};
+pub use synproxy::{
+    EPOCH_SHIFT, MSS_TABLE, SYNTH_WINDOW, SynFlow, SynProxyCfg, SynProxyKey, TcpSynth,
+    check_cookie, csum_replace_u32, epoch_of, make_cookie, mss_index, plan_server_ack,
+    plan_server_syn, plan_syn_ack, seq_delta, translate_to_client, translate_to_server,
 };

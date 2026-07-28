@@ -359,9 +359,12 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
                 reply_policy: s.reply_policy,
             })
             .collect(),
-        // Port-forwards are a file-config-only (appliance) feature; the gRPC
-        // NodeConfig has no equivalent message, so they convert to/from empty.
+        // Port-forwards and the SYN proxy are file-config-only (appliance)
+        // features; the gRPC NodeConfig has no equivalent message, so they
+        // convert to/from empty. Both protect a service the appliance publishes,
+        // which is a firewall concern rather than a fabric one.
         port_forwards: Vec::new(),
+        synproxy: Vec::new(),
         overlay: cfg.overlay.as_ref().map(|o| OverlayCfg {
             local_vtep: o.local_vtep.clone(),
             underlay_iface: o.underlay_iface.clone(),

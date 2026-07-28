@@ -142,7 +142,7 @@ fn rst_tcp_header(sport: u16, dport: u16, seq: u32, ack: u32, flags: u8) -> [u8;
 }
 
 /// TCP checksum over the IPv4 pseudo-header + a (checksum-zeroed) TCP segment.
-fn tcp_checksum(src: [u8; 4], dst: [u8; 4], segment: &[u8]) -> u16 {
+pub(crate) fn tcp_checksum(src: [u8; 4], dst: [u8; 4], segment: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     // Pseudo-header: src, dst, zero/proto, TCP length.
     for w in [
