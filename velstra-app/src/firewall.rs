@@ -29,14 +29,14 @@ use velstra_common::{
     GlobalConfig, IrbEndpoint, LocalMac, LocalMacKey, MAX_RULE_LIMITS, MacFdbKey, NdKey, Npt66,
     OverlayConfig, PolicyId, PortFwd, RateBucket, RouteEntry, ScopedAddr, ScopedAddr6,
     ScopedDstPortKey, ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue, Srv6Config,
-    Srv6Endpoint, Srv6LocalSid, Srv6SidKey, TunnelEndpoint, TunnelKey, parse_cidr_v4,
-    parse_cidr_v6, parse_mac, port_rule_value, port_rule_with_limit,
+    Srv6Endpoint, Srv6LocalSid, Srv6SidKey, SynProxyCfg, SynProxyKey, TunnelEndpoint, TunnelKey,
+    parse_cidr_v4, parse_cidr_v6, parse_mac, port_rule_value, port_rule_with_limit,
 };
 use velstra_config::{
     PolicyConfig, ResolvedFloodVtep, ResolvedInterface, ResolvedIrbRoute, ResolvedMacRoute,
     ResolvedNd6, ResolvedNeighbor, ResolvedNpt66, ResolvedOverlay, ResolvedPortForward,
     ResolvedRoute, ResolvedService, ResolvedSrv6, ResolvedSrv6LocalSid, ResolvedSrv6Route,
-    ResolvedTunnel, RuntimeConfig,
+    ResolvedSynProxy, ResolvedTunnel, RuntimeConfig,
 };
 
 /// How to attach the XDP program to the interface.
@@ -1052,6 +1052,7 @@ fn apply_config(ebpf: &mut Ebpf, cfg: &RuntimeConfig, old: Option<&RuntimeConfig
     program_routes(ebpf, &cfg.routes)?;
     program_services(ebpf, &cfg.services, &cfg.interfaces)?;
     program_port_forwards(ebpf, &cfg.port_forwards, &cfg.interfaces)?;
+    program_synproxy(ebpf, &cfg.synproxy)?;
     program_masquerade(ebpf, &cfg.interfaces)?;
     program_cgnat(ebpf, &cfg.interfaces)?;
     program_npt66(ebpf, &cfg.npt66)?;
@@ -1451,6 +1452,57 @@ fn program_port_forwards(
     for (key, value) in &prepared {
         map.insert(key, value, 0)
             .context("inserting port-forward")?;
+    }
+    Ok(())
+}
+
+/// Write the C15 `SYNPROXY` map and, the first time a proxy is configured, the
+/// key its cookies are minted with.
+///
+/// **The key is generated here, per boot, from the kernel's random source.** It
+/// is the whole basis of the defence: anyone who knows it can mint a cookie for
+/// a connection they cannot receive, and so walk straight past the proxy. It is
+/// therefore never derived from the config, never logged, and never the same
+/// twice — a fixed key in a shipped image would protect nothing at all.
+///
+/// Rotating it on every reconfigure would be worse than useless: every client
+/// mid-handshake would have its ACK rejected. So it is written once, when it is
+/// still zero.
+fn program_synproxy(ebpf: &mut Ebpf, ports: &[ResolvedSynProxy]) -> Result<()> {
+    if ports.is_empty() {
+        return Ok(());
+    }
+    {
+        let mut secret: Array<_, u64> = Array::try_from(
+            ebpf.map_mut("SYN_SECRET")
+                .ok_or_else(|| anyhow!("SYN_SECRET map missing"))?,
+        )?;
+        let installed = secret.get(&0, 0).unwrap_or(0) | secret.get(&1, 0).unwrap_or(0);
+        if installed == 0 {
+            // Straight from the kernel's pool. No crate for this: a sixteen-byte
+            // read is the whole requirement, and a dependency that could ever be
+            // swapped for something deterministic sits under the one secret the
+            // feature cannot afford to have guessed.
+            let mut bytes = [0u8; 16];
+            std::fs::File::open("/dev/urandom")
+                .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes))
+                .context("drawing a SYN-cookie key from /dev/urandom")?;
+            secret
+                .set(0, u64::from_ne_bytes(bytes[..8].try_into().unwrap()), 0)
+                .context("installing the SYN-cookie key")?;
+            secret
+                .set(1, u64::from_ne_bytes(bytes[8..].try_into().unwrap()), 0)
+                .context("installing the SYN-cookie key")?;
+        }
+    }
+
+    let mut map: HashMap<_, SynProxyKey, SynProxyCfg> = HashMap::try_from(
+        ebpf.map_mut("SYNPROXY")
+            .ok_or_else(|| anyhow!("SYNPROXY map missing"))?,
+    )?;
+    for port in ports {
+        map.insert(SynProxyKey::tcp(port.port), SynProxyCfg::new(port.mss), 0)
+            .context("inserting a synproxy port")?;
     }
     Ok(())
 }
@@ -2352,6 +2404,7 @@ fn is_drop_counter(counter: Counter) -> bool {
             | Counter::DroppedIcmp
             | Counter::DroppedRateLimit
             | Counter::DroppedSpoofed
+            | Counter::SynproxyRejected
             | Counter::ForwardTtlExceeded
             | Counter::EgressDropped
     )

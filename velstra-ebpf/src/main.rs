@@ -53,7 +53,9 @@ use aya_ebpf::{
         BPF_FIB_LKUP_RET_SUCCESS, TC_ACT_OK, TC_ACT_SHOT, bpf_adj_room_mode::BPF_ADJ_ROOM_MAC,
         bpf_fib_lookup, xdp_action,
     },
-    helpers::{bpf_fib_lookup as fib_lookup, bpf_ktime_get_ns, bpf_xdp_adjust_head},
+    helpers::{
+        bpf_fib_lookup as fib_lookup, bpf_ktime_get_ns, bpf_xdp_adjust_head, bpf_xdp_adjust_tail,
+    },
     macros::{classifier, map, xdp},
     maps::{Array, DevMap, HashMap, LpmTrie, LruHashMap, PerCpuArray, ProgramArray, lpm_trie::Key},
     programs::{TcContext, XdpContext},
@@ -71,12 +73,14 @@ use velstra_common::{
     MAX_RULE_LIMITS, MacFdbKey, ND_NA_MSG_LEN, Nat, NdKey, Npt66, OVERLAY_OUTER_LEN, OverlayConfig,
     PacketMeta, PolicyId, PortFwd, RateBucket, Rewrite, RouteEntry, SRV6_L2_OUTER_LEN, ScopedAddr,
     ScopedAddr6, ScopedDstPortKey, ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue,
-    SourceValidation, Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, TunnelEndpoint,
-    TunnelKey, build_encap, build_srv6_encap, decide, decode_vni, icmp, icmp_checksum, ip_proto,
-    ipv6_ext_len, is_ipv6_ext, is_overlay_dport, lpm_key_addr, plan_arp_reply, plan_forward,
-    plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_tcp_rst, port_rule_action,
-    port_rule_limit, port_rule_logs, port_rule_present, port_rule_winner, select_backend,
-    session_hash, tcp_flags,
+    SourceValidation, Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, SynFlow, SynProxyCfg,
+    SynProxyKey, TcpSynth, TunnelEndpoint, TunnelKey, build_encap, build_srv6_encap, check_cookie,
+    csum_replace_u32, decide, decode_vni, epoch_of, icmp, icmp_checksum, ip_proto, ipv6_ext_len,
+    is_ipv6_ext, is_overlay_dport, lpm_key_addr, make_cookie, plan_arp_reply, plan_forward,
+    plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_server_ack, plan_server_syn,
+    plan_syn_ack, plan_tcp_rst, port_rule_action, port_rule_limit, port_rule_logs,
+    port_rule_present, port_rule_winner, select_backend, session_hash, tcp_flags,
+    translate_to_client, translate_to_server,
 };
 
 /// Maps an ingress interface index to its policy id, so one XDP program can
@@ -228,6 +232,58 @@ static CONNTRACK: LruHashMap<FlowKey, FlowState> = LruHashMap::with_max_entries(
 /// firewall/router config); the reply path in [`try_load_balance`] falls back to
 /// it after the policy-scoped miss. LB tenant isolation is untouched.
 const ROUTER_NAT_POLICY: PolicyId = 0;
+
+/// C15 **SYN proxy**: the TCP ports a proxy stands in front of, and what it
+/// offers. Small on purpose — this names services, not connections.
+#[map]
+static SYNPROXY: HashMap<SynProxyKey, SynProxyCfg> = HashMap::with_max_entries(256, 0);
+
+/// Per-connection SYN-proxy state, created only once a client has proved itself.
+/// An LRU, so a client that vanishes between its ACK and the server's answer
+/// costs a slot that is reclaimed rather than leaked.
+#[map]
+static SYN_FLOWS: LruHashMap<FlowKey, SynFlow> = LruHashMap::with_max_entries(65536, 0);
+
+/// The key the SYN cookies are minted with, installed by user space at load.
+///
+/// A per-boot random value, and it must be: an attacker who knew it could mint
+/// cookies for connections they cannot receive, which is precisely the property
+/// the proxy rests on. Zero means "no key installed" and the proxy stays out of
+/// the way rather than issuing forgeable cookies.
+#[map]
+static SYN_SECRET: Array<u64> = Array::with_max_entries(2, 0);
+
+/// Read the cookie key, or `None` when user space has not installed one.
+#[inline(always)]
+fn syn_secret() -> Option<[u64; 2]> {
+    let lo = *SYN_SECRET.get(0)?;
+    let hi = *SYN_SECRET.get(1)?;
+    if lo == 0 && hi == 0 {
+        return None;
+    }
+    Some([lo, hi])
+}
+
+/// The key a proxied connection's state lives under.
+///
+/// Deliberately **not** the full 5-tuple: the server's address is zeroed, so the
+/// key is identical on both sides of a destination NAT. A port-forward that
+/// rewrites the address is therefore transparent here, and the same lookup
+/// serves the client's packets (where the protected port is the destination) and
+/// the server's (where it is the source). The namespace is the policy-independent
+/// one for the same reason conntrack's router-NAT entries are — the two
+/// directions arrive through different zones.
+#[inline(always)]
+fn syn_flow_key(client: [u8; 4], client_port: u16, service_port: u16) -> FlowKey {
+    FlowKey::new(
+        ROUTER_NAT_POLICY,
+        client,
+        [0; 4],
+        client_port,
+        service_port,
+        ip_proto::TCP,
+    )
+}
 
 /// Look a flow up in `CONNTRACK` and, on a hit, **account this packet to it**.
 ///
@@ -1540,6 +1596,16 @@ fn try_velstra_forward(ctx: &XdpContext) -> Result<u32, ()> {
     let ihl_bytes = s.ihl_bytes as usize;
     let ocfg = overlay_config();
     let log = s.log != 0;
+
+    // C15: SYN proxy. Runs before every transform below, because the client's
+    // handshake is answered here without the server ever hearing about it, and
+    // because the ACK that admits a connection leaves as a SYN which the
+    // port-forward and routing phases below then treat as any other new flow.
+    if let Some(action) = try_synproxy(
+        ctx, ihl_bytes, s.src_addr, s.dst_addr, s.src_port, s.dst_port, s.proto,
+    )? {
+        return Ok(action);
+    }
 
     // Phase 4 (B9): SRv6 overlay encapsulation. When the host runs the SRv6 wire
     // format, a tenant frame whose inner destination MAC resolves to a remote
@@ -2939,6 +3005,312 @@ fn try_port_forward(
     }
     bump(Counter::LoadBalanced);
     Ok(Some(xdp_action::XDP_PASS))
+}
+
+/// Offset of the first TCP option byte, valid only for a 20-byte TCP header.
+const O_TCP_OPT: usize = O_TCP_URG + 2; // 54
+
+/// The MSS a client advertised, read at a **fixed** offset.
+///
+/// A SYN's options are a variable-length list, and walking one means a loop the
+/// verifier has to bound and a chain of data-dependent offsets — the pattern
+/// this program deliberately avoids everywhere else. It is also unnecessary:
+/// every mainstream stack puts the MSS option first, immediately after the
+/// twenty fixed bytes, because it is the option that must not be missed. So the
+/// probe looks exactly there and nowhere else.
+///
+/// A SYN that puts something else first simply reads as "no MSS advertised" and
+/// gets the conservative default. That is a throughput choice for an unusual
+/// client, never a correctness one — which is what makes the shortcut safe.
+#[inline(always)]
+fn client_mss(ctx: &XdpContext) -> Option<u16> {
+    let data_off = unsafe { *ptr_at::<u8>(ctx, O_TCP_OFF).ok()? };
+    if (data_off >> 4) < 6 {
+        return None;
+    }
+    let opt = unsafe { *ptr_at::<[u8; 4]>(ctx, O_TCP_OPT).ok()? };
+    // Kind 2 (maximum segment size), length 4.
+    if opt[0] != 2 || opt[1] != 4 {
+        return None;
+    }
+    Some(u16::from_be_bytes([opt[2], opt[3]]))
+}
+
+/// Write a synthesised TCP segment over the packet in hand.
+///
+/// The addresses and ports are the ones to *write*, so the caller decides
+/// whether the segment faces back the way the packet came or continues onward.
+/// `reflect` additionally swaps the Ethernet addresses, which is what makes an
+/// `XDP_TX` land back at the sender.
+///
+/// The frame is never shortened: the IP total length is set to the synthesised
+/// segment's, and any trailing bytes of a longer original are ignored by the
+/// receiver — the same trick [`reject_packet`] uses. It *is* grown when a
+/// four-byte MSS option will not fit, which is the ordinary case for a bare ACK.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn write_synth(
+    ctx: &XdpContext,
+    plan: TcpSynth,
+    new_src: [u8; 4],
+    new_dst: [u8; 4],
+    new_sport: u16,
+    new_dport: u16,
+    reflect: bool,
+) -> Result<(), ()> {
+    let want_mss = plan.mss.is_some();
+    // A bare ACK is 54 bytes and an MSS option needs four more. Growing the tail
+    // invalidates every packet pointer, so it happens before anything is read.
+    if want_mss && ctx.data() + O_TCP_OPT + 4 > ctx.data_end() {
+        let grow = (O_TCP_OPT + 4).saturating_sub(ctx.data_end() - ctx.data()) as i32;
+        if unsafe { bpf_xdp_adjust_tail(ctx.ctx, grow) } != 0 {
+            return Err(());
+        }
+    }
+
+    let (eth_dst, eth_src) = if reflect {
+        (unsafe { *ptr_at::<[u8; 6]>(ctx, O_ETH_DST)? }, unsafe {
+            *ptr_at::<[u8; 6]>(ctx, O_ETH_SRC)?
+        })
+    } else {
+        ([0u8; 6], [0u8; 6])
+    };
+
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    if data + O_TCP_OPT + 4 > data_end {
+        return Err(());
+    }
+    // SAFETY: the check above proves every byte through the first option word is
+    // in bounds; all writes below are at constant offsets from one pointer.
+    unsafe {
+        if reflect {
+            *((data + O_ETH_DST) as *mut [u8; 6]) = eth_src;
+            *((data + O_ETH_SRC) as *mut [u8; 6]) = eth_dst;
+        }
+        *((data + O_IP_SRC) as *mut [u8; 4]) = new_src;
+        *((data + O_IP_DST) as *mut [u8; 4]) = new_dst;
+        *((data + O_IP_TOTLEN) as *mut [u8; 2]) = plan.total_len.to_be_bytes();
+        *((data + O_IP_ID) as *mut [u8; 2]) = [0, 0];
+        *((data + O_IP_FRAG) as *mut [u8; 2]) = [0, 0];
+        *((data + O_IP_TTL) as *mut u8) = 64;
+        *((data + O_IP_PROTO) as *mut u8) = ip_proto::TCP;
+        *((data + O_IP_CSUM) as *mut [u8; 2]) = plan.ip_checksum.to_be_bytes();
+        *((data + O_L4_SPORT) as *mut [u8; 2]) = new_sport.to_be_bytes();
+        *((data + O_L4_DPORT) as *mut [u8; 2]) = new_dport.to_be_bytes();
+        *((data + O_TCP_SEQ) as *mut [u8; 4]) = plan.seq.to_be_bytes();
+        *((data + O_TCP_ACK) as *mut [u8; 4]) = plan.ack.to_be_bytes();
+        *((data + O_TCP_OFF) as *mut u8) = plan.data_offset << 4;
+        *((data + O_TCP_FLAGS) as *mut u8) = plan.flags;
+        *((data + O_TCP_WIN) as *mut [u8; 2]) = plan.window.to_be_bytes();
+        *((data + O_TCP_CSUM) as *mut [u8; 2]) = plan.tcp_checksum.to_be_bytes();
+        *((data + O_TCP_URG) as *mut [u8; 2]) = [0, 0];
+        // The option area is written whether or not it is used: leaving a
+        // stale four bytes there would be read as an option by the receiver
+        // when `data_offset` says six, and as padding when it says five.
+        let opt: [u8; 4] = match plan.mss {
+            Some(m) => [2, 4, (m >> 8) as u8, m as u8],
+            None => [0; 4],
+        };
+        *((data + O_TCP_OPT) as *mut [u8; 4]) = opt;
+    }
+    Ok(())
+}
+
+/// Rewrite a 32-bit TCP header field (sequence or acknowledgement) and repair
+/// the segment's checksum, both at constant offsets.
+#[inline(always)]
+fn write_tcp_u32(ctx: &XdpContext, offset: usize, old: u32, new: u32) -> Result<(), ()> {
+    if old == new {
+        return Ok(());
+    }
+    let check = u16::from_be_bytes(unsafe { *ptr_at::<[u8; 2]>(ctx, O_TCP_CSUM)? });
+    let repaired = csum_replace_u32(check, old, new);
+    let data = ctx.data();
+    if data + O_TCP_URG + 2 > ctx.data_end() {
+        return Err(());
+    }
+    // SAFETY: bounds proved above; both offsets are constants inside the header.
+    unsafe {
+        *((data + offset) as *mut [u8; 4]) = new.to_be_bytes();
+        *((data + O_TCP_CSUM) as *mut [u8; 2]) = repaired.to_be_bytes();
+    }
+    Ok(())
+}
+
+/// C15 **SYN proxy**. Returns `Ok(Some(action))` when the segment was handled
+/// here, or `Ok(None)` to continue through the ordinary forwarding path — the
+/// latter possibly after having rewritten the segment.
+///
+/// Both directions of a proxied connection pass through here, distinguished by
+/// which end of the packet carries the protected port. Everything else is
+/// untouched: a port with no proxy configured costs one failed hash lookup.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn try_synproxy(
+    ctx: &XdpContext,
+    ihl_bytes: usize,
+    src_addr: [u8; 4],
+    dst_addr: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    proto: u8,
+) -> Result<Option<u32>, ()> {
+    // Only TCP over a plain 20-byte IPv4 header: every offset below is a
+    // compile-time constant, which is what the verifier accepts.
+    if proto != ip_proto::TCP || ihl_bytes != Ipv4Hdr::LEN {
+        return Ok(None);
+    }
+    let Some(secret) = syn_secret() else {
+        return Ok(None);
+    };
+
+    // The two directions are resolved one after the other, never together, and
+    // each result is copied out of the map before the next lookup happens. Two
+    // live lookups of the *same* map across a merge point is precisely what LLVM
+    // folds into a bitwise-OR on a map-value pointer — which the verifier
+    // rejects outright (`R7 pointer |= pointer prohibited`). The same trap is
+    // documented on `port_forward_exists`, and the same discipline answers it.
+    if let Some(cfg) = synproxy_cfg(dst_port) {
+        let flags = unsafe { *ptr_at::<u8>(ctx, O_TCP_FLAGS)? };
+        let seq = u32::from_be_bytes(unsafe { *ptr_at::<[u8; 4]>(ctx, O_TCP_SEQ)? });
+        let ack = u32::from_be_bytes(unsafe { *ptr_at::<[u8; 4]>(ctx, O_TCP_ACK)? });
+        return synproxy_client(
+            ctx, secret, cfg, src_addr, dst_addr, src_port, dst_port, flags, seq, ack,
+        );
+    }
+    if !synproxy_protects(src_port) {
+        return Ok(None);
+    }
+    let flags = unsafe { *ptr_at::<u8>(ctx, O_TCP_FLAGS)? };
+    let seq = u32::from_be_bytes(unsafe { *ptr_at::<[u8; 4]>(ctx, O_TCP_SEQ)? });
+    synproxy_server(ctx, src_addr, dst_addr, src_port, dst_port, flags, seq)
+}
+
+/// The proxy configured for a port, copied out of the map immediately.
+#[inline(always)]
+fn synproxy_cfg(port: u16) -> Option<SynProxyCfg> {
+    unsafe { SYNPROXY.get(&SynProxyKey::tcp(port)) }.copied()
+}
+
+/// Whether a port is proxied at all — a plain bool from the lookup
+/// discriminant, so no map-value pointer outlives the call. See the note in
+/// [`try_synproxy`] for why that matters.
+#[inline(always)]
+fn synproxy_protects(port: u16) -> bool {
+    unsafe { SYNPROXY.get(&SynProxyKey::tcp(port)) }.is_some()
+}
+
+/// The client-facing half: answer a SYN with a cookie, admit an ACK that
+/// returns a valid one, and translate the acknowledgements of an admitted
+/// connection into the server's sequence space.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn synproxy_client(
+    ctx: &XdpContext,
+    secret: [u64; 2],
+    cfg: SynProxyCfg,
+    src_addr: [u8; 4],
+    dst_addr: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    flags: u8,
+    seq: u32,
+    ack: u32,
+) -> Result<Option<u32>, ()> {
+    let epoch = epoch_of(unsafe { bpf_ktime_get_ns() });
+
+    // A bare SYN is answered, never forwarded, and costs no state at all. This
+    // is the entire defence: a flood of these buys the attacker one reply each.
+    if flags & tcp_flags::SYN != 0 && flags & tcp_flags::ACK == 0 {
+        let advertised = client_mss(ctx).unwrap_or(cfg.mss);
+        let cookie = make_cookie(
+            secret, src_addr, dst_addr, src_port, dst_port, epoch, advertised,
+        );
+        let plan = plan_syn_ack(src_addr, dst_addr, src_port, dst_port, seq, cookie, cfg.mss);
+        write_synth(ctx, plan, dst_addr, src_addr, dst_port, src_port, true)?;
+        bump(Counter::SynproxyChallenged);
+        return Ok(Some(xdp_action::XDP_TX));
+    }
+
+    let key = syn_flow_key(src_addr, src_port, dst_port);
+    if let Some(flow) = unsafe { SYN_FLOWS.get(&key) }.copied() {
+        if !flow.is_spliced() {
+            // The server has not answered yet, so there is no sequence space to
+            // translate into. Dropping is right: TCP retransmits, and by then
+            // the splice is done. Forwarding untranslated would corrupt it.
+            return Ok(Some(xdp_action::XDP_DROP));
+        }
+        let translated = translate_to_server(ack, flow.delta);
+        write_tcp_u32(ctx, O_TCP_ACK, ack, translated)?;
+        return Ok(None);
+    }
+
+    // No state: this must be the ACK that completes the handshake we faked.
+    if flags & tcp_flags::ACK == 0 || flags & tcp_flags::SYN != 0 {
+        bump(Counter::SynproxyRejected);
+        return Ok(Some(xdp_action::XDP_DROP));
+    }
+    let cookie = ack.wrapping_sub(1);
+    let Some(mss) = check_cookie(
+        secret, src_addr, dst_addr, src_port, dst_port, epoch, cookie,
+    ) else {
+        bump(Counter::SynproxyRejected);
+        return Ok(Some(xdp_action::XDP_DROP));
+    };
+
+    // The client is real. Open the connection to the server by turning this very
+    // ACK into the SYN it stands for — carrying the client's own initial
+    // sequence number, so only the server's direction ever needs translating.
+    let client_isn = seq.wrapping_sub(1);
+    let _ = SYN_FLOWS.insert(&key, &SynFlow::pending(cookie, client_isn), 0);
+    let plan = plan_server_syn(src_addr, dst_addr, src_port, dst_port, client_isn, mss);
+    write_synth(ctx, plan, src_addr, dst_addr, src_port, dst_port, false)?;
+    bump(Counter::SynproxyAdmitted);
+    // Fall through: the ordinary path forwards this SYN, applying whatever
+    // destination NAT and routing the configuration calls for.
+    Ok(None)
+}
+
+/// The server-facing half: complete the handshake the server thinks it is
+/// having, and translate its sequence numbers back into the space the client
+/// was promised.
+#[inline(always)]
+fn synproxy_server(
+    ctx: &XdpContext,
+    src_addr: [u8; 4],
+    dst_addr: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    flags: u8,
+    seq: u32,
+) -> Result<Option<u32>, ()> {
+    // Here the client is the packet's *destination*.
+    let key = syn_flow_key(dst_addr, dst_port, src_port);
+    let Some(mut flow) = unsafe { SYN_FLOWS.get(&key) }.copied() else {
+        return Ok(None);
+    };
+
+    if flags & tcp_flags::SYN != 0 && flags & tcp_flags::ACK != 0 {
+        // The server chose its own initial sequence number; record how far it
+        // sits from the cookie the client was given, and finish the handshake
+        // on the client's behalf. The SYN-ACK itself goes no further — the
+        // client was answered long ago.
+        if !flow.is_spliced() {
+            flow.splice(seq);
+            let _ = SYN_FLOWS.insert(&key, &flow, 0);
+            bump(Counter::SynproxySpliced);
+        }
+        let plan = plan_server_ack(src_addr, dst_addr, src_port, dst_port, seq, flow.client_isn);
+        write_synth(ctx, plan, dst_addr, src_addr, dst_port, src_port, true)?;
+        return Ok(Some(xdp_action::XDP_TX));
+    }
+
+    if flow.is_spliced() {
+        let translated = translate_to_client(seq, flow.delta);
+        write_tcp_u32(ctx, O_TCP_SEQ, seq, translated)?;
+    }
+    Ok(None)
 }
 
 /// Phase 3 **reject**: actively refuse a packet. For a TCP segment, rewrite the

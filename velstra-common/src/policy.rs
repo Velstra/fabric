@@ -293,11 +293,31 @@ pub enum Counter {
     /// on an internal one is usually asymmetric routing meeting strict mode, and
     /// the answer there is loose.
     DroppedSpoofed = 35,
+
+    /// A SYN answered with a cookie instead of being forwarded (C15 SYN proxy).
+    ///
+    /// This is the cost of a flood: one reply packet and no state. A high rate
+    /// here with a low [`Counter::SynproxyAdmitted`] beside it *is* the attack
+    /// being absorbed — the two read together, never alone.
+    SynproxyChallenged = 36,
+
+    /// A client returned a valid cookie, so the connection was opened to the
+    /// real server. The only path on which the proxy allocates memory.
+    SynproxyAdmitted = 37,
+
+    /// An ACK carrying no cookie this appliance minted for that connection.
+    /// Ordinary during a spoofed-ACK flood; also what a cookie that expired
+    /// between the SYN and the ACK looks like.
+    SynproxyRejected = 38,
+
+    /// A protected server answered, and its sequence space was joined to the
+    /// one the client was given. One per proxied connection.
+    SynproxySpliced = 39,
 }
 
 impl Counter {
     /// Number of distinct counters — the `max_entries` of the `STATS` map.
-    pub const COUNT: u32 = 36;
+    pub const COUNT: u32 = 40;
 
     /// The array index of this counter.
     #[inline]
@@ -345,6 +365,10 @@ impl Counter {
             33 => Counter::IrbRouted,
             34 => Counter::DroppedRateLimit,
             35 => Counter::DroppedSpoofed,
+            36 => Counter::SynproxyChallenged,
+            37 => Counter::SynproxyAdmitted,
+            38 => Counter::SynproxyRejected,
+            39 => Counter::SynproxySpliced,
             _ => return None,
         };
         Some(counter)
@@ -397,6 +421,10 @@ impl Counter {
             Counter::IrbRouted => "irb_routed",
             Counter::DroppedRateLimit => "dropped_rate_limit",
             Counter::DroppedSpoofed => "dropped_spoofed",
+            Counter::SynproxyChallenged => "synproxy_challenged",
+            Counter::SynproxyAdmitted => "synproxy_admitted",
+            Counter::SynproxyRejected => "synproxy_rejected",
+            Counter::SynproxySpliced => "synproxy_spliced",
         }
     }
 }

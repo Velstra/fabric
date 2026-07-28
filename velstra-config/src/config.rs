@@ -601,6 +601,9 @@ pub struct FileConfig {
     /// Phase 4 1:1 DNAT port-forwards. Spelled `[[port_forward]]` in TOML.
     #[serde(default, rename = "port_forward")]
     pub port_forwards: Vec<PortForwardCfg>,
+    /// C15 SYN-proxy: the TCP ports a proxy stands in front of.
+    #[serde(default, rename = "synproxy")]
+    pub synproxy: Vec<SynProxyPortCfg>,
     /// Phase 4 overlay endpoint for this host. Spelled `[overlay]` in TOML.
     #[serde(default)]
     pub overlay: Option<OverlayCfg>,
@@ -732,6 +735,39 @@ pub struct ResolvedRoute {
     pub dst_mac: [u8; 6],
     /// [`RouteEntry`] flag bits (e.g. decrement TTL).
     pub flags: u16,
+}
+
+/// A TCP port a SYN proxy stands in front of (TOML `[[synproxy]]`).
+///
+/// Named by port rather than by zone: what is protected is a *service*, and a
+/// service answers on its port whichever zone a client reaches it from. Scoping
+/// this by zone would mean a flood arriving on a zone nobody listed reaches the
+/// server — the failure the feature exists to prevent, reintroduced as a
+/// configuration mistake.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SynProxyPortCfg {
+    /// TCP port to protect. The proxy answers every SYN to it.
+    pub port: u16,
+    /// MSS the synthesised SYN-ACK advertises to clients. Defaults to the
+    /// largest value an untunnelled Ethernet path carries.
+    #[serde(default = "default_synproxy_mss")]
+    pub mss: u16,
+}
+
+/// The MSS a proxy advertises when the config does not say: a 1500-byte
+/// Ethernet MTU less the IPv4 and TCP headers.
+fn default_synproxy_mss() -> u16 {
+    1460
+}
+
+/// A resolved SYN-proxy port, ready for the `SYNPROXY` map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedSynProxy {
+    /// Protected TCP port.
+    pub port: u16,
+    /// MSS advertised to clients.
+    pub mss: u16,
 }
 
 /// A 1:1 inbound DNAT port-forward (TOML `[[port_forward]]`): rewrite a
@@ -1028,6 +1064,8 @@ pub struct RuntimeConfig {
     pub services: Vec<ResolvedService>,
     /// 1:1 DNAT port-forwards for the `PORT_FORWARDS` map (Phase 4).
     pub port_forwards: Vec<ResolvedPortForward>,
+    /// C15 SYN-proxy ports.
+    pub synproxy: Vec<ResolvedSynProxy>,
     /// This host's overlay endpoint (Phase 4), or `None` if not participating.
     pub overlay: Option<ResolvedOverlay>,
     /// Overlay forwarding entries for the `OVERLAY_FDB` map (Phase 4).
@@ -1078,6 +1116,7 @@ impl RuntimeConfig {
             routes: Vec::new(),
             services: Vec::new(),
             port_forwards: Vec::new(),
+            synproxy: Vec::new(),
             overlay: None,
             tunnels: Vec::new(),
             mac_routes: Vec::new(),
@@ -1376,6 +1415,36 @@ impl FileConfig {
         }
 
         // Phase 4: 1:1 DNAT port-forwards.
+        // C15 SYN proxy. Refused rather than clamped on a bad MSS: a proxy that
+        // silently advertises something other than what was written would be
+        // discovered as a throughput mystery months later. 536 is the IPv4
+        // minimum every implementation must accept; 1460 the untunnelled
+        // Ethernet maximum, and offering more than the path carries is the one
+        // direction that breaks.
+        let mut synproxy = Vec::with_capacity(self.synproxy.len());
+        for sp in &self.synproxy {
+            if sp.port == 0 {
+                bail!("synproxy port must not be 0");
+            }
+            if sp.mss < 536 || sp.mss > 1460 {
+                bail!(
+                    "synproxy port {} mss {} is outside 536..=1460",
+                    sp.port,
+                    sp.mss
+                );
+            }
+            if synproxy
+                .iter()
+                .any(|s: &ResolvedSynProxy| s.port == sp.port)
+            {
+                bail!("synproxy port {} is configured twice", sp.port);
+            }
+            synproxy.push(ResolvedSynProxy {
+                port: sp.port,
+                mss: sp.mss,
+            });
+        }
+
         let mut port_forwards = Vec::with_capacity(self.port_forwards.len());
         for pf in &self.port_forwards {
             let proto = match pf.proto {
@@ -1723,6 +1792,7 @@ impl FileConfig {
             routes,
             services,
             port_forwards,
+            synproxy,
             overlay,
             tunnels,
             mac_routes,
