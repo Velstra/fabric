@@ -1422,6 +1422,9 @@ impl Topology {
                 source_validation: SourceValidationName::Disable,
                 blocklist: Vec::new(),
                 port_rules: Vec::new(),
+                // A captive portal is an appliance feature (C20). A fabric
+                // tenant network has no guests to hold at a gate.
+                portal: None,
             });
         }
 
@@ -1452,6 +1455,7 @@ impl Topology {
                     source_validation: SourceValidationName::Disable,
                     blocklist: sg.blocklist.clone(),
                     port_rules: sg.rules.clone(),
+                    portal: None,
                 });
             }
         }

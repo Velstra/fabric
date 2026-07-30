@@ -71,11 +71,12 @@ use velstra_common::{
     GlobalConfig, ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, ICMPV6_NEIGHBOR_SOLICIT,
     IrbEndpoint, IrbRewrite, LocalMac, LocalMacKey, MAX_BLOCKLIST, MAX_FLOOD_VTEPS,
     MAX_RULE_LIMITS, MacFdbKey, ND_NA_MSG_LEN, Nat, NdKey, Npt66, OVERLAY_OUTER_LEN, OverlayConfig,
-    PacketMeta, PolicyId, PortFwd, RateBucket, Rewrite, RouteEntry, SRV6_L2_OUTER_LEN, ScopedAddr,
-    ScopedAddr6, ScopedDstPortKey, ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue,
-    SourceValidation, Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, SynFlow, SynProxyCfg,
-    SynProxyKey, TcpSynth, TunnelEndpoint, TunnelKey, build_encap, build_srv6_encap, check_cookie,
-    csum_replace_u32, decide, decode_vni, epoch_of, icmp, icmp_checksum, ip_proto, ipv6_ext_len,
+    PacketMeta, PolicyId, PortFwd, PortalClientKey, PortalGate, PortalSeenKey, RateBucket, Rewrite,
+    RouteEntry, SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6, ScopedDstPortKey, ScopedPortKey,
+    ScopedSrcPortKey, ServiceKey, ServiceValue, SourceValidation, Srv6Config, Srv6Endpoint,
+    Srv6LocalSid, Srv6SidKey, SynFlow, SynProxyCfg, SynProxyKey, TcpSynth, TunnelEndpoint,
+    TunnelKey, build_encap, build_srv6_encap, check_cookie, csum_replace_u32, decide, decode_vni,
+    epoch_of, gate_admits_unauthenticated, icmp, icmp_checksum, ip_proto, ipv6_ext_len,
     is_ipv6_ext, is_overlay_dport, lpm_key_addr, make_cookie, plan_arp_reply, plan_forward,
     plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_server_ack, plan_server_syn,
     plan_syn_ack, plan_tcp_rst, port_rule_action, port_rule_limit, port_rule_logs,
@@ -313,6 +314,112 @@ fn account_flow(key: &FlowKey, bytes: u64) -> Option<FlowState> {
 /// map, populated and read entirely by the data plane.
 #[map]
 static FW_FLOWS: LruHashMap<FlowKey, u8> = LruHashMap::with_max_entries(65536, 0);
+
+/// C20 captive portal: which policies are gated, and the appliance's own address
+/// in each. Written when the configuration is applied. An entry only *matters*
+/// for a policy whose [`ConfigFlags::PORTAL`] bit is set — the flag is what keeps
+/// every ungated policy from paying for this lookup.
+#[map]
+static PORTAL_GATES: HashMap<PolicyId, PortalGate> = HashMap::with_max_entries(64, 0);
+
+/// C20 captive portal: the devices currently admitted, keyed by
+/// `(policy, MAC)`.
+///
+/// This is the one map in the data plane written by an *event* rather than by a
+/// configuration — a person logging in — and it is deliberately a plain
+/// `HashMap` rather than an LRU: an admitted session must end because its
+/// deadline passed and the agent removed it, never because the table filled up
+/// and evicted somebody mid-download. A full table refuses new logins, which is
+/// visible and correct, instead of ending old ones invisibly.
+#[map]
+static PORTAL_CLIENTS: HashMap<PortalClientKey, u8> = HashMap::with_max_entries(4096, 0);
+
+/// C20: which MAC an address was last seen with, on traffic addressed to the
+/// portal.
+///
+/// The portal server knows its visitor by address; the gate is keyed by MAC.
+/// This is where the two are joined, by the only party that sees both — see
+/// `velstra_common::portal::PortalSeenKey` for why not the kernel's neighbour
+/// table. An LRU, because it is a cache of something re-learned by the next
+/// packet: losing an entry costs one retry of a login, never a session.
+#[map]
+static PORTAL_SEEN: LruHashMap<PortalSeenKey, [u8; 6]> = LruHashMap::with_max_entries(4096, 0);
+
+/// Record the source MAC of a frame addressed to the portal.
+///
+/// Only ever called on the portal-bound path, which is DNS and a login page —
+/// nothing that runs at line rate.
+fn portal_learn(ctx: &XdpContext, key: &PortalSeenKey) {
+    if let Ok(mac) = unsafe { ptr_at::<[u8; 6]>(ctx, O_ETH_SRC) } {
+        let _ = PORTAL_SEEN.insert(key, unsafe { &*mac }, 0);
+    }
+}
+
+/// Whether the device that sent this frame has been admitted to `policy_id`.
+///
+/// Split out of [`portal_admits`] so the source-MAC read and the map lookup
+/// happen with one live map value and no packet pointer surviving the merge —
+/// the shape that has repeatedly compiled, where carrying an `Option` out of a
+/// lookup has repeatedly not.
+fn portal_client_admitted(ctx: &XdpContext, policy_id: PolicyId) -> bool {
+    let Ok(mac) = (unsafe { ptr_at::<[u8; 6]>(ctx, O_ETH_SRC) }) else {
+        return false;
+    };
+    let key = PortalClientKey::new(policy_id, unsafe { *mac });
+    unsafe { PORTAL_CLIENTS.get(&key) }.is_some()
+}
+
+/// The C20 gate for an IPv4 packet: may this sender talk *past* the appliance?
+///
+/// A policy whose portal bit is set but which has no gate entry admits
+/// everything. The two are written together by one apply, so this only describes
+/// the instant between them — and failing *open* there is the right way round: a
+/// gate that has not been configured yet must not black-hole a zone.
+fn portal_admits(ctx: &XdpContext, policy_id: PolicyId, meta: &PacketMeta) -> bool {
+    let Some(gate) = (unsafe { PORTAL_GATES.get(&policy_id) }).copied() else {
+        return true;
+    };
+    let to_portal = gate.is_portal4(meta.dst_addr);
+    if to_portal {
+        // The login is about to arrive over this very connection; remember which
+        // device it came from while both halves are in front of us.
+        portal_learn(ctx, &PortalSeenKey::v4(policy_id, meta.src_addr));
+    }
+    if gate_admits_unauthenticated(to_portal, meta.proto, meta.src_port, meta.dst_port, false) {
+        return true;
+    }
+    portal_client_admitted(ctx, policy_id)
+}
+
+/// The C20 gate for an IPv6 packet. Same allow-set, same session — a device
+/// admitted over IPv4 is admitted here by the very same `(policy, MAC)` entry,
+/// which is the reason the key is a MAC (see `velstra_common::portal`).
+fn portal_admits_v6(
+    ctx: &XdpContext,
+    policy_id: PolicyId,
+    hdr: &[u8; Ipv6Hdr::LEN],
+    meta: &PacketMeta,
+) -> bool {
+    let Some(gate) = (unsafe { PORTAL_GATES.get(&policy_id) }).copied() else {
+        return true;
+    };
+    let dst: [u8; 16] = [
+        hdr[24], hdr[25], hdr[26], hdr[27], hdr[28], hdr[29], hdr[30], hdr[31], hdr[32], hdr[33],
+        hdr[34], hdr[35], hdr[36], hdr[37], hdr[38], hdr[39],
+    ];
+    let to_portal = gate.is_portal6(dst);
+    if to_portal {
+        let src: [u8; 16] = [
+            hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15], hdr[16], hdr[17],
+            hdr[18], hdr[19], hdr[20], hdr[21], hdr[22], hdr[23],
+        ];
+        portal_learn(ctx, &PortalSeenKey::v6(policy_id, src));
+    }
+    if gate_admits_unauthenticated(to_portal, meta.proto, meta.src_port, meta.dst_port, true) {
+        return true;
+    }
+    portal_client_admitted(ctx, policy_id)
+}
 
 /// Phase 4 overlay endpoint for this host — a single-entry array holding the
 /// [`OverlayConfig`]. Absent/disabled by default, so encap/decap never trigger
@@ -1339,6 +1446,28 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_DROP);
     }
 
+    // --- C20: the captive portal gate ---------------------------------------
+    // Ahead of the rules, because on a gated zone the question "has this device
+    // logged in" precedes every question the rules ask, and behind source
+    // validation, because a packet whose source cannot be the sender is not
+    // worth asking about at all.
+    if cfg.has_flag(ConfigFlags::PORTAL) && !portal_admits(ctx, policy_id, &meta) {
+        bump(Counter::DroppedPortal);
+        if cfg.has_flag(ConfigFlags::LOG) {
+            info!(
+                ctx,
+                "DROP portal {}.{}.{}.{} proto={} dport={}",
+                src_addr[0],
+                src_addr[1],
+                src_addr[2],
+                src_addr[3],
+                proto,
+                dst_port,
+            );
+        }
+        return Ok(xdp_action::XDP_DROP);
+    }
+
     let blocklisted = BLOCKLIST
         .get(Key::new(
             ScopedAddr::FULL_PREFIX,
@@ -1827,6 +1956,18 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
         bump(Counter::DroppedSpoofed);
         if cfg.has_flag(ConfigFlags::LOG) {
             info!(ctx, "DROP6 spoofed source proto={}", proto);
+        }
+        return Ok(xdp_action::XDP_DROP);
+    }
+
+    // C20: the same gate and the same session as the IPv4 path. Without this a
+    // dual-stacked guest zone would hand every unadmitted device a working IPv6
+    // path around the portal, which is not a gap in the feature — it is the
+    // feature not existing.
+    if cfg.has_flag(ConfigFlags::PORTAL) && !portal_admits_v6(ctx, policy_id, &hdr, &meta) {
+        bump(Counter::DroppedPortal);
+        if cfg.has_flag(ConfigFlags::LOG) {
+            info!(ctx, "DROP6 portal proto={} dport={}", proto, dst_port);
         }
         return Ok(xdp_action::XDP_DROP);
     }

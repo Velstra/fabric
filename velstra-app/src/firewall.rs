@@ -27,10 +27,11 @@ use tokio::sync::Mutex;
 use velstra_common::{
     ArpEntry, ArpKey, Backend, CgnatLayout, Cidr4, Counter, FloodSet, FlowKey, FlowState,
     GlobalConfig, IrbEndpoint, LocalMac, LocalMacKey, MAX_RULE_LIMITS, MacFdbKey, NdKey, Npt66,
-    OverlayConfig, PolicyId, PortFwd, RateBucket, RouteEntry, ScopedAddr, ScopedAddr6,
-    ScopedDstPortKey, ScopedPortKey, ScopedSrcPortKey, ServiceKey, ServiceValue, Srv6Config,
-    Srv6Endpoint, Srv6LocalSid, Srv6SidKey, SynProxyCfg, SynProxyKey, TunnelEndpoint, TunnelKey,
-    parse_cidr_v4, parse_cidr_v6, parse_mac, port_rule_value, port_rule_with_limit,
+    OverlayConfig, PolicyId, PortFwd, PortalClientKey, PortalGate, PortalSeenKey, RateBucket,
+    RouteEntry, ScopedAddr, ScopedAddr6, ScopedDstPortKey, ScopedPortKey, ScopedSrcPortKey,
+    ServiceKey, ServiceValue, Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, SynProxyCfg,
+    SynProxyKey, TunnelEndpoint, TunnelKey, parse_cidr_v4, parse_cidr_v6, parse_mac,
+    port_rule_value, port_rule_with_limit,
 };
 use velstra_config::{
     PolicyConfig, ResolvedFloodVtep, ResolvedInterface, ResolvedIrbRoute, ResolvedMacRoute,
@@ -104,6 +105,16 @@ pub struct Firewall {
     /// that decided on it, or an appliance ends up enforcing a reason no one can
     /// reconstruct. Restarting the agent is therefore always a way out.
     runtime_blocks: BTreeMap<String, Instant>,
+    /// C20 captive-portal sessions: `(policy, MAC)` → the moment the device stops
+    /// being admitted.
+    ///
+    /// Held here for the same reason as `runtime_blocks`, and deliberately not
+    /// persisted for the mirror-image reason: a block that outlived the process
+    /// that decided on it enforces a reason nobody can reconstruct, and an
+    /// *admission* that outlived it would let a guest back onto the network after
+    /// a restart nobody connected to their login. Restarting the agent ends every
+    /// session, which is the correct way round.
+    portal_sessions: BTreeMap<(PolicyId, [u8; 6]), Instant>,
 }
 
 impl Firewall {
@@ -237,6 +248,7 @@ impl Firewall {
             config_attached: HashSet::new(),
             conntrack: None,
             runtime_blocks: BTreeMap::new(),
+            portal_sessions: BTreeMap::new(),
         })
     }
 
@@ -506,6 +518,140 @@ impl Firewall {
                 )
             })
             .collect()
+    }
+
+    /// The policies (zones) that are behind a captive portal, in id order.
+    ///
+    /// Only these can be admitted into: the `PORTAL_CLIENTS` map is consulted
+    /// nowhere else, so an admission is structurally incapable of opening
+    /// anything in a zone that has no portal. That is the property that makes a
+    /// write verb on the portal socket a bounded thing rather than a hole.
+    pub fn portal_policies(&self) -> Vec<PolicyId> {
+        let mut ids: Vec<PolicyId> = self
+            .applied
+            .policies
+            .iter()
+            .filter(|p| p.portal.is_some())
+            .map(|p| p.id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// The MAC the data plane last saw `addr` use, in `policy`, on traffic
+    /// addressed to the portal.
+    ///
+    /// `None` means that address has not talked to the portal — which is what a
+    /// login from an address nobody has seen looks like, and is exactly the case
+    /// that must not be admitted.
+    pub fn portal_mac_for(
+        &mut self,
+        policy: PolicyId,
+        addr: std::net::IpAddr,
+    ) -> Result<Option<[u8; 6]>> {
+        let key = match addr {
+            std::net::IpAddr::V4(v4) => PortalSeenKey::v4(policy, v4.octets()),
+            std::net::IpAddr::V6(v6) => PortalSeenKey::v6(policy, v6.octets()),
+        };
+        let seen: HashMap<_, PortalSeenKey, [u8; 6]> = HashMap::try_from(
+            self.ebpf
+                .map_mut("PORTAL_SEEN")
+                .ok_or_else(|| anyhow!("PORTAL_SEEN map missing"))?,
+        )?;
+        Ok(seen.get(&key, 0).ok())
+    }
+
+    /// Admit `mac` to `policy` for `ttl`.
+    ///
+    /// Re-admitting a device that is already admitted **extends** its session
+    /// rather than refusing: a guest who logs in again because a page said their
+    /// time was nearly up means to keep going, and answering "you are already in"
+    /// would let the old deadline end them mid-sentence.
+    pub fn portal_admit(&mut self, policy: PolicyId, mac: [u8; 6], ttl: Duration) -> Result<()> {
+        if !self.portal_policies().contains(&policy) {
+            bail!("policy {policy} has no captive portal, so nothing can be admitted to it");
+        }
+        self.write_portal(policy, mac, true)?;
+        self.portal_sessions
+            .insert((policy, mac), Instant::now() + ttl);
+        Ok(())
+    }
+
+    /// End one session early. Returns whether there was one.
+    pub fn portal_revoke(&mut self, policy: PolicyId, mac: [u8; 6]) -> Result<bool> {
+        if self.portal_sessions.remove(&(policy, mac)).is_none() {
+            return Ok(false);
+        }
+        self.write_portal(policy, mac, false)?;
+        Ok(true)
+    }
+
+    /// End every session. Returns how many there were.
+    pub fn portal_revoke_all(&mut self) -> Result<usize> {
+        let all: Vec<(PolicyId, [u8; 6])> = self.portal_sessions.keys().copied().collect();
+        for (policy, mac) in &all {
+            self.portal_sessions.remove(&(*policy, *mac));
+            self.write_portal(*policy, *mac, false)
+                .with_context(|| format!("ending the session for {}", render_mac(*mac)))?;
+        }
+        Ok(all.len())
+    }
+
+    /// Remove every session whose time is up. Returns how many went.
+    ///
+    /// The deadline lives here rather than in the map because the data plane has
+    /// no wall clock — and because it is user space that must survive the
+    /// question "why is this device still on the network".
+    pub fn expire_portal_sessions(&mut self) -> usize {
+        let now = Instant::now();
+        let due: Vec<(PolicyId, [u8; 6])> = self
+            .portal_sessions
+            .iter()
+            .filter(|(_, expiry)| **expiry <= now)
+            .map(|(key, _)| *key)
+            .collect();
+        for (policy, mac) in &due {
+            self.portal_sessions.remove(&(*policy, *mac));
+            if let Err(e) = self.write_portal(*policy, *mac, false) {
+                warn!(
+                    "could not end the expired session for {}: {e:#}",
+                    render_mac(*mac)
+                );
+            }
+        }
+        due.len()
+    }
+
+    /// The live sessions as `(policy, mac, seconds remaining)`.
+    pub fn portal_sessions(&self) -> Vec<(PolicyId, [u8; 6], u64)> {
+        let now = Instant::now();
+        self.portal_sessions
+            .iter()
+            .map(|(&(policy, mac), &expiry)| {
+                (policy, mac, expiry.saturating_duration_since(now).as_secs())
+            })
+            .collect()
+    }
+
+    /// Insert or remove one `(policy, MAC)` in `PORTAL_CLIENTS`.
+    fn write_portal(&mut self, policy: PolicyId, mac: [u8; 6], admit: bool) -> Result<()> {
+        let mut clients: HashMap<_, PortalClientKey, u8> = HashMap::try_from(
+            self.ebpf
+                .map_mut("PORTAL_CLIENTS")
+                .ok_or_else(|| anyhow!("PORTAL_CLIENTS map missing"))?,
+        )?;
+        let key = PortalClientKey::new(policy, mac);
+        if admit {
+            clients.insert(key, 1u8, 0).with_context(|| {
+                format!(
+                    "admitting {} to policy {policy} (the table may be full)",
+                    render_mac(mac)
+                )
+            })?;
+        } else {
+            let _ = clients.remove(&key);
+        }
+        Ok(())
     }
 
     /// Whether the applied configuration already blocks this exact CIDR.
@@ -779,6 +925,16 @@ fn spawn_log_forwarder(ebpf: &mut Ebpf) {
     }
 }
 
+/// A MAC address as an operator writes it. Used wherever one appears in a
+/// message, so a session, a log line and a diagnostic all name a device the same
+/// way.
+pub fn render_mac(mac: [u8; 6]) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    )
+}
+
 /// Remove every map entry that `old` installed, so a reconfigure doesn't leave
 /// stale rules behind. Missing keys are ignored (the entry may already be gone).
 fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
@@ -789,6 +945,15 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
         )?;
         for policy in &old.policies {
             let _ = config.remove(&policy.id);
+        }
+    }
+    {
+        let mut gates: HashMap<_, PolicyId, PortalGate> = HashMap::try_from(
+            ebpf.map_mut("PORTAL_GATES")
+                .ok_or_else(|| anyhow!("PORTAL_GATES map missing"))?,
+        )?;
+        for policy in &old.policies {
+            let _ = gates.remove(&policy.id);
         }
     }
     {
@@ -1150,6 +1315,27 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
             config
                 .insert(policy.id, policy.global, 0)
                 .with_context(|| format!("writing CONFIG for policy {}", policy.id))?;
+        }
+    }
+    {
+        // C20: the gate entry and the policy's portal flag are written by the
+        // same apply, in this order, so the flag is never set while the gate it
+        // reads is missing.
+        let mut gates: HashMap<_, PolicyId, PortalGate> = HashMap::try_from(
+            ebpf.map_mut("PORTAL_GATES")
+                .ok_or_else(|| anyhow!("PORTAL_GATES map missing"))?,
+        )?;
+        for policy in policies {
+            match policy.portal {
+                Some(gate) => gates
+                    .insert(policy.id, gate, 0)
+                    .with_context(|| format!("writing PORTAL_GATES for policy {}", policy.id))?,
+                // A policy that lost its portal must lose its gate too, or a
+                // later re-gating would inherit yesterday's address.
+                None => {
+                    let _ = gates.remove(&policy.id);
+                }
+            }
         }
     }
     {

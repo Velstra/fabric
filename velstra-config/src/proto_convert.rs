@@ -281,6 +281,11 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
         drop_icmp: cfg.drop_icmp,
         log: cfg.log,
         stateful: cfg.stateful,
+        // A captive portal is an appliance feature configured on the appliance
+        // (C20); the fabric controller has no notion of one, and inventing an
+        // empty gate here would set the portal flag on every controller-driven
+        // node.
+        portal: None,
         source_validation: rpf_from_proto(cfg.source_validation()),
         fail_closed: cfg.fail_closed,
         blocklist: cfg.blocklist.clone(),
@@ -302,6 +307,7 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
                 source_validation: rpf_from_proto(p.source_validation()),
                 blocklist: p.blocklist.clone(),
                 port_rules: p.port_rules.iter().map(port_rule_from_proto).collect(),
+                portal: None,
             })
             .collect(),
         interfaces: cfg
