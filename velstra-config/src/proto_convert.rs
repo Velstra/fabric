@@ -365,6 +365,7 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
         // which is a firewall concern rather than a fabric one.
         port_forwards: Vec::new(),
         synproxy: Vec::new(),
+        flow_export: None,
         overlay: cfg.overlay.as_ref().map(|o| OverlayCfg {
             local_vtep: o.local_vtep.clone(),
             underlay_iface: o.underlay_iface.clone(),

@@ -12,10 +12,11 @@ mod proto_convert;
 pub use config::{
     ActionName, BackendCfg, EncapName, FileConfig, FloodVtepCfg, ForwardMode, InterfaceFile,
     IrbRouteCfg, MacRouteCfg, Nd6Cfg, NeighborCfg, Npt66Cfg, OverlayCfg, PolicyConfig, PolicyFile,
-    PortForwardCfg, PortRule, ProtoName, ResolvedFloodVtep, ResolvedInterface, ResolvedIrbRoute,
-    ResolvedMacRoute, ResolvedNd6, ResolvedNeighbor, ResolvedNpt66, ResolvedOverlay,
-    ResolvedPortForward, ResolvedRoute, ResolvedService, ResolvedSrv6, ResolvedSrv6LocalSid,
-    ResolvedSrv6Route, ResolvedSynProxy, ResolvedTunnel, RouteCfg, RuntimeConfig, ServiceCfg,
-    SourceValidationName, Srv6Cfg, Srv6LocalSidCfg, Srv6RouteCfg, TunnelCfg, load_file,
+    PortForwardCfg, PortRule, ProtoName, ResolvedFloodVtep, ResolvedFlowExport, ResolvedInterface,
+    ResolvedIrbRoute, ResolvedMacRoute, ResolvedNd6, ResolvedNeighbor, ResolvedNpt66,
+    ResolvedOverlay, ResolvedPortForward, ResolvedRoute, ResolvedService, ResolvedSrv6,
+    ResolvedSrv6LocalSid, ResolvedSrv6Route, ResolvedSynProxy, ResolvedTunnel, RouteCfg,
+    RuntimeConfig, ServiceCfg, SourceValidationName, Srv6Cfg, Srv6LocalSidCfg, Srv6RouteCfg,
+    TunnelCfg, load_file,
 };
 pub use proto_convert::{file_config_from_proto, file_config_to_proto, runtime_from_proto};

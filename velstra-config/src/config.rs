@@ -632,6 +632,9 @@ pub struct FileConfig {
     /// C9 stateful-HA conntrack sync. Spelled `[conntrack_sync]` in TOML.
     #[serde(default)]
     pub conntrack_sync: Option<ConntrackSyncCfg>,
+    /// C12 IPFIX flow export. Spelled `[flow_export]` in TOML.
+    #[serde(default, rename = "flow_export")]
+    pub flow_export: Option<FlowExportCfg>,
     /// B9 SRv6 overlay endpoint for this host. Spelled `[srv6]` in TOML.
     #[serde(default)]
     pub srv6: Option<Srv6Cfg>,
@@ -665,6 +668,45 @@ pub struct ResolvedNpt66 {
     pub interface: String,
     /// The precomputed translation (prefixes + checksum-neutral adjustment).
     pub npt: Npt66,
+}
+
+/// C12 IPFIX flow export (`[flow_export]`). When present, the agent ships the
+/// conntrack table's per-flow deltas to a collector as IPFIX (RFC 7011).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FlowExportCfg {
+    /// Where the collector listens, `host:port`.
+    pub collector: String,
+    /// Seconds between exports. Defaults to 30 — often enough that a graph has
+    /// shape, rarely enough that the export is not itself the traffic.
+    #[serde(default = "default_export_interval_secs")]
+    pub interval_secs: u64,
+    /// IPFIX observation domain. Distinguishes this appliance's records from
+    /// another's at a collector that receives both; defaults to 1.
+    #[serde(default = "default_observation_domain")]
+    pub observation_domain: u32,
+}
+
+/// Default flow-export interval (seconds).
+fn default_export_interval_secs() -> u64 {
+    30
+}
+
+/// Default IPFIX observation domain.
+fn default_observation_domain() -> u32 {
+    1
+}
+
+/// A resolved `[flow_export]` block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedFlowExport {
+    /// Collector endpoint, as written (resolved when the exporter starts, so a
+    /// name that is not yet resolvable at boot does not fail the config).
+    pub collector: String,
+    /// Seconds between exports.
+    pub interval_secs: u64,
+    /// IPFIX observation domain.
+    pub observation_domain: u32,
 }
 
 /// C9 stateful-HA conntrack-state sync (a pfsync-analog for the eBPF `CONNTRACK`
@@ -1085,6 +1127,8 @@ pub struct RuntimeConfig {
     pub npt66: Vec<ResolvedNpt66>,
     /// C9 stateful-HA conntrack sync, or `None` if this node is not in an HA pair.
     pub conntrack_sync: Option<ResolvedConntrackSync>,
+    /// C12 IPFIX flow export.
+    pub flow_export: Option<ResolvedFlowExport>,
     /// This host's SRv6 endpoint (B9), or `None` if not running the SRv6 overlay.
     pub srv6: Option<ResolvedSrv6>,
     /// SRv6 per-MAC L2 forwarding entries for the `SRV6_FDB` map (B9).
@@ -1126,6 +1170,7 @@ impl RuntimeConfig {
             flood_vteps: Vec::new(),
             npt66: Vec::new(),
             conntrack_sync: None,
+            flow_export: None,
             srv6: None,
             srv6_routes: Vec::new(),
             srv6_local_sids: Vec::new(),
@@ -1805,6 +1850,25 @@ impl FileConfig {
                 .conntrack_sync
                 .as_ref()
                 .map(resolve_conntrack_sync)
+                .transpose()?,
+            flow_export: self
+                .flow_export
+                .as_ref()
+                .map(|f| {
+                    if f.collector.trim().is_empty() {
+                        anyhow::bail!("flow_export.collector must not be empty");
+                    }
+                    // The address is NOT resolved here. A collector named by
+                    // hostname may well not resolve at boot — the appliance is
+                    // often what its DNS depends on — and refusing the whole
+                    // config for that would take the firewall down to lose a
+                    // graph. The exporter resolves when it starts instead.
+                    Ok(ResolvedFlowExport {
+                        collector: f.collector.trim().to_string(),
+                        interval_secs: f.interval_secs.max(1),
+                        observation_domain: f.observation_domain,
+                    })
+                })
                 .transpose()?,
             srv6,
             srv6_routes,
