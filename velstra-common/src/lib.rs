@@ -41,6 +41,7 @@ mod overlay;
 mod packet;
 pub mod parse;
 mod policy;
+mod portal;
 mod ratelimit;
 mod reject;
 pub mod srv6;
@@ -78,6 +79,7 @@ pub use policy::{
     decide, port_rule_action, port_rule_bits, port_rule_limit, port_rule_logs, port_rule_present,
     port_rule_value, port_rule_winner, port_rule_with_limit,
 };
+pub use portal::{PortalClientKey, PortalGate, PortalSeenKey, gate_admits_unauthenticated};
 pub use ratelimit::RateBucket;
 pub use reject::{
     ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, IcmpUnreach, TcpRst, icmp, icmp_checksum,

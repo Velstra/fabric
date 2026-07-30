@@ -313,11 +313,21 @@ pub enum Counter {
     /// A protected server answered, and its sequence space was joined to the
     /// one the client was given. One per proxied connection.
     SynproxySpliced = 39,
+
+    /// Dropped by the **captive portal gate** (C20): the sender has not been
+    /// admitted, and what it was sending was not one of the things an unadmitted
+    /// client may still do.
+    ///
+    /// This is the normal, expected reading on a guest zone — every device that
+    /// has not logged in yet is counted here, continuously, by whatever it
+    /// retries. It is only a fault when it rises for a device that *has* logged
+    /// in, which means the session went and the portal did not say so.
+    DroppedPortal = 40,
 }
 
 impl Counter {
     /// Number of distinct counters — the `max_entries` of the `STATS` map.
-    pub const COUNT: u32 = 40;
+    pub const COUNT: u32 = 41;
 
     /// The array index of this counter.
     #[inline]
@@ -369,6 +379,7 @@ impl Counter {
             37 => Counter::SynproxyAdmitted,
             38 => Counter::SynproxyRejected,
             39 => Counter::SynproxySpliced,
+            40 => Counter::DroppedPortal,
             _ => return None,
         };
         Some(counter)
@@ -425,6 +436,7 @@ impl Counter {
             Counter::SynproxyAdmitted => "synproxy_admitted",
             Counter::SynproxyRejected => "synproxy_rejected",
             Counter::SynproxySpliced => "synproxy_spliced",
+            Counter::DroppedPortal => "dropped_portal",
         }
     }
 }

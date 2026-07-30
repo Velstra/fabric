@@ -34,10 +34,22 @@ impl ConfigFlags {
     /// Set together with [`Self::RPF_LOOSE`], strict wins; the data plane reads
     /// this bit first.
     pub const RPF_STRICT: u32 = 1 << 4;
+    /// This policy is behind a **captive portal** (C20): a source that has not
+    /// been admitted at run time may only reach the appliance itself, get an
+    /// address, and find its neighbours. See [`crate::PortalGate`].
+    ///
+    /// The bit gates the map lookups rather than replacing them, so a policy
+    /// without a portal — which is every policy on most appliances — pays
+    /// nothing for the feature existing.
+    pub const PORTAL: u32 = 1 << 5;
 
     /// Mask of all defined flags; used to reject unknown bits.
-    pub const ALL: u32 =
-        Self::DROP_ICMP | Self::LOG | Self::STATEFUL | Self::RPF_LOOSE | Self::RPF_STRICT;
+    pub const ALL: u32 = Self::DROP_ICMP
+        | Self::LOG
+        | Self::STATEFUL
+        | Self::RPF_LOOSE
+        | Self::RPF_STRICT
+        | Self::PORTAL;
 }
 
 /// Global firewall configuration shared kernel <-> user space.

@@ -33,8 +33,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use velstra_common::{
     Action, Backend, CgnatLayout, Cidr4, Cidr6, ConfigFlags, GENEVE_PORT, GlobalConfig,
-    MAX_BLOCKLIST, Npt66, PolicyId, PortKey, RouteEntry, ServiceKey, SourceValidation, VXLAN_PORT,
-    encap_kind, ip_proto, parse_cidr_v4, parse_cidr_v6, parse_mac,
+    MAX_BLOCKLIST, Npt66, PolicyId, PortKey, PortalGate, RouteEntry, ServiceKey, SourceValidation,
+    VXLAN_PORT, encap_kind, ip_proto, parse_cidr_v4, parse_cidr_v6, parse_mac,
 };
 
 /// A firewall verdict as written in TOML (`"pass"` / `"drop"`).
@@ -502,6 +502,10 @@ pub struct Srv6LocalSidCfg {
 pub struct PolicyFile {
     /// Policy id (must be non-zero; `0` is the default top-level policy).
     pub id: PolicyId,
+    /// C20 captive portal: gate this policy's clients until each is admitted at
+    /// run time. Absent ⇒ no portal, and no cost.
+    #[serde(default)]
+    pub portal: Option<PortalCfg>,
     /// Optional human-readable name (for logs only).
     #[serde(default)]
     pub name: Option<String>,
@@ -520,6 +524,26 @@ pub struct PolicyFile {
     pub blocklist: Vec<String>,
     #[serde(default, rename = "port_rule")]
     pub port_rules: Vec<PortRule>,
+}
+
+/// C20 captive portal settings for one policy (`portal = { address = … }`).
+///
+/// The addresses named here are **the appliance's own**, in the gated zone: they
+/// are what a client that has not logged in is still allowed to reach, and
+/// therefore where the portal page and the resolver live. They are not a filter
+/// on what is admitted afterwards — that is the ordinary ruleset's job, and it
+/// still runs.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PortalCfg {
+    /// The appliance's IPv4 address in the gated zone.
+    #[serde(default)]
+    pub address: Option<String>,
+    /// The appliance's IPv6 address in the gated zone. A dual-stacked zone wants
+    /// both: the gate closes IPv6 as well, and a client with no v6 address to
+    /// reach cannot load the portal over v6 at all.
+    #[serde(default)]
+    pub address6: Option<String>,
 }
 
 /// Maps an interface to a policy and (optionally) an overlay segment
@@ -570,6 +594,8 @@ pub struct FileConfig {
     pub log: bool,
     /// Track connections and allow established flows (stateful firewall).
     pub stateful: bool,
+    /// C20 captive portal for the default policy. See [`PortalCfg`].
+    pub portal: Option<PortalCfg>,
     /// Source-address validation (uRPF, RFC 3704): `disable` (default), `loose`
     /// or `strict`. Applies to the default policy; `[[policy]]` blocks set their
     /// own.
@@ -886,6 +912,10 @@ pub struct PolicyConfig {
     /// This policy's resolved firewall rules, for the `PORT_RULES` and `DST_RULES`
     /// tries.
     pub port_rules: Vec<ResolvedRule>,
+    /// C20: the `PORTAL_GATES` entry for this policy, or `None` when it is not
+    /// gated. Always `Some` exactly when `global` carries [`ConfigFlags::PORTAL`]
+    /// — the two are written by the same apply and read together.
+    pub portal: Option<PortalGate>,
 }
 
 /// One resolved firewall rule. `src` and `dst` are the optional address
@@ -1152,6 +1182,7 @@ impl RuntimeConfig {
             policies: vec![PolicyConfig {
                 id: 0,
                 global: GlobalConfig::new(Action::Pass, 0),
+                portal: None,
                 blocklist: Vec::new(),
                 blocklist6: Vec::new(),
                 port_rules: Vec::new(),
@@ -1210,6 +1241,7 @@ fn resolve_firewall(
     source_validation: SourceValidationName,
     blocklist: &[String],
     port_rules: &[PortRule],
+    portal: Option<&PortalCfg>,
 ) -> Result<PolicyConfig> {
     let mut flags = source_validation.flags();
     if drop_icmp {
@@ -1220,6 +1252,10 @@ fn resolve_firewall(
     }
     if stateful {
         flags |= ConfigFlags::STATEFUL;
+    }
+    let portal = resolve_portal(id, portal)?;
+    if portal.is_some() {
+        flags |= ConfigFlags::PORTAL;
     }
     let global = GlobalConfig::new(default_action.into(), flags);
 
@@ -1306,7 +1342,42 @@ fn resolve_firewall(
         blocklist: cidrs,
         blocklist6: cidrs6,
         port_rules: rules,
+        portal,
     })
+}
+
+/// Resolve a policy's `portal = { … }` block into its `PORTAL_GATES` entry.
+///
+/// A portal with no address at all is **refused**. It would parse, and it would
+/// gate the zone — closing it to everything but DHCP and Neighbor Discovery,
+/// with nowhere for a client to go and no way to be admitted. That is not a
+/// portal, it is a zone that is off, and an operator who meant that would have
+/// said `default_action = "drop"`.
+fn resolve_portal(id: PolicyId, portal: Option<&PortalCfg>) -> Result<Option<PortalGate>> {
+    let Some(cfg) = portal else {
+        return Ok(None);
+    };
+    let portal4 = match &cfg.address {
+        Some(addr) => addr
+            .parse::<std::net::Ipv4Addr>()
+            .map_err(|e| anyhow::anyhow!("policy {id}: invalid portal address {addr:?}: {e}"))?
+            .octets(),
+        None => [0; 4],
+    };
+    let portal6 = match &cfg.address6 {
+        Some(addr) => addr
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|e| anyhow::anyhow!("policy {id}: invalid portal address {addr:?}: {e}"))?
+            .octets(),
+        None => [0; 16],
+    };
+    if portal4 == [0; 4] && portal6 == [0; 16] {
+        bail!(
+            "policy {id}: a captive portal needs an address for clients to reach; \
+             without one the zone is simply closed"
+        );
+    }
+    Ok(Some(PortalGate::new(portal4, portal6)))
 }
 
 impl FileConfig {
@@ -1325,6 +1396,7 @@ impl FileConfig {
             self.source_validation,
             &self.blocklist,
             &self.port_rules,
+            self.portal.as_ref(),
         )?];
         for policy in &self.policies {
             if policy.id == 0 {
@@ -1342,6 +1414,7 @@ impl FileConfig {
                 policy.source_validation,
                 &policy.blocklist,
                 &policy.port_rules,
+                policy.portal.as_ref(),
             )?);
         }
 
@@ -2353,6 +2426,93 @@ mod tests {
         let toml = r#"blocklist = ["2001:db8::/200"]"#;
         let file: FileConfig = toml::from_str(toml).unwrap();
         assert!(file.resolve().is_err());
+    }
+
+    /// The portal flag and the gate entry are two halves of one thing: the data
+    /// plane reads the flag to decide whether to look the gate up, so a config
+    /// that set one without the other would gate a zone against an address that
+    /// is not there, or carry an address nothing consults.
+    #[test]
+    fn a_portal_sets_both_the_flag_and_the_gate() {
+        let toml = r#"
+            default_action = "drop"
+            [[policy]]
+            id = 4
+            default_action = "drop"
+            portal = { address = "192.168.50.1", address6 = "2001:db8:50::1" }
+            [[policy]]
+            id = 5
+            default_action = "drop"
+        "#;
+        let cfg = toml::from_str::<FileConfig>(toml)
+            .unwrap()
+            .resolve()
+            .unwrap();
+
+        let gated = cfg.policies.iter().find(|p| p.id == 4).unwrap();
+        assert!(gated.global.has_flag(ConfigFlags::PORTAL));
+        let gate = gated.portal.expect("policy 4 carries no gate");
+        assert!(gate.is_portal4([192, 168, 50, 1]));
+        assert!(
+            gate.is_portal6(
+                "2001:db8:50::1"
+                    .parse::<std::net::Ipv6Addr>()
+                    .unwrap()
+                    .octets()
+            )
+        );
+
+        // …and a zone without a portal pays for none of it.
+        let plain = cfg.policies.iter().find(|p| p.id == 5).unwrap();
+        assert!(!plain.global.has_flag(ConfigFlags::PORTAL));
+        assert!(plain.portal.is_none());
+    }
+
+    /// A portal with no address would gate the zone with nowhere for a client to
+    /// go — a zone that is off, written the long way round.
+    #[test]
+    fn a_portal_without_an_address_is_refused() {
+        let toml = r#"
+            [[policy]]
+            id = 4
+            portal = {}
+        "#;
+        let file: FileConfig = toml::from_str(toml).unwrap();
+        assert!(file.resolve().is_err());
+    }
+
+    /// One family is enough — a v4-only guest zone is an ordinary thing — but
+    /// what is written has to parse.
+    #[test]
+    fn one_family_is_enough_and_a_typo_is_not() {
+        let ok = r#"
+            [[policy]]
+            id = 4
+            portal = { address = "192.168.50.1" }
+        "#;
+        let cfg = toml::from_str::<FileConfig>(ok).unwrap().resolve().unwrap();
+        let gate = cfg
+            .policies
+            .iter()
+            .find(|p| p.id == 4)
+            .unwrap()
+            .portal
+            .unwrap();
+        assert!(gate.is_portal4([192, 168, 50, 1]));
+        // No v6 address ⇒ the v6 gate matches nothing, rather than everything.
+        assert!(!gate.is_portal6([0; 16]));
+
+        let typo = r#"
+            [[policy]]
+            id = 4
+            portal = { address = "192.168.50" }
+        "#;
+        assert!(
+            toml::from_str::<FileConfig>(typo)
+                .unwrap()
+                .resolve()
+                .is_err()
+        );
     }
 
     #[test]

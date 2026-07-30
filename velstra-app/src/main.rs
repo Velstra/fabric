@@ -17,6 +17,7 @@ mod controller_client;
 mod firewall;
 mod flows;
 mod ipfix;
+mod portal;
 mod query;
 mod wren;
 
@@ -76,6 +77,14 @@ struct RunArgs {
     /// instead of scraping the agent's log. Unset ⇒ no socket.
     #[arg(long)]
     query_socket: Option<PathBuf>,
+
+    /// Serve the captive-portal socket at this path (`sessions`, `allow`,
+    /// `revoke`), so a portal can admit a device it has just authenticated.
+    /// Separate from `--query-socket` on purpose: this is the only socket on
+    /// which anything can be opened, and it should be possible to run the
+    /// diagnostics one without it. Unset ⇒ no socket, and no way in.
+    #[arg(long)]
+    portal_socket: Option<PathBuf>,
 
     /// Path to a local TOML config. Mutually exclusive with `--controller`.
     #[arg(short, long, conflicts_with = "controllers")]
@@ -265,6 +274,14 @@ async fn run(args: RunArgs) -> Result<()> {
         // A run-time block carries a deadline; this is what makes the deadline
         // real rather than something only honoured when someone asks.
         tokio::spawn(query::expire_blocks_loop(firewall.clone()));
+    }
+
+    // C20: the captive-portal socket, where a portal admits a device it has
+    // authenticated. Every session it opens carries a deadline, and the sweep is
+    // what makes that deadline something other than a promise.
+    if let Some(path) = args.portal_socket.clone() {
+        tokio::spawn(portal::serve(path, firewall.clone()));
+        tokio::spawn(portal::expire_sessions_loop(firewall.clone()));
     }
 
     // Auto-attach: pick up matching interfaces (VM taps, pod veths) as they appear.
