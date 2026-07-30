@@ -16,6 +16,7 @@ mod conntrack_sync;
 mod controller_client;
 mod firewall;
 mod flows;
+mod ipfix;
 mod query;
 mod wren;
 
@@ -336,6 +337,31 @@ async fn run(args: RunArgs) -> Result<()> {
     // take the CONNTRACK map handle and run the pfsync-analog task — push our flow
     // table to the HA peer(s) and apply theirs — so established NAT flows survive a
     // VRRP failover. Opt-in (present only on an HA appliance) and best-effort.
+    // C12 IPFIX flow export. Shares the conntrack handle rather than taking it:
+    // the same table feeds HA sync and the query socket, and a single owner
+    // would mean choosing which one an operator gets.
+    if let Some(fx) = initial.flow_export.clone() {
+        match ipfix::parse_collector(&fx.collector) {
+            Ok(collector) => {
+                let handle = { firewall.lock().await.conntrack_handle() };
+                match handle {
+                    Ok(conntrack) => {
+                        tokio::spawn(ipfix::run(
+                            conntrack,
+                            collector,
+                            fx.observation_domain,
+                            fx.interval_secs,
+                        ));
+                    }
+                    Err(e) => warn!("could not start flow export: {e:#}"),
+                }
+            }
+            // A collector named by a hostname the appliance cannot resolve yet
+            // is a warning, not a reason to come up without a firewall.
+            Err(e) => warn!("flow export disabled: {e:#}"),
+        }
+    }
+
     if let Some(cts) = initial.conntrack_sync.clone() {
         // Take both flow tables the datapath keys on: CONNTRACK (NAT) and FW_FLOWS
         // (stateful-firewall replies). Both must cross to the backup or a failover
