@@ -17,6 +17,7 @@ mod controller_client;
 mod firewall;
 mod flows;
 mod ipfix;
+mod mapping;
 mod portal;
 mod query;
 mod wren;
@@ -85,6 +86,14 @@ struct RunArgs {
     /// diagnostics one without it. Unset ⇒ no socket, and no way in.
     #[arg(long)]
     portal_socket: Option<PathBuf>,
+
+    /// Serve the port-mapping socket at this path (`mappings`, `map`, `unmap`),
+    /// so a NAT-PMP/PCP daemon can open an inbound port for a while. A third
+    /// socket rather than a third verb on an existing one: opening an inbound
+    /// port is a different amount of trust than admitting a guest or adding a
+    /// drop, and a service that needs one should not be handed the others.
+    #[arg(long)]
+    mapping_socket: Option<PathBuf>,
 
     /// Path to a local TOML config. Mutually exclusive with `--controller`.
     #[arg(short, long, conflicts_with = "controllers")]
@@ -282,6 +291,14 @@ async fn run(args: RunArgs) -> Result<()> {
     if let Some(path) = args.portal_socket.clone() {
         tokio::spawn(portal::serve(path, firewall.clone()));
         tokio::spawn(portal::expire_sessions_loop(firewall.clone()));
+    }
+
+    // C18: port mappings a host on the inside asked for. Every one carries a
+    // deadline, and the sweep is what stops an inbound port outliving whatever
+    // wanted it.
+    if let Some(path) = args.mapping_socket.clone() {
+        tokio::spawn(mapping::serve(path, firewall.clone()));
+        tokio::spawn(mapping::expire_mappings_loop(firewall.clone()));
     }
 
     // Auto-attach: pick up matching interfaces (VM taps, pod veths) as they appear.
