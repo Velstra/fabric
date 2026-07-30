@@ -115,7 +115,25 @@ pub struct Firewall {
     /// a restart nobody connected to their login. Restarting the agent ends every
     /// session, which is the correct way round.
     portal_sessions: BTreeMap<(PolicyId, [u8; 6]), Instant>,
+    /// C18 port mappings opened at **run time** by a NAT-PMP/PCP request, keyed
+    /// by `(policy, proto, external port)` and carrying the internal target and
+    /// the moment the mapping closes.
+    ///
+    /// Not persisted, like the other two run-time tables — and here the reason is
+    /// the sharpest of the three: a mapping is a hole a host on the inside asked
+    /// for, and one that outlived the process that opened it would be an inbound
+    /// port nobody can account for. A host that still wants it asks again, which
+    /// is what the protocol has it do anyway.
+    runtime_mappings: BTreeMap<(PolicyId, u8, u16), ([u8; 4], u16, Instant)>,
 }
+
+/// The most run-time port mappings held at once.
+///
+/// `PORT_FORWARDS` holds 1024 entries and the operator's own forwards live in
+/// the same table, so this is deliberately a small fraction of it: the failure
+/// this prevents is a LAN host — a misbehaving one, or simply a busy one —
+/// filling the map and leaving no room for a forward somebody configured.
+const MAX_RUNTIME_MAPPINGS: usize = 256;
 
 impl Firewall {
     /// Load the embedded eBPF object, program the maps from `cfg`, and attach
@@ -249,6 +267,7 @@ impl Firewall {
             conntrack: None,
             runtime_blocks: BTreeMap::new(),
             portal_sessions: BTreeMap::new(),
+            runtime_mappings: BTreeMap::new(),
         })
     }
 
@@ -518,6 +537,157 @@ impl Firewall {
                 )
             })
             .collect()
+    }
+
+    /// Open one port-forward at **run time**, until `ttl` has passed.
+    ///
+    /// This is what a NAT-PMP/PCP request becomes (roadmap C18). It is the only
+    /// other thing besides a portal admission that opens the firewall without a
+    /// configuration change, and it is bounded much more tightly, because the
+    /// party asking is a host on the inside rather than a person at a page:
+    ///
+    /// * a `(policy, proto, port)` the **configuration** already forwards is
+    ///   refused outright. Overwriting it would silently redirect somebody
+    ///   else's service, and — worse — the expiry would later *delete* an entry
+    ///   the operator wrote, turning their port-forward off hours after a LAN
+    ///   host asked for something unrelated;
+    /// * the number of run-time mappings is capped well below the map's size, so
+    ///   one host cannot fill the table and starve the operator's own forwards;
+    /// * every mapping carries a deadline, like every other run-time opening
+    ///   here.
+    ///
+    /// Returns `false` when the configuration owns that key.
+    pub fn map_port(
+        &mut self,
+        policy: PolicyId,
+        proto: u8,
+        external_port: u16,
+        internal: [u8; 4],
+        internal_port: u16,
+        ttl: Duration,
+    ) -> Result<bool> {
+        if external_port == 0 {
+            bail!("port 0 is not a port");
+        }
+        if internal == [0; 4] {
+            bail!("0.0.0.0 is not a host to forward to");
+        }
+        let key = (policy, proto, external_port);
+        if self.forwarded_by_config(policy, proto, external_port) {
+            return Ok(false);
+        }
+        if !self.runtime_mappings.contains_key(&key)
+            && self.runtime_mappings.len() >= MAX_RUNTIME_MAPPINGS
+        {
+            bail!(
+                "already holding {MAX_RUNTIME_MAPPINGS} run-time mappings; \
+                 refusing to crowd out the configured port-forwards"
+            );
+        }
+        let reply = resolve_reply_policy(internal, &self.applied.interfaces);
+        let value = PortFwd::new(internal, internal_port).with_reply_policy(reply);
+        self.write_mapping(policy, proto, external_port, Some(value))?;
+        self.runtime_mappings
+            .insert(key, (internal, internal_port, Instant::now() + ttl));
+        Ok(true)
+    }
+
+    /// Close one run-time mapping early. Returns whether there was one.
+    ///
+    /// Only a **run-time** mapping: a configured port-forward is not something a
+    /// request from the inside may take away, any more than it is something it
+    /// may overwrite.
+    pub fn unmap_port(&mut self, policy: PolicyId, proto: u8, external_port: u16) -> Result<bool> {
+        if self
+            .runtime_mappings
+            .remove(&(policy, proto, external_port))
+            .is_none()
+        {
+            return Ok(false);
+        }
+        self.write_mapping(policy, proto, external_port, None)?;
+        Ok(true)
+    }
+
+    /// Close every run-time mapping. Returns how many there were.
+    pub fn unmap_all(&mut self) -> Result<usize> {
+        let all: Vec<(PolicyId, u8, u16)> = self.runtime_mappings.keys().copied().collect();
+        for (policy, proto, port) in &all {
+            self.runtime_mappings.remove(&(*policy, *proto, *port));
+            self.write_mapping(*policy, *proto, *port, None)
+                .with_context(|| format!("closing the mapping on {proto}/{port}"))?;
+        }
+        Ok(all.len())
+    }
+
+    /// Remove every mapping whose time is up. Returns how many went.
+    pub fn expire_mappings(&mut self) -> usize {
+        let now = Instant::now();
+        let due: Vec<(PolicyId, u8, u16)> = self
+            .runtime_mappings
+            .iter()
+            .filter(|(_, (_, _, expiry))| *expiry <= now)
+            .map(|(key, _)| *key)
+            .collect();
+        for (policy, proto, port) in &due {
+            self.runtime_mappings.remove(&(*policy, *proto, *port));
+            if let Err(e) = self.write_mapping(*policy, *proto, *port, None) {
+                warn!("could not close the expired mapping on {proto}/{port}: {e}");
+            }
+        }
+        due.len()
+    }
+
+    /// The live run-time mappings as
+    /// `(policy, proto, external port, internal ip, internal port, seconds left)`.
+    pub fn runtime_mappings(&self) -> Vec<(PolicyId, u8, u16, [u8; 4], u16, u64)> {
+        let now = Instant::now();
+        self.runtime_mappings
+            .iter()
+            .map(|(&(policy, proto, port), &(ip, iport, expiry))| {
+                (
+                    policy,
+                    proto,
+                    port,
+                    ip,
+                    iport,
+                    expiry.saturating_duration_since(now).as_secs(),
+                )
+            })
+            .collect()
+    }
+
+    /// Whether the applied configuration already forwards this exact key.
+    fn forwarded_by_config(&self, policy: PolicyId, proto: u8, port: u16) -> bool {
+        self.applied
+            .port_forwards
+            .iter()
+            .any(|pf| pf.policy == policy && pf.proto == proto && pf.port == port)
+    }
+
+    /// Insert or remove one `PORT_FORWARDS` entry.
+    fn write_mapping(
+        &mut self,
+        policy: PolicyId,
+        proto: u8,
+        port: u16,
+        value: Option<PortFwd>,
+    ) -> Result<()> {
+        let mut map: HashMap<_, ScopedPortKey, PortFwd> = HashMap::try_from(
+            self.ebpf
+                .map_mut("PORT_FORWARDS")
+                .ok_or_else(|| anyhow!("PORT_FORWARDS map missing"))?,
+        )?;
+        let key = ScopedPortKey::new(policy, proto, port);
+        match value {
+            Some(value) => map
+                .insert(key, value, 0)
+                .with_context(|| format!("mapping {proto}/{port} in policy {policy}"))?,
+            None => {
+                let _ = map.remove(&key);
+            }
+        }
+        Ok(())
     }
 
     /// The policies (zones) that are behind a captive portal, in id order.
