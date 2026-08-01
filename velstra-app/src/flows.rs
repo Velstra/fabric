@@ -317,8 +317,8 @@ mod tests {
     fn a_load_balanced_flow_is_attributed_to_its_client_not_the_backend() {
         let client = [198, 51, 100, 4];
         let backend = [10, 0, 0, 9];
-        let (key, mut state) = flow(client, [203, 0, 113, 10], 40000, ip_proto::TCP);
-        state = FlowState::forward(backend, 8443);
+        let (key, _) = flow(client, [203, 0, 113, 10], 40000, ip_proto::TCP);
+        let mut state = FlowState::forward(backend, 8443);
         state.bytes = 500_000;
 
         let ranked = top_talkers(&[(key, state)], 0);

@@ -94,7 +94,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run the controller server.
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
     /// Administer a running controller over its admin API.
     Admin(AdminArgs),
     /// Orchestrate the fabric (hosts/networks/ports) over the admin API.
@@ -1909,7 +1909,7 @@ impl VelstraOrchestrator for OrchestratorSvc {
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     match Cli::parse().command {
-        Command::Serve(args) => serve(args).await,
+        Command::Serve(args) => serve(*args).await,
         Command::Admin(args) => admin(args).await,
         Command::Orch(args) => orch(args).await,
     }

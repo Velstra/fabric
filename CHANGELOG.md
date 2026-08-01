@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-08-01
+
+A build fix. 0.4.0 is sound, but its CI lane was red — and had been since
+2026-07-30, which is the part worth saying out loud: three lints were failing
+`-D warnings` and nobody was looking.
+
+### Fixed
+
+- **`velstra-controller`: the command enum is boxed.** `clippy::large_enum_variant`
+  on a 464-byte `Command`. It is parsed once at start-up, so the size costs
+  nothing in practice — but a lint that fails the build is a lint that has to be
+  answered, and `Box<ServeArgs>` is what clippy itself suggests. `clap`'s derive
+  takes it without complaint and `--help` is unchanged.
+- **`velstra-app`: the run-time port-mapping table has named types.**
+  `BTreeMap<(PolicyId, u8, u16), ([u8; 4], u16, Instant)>` says nothing about
+  what is a key and what is a deadline; `MappingKey` and `MappingValue` do.
+- **`velstra-app`: a test no longer assigns a flow state it immediately
+  discards.** The value from `flow()` was overwritten before it was read.
+
+Nothing about the data plane, the API or the wire format changes — the eBPF
+object is untouched, so an appliance pinning it needs no `ebpfHash` bump.
+
 ## [0.4.0] — 2026-08-01
 
 ### Added
