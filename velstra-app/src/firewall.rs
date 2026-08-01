@@ -124,8 +124,15 @@ pub struct Firewall {
     /// for, and one that outlived the process that opened it would be an inbound
     /// port nobody can account for. A host that still wants it asks again, which
     /// is what the protocol has it do anyway.
-    runtime_mappings: BTreeMap<(PolicyId, u8, u16), ([u8; 4], u16, Instant)>,
+    runtime_mappings: BTreeMap<MappingKey, MappingValue>,
 }
+
+/// Which hole: the zone policy it lives in, the protocol, and the WAN port.
+type MappingKey = (PolicyId, u8, u16);
+
+/// Where it points and until when: the inside address, its port, and the
+/// deadline after which the hole closes on its own.
+type MappingValue = ([u8; 4], u16, Instant);
 
 /// The most run-time port mappings held at once.
 ///
@@ -611,7 +618,7 @@ impl Firewall {
 
     /// Close every run-time mapping. Returns how many there were.
     pub fn unmap_all(&mut self) -> Result<usize> {
-        let all: Vec<(PolicyId, u8, u16)> = self.runtime_mappings.keys().copied().collect();
+        let all: Vec<MappingKey> = self.runtime_mappings.keys().copied().collect();
         for (policy, proto, port) in &all {
             self.runtime_mappings.remove(&(*policy, *proto, *port));
             self.write_mapping(*policy, *proto, *port, None)
