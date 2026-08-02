@@ -25,13 +25,13 @@ use clap::ValueEnum;
 use log::warn;
 use tokio::sync::Mutex;
 use velstra_common::{
-    ArpEntry, ArpKey, Backend, CgnatLayout, Cidr4, Counter, FloodSet, FlowKey, FlowState,
+    ArpEntry, ArpKey, Backend, CgnatLayout, Cidr4, Cidr6, Counter, FloodSet, FlowKey, FlowState,
     GlobalConfig, IrbEndpoint, LocalMac, LocalMacKey, MAX_RULE_LIMITS, MacFdbKey, NdKey, Npt66,
     OverlayConfig, PolicyId, PortFwd, PortalClientKey, PortalGate, PortalSeenKey, RateBucket,
-    RouteEntry, ScopedAddr, ScopedAddr6, ScopedDstPortKey, ScopedPortKey, ScopedSrcPortKey,
-    ServiceKey, ServiceValue, Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, SynProxyCfg,
-    SynProxyKey, TunnelEndpoint, TunnelKey, parse_cidr_v4, parse_cidr_v6, parse_mac,
-    port_rule_value, port_rule_with_limit,
+    RouteEntry, ScopedAddr, ScopedAddr6, ScopedDstPortKey, ScopedDstPortKey6, ScopedPortKey,
+    ScopedSrcPortKey, ScopedSrcPortKey6, ServiceKey, ServiceValue, Srv6Config, Srv6Endpoint,
+    Srv6LocalSid, Srv6SidKey, SynProxyCfg, SynProxyKey, TunnelEndpoint, TunnelKey, parse_cidr_v4,
+    parse_cidr_v6, parse_mac, port_rule_value, port_rule_with_limit,
 };
 use velstra_config::{
     PolicyConfig, ResolvedFloodVtep, ResolvedInterface, ResolvedIrbRoute, ResolvedMacRoute,
@@ -1050,6 +1050,34 @@ fn port_rule_dst_lpm(dst: &Option<Cidr4>) -> (u32, u32) {
     }
 }
 
+/// The prefix length an IPv6 address constraint matches on, for the specificity
+/// byte packed into the rule value.
+fn cidr6_bits(cidr: &Option<Cidr6>) -> u8 {
+    cidr.as_ref().map_or(0, |c| c.prefix)
+}
+
+/// The `PORT_RULES6` LPM prefix + key tail for an IPv6 source constraint.
+fn port_rule_src6_lpm(src: &Option<Cidr6>) -> (u32, [u8; 16]) {
+    match src {
+        Some(c) => {
+            let (bits, addr) = c.lpm_key();
+            (ScopedSrcPortKey6::FIXED_BITS + bits, addr)
+        }
+        None => (ScopedSrcPortKey6::prefix_len(0), [0; 16]),
+    }
+}
+
+/// The `DST_RULES6` LPM prefix + key tail for an IPv6 destination constraint.
+fn port_rule_dst6_lpm(dst: &Option<Cidr6>) -> (u32, [u8; 16]) {
+    match dst {
+        Some(c) => {
+            let (bits, addr) = c.lpm_key();
+            (ScopedDstPortKey6::FIXED_BITS + bits, addr)
+        }
+        None => (ScopedDstPortKey6::prefix_len(0), [0; 16]),
+    }
+}
+
 fn port_rule_src_lpm(src: &Option<Cidr4>) -> (u32, u32) {
     match src {
         Some(c) => {
@@ -1171,11 +1199,48 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
                 .ok_or_else(|| anyhow!("PORT_RULES map missing"))?,
         )?;
         for policy in &old.policies {
-            for rule in policy.port_rules.iter().filter(|r| r.dst.is_none()) {
+            for rule in policy
+                .port_rules
+                .iter()
+                .filter(|r| r.dst.is_none() && r.src6.is_none() && r.dst6.is_none())
+            {
                 let (prefix, addr) = port_rule_src_lpm(&rule.src);
                 let _ = rules.remove(&Key::new(
                     prefix,
                     ScopedSrcPortKey::new(policy.id, rule.key.proto, rule.key.port, addr),
+                ));
+            }
+        }
+    }
+    {
+        // The v6 tries are cleared the same way: a rule that survives the sweep
+        // because nobody looked in its trie is a rule the operator deleted and
+        // the data plane still enforces.
+        let mut rules: LpmTrie<_, ScopedSrcPortKey6, u32> = LpmTrie::try_from(
+            ebpf.map_mut("PORT_RULES6")
+                .ok_or_else(|| anyhow!("PORT_RULES6 map missing"))?,
+        )?;
+        for policy in &old.policies {
+            for rule in policy.port_rules.iter().filter(|r| r.src6.is_some()) {
+                let (prefix, addr) = port_rule_src6_lpm(&rule.src6);
+                let _ = rules.remove(&Key::new(
+                    prefix,
+                    ScopedSrcPortKey6::new(policy.id, rule.key.proto, rule.key.port, addr),
+                ));
+            }
+        }
+    }
+    {
+        let mut rules: LpmTrie<_, ScopedDstPortKey6, u32> = LpmTrie::try_from(
+            ebpf.map_mut("DST_RULES6")
+                .ok_or_else(|| anyhow!("DST_RULES6 map missing"))?,
+        )?;
+        for policy in &old.policies {
+            for rule in policy.port_rules.iter().filter(|r| r.dst6.is_some()) {
+                let (prefix, addr) = port_rule_dst6_lpm(&rule.dst6);
+                let _ = rules.remove(&Key::new(
+                    prefix,
+                    ScopedDstPortKey6::new(policy.id, rule.key.proto, rule.key.port, addr),
                 ));
             }
         }
@@ -1561,7 +1626,7 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
                 .port_rules
                 .iter()
                 .enumerate()
-                .filter(|(_, r)| r.dst.is_none())
+                .filter(|(_, r)| r.dst.is_none() && r.src6.is_none() && r.dst6.is_none())
             {
                 let (prefix, addr) = port_rule_src_lpm(&rule.src);
                 let slot = limit_slots.get(&(policy.id, index)).copied().unwrap_or(0);
@@ -1578,6 +1643,70 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
                         0,
                     )
                     .context("inserting port rule")?;
+            }
+        }
+    }
+    {
+        // The IPv6 source trie. A rule lands in exactly one of the four tries —
+        // the family follows from what the operator wrote, and a rule that named
+        // a v6 prefix used to land in none of them at all.
+        let mut rules: LpmTrie<_, ScopedSrcPortKey6, u32> = LpmTrie::try_from(
+            ebpf.map_mut("PORT_RULES6")
+                .ok_or_else(|| anyhow!("PORT_RULES6 map missing"))?,
+        )?;
+        for policy in policies {
+            for (index, rule) in policy
+                .port_rules
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.src6.is_some())
+            {
+                let (prefix, addr) = port_rule_src6_lpm(&rule.src6);
+                let slot = limit_slots.get(&(policy.id, index)).copied().unwrap_or(0);
+                rules
+                    .insert(
+                        &Key::new(
+                            prefix,
+                            ScopedSrcPortKey6::new(policy.id, rule.key.proto, rule.key.port, addr),
+                        ),
+                        port_rule_with_limit(
+                            port_rule_value(rule.action, rule.log, cidr6_bits(&rule.src6)),
+                            slot,
+                        ),
+                        0,
+                    )
+                    .context("inserting IPv6 port rule")?;
+            }
+        }
+    }
+    {
+        // The IPv6 destination trie.
+        let mut rules: LpmTrie<_, ScopedDstPortKey6, u32> = LpmTrie::try_from(
+            ebpf.map_mut("DST_RULES6")
+                .ok_or_else(|| anyhow!("DST_RULES6 map missing"))?,
+        )?;
+        for policy in policies {
+            for (index, rule) in policy
+                .port_rules
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.dst6.is_some())
+            {
+                let (prefix, addr) = port_rule_dst6_lpm(&rule.dst6);
+                let slot = limit_slots.get(&(policy.id, index)).copied().unwrap_or(0);
+                rules
+                    .insert(
+                        &Key::new(
+                            prefix,
+                            ScopedDstPortKey6::new(policy.id, rule.key.proto, rule.key.port, addr),
+                        ),
+                        port_rule_with_limit(
+                            port_rule_value(rule.action, rule.log, cidr6_bits(&rule.dst6)),
+                            slot,
+                        ),
+                        0,
+                    )
+                    .context("inserting IPv6 destination rule")?;
             }
         }
     }

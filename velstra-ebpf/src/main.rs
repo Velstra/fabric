@@ -72,16 +72,16 @@ use velstra_common::{
     IrbEndpoint, IrbRewrite, LocalMac, LocalMacKey, MAX_BLOCKLIST, MAX_FLOOD_VTEPS,
     MAX_RULE_LIMITS, MacFdbKey, ND_NA_MSG_LEN, Nat, NdKey, Npt66, OVERLAY_OUTER_LEN, OverlayConfig,
     PacketMeta, PolicyId, PortFwd, PortalClientKey, PortalGate, PortalSeenKey, RateBucket, Rewrite,
-    RouteEntry, SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6, ScopedDstPortKey, ScopedPortKey,
-    ScopedSrcPortKey, ServiceKey, ServiceValue, SourceValidation, Srv6Config, Srv6Endpoint,
-    Srv6LocalSid, Srv6SidKey, SynFlow, SynProxyCfg, SynProxyKey, TcpSynth, TunnelEndpoint,
-    TunnelKey, build_encap, build_srv6_encap, check_cookie, csum_replace_u32, decide, decode_vni,
-    epoch_of, gate_admits_unauthenticated, icmp, icmp_checksum, ip_proto, ipv6_ext_len,
-    is_ipv6_ext, is_overlay_dport, lpm_key_addr, make_cookie, plan_arp_reply, plan_forward,
-    plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_server_ack, plan_server_syn,
-    plan_syn_ack, plan_tcp_rst, port_rule_action, port_rule_limit, port_rule_logs,
-    port_rule_present, port_rule_winner, select_backend, session_hash, tcp_flags,
-    translate_to_client, translate_to_server,
+    RouteEntry, SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6, ScopedDstPortKey, ScopedDstPortKey6,
+    ScopedPortKey, ScopedSrcPortKey, ScopedSrcPortKey6, ServiceKey, ServiceValue, SourceValidation,
+    Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, SynFlow, SynProxyCfg, SynProxyKey,
+    TcpSynth, TunnelEndpoint, TunnelKey, build_encap, build_srv6_encap, check_cookie,
+    csum_replace_u32, decide, decode_vni, epoch_of, gate_admits_unauthenticated, icmp,
+    icmp_checksum, ip_proto, ipv6_ext_len, is_ipv6_ext, is_overlay_dport, lpm_key_addr,
+    make_cookie, plan_arp_reply, plan_forward, plan_icmp_unreachable, plan_irb, plan_na_reply,
+    plan_nat, plan_server_ack, plan_server_syn, plan_syn_ack, plan_tcp_rst, port_rule_action,
+    port_rule_limit, port_rule_logs, port_rule_present, port_rule_winner, select_backend,
+    session_hash, tcp_flags, translate_to_client, translate_to_server,
 };
 
 /// Maps an ingress interface index to its policy id, so one XDP program can
@@ -153,6 +153,24 @@ static PORT_RULES: LpmTrie<ScopedSrcPortKey, u32> = LpmTrie::with_max_entries(81
 /// trie rather than a second dimension of the first.
 #[map]
 static DST_RULES: LpmTrie<ScopedDstPortKey, u32> = LpmTrie::with_max_entries(8192, 0);
+
+/// The IPv6 counterparts of [`PORT_RULES`] and [`DST_RULES`].
+///
+/// Separate tries rather than wider keys: an LPM trie matches a prefix that is
+/// contiguous from byte zero, so a 32-bit and a 128-bit address cannot be ranked
+/// in one trie without one of them carrying dead bits every lookup still has to
+/// walk. Splitting them also leaves the v4 key — and the v4 path's stack use
+/// inside this program — untouched.
+///
+/// Until these existed an address-scoped rule simply did not apply to IPv6: the
+/// v6 path looked the tries up with the address as `0`, so only rules with no
+/// address constraint could ever match. On a dual-stacked network that is a rule
+/// which reads as enforced and is not.
+#[map]
+static PORT_RULES6: LpmTrie<ScopedSrcPortKey6, u32> = LpmTrie::with_max_entries(8192, 0);
+
+#[map]
+static DST_RULES6: LpmTrie<ScopedDstPortKey6, u32> = LpmTrie::with_max_entries(8192, 0);
 
 /// Per-rule token buckets (roadmap C15), indexed by the 1-based slot a rule's
 /// packed value carries. Slot 0 is never used, so an unlimited rule — nearly all
@@ -1978,13 +1996,19 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
             ScopedAddr6::new(policy_id, src_addr),
         ))
         .is_some();
-    // The rule tries' address matches are IPv4-only, so an IPv4 source- or
-    // destination-CIDR rule can never apply to a v6 packet; look up with the
-    // address as `0` to match only the unconstrained (`/0`) rules for this
-    // `(policy, proto, dport)`.
+    // Both address dimensions in the v6 tries, with the packet's real addresses
+    // — and the v4 tries too, looked up with the address as `0`, so a rule that
+    // names a protocol and a port but no address still applies to both families
+    // exactly as it reads.
     let rule = port_rule_winner(
-        lookup_port_rule(policy_id, proto, dst_port, 0),
-        lookup_dst_rule(policy_id, proto, dst_port, 0),
+        port_rule_winner(
+            lookup_port_rule6(policy_id, proto, dst_port, &hdr),
+            lookup_dst_rule6(policy_id, proto, dst_port, &hdr),
+        ),
+        port_rule_winner(
+            lookup_port_rule(policy_id, proto, dst_port, 0),
+            lookup_dst_rule(policy_id, proto, dst_port, 0),
+        ),
     );
     let rule_action = if port_rule_present(rule) {
         Some(port_rule_action(rule))
@@ -3691,6 +3715,73 @@ fn lookup_port_rule(policy_id: PolicyId, proto: u8, dst_port: u16, src: u32) -> 
         ScopedSrcPortKey::FULL_PREFIX,
         ScopedSrcPortKey::new(policy_id, proto, dst_port, src),
     )) {
+        Some(value) => *value,
+        None => 0,
+    }
+}
+
+/// Scratch slots for the IPv6 rule keys.
+///
+/// A `Key<ScopedSrcPortKey6>` is 28 bytes, and two of them on the stack push the
+/// IPv6 path's frame past what the verifier will accept once the bpf-to-bpf call
+/// chain is summed:
+///
+///   combined stack size of 2 calls is 592. Too large
+///   stack depth 480+32+0+0+0+112+40
+///
+/// The v4 keys are 16 bytes and fit; the v6 ones do not. Building them in a
+/// per-CPU map instead takes them off the stack entirely — the same escape
+/// hatch `FIB_SCRATCH` uses, and the reason `get` taking `impl Borrow<Key<K>>`
+/// matters here.
+#[map]
+static RULE6_SRC_SCRATCH: PerCpuArray<Key<ScopedSrcPortKey6>> = PerCpuArray::with_max_entries(1, 0);
+
+#[map]
+static RULE6_DST_SCRATCH: PerCpuArray<Key<ScopedDstPortKey6>> = PerCpuArray::with_max_entries(1, 0);
+
+/// The IPv6 counterpart of [`lookup_port_rule`]. `0` for a miss, for the same
+/// reason: two `Option`s carried to one merge point let LLVM fold their map-value
+/// pointers together, which the verifier rejects.
+#[inline(always)]
+fn lookup_port_rule6(policy_id: PolicyId, proto: u8, dst_port: u16, hdr: &[u8; 40]) -> u32 {
+    let Some(slot) = RULE6_SRC_SCRATCH.get_ptr_mut(0) else {
+        return 0;
+    };
+    // SAFETY: `get_ptr_mut` gave us this CPU's own slot for the duration of the
+    // program run; it is written in full before it is read.
+    let key = unsafe { &mut *slot };
+    key.prefix_len = ScopedSrcPortKey6::FULL_PREFIX;
+    key.data.policy_id = policy_id;
+    key.data.proto = proto;
+    key.data._pad = 0;
+    key.data.port = dst_port;
+    key.data.src.copy_from_slice(&hdr[8..24]);
+    match PORT_RULES6.get(&*key) {
+        Some(value) => *value,
+        None => 0,
+    }
+}
+
+/// The IPv6 counterpart of [`lookup_dst_rule`].
+///
+/// Takes the fixed header rather than an address: materialising the destination
+/// as a `[u8; 16]` local costs 16 bytes of the caller's frame, and on this path
+/// that is the difference between a program the verifier loads and one it does
+/// not. Copied straight from the header into the map slot instead.
+#[inline(always)]
+fn lookup_dst_rule6(policy_id: PolicyId, proto: u8, dst_port: u16, hdr: &[u8; 40]) -> u32 {
+    let Some(slot) = RULE6_DST_SCRATCH.get_ptr_mut(0) else {
+        return 0;
+    };
+    // SAFETY: as above.
+    let key = unsafe { &mut *slot };
+    key.prefix_len = ScopedDstPortKey6::FULL_PREFIX;
+    key.data.policy_id = policy_id;
+    key.data.proto = proto;
+    key.data._pad = 0;
+    key.data.port = dst_port;
+    key.data.dst.copy_from_slice(&hdr[24..40]);
+    match DST_RULES6.get(&*key) {
         Some(value) => *value,
         None => 0,
     }
