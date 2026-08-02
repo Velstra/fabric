@@ -425,11 +425,18 @@ enum SourceValidation {
   SOURCE_VALIDATION_STRICT = 2; // ...and by the interface it arrived on
 }
 
-// Transport protocol.
+// A protocol a firewall rule can name. Not only the two that carry ports: a
+// rule on a port-less protocol matches on the protocol alone, with the port
+// field left at zero.
 enum Proto {
   PROTO_TCP = 0;
   PROTO_UDP = 1;
   PROTO_ICMP = 2;
+  PROTO_ICMPV6 = 3;
+  PROTO_VRRP = 4;
+  PROTO_ESP = 5;
+  PROTO_AH = 6;
+  PROTO_GRE = 7;
 }
 
 // Forwarding behaviour for a route.

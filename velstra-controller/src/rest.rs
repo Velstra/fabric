@@ -379,6 +379,11 @@ fn proto_name_str(p: ProtoName) -> &'static str {
         ProtoName::Tcp => "tcp",
         ProtoName::Udp => "udp",
         ProtoName::Icmp => "icmp",
+        ProtoName::Icmpv6 => "icmpv6",
+        ProtoName::Vrrp => "vrrp",
+        ProtoName::Esp => "esp",
+        ProtoName::Ah => "ah",
+        ProtoName::Gre => "gre",
     }
 }
 

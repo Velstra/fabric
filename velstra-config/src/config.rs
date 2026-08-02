@@ -86,14 +86,35 @@ impl SourceValidationName {
     }
 }
 
-/// A transport protocol name as written in TOML.
+/// A protocol name as written in TOML.
+///
+/// Not only the two that carry ports. The data plane keys a rule on
+/// `(policy, protocol, destination port)` and passes port `0` for anything that
+/// is not TCP or UDP, so a rule naming one of the port-less protocols below
+/// matches on the protocol alone — which is what "allow ICMP between these two
+/// zones" has always needed and what the per-zone `drop_icmp` switch could only
+/// answer for a whole zone at once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProtoName {
     Tcp,
     Udp,
-    /// ICMP (cannot carry a port rule — use `drop_icmp` instead).
+    /// ICMP for IPv4. Carries no port: a rule naming it matches every ICMP
+    /// packet under its policy, subject to the rule's address constraints.
     Icmp,
+    /// ICMPv6 (IANA 58). A separate protocol from ICMP, not a variant of it —
+    /// and the one that carries neighbour discovery, so a v6 network without it
+    /// does not work at all.
+    #[serde(rename = "icmpv6", alias = "ipv6-icmp", alias = "icmp6")]
+    Icmpv6,
+    /// VRRP (IANA 112) — the advertisements a redundant pair exchanges.
+    Vrrp,
+    /// ESP (IANA 50) — the payload half of IPsec.
+    Esp,
+    /// AH (IANA 51) — the authentication half of IPsec.
+    Ah,
+    /// GRE (IANA 47).
+    Gre,
 }
 
 impl ProtoName {
@@ -103,7 +124,18 @@ impl ProtoName {
             ProtoName::Tcp => ip_proto::TCP,
             ProtoName::Udp => ip_proto::UDP,
             ProtoName::Icmp => ip_proto::ICMP,
+            ProtoName::Icmpv6 => 58,
+            ProtoName::Vrrp => 112,
+            ProtoName::Esp => 50,
+            ProtoName::Ah => 51,
+            ProtoName::Gre => 47,
         }
+    }
+
+    /// Whether this protocol has ports at all. Everything else is matched on the
+    /// protocol alone, with the port field left at `0`.
+    pub fn has_ports(self) -> bool {
+        matches!(self, ProtoName::Tcp | ProtoName::Udp)
     }
 }
 
@@ -1507,7 +1539,8 @@ impl FileConfig {
             let proto = match service.proto {
                 ProtoName::Tcp => ip_proto::TCP,
                 ProtoName::Udp => ip_proto::UDP,
-                ProtoName::Icmp => bail!("load-balancer service protocol must be tcp or udp"),
+                // Everything else has no ports, so it cannot front a service.
+                _ => bail!("load-balancer service protocol must be tcp or udp"),
             };
             let vip: Ipv4Addr = service
                 .vip
@@ -1568,7 +1601,8 @@ impl FileConfig {
             let proto = match pf.proto {
                 ProtoName::Tcp => ip_proto::TCP,
                 ProtoName::Udp => ip_proto::UDP,
-                ProtoName::Icmp => bail!("port-forward protocol must be tcp or udp"),
+                // Everything else has no ports, so there is nothing to forward.
+                _ => bail!("port-forward protocol must be tcp or udp"),
             };
             if !policies.iter().any(|p| p.id == pf.policy) {
                 bail!("port-forward references unknown policy id {}", pf.policy);
