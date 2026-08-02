@@ -265,6 +265,108 @@ impl ScopedSrcPortKey {
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for ScopedSrcPortKey {}
 
+/// Key for the IPv6 firewall-rule LPM tries: the same fixed
+/// `(policy, proto, port)` head as [`ScopedSrcPortKey`], with a **128-bit**
+/// address as the longest-prefix-matched tail.
+///
+/// A separate key (and a separate map) rather than a widened one: an LPM trie
+/// walks the key from byte zero, so a v4 rule and a v6 rule cannot share a trie
+/// without one of them carrying dead bits that every lookup would still have to
+/// match. Two tries also keep the v4 path's key — and its stack use inside the
+/// XDP program — exactly as it was.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct ScopedSrcPortKey6 {
+    /// Policy id, matched exactly.
+    pub policy_id: PolicyId,
+    /// IP protocol number (the upper-layer one, after the extension chain).
+    pub proto: u8,
+    /// Explicit padding, always zero.
+    pub _pad: u8,
+    /// Destination port, host byte order.
+    pub port: u16,
+    /// Source address, network-order octets, matched longest-prefix.
+    pub src: [u8; 16],
+}
+
+impl ScopedSrcPortKey6 {
+    /// Prefix bits covering the exactly-matched head, as for the v4 key.
+    pub const FIXED_BITS: u32 = 64;
+
+    /// Build a scoped IPv6 source/port key.
+    #[inline]
+    pub const fn new(policy_id: PolicyId, proto: u8, port: u16, src: [u8; 16]) -> Self {
+        Self {
+            policy_id,
+            proto,
+            _pad: 0,
+            port,
+            src,
+        }
+    }
+
+    /// The LPM prefix length for a rule whose source is a `/cidr_bits` block
+    /// (`0` for "from any").
+    #[inline]
+    pub const fn prefix_len(cidr_bits: u8) -> u32 {
+        Self::FIXED_BITS + cidr_bits as u32
+    }
+
+    /// The LPM prefix length for a lookup (every source bit known).
+    pub const FULL_PREFIX: u32 = Self::FIXED_BITS + 128;
+}
+
+// SAFETY: `#[repr(C)]`, integer fields, padding zeroed — POD.
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ScopedSrcPortKey6 {}
+
+/// The destination counterpart of [`ScopedSrcPortKey6`], for the same reason the
+/// v4 path has two tries: one trie ranks exactly one address field.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct ScopedDstPortKey6 {
+    /// Policy id, matched exactly.
+    pub policy_id: PolicyId,
+    /// IP protocol number.
+    pub proto: u8,
+    /// Explicit padding, always zero.
+    pub _pad: u8,
+    /// Destination port, host byte order.
+    pub port: u16,
+    /// Destination address, network-order octets, matched longest-prefix.
+    pub dst: [u8; 16],
+}
+
+impl ScopedDstPortKey6 {
+    /// Prefix bits covering the exactly-matched head.
+    pub const FIXED_BITS: u32 = 64;
+
+    /// Build a scoped IPv6 destination/port key.
+    #[inline]
+    pub const fn new(policy_id: PolicyId, proto: u8, port: u16, dst: [u8; 16]) -> Self {
+        Self {
+            policy_id,
+            proto,
+            _pad: 0,
+            port,
+            dst,
+        }
+    }
+
+    /// The LPM prefix length for a rule whose destination is a `/cidr_bits` block.
+    #[inline]
+    pub const fn prefix_len(cidr_bits: u8) -> u32 {
+        Self::FIXED_BITS + cidr_bits as u32
+    }
+
+    /// The LPM prefix length for a lookup.
+    pub const FULL_PREFIX: u32 = Self::FIXED_BITS + 128;
+}
+
+// SAFETY: `#[repr(C)]`, integer fields, padding zeroed — POD.
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ScopedDstPortKey6 {}
+
 /// Key for the `DST_RULES` LPM trie: the mirror of [`ScopedSrcPortKey`] with the
 /// **destination** address as the longest-prefix-matched tail.
 ///

@@ -961,6 +961,13 @@ pub struct ResolvedRule {
     pub src: Option<Cidr4>,
     /// Destination-CIDR constraint, or `None` for "to any".
     pub dst: Option<Cidr4>,
+    /// The IPv6 source constraint, when the rule names one. A rule constrains
+    /// one end in one family: the four fields are mutually exclusive, because
+    /// each lives in a different longest-prefix trie and a prefix is contiguous
+    /// from the front of its key.
+    pub src6: Option<Cidr6>,
+    /// The IPv6 destination constraint.
+    pub dst6: Option<Cidr6>,
     /// What to do on a match.
     pub action: Action,
     /// Log packets this rule matches, regardless of the policy-wide flag.
@@ -1325,18 +1332,40 @@ fn resolve_firewall(
                 rule.port
             );
         }
-        let src =
-            match &rule.src {
-                Some(cidr) => Some(parse_cidr_v4(cidr).map_err(|e| {
+        // One field, either family: a rule's `src`/`dst` is a string, and which
+        // trie it belongs to follows from what it says. An operator writing
+        // `fd12::/64` means the same thing they mean by `10.0.0.0/8`, and having
+        // to remember a second field name for it is a distinction the
+        // configuration should not have.
+        let (src, src6) = match &rule.src {
+            Some(cidr) if cidr.contains(':') => (
+                None,
+                Some(parse_cidr_v6(cidr).map_err(|e| {
                     anyhow::anyhow!("policy {id}: invalid rule source {cidr:?}: {e}")
                 })?),
-                None => None,
-            };
-        let dst = match &rule.dst {
-            Some(cidr) => Some(parse_cidr_v4(cidr).map_err(|e| {
-                anyhow::anyhow!("policy {id}: invalid rule destination {cidr:?}: {e}")
-            })?),
-            None => None,
+            ),
+            Some(cidr) => (
+                Some(parse_cidr_v4(cidr).map_err(|e| {
+                    anyhow::anyhow!("policy {id}: invalid rule source {cidr:?}: {e}")
+                })?),
+                None,
+            ),
+            None => (None, None),
+        };
+        let (dst, dst6) = match &rule.dst {
+            Some(cidr) if cidr.contains(':') => (
+                None,
+                Some(parse_cidr_v6(cidr).map_err(|e| {
+                    anyhow::anyhow!("policy {id}: invalid rule destination {cidr:?}: {e}")
+                })?),
+            ),
+            Some(cidr) => (
+                Some(parse_cidr_v4(cidr).map_err(|e| {
+                    anyhow::anyhow!("policy {id}: invalid rule destination {cidr:?}: {e}")
+                })?),
+                None,
+            ),
+            None => (None, None),
         };
         // A limit is only meaningful where the rule would let traffic through;
         // attaching one to a drop rule reads as "throttle these" and does nothing,
@@ -1362,6 +1391,8 @@ fn resolve_firewall(
             key: PortKey::new(rule.proto.number(), rule.port),
             src,
             dst,
+            src6,
+            dst6,
             action: rule.action.into(),
             log: rule.log,
             limit,
@@ -2358,6 +2389,8 @@ mod tests {
             p0.port_rules[0],
             ResolvedRule {
                 key: PortKey::new(ip_proto::TCP, 443),
+                src6: None,
+                dst6: None,
                 src: None,
                 dst: None,
                 action: Action::Pass,
@@ -2370,6 +2403,8 @@ mod tests {
             p0.port_rules[1],
             ResolvedRule {
                 key: PortKey::new(ip_proto::UDP, 53),
+                src6: None,
+                dst6: None,
                 src: None,
                 dst: None,
                 action: Action::Drop,
