@@ -959,6 +959,11 @@ fn proto_from_proto(p: Proto) -> ProtoName {
         Proto::Tcp => ProtoName::Tcp,
         Proto::Udp => ProtoName::Udp,
         Proto::Icmp => ProtoName::Icmp,
+        Proto::Icmpv6 => ProtoName::Icmpv6,
+        Proto::Vrrp => ProtoName::Vrrp,
+        Proto::Esp => ProtoName::Esp,
+        Proto::Ah => ProtoName::Ah,
+        Proto::Gre => ProtoName::Gre,
     }
 }
 
@@ -967,6 +972,11 @@ fn proto_to_proto(p: ProtoName) -> Proto {
         ProtoName::Tcp => Proto::Tcp,
         ProtoName::Udp => Proto::Udp,
         ProtoName::Icmp => Proto::Icmp,
+        ProtoName::Icmpv6 => Proto::Icmpv6,
+        ProtoName::Vrrp => Proto::Vrrp,
+        ProtoName::Esp => Proto::Esp,
+        ProtoName::Ah => Proto::Ah,
+        ProtoName::Gre => Proto::Gre,
     }
 }
 
