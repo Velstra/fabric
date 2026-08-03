@@ -1319,9 +1319,21 @@ fn resolve_firewall(
 
     let mut rules = Vec::with_capacity(port_rules.len());
     for rule in port_rules {
-        if rule.proto == ProtoName::Icmp {
+        // A protocol with no ports is keyed at port 0 — that is what "matches
+        // every packet of this protocol the rule scopes" compiles to, and the
+        // data plane reads 0 off a packet that carries no ports. What is still
+        // wrong is a *port* on such a protocol: it would silently match nothing.
+        //
+        // This used to refuse every ICMP rule outright, from before a rule could
+        // name a port-less protocol at all. The schema was updated when that
+        // landed and this check was not, so the control plane emitted rules the
+        // data plane's own loader then rejected — the feature never worked end
+        // to end.
+        if !rule.proto.has_ports() && rule.port != 0 {
             bail!(
-                "policy {id}: port rule on ICMP is invalid (ICMP has no ports); use `drop_icmp = true`"
+                "policy {id}: {} carries no ports, so port {} cannot match; drop the port",
+                rule.proto.number(),
+                rule.port
             );
         }
         if rule.src.is_some() && rule.dst.is_some() {
@@ -1446,8 +1458,8 @@ fn resolve_portal(id: PolicyId, portal: Option<&PortalCfg>) -> Result<Option<Por
 impl FileConfig {
     /// Validate the document and resolve it into a [`RuntimeConfig`].
     ///
-    /// Fails if a CIDR is malformed, a port rule targets ICMP, or two policies
-    /// share an id.
+    /// Fails if a CIDR is malformed, a port-less protocol carries a port, or two
+    /// policies share an id.
     pub fn resolve(&self) -> Result<RuntimeConfig> {
         // Policy 0 is the top-level config; `[[policy]]` blocks add tenants.
         let mut policies = vec![resolve_firewall(
@@ -2297,6 +2309,38 @@ impl fmt::Display for RuntimeConfig {
 
 #[cfg(test)]
 mod tests {
+
+    /// A protocol with no ports is keyed at port 0 — that is what "match every
+    /// packet of this protocol" compiles to. Refusing such a rule outright, as
+    /// this used to for ICMP, meant the control plane emitted rules this loader
+    /// then rejected: the feature that let a rule name a port-less protocol had
+    /// a schema that accepted it and a validator that did not, so it never
+    /// worked end to end.
+    #[test]
+    fn a_port_less_protocol_is_accepted_at_port_zero_and_refused_with_one() {
+        let cfg = |proto: &str, port: u16| {
+            format!(
+                "default_action = \"drop\"\n\
+                 [[policy]]\nid = 1\nname = \"wan\"\ndefault_action = \"drop\"\n\
+                 [[policy.port_rule]]\nproto = \"{proto}\"\nport = {port}\naction = \"pass\"\n"
+            )
+        };
+        for proto in ["icmp", "icmpv6", "vrrp", "esp", "ah", "gre"] {
+            let good: FileConfig = toml::from_str(&cfg(proto, 0)).expect("parses");
+            assert!(
+                good.resolve().is_ok(),
+                "{proto} at port 0 was refused, so a rule naming it cannot be loaded"
+            );
+            let bad: FileConfig = toml::from_str(&cfg(proto, 443)).expect("parses");
+            assert!(
+                bad.resolve().is_err(),
+                "{proto} with a port was accepted, and would silently match nothing"
+            );
+        }
+        // …and tcp/udp are unaffected in both directions.
+        let tcp: FileConfig = toml::from_str(&cfg("tcp", 443)).expect("parses");
+        assert!(tcp.resolve().is_ok());
+    }
     use super::*;
 
     #[test]
