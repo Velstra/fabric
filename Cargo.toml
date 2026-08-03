@@ -50,8 +50,10 @@ libc = { version = "0.2.159", default-features = false }
 log = { version = "0.4.22", default-features = false }
 # Packet header definitions for the eBPF crate. Only one member uses it today,
 # so there is nothing to skew yet — it sits here so the second one cannot start
-# a skew by picking its own version.
-network-types = { version = "0.2.0", default-features = false }
+# a skew by picking its own version. Default features stay ON: the neighbouring
+# entries turn them off, and copying that here silently dropped three crates
+# from the lock file.
+network-types = "0.2.0"
 tokio = { version = "1.40.0", default-features = false }
 which = { version = "6.0.0", default-features = false }
 serde = { version = "1.0.210", default-features = false, features = ["derive"] }
