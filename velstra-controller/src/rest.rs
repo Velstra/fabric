@@ -751,6 +751,9 @@ struct RuleReq {
     /// Restrict the rule to one direction ("in"/"out"); absent = both.
     #[serde(default)]
     direction: Option<String>,
+    /// Scope the rule to one interface by name; absent = every interface.
+    #[serde(default, rename = "in-interface")]
+    in_interface: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1341,6 +1344,7 @@ async fn create_security_group(
             icmp_type: u32::from(r.icmp_type.unwrap_or(0)),
             family: r.family.clone().unwrap_or_default(),
             direction: r.direction.clone().unwrap_or_default(),
+            in_interface: r.in_interface.clone().unwrap_or_default(),
         });
     }
     let spec = ProtoSgSpec {

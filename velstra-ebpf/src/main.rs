@@ -1023,6 +1023,7 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
         proto,
         icmp_type,
         dst_port,
+        ifindex,
         lpm_key_addr(src_addr),
         lpm_key_addr(dst_addr),
         PORT_RULE_IN_ONLY | PORT_RULE_V6_ONLY,
@@ -1572,6 +1573,7 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
         proto,
         icmp_type,
         dst_port,
+        ifindex,
         lpm_key_addr(src_addr),
         lpm_key_addr(dst_addr),
         PORT_RULE_OUT_ONLY | PORT_RULE_V6_ONLY,
@@ -2104,6 +2106,7 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
             proto,
             icmp_type,
             dst_port,
+            ifindex,
             &hdr,
             PORT_RULE_OUT_ONLY | PORT_RULE_V4_ONLY,
         ),
@@ -2115,6 +2118,7 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
             proto,
             icmp_type,
             dst_port,
+            ifindex,
             0,
             0,
             PORT_RULE_OUT_ONLY | PORT_RULE_V4_ONLY,
@@ -3820,14 +3824,25 @@ fn forward(ctx: &XdpContext, rewrite: Rewrite, log: bool) -> Result<u32, ()> {
 /// map lookups to a merge point let LLVM fold their map-value pointers into one
 /// and null-check once, which the verifier rejects (see [`lookup_port_forward`]).
 #[inline(always)]
-fn lookup_port_rule(policy_id: PolicyId, proto: u8, icmp_type: u8, dst_port: u16, src: u32) -> u32 {
+fn lookup_port_rule(
+    policy_id: PolicyId,
+    proto: u8,
+    icmp_type: u8,
+    dst_port: u16,
+    ifindex: u32,
+    src: u32,
+) -> u32 {
     match PORT_RULES.get(Key::new(
         ScopedSrcPortKey::FULL_PREFIX,
-        if icmp_type == 0 {
-            ScopedSrcPortKey::new(policy_id, proto, dst_port, src)
-        } else {
-            ScopedSrcPortKey::with_icmp_type(policy_id, proto, icmp_type, src)
-        },
+        ScopedSrcPortKey::with_ifindex(
+            policy_id,
+            proto,
+            icmp_type,
+            // A typed rule is keyed at port 0: ICMP has no ports.
+            if icmp_type == 0 { dst_port } else { 0 },
+            ifindex,
+            src,
+        ),
     )) {
         Some(value) => *value,
         None => 0,
@@ -3862,6 +3877,7 @@ fn lookup_port_rule6(
     proto: u8,
     icmp_type: u8,
     dst_port: u16,
+    ifindex: u32,
     hdr: &[u8; 40],
 ) -> u32 {
     let Some(slot) = RULE6_SRC_SCRATCH.get_ptr_mut(0) else {
@@ -3874,6 +3890,7 @@ fn lookup_port_rule6(
     key.data.policy_id = policy_id;
     key.data.proto = proto;
     key.data.icmp_type = icmp_type;
+    key.data.ifindex = ifindex;
     key.data.port = dst_port;
     key.data.src.copy_from_slice(&hdr[8..24]);
     match PORT_RULES6.get(&*key) {
@@ -3894,6 +3911,7 @@ fn lookup_dst_rule6(
     proto: u8,
     icmp_type: u8,
     dst_port: u16,
+    ifindex: u32,
     hdr: &[u8; 40],
 ) -> u32 {
     let Some(slot) = RULE6_DST_SCRATCH.get_ptr_mut(0) else {
@@ -3905,6 +3923,7 @@ fn lookup_dst_rule6(
     key.data.policy_id = policy_id;
     key.data.proto = proto;
     key.data.icmp_type = icmp_type;
+    key.data.ifindex = ifindex;
     key.data.port = dst_port;
     key.data.dst.copy_from_slice(&hdr[24..40]);
     match DST_RULES6.get(&*key) {
@@ -3957,10 +3976,29 @@ fn clamp_mss_egress(ctx: &TcContext, ihl_bytes: usize, proto: u8, ifindex: u32) 
         if off + 1 > opts_end {
             return;
         }
-        let Ok(kind) = (unsafe { ptr_at_tc::<u8>(ctx, off) }) else {
+        // Four bytes, never one: the option's kind and length are the first two,
+        // and a one-byte read at a variable offset establishes no readable range
+        // on the pointer. That refusal is the same one the ICMP type hit, and it
+        // reappeared here only once this function grew — the option walk verified
+        // on its own and stopped verifying under the register pressure the rule
+        // lookups added. The narrow read was always the fragile one.
+        // `bpf_skb_load_bytes`, not a packet pointer. Two pointer forms were
+        // refused here before this one: a `[u8; 4]` (LLVM re-derives the pointer
+        // per byte, and the second access carries no range) and a `u32` (the
+        // bounds check does not survive the register spill the loop forces —
+        // "size=4 … r=0", with a stack store sitting between check and use).
+        //
+        // A helper load takes the variable offset as a value and copies into a
+        // local, so there is no packet pointer for the verifier to lose track
+        // of. It is what the masquerade path already uses for the same reason,
+        // and what `ctx.store` below is the counterpart of.
+        let Ok(word) = ctx.load::<u32>(off) else {
             return;
         };
-        match unsafe { *kind } {
+        let word = u32::from_be(word);
+        let kind = (word >> 24) as u8;
+        let opt_len = ((word >> 16) & 0xff) as u8;
+        match kind {
             // End of option list.
             0 => return,
             // A single-byte no-op pad; step one and keep looking.
@@ -3970,14 +4008,10 @@ fn clamp_mss_egress(ctx: &TcContext, ihl_bytes: usize, proto: u8, ifindex: u32) 
             }
             // Maximum Segment Size: kind 2, length 4, then the value.
             2 => {
-                let Ok(opt) = (unsafe { ptr_at_tc::<[u8; 4]>(ctx, off) }) else {
-                    return;
-                };
-                let opt = unsafe { *opt };
-                if opt[1] != 4 {
+                if opt_len != 4 {
                     return;
                 }
-                let current = u16::from_be_bytes([opt[2], opt[3]]);
+                let current = (word & 0xffff) as u16;
                 // Only ever downward. A clamp that raised the MSS would be
                 // advertising room the path does not have.
                 if current <= limit {
@@ -3997,10 +4031,7 @@ fn clamp_mss_egress(ctx: &TcContext, ihl_bytes: usize, proto: u8, ifindex: u32) 
                 // Every other option is length-prefixed. A length below two would
                 // not advance, and a walk that does not advance is a loop the
                 // verifier is right to refuse.
-                let Ok(len) = (unsafe { ptr_at_tc::<u8>(ctx, off + 1) }) else {
-                    return;
-                };
-                let len = unsafe { *len } as usize;
+                let len = opt_len as usize;
                 if len < 2 {
                     return;
                 }
@@ -4028,22 +4059,34 @@ fn rule_winner_v4(
     proto: u8,
     icmp_type: u8,
     dst_port: u16,
+    ifindex: u32,
     src: u32,
     dst: u32,
     exclude: u32,
 ) -> u32 {
+    // A rule scoped to *this* link first: naming the interface is the more
+    // specific statement, so it outranks the same rule written for the zone.
+    if ifindex != 0 {
+        let scoped = port_rule_winner(
+            lookup_port_rule(policy_id, proto, icmp_type, dst_port, ifindex, src),
+            lookup_dst_rule(policy_id, proto, icmp_type, dst_port, ifindex, dst),
+        );
+        if port_rule_present(scoped) && !port_rule_excluded(scoped, exclude) {
+            return scoped;
+        }
+    }
     if icmp_type != 0 {
         let typed = port_rule_winner(
-            lookup_port_rule(policy_id, proto, icmp_type, 0, src),
-            lookup_dst_rule(policy_id, proto, icmp_type, 0, dst),
+            lookup_port_rule(policy_id, proto, icmp_type, 0, 0, src),
+            lookup_dst_rule(policy_id, proto, icmp_type, 0, 0, dst),
         );
         if port_rule_present(typed) && !port_rule_excluded(typed, exclude) {
             return typed;
         }
     }
     let found = port_rule_winner(
-        lookup_port_rule(policy_id, proto, 0, dst_port, src),
-        lookup_dst_rule(policy_id, proto, 0, dst_port, dst),
+        lookup_port_rule(policy_id, proto, 0, dst_port, 0, src),
+        lookup_dst_rule(policy_id, proto, 0, dst_port, 0, dst),
     );
     // A rule scoped to the other family or the other direction is not a match
     // here. Zero is what "no rule" already means, so nothing downstream changes.
@@ -4061,21 +4104,31 @@ fn rule_winner_v6(
     proto: u8,
     icmp_type: u8,
     dst_port: u16,
+    ifindex: u32,
     hdr: &[u8; 40],
     exclude: u32,
 ) -> u32 {
+    if ifindex != 0 {
+        let scoped = port_rule_winner(
+            lookup_port_rule6(policy_id, proto, icmp_type, dst_port, ifindex, hdr),
+            lookup_dst_rule6(policy_id, proto, icmp_type, dst_port, ifindex, hdr),
+        );
+        if port_rule_present(scoped) && !port_rule_excluded(scoped, exclude) {
+            return scoped;
+        }
+    }
     if icmp_type != 0 {
         let typed = port_rule_winner(
-            lookup_port_rule6(policy_id, proto, icmp_type, 0, hdr),
-            lookup_dst_rule6(policy_id, proto, icmp_type, 0, hdr),
+            lookup_port_rule6(policy_id, proto, icmp_type, 0, 0, hdr),
+            lookup_dst_rule6(policy_id, proto, icmp_type, 0, 0, hdr),
         );
         if port_rule_present(typed) && !port_rule_excluded(typed, exclude) {
             return typed;
         }
     }
     let found = port_rule_winner(
-        lookup_port_rule6(policy_id, proto, 0, dst_port, hdr),
-        lookup_dst_rule6(policy_id, proto, 0, dst_port, hdr),
+        lookup_port_rule6(policy_id, proto, 0, dst_port, 0, hdr),
+        lookup_dst_rule6(policy_id, proto, 0, dst_port, 0, hdr),
     );
     if port_rule_excluded(found, exclude) {
         0
@@ -4114,14 +4167,24 @@ fn rate_limits_allow(slot: u32) -> bool {
 /// address. Pass `dst` as `0` on a non-IPv4 packet to match only rules with no
 /// destination constraint. `0` for a miss, for the reason given above.
 #[inline(always)]
-fn lookup_dst_rule(policy_id: PolicyId, proto: u8, icmp_type: u8, dst_port: u16, dst: u32) -> u32 {
+fn lookup_dst_rule(
+    policy_id: PolicyId,
+    proto: u8,
+    icmp_type: u8,
+    dst_port: u16,
+    ifindex: u32,
+    dst: u32,
+) -> u32 {
     match DST_RULES.get(Key::new(
         ScopedDstPortKey::FULL_PREFIX,
-        if icmp_type == 0 {
-            ScopedDstPortKey::new(policy_id, proto, dst_port, dst)
-        } else {
-            ScopedDstPortKey::with_icmp_type(policy_id, proto, icmp_type, dst)
-        },
+        ScopedDstPortKey::with_ifindex(
+            policy_id,
+            proto,
+            icmp_type,
+            if icmp_type == 0 { dst_port } else { 0 },
+            ifindex,
+            dst,
+        ),
     )) {
         Some(value) => *value,
         None => 0,

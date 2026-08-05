@@ -1233,16 +1233,18 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
                 let (prefix, addr) = port_rule_src_lpm(&rule.src);
                 let _ = rules.remove(&Key::new(
                     prefix,
-                    if rule.icmp_type == 0 {
-                        ScopedSrcPortKey::new(policy.id, rule.key.proto, rule.key.port, addr)
-                    } else {
-                        ScopedSrcPortKey::with_icmp_type(
-                            policy.id,
-                            rule.key.proto,
-                            rule.icmp_type,
-                            addr,
-                        )
-                    },
+                    ScopedSrcPortKey::with_ifindex(
+                        policy.id,
+                        rule.key.proto,
+                        rule.icmp_type,
+                        if rule.icmp_type == 0 {
+                            rule.key.port
+                        } else {
+                            0
+                        },
+                        rule_ifindex(&rule.in_interface),
+                        addr,
+                    ),
                 ));
             }
         }
@@ -1260,16 +1262,18 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
                 let (prefix, addr) = port_rule_src6_lpm(&rule.src6);
                 let _ = rules.remove(&Key::new(
                     prefix,
-                    if rule.icmp_type == 0 {
-                        ScopedSrcPortKey6::new(policy.id, rule.key.proto, rule.key.port, addr)
-                    } else {
-                        ScopedSrcPortKey6::with_icmp_type(
-                            policy.id,
-                            rule.key.proto,
-                            rule.icmp_type,
-                            addr,
-                        )
-                    },
+                    ScopedSrcPortKey6::with_ifindex(
+                        policy.id,
+                        rule.key.proto,
+                        rule.icmp_type,
+                        if rule.icmp_type == 0 {
+                            rule.key.port
+                        } else {
+                            0
+                        },
+                        rule_ifindex(&rule.in_interface),
+                        addr,
+                    ),
                 ));
             }
         }
@@ -1284,16 +1288,18 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
                 let (prefix, addr) = port_rule_dst6_lpm(&rule.dst6);
                 let _ = rules.remove(&Key::new(
                     prefix,
-                    if rule.icmp_type == 0 {
-                        ScopedDstPortKey6::new(policy.id, rule.key.proto, rule.key.port, addr)
-                    } else {
-                        ScopedDstPortKey6::with_icmp_type(
-                            policy.id,
-                            rule.key.proto,
-                            rule.icmp_type,
-                            addr,
-                        )
-                    },
+                    ScopedDstPortKey6::with_ifindex(
+                        policy.id,
+                        rule.key.proto,
+                        rule.icmp_type,
+                        if rule.icmp_type == 0 {
+                            rule.key.port
+                        } else {
+                            0
+                        },
+                        rule_ifindex(&rule.in_interface),
+                        addr,
+                    ),
                 ));
             }
         }
@@ -1308,16 +1314,18 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
                 let (prefix, addr) = port_rule_dst_lpm(&rule.dst);
                 let _ = rules.remove(&Key::new(
                     prefix,
-                    if rule.icmp_type == 0 {
-                        ScopedDstPortKey::new(policy.id, rule.key.proto, rule.key.port, addr)
-                    } else {
-                        ScopedDstPortKey::with_icmp_type(
-                            policy.id,
-                            rule.key.proto,
-                            rule.icmp_type,
-                            addr,
-                        )
-                    },
+                    ScopedDstPortKey::with_ifindex(
+                        policy.id,
+                        rule.key.proto,
+                        rule.icmp_type,
+                        if rule.icmp_type == 0 {
+                            rule.key.port
+                        } else {
+                            0
+                        },
+                        rule_ifindex(&rule.in_interface),
+                        addr,
+                    ),
                 ));
             }
         }
@@ -1698,21 +1706,18 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
                     .insert(
                         &Key::new(
                             prefix,
-                            if rule.icmp_type == 0 {
-                                ScopedSrcPortKey::new(
-                                    policy.id,
-                                    rule.key.proto,
-                                    rule.key.port,
-                                    addr,
-                                )
-                            } else {
-                                ScopedSrcPortKey::with_icmp_type(
-                                    policy.id,
-                                    rule.key.proto,
-                                    rule.icmp_type,
-                                    addr,
-                                )
-                            },
+                            ScopedSrcPortKey::with_ifindex(
+                                policy.id,
+                                rule.key.proto,
+                                rule.icmp_type,
+                                if rule.icmp_type == 0 {
+                                    rule.key.port
+                                } else {
+                                    0
+                                },
+                                rule_ifindex(&rule.in_interface),
+                                addr,
+                            ),
                         ),
                         port_rule_with_limit(
                             port_rule_value(rule.action, rule.log, cidr_bits(&rule.src))
@@ -1746,21 +1751,18 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
                     .insert(
                         &Key::new(
                             prefix,
-                            if rule.icmp_type == 0 {
-                                ScopedSrcPortKey6::new(
-                                    policy.id,
-                                    rule.key.proto,
-                                    rule.key.port,
-                                    addr,
-                                )
-                            } else {
-                                ScopedSrcPortKey6::with_icmp_type(
-                                    policy.id,
-                                    rule.key.proto,
-                                    rule.icmp_type,
-                                    addr,
-                                )
-                            },
+                            ScopedSrcPortKey6::with_ifindex(
+                                policy.id,
+                                rule.key.proto,
+                                rule.icmp_type,
+                                if rule.icmp_type == 0 {
+                                    rule.key.port
+                                } else {
+                                    0
+                                },
+                                rule_ifindex(&rule.in_interface),
+                                addr,
+                            ),
                         ),
                         port_rule_with_limit(
                             port_rule_value(rule.action, rule.log, cidr6_bits(&rule.src6))
@@ -1792,21 +1794,18 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
                     .insert(
                         &Key::new(
                             prefix,
-                            if rule.icmp_type == 0 {
-                                ScopedDstPortKey6::new(
-                                    policy.id,
-                                    rule.key.proto,
-                                    rule.key.port,
-                                    addr,
-                                )
-                            } else {
-                                ScopedDstPortKey6::with_icmp_type(
-                                    policy.id,
-                                    rule.key.proto,
-                                    rule.icmp_type,
-                                    addr,
-                                )
-                            },
+                            ScopedDstPortKey6::with_ifindex(
+                                policy.id,
+                                rule.key.proto,
+                                rule.icmp_type,
+                                if rule.icmp_type == 0 {
+                                    rule.key.port
+                                } else {
+                                    0
+                                },
+                                rule_ifindex(&rule.in_interface),
+                                addr,
+                            ),
                         ),
                         port_rule_with_limit(
                             port_rule_value(rule.action, rule.log, cidr6_bits(&rule.dst6))
@@ -1839,21 +1838,18 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
                     .insert(
                         &Key::new(
                             prefix,
-                            if rule.icmp_type == 0 {
-                                ScopedDstPortKey::new(
-                                    policy.id,
-                                    rule.key.proto,
-                                    rule.key.port,
-                                    addr,
-                                )
-                            } else {
-                                ScopedDstPortKey::with_icmp_type(
-                                    policy.id,
-                                    rule.key.proto,
-                                    rule.icmp_type,
-                                    addr,
-                                )
-                            },
+                            ScopedDstPortKey::with_ifindex(
+                                policy.id,
+                                rule.key.proto,
+                                rule.icmp_type,
+                                if rule.icmp_type == 0 {
+                                    rule.key.port
+                                } else {
+                                    0
+                                },
+                                rule_ifindex(&rule.in_interface),
+                                addr,
+                            ),
                         ),
                         port_rule_with_limit(
                             port_rule_value(rule.action, rule.log, cidr_bits(&rule.dst))
@@ -2156,6 +2152,20 @@ fn program_masquerade(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Resu
             .with_context(|| format!("inserting masquerade ifindex {ifindex}"))?;
     }
     Ok(())
+}
+
+/// The ifindex a rule is scoped to, or `0` for "every interface".
+///
+/// An interface that is named and absent resolves to `0` rather than to a
+/// nonexistent index — which would make the rule match nothing at all. `0` makes
+/// it match everywhere, so the failure is a rule that is too broad rather than
+/// one that is silently inert, and the reconfigure that follows a NIC appearing
+/// narrows it.
+fn rule_ifindex(name: &str) -> u32 {
+    if name.is_empty() {
+        return 0;
+    }
+    if_nametoindex(name).unwrap_or(0)
 }
 
 /// Write the `MAC_RULES` map: a policy's verdicts on sender hardware addresses.

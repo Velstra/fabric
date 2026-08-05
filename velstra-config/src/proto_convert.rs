@@ -28,12 +28,14 @@ fn port_rule_to_proto(r: &PortRule) -> proto::PortRule {
         icmp_type: u32::from(r.icmp_type.unwrap_or(0)),
         family: r.family.clone().unwrap_or_default(),
         direction: r.direction.clone().unwrap_or_default(),
+        in_interface: r.in_interface.clone().unwrap_or_default(),
     }
 }
 
 fn port_rule_from_proto(r: &proto::PortRule) -> PortRule {
     PortRule {
         src_mac: None,
+        in_interface: (!r.in_interface.is_empty()).then(|| r.in_interface.clone()),
         proto: proto_from_proto(r.proto()),
         // The proto carries the port as u32; a value past 65535 is invalid. Saturate
         // rather than `as u16`-truncate, which would wrap (e.g. 65536 → 0, the

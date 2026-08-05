@@ -1238,6 +1238,7 @@ mod tests {
                     rules: vec![PortRule {
                         icmp_type: None,
                         src_mac: None,
+                        in_interface: None,
                         family: None,
                         direction: None,
                         proto: ProtoName::Tcp,
