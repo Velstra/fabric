@@ -983,6 +983,7 @@ fn proto_to_proto(p: ProtoName) -> Proto {
 fn config_rule_from_proto(r: &PortRule) -> ConfigPortRule {
     ConfigPortRule {
         src_mac: None,
+        in_interface: (!r.in_interface.is_empty()).then(|| r.in_interface.clone()),
         proto: proto_from_proto(r.proto()),
         port: r.port as u16,
         action: action_from_proto(r.action()),
@@ -1002,6 +1003,7 @@ fn proto_rule_from_config(r: &ConfigPortRule) -> PortRule {
         proto: proto_to_proto(r.proto) as i32,
         port: r.port as u32,
         icmp_type: u32::from(r.icmp_type.unwrap_or(0)),
+        in_interface: r.in_interface.clone().unwrap_or_default(),
         family: r.family.clone().unwrap_or_default(),
         direction: r.direction.clone().unwrap_or_default(),
         action: action_to_proto(r.action) as i32,
@@ -2848,6 +2850,7 @@ fn parse_cli_rule(spec: &str, action: Action) -> Result<PortRule> {
         icmp_type: 0,
         family: String::new(),
         direction: String::new(),
+        in_interface: String::new(),
         action: action as i32,
         log: false,
         src: String::new(),

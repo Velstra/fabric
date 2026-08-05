@@ -183,6 +183,18 @@ pub struct PortRule {
     /// leave `port`/`src`/`dst` alone.
     #[serde(default, rename = "src-mac", skip_serializing_if = "Option::is_none")]
     pub src_mac: Option<String>,
+    /// Scope this rule to one interface, by name. Absent means every interface
+    /// the policy covers.
+    ///
+    /// Resolved to an ifindex at load time and matched in the rule key's head, so
+    /// a scoped rule and an unscoped one are different entries — and a scoped one
+    /// outranks the other, because naming the link is the more specific statement.
+    #[serde(
+        default,
+        rename = "in-interface",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub in_interface: Option<String>,
     /// Optional source-address constraint (an IPv4 CIDR like `"10.0.0.0/24"` or a
     /// bare `"198.51.100.7"` host). Absent means "from any source". A rule with a
     /// more specific source wins over a `from any` rule on the same port.
@@ -999,6 +1011,9 @@ pub struct ResolvedRule {
     /// has no types. It rides in the trie key's formerly-padding byte, so a
     /// typed rule is a separate entry rather than a wider key.
     pub icmp_type: u8,
+    /// The interface name this rule is scoped to, resolved to an ifindex when the
+    /// maps are written. Empty for a rule that names none.
+    pub in_interface: String,
     /// Scope bits — family and direction — packed into the rule's map value, so
     /// the datapath reads them off a value it has already loaded rather than
     /// paying for another lookup. `0` means "every family, both directions".
@@ -1502,6 +1517,7 @@ fn resolve_firewall(
         rules.push(ResolvedRule {
             key: PortKey::new(rule.proto.number(), rule.port),
             icmp_type: rule.icmp_type.unwrap_or(0),
+            in_interface: rule.in_interface.clone().unwrap_or_default(),
             scope,
             src,
             dst,
@@ -2579,6 +2595,7 @@ mod tests {
             p0.port_rules[0],
             ResolvedRule {
                 icmp_type: 0,
+                in_interface: String::new(),
                 scope: 0,
                 key: PortKey::new(ip_proto::TCP, 443),
                 src6: None,
@@ -2595,6 +2612,7 @@ mod tests {
             p0.port_rules[1],
             ResolvedRule {
                 icmp_type: 0,
+                in_interface: String::new(),
                 scope: 0,
                 key: PortKey::new(ip_proto::UDP, 53),
                 src6: None,

@@ -272,6 +272,14 @@ pub struct ScopedSrcPortKey {
     pub icmp_type: u8,
     /// Destination port, host byte order.
     pub port: u16,
+    /// The interface this rule is scoped to, or `0` for "any interface".
+    ///
+    /// In the exactly-matched head, so a rule scoped to one link is a different
+    /// entry from one that is not — and a lookup therefore asks twice, with this
+    /// packet's own ifindex and then with `0`. That is the same shape the ICMP
+    /// type uses, and the reason is the same: an LPM prefix is contiguous from
+    /// byte zero, so a wildcard cannot sit in the middle of a key.
+    pub ifindex: u32,
     /// Source address in [`lpm_key_addr`] form, matched longest-prefix.
     pub src: u32,
 }
@@ -279,7 +287,7 @@ pub struct ScopedSrcPortKey {
 impl ScopedSrcPortKey {
     /// Prefix bits covering the exactly-matched head (`policy_id` + `proto` +
     /// `_pad` + `port` = 32 + 8 + 8 + 16).
-    pub const FIXED_BITS: u32 = 64;
+    pub const FIXED_BITS: u32 = 96;
 
     /// Build a scoped source/port key.
     #[inline]
@@ -288,6 +296,7 @@ impl ScopedSrcPortKey {
             policy_id,
             proto,
             icmp_type: 0,
+            ifindex: 0,
             port,
             src,
         }
@@ -302,7 +311,30 @@ impl ScopedSrcPortKey {
             policy_id,
             proto,
             icmp_type,
+            ifindex: 0,
             port: 0,
+            src,
+        }
+    }
+
+    /// The same key, scoped to one interface. `0` means every interface, which
+    /// is what a rule that names none has always meant — so an unscoped rule and
+    /// a scoped one are different entries, and a lookup asks for both.
+    #[inline]
+    pub const fn with_ifindex(
+        policy_id: PolicyId,
+        proto: u8,
+        icmp_type: u8,
+        port: u16,
+        ifindex: u32,
+        src: u32,
+    ) -> Self {
+        Self {
+            policy_id,
+            proto,
+            icmp_type,
+            ifindex,
+            port,
             src,
         }
     }
@@ -350,13 +382,21 @@ pub struct ScopedSrcPortKey6 {
     pub icmp_type: u8,
     /// Destination port, host byte order.
     pub port: u16,
+    /// The interface this rule is scoped to, or `0` for "any interface".
+    ///
+    /// In the exactly-matched head, so a rule scoped to one link is a different
+    /// entry from one that is not — and a lookup therefore asks twice, with this
+    /// packet's own ifindex and then with `0`. That is the same shape the ICMP
+    /// type uses, and the reason is the same: an LPM prefix is contiguous from
+    /// byte zero, so a wildcard cannot sit in the middle of a key.
+    pub ifindex: u32,
     /// Source address, network-order octets, matched longest-prefix.
     pub src: [u8; 16],
 }
 
 impl ScopedSrcPortKey6 {
     /// Prefix bits covering the exactly-matched head, as for the v4 key.
-    pub const FIXED_BITS: u32 = 64;
+    pub const FIXED_BITS: u32 = 96;
 
     /// Build a scoped IPv6 source/port key.
     #[inline]
@@ -365,6 +405,7 @@ impl ScopedSrcPortKey6 {
             policy_id,
             proto,
             icmp_type: 0,
+            ifindex: 0,
             port,
             src,
         }
@@ -384,7 +425,30 @@ impl ScopedSrcPortKey6 {
             policy_id,
             proto,
             icmp_type,
+            ifindex: 0,
             port: 0,
+            src,
+        }
+    }
+
+    /// The same key, scoped to one interface. `0` means every interface, which
+    /// is what a rule that names none has always meant — so an unscoped rule and
+    /// a scoped one are different entries, and a lookup asks for both.
+    #[inline]
+    pub const fn with_ifindex(
+        policy_id: PolicyId,
+        proto: u8,
+        icmp_type: u8,
+        port: u16,
+        ifindex: u32,
+        src: [u8; 16],
+    ) -> Self {
+        Self {
+            policy_id,
+            proto,
+            icmp_type,
+            ifindex,
+            port,
             src,
         }
     }
@@ -425,13 +489,21 @@ pub struct ScopedDstPortKey6 {
     pub icmp_type: u8,
     /// Destination port, host byte order.
     pub port: u16,
+    /// The interface this rule is scoped to, or `0` for "any interface".
+    ///
+    /// In the exactly-matched head, so a rule scoped to one link is a different
+    /// entry from one that is not — and a lookup therefore asks twice, with this
+    /// packet's own ifindex and then with `0`. That is the same shape the ICMP
+    /// type uses, and the reason is the same: an LPM prefix is contiguous from
+    /// byte zero, so a wildcard cannot sit in the middle of a key.
+    pub ifindex: u32,
     /// Destination address, network-order octets, matched longest-prefix.
     pub dst: [u8; 16],
 }
 
 impl ScopedDstPortKey6 {
     /// Prefix bits covering the exactly-matched head.
-    pub const FIXED_BITS: u32 = 64;
+    pub const FIXED_BITS: u32 = 96;
 
     /// Build a scoped IPv6 destination/port key.
     #[inline]
@@ -440,6 +512,7 @@ impl ScopedDstPortKey6 {
             policy_id,
             proto,
             icmp_type: 0,
+            ifindex: 0,
             port,
             dst,
         }
@@ -459,7 +532,30 @@ impl ScopedDstPortKey6 {
             policy_id,
             proto,
             icmp_type,
+            ifindex: 0,
             port: 0,
+            dst,
+        }
+    }
+
+    /// The same key, scoped to one interface. `0` means every interface, which
+    /// is what a rule that names none has always meant — so an unscoped rule and
+    /// a scoped one are different entries, and a lookup asks for both.
+    #[inline]
+    pub const fn with_ifindex(
+        policy_id: PolicyId,
+        proto: u8,
+        icmp_type: u8,
+        port: u16,
+        ifindex: u32,
+        dst: [u8; 16],
+    ) -> Self {
+        Self {
+            policy_id,
+            proto,
+            icmp_type,
+            ifindex,
+            port,
             dst,
         }
     }
@@ -507,6 +603,14 @@ pub struct ScopedDstPortKey {
     pub icmp_type: u8,
     /// Destination port, host byte order.
     pub port: u16,
+    /// The interface this rule is scoped to, or `0` for "any interface".
+    ///
+    /// In the exactly-matched head, so a rule scoped to one link is a different
+    /// entry from one that is not — and a lookup therefore asks twice, with this
+    /// packet's own ifindex and then with `0`. That is the same shape the ICMP
+    /// type uses, and the reason is the same: an LPM prefix is contiguous from
+    /// byte zero, so a wildcard cannot sit in the middle of a key.
+    pub ifindex: u32,
     /// Destination address in [`lpm_key_addr`] form, matched longest-prefix.
     pub dst: u32,
 }
@@ -514,7 +618,7 @@ pub struct ScopedDstPortKey {
 impl ScopedDstPortKey {
     /// Prefix bits covering the exactly-matched head (`policy_id` + `proto` +
     /// `_pad` + `port` = 32 + 8 + 8 + 16).
-    pub const FIXED_BITS: u32 = 64;
+    pub const FIXED_BITS: u32 = 96;
 
     /// Build a scoped destination/port key.
     #[inline]
@@ -523,6 +627,7 @@ impl ScopedDstPortKey {
             policy_id,
             proto,
             icmp_type: 0,
+            ifindex: 0,
             port,
             dst,
         }
@@ -537,7 +642,30 @@ impl ScopedDstPortKey {
             policy_id,
             proto,
             icmp_type,
+            ifindex: 0,
             port: 0,
+            dst,
+        }
+    }
+
+    /// The same key, scoped to one interface. `0` means every interface, which
+    /// is what a rule that names none has always meant — so an unscoped rule and
+    /// a scoped one are different entries, and a lookup asks for both.
+    #[inline]
+    pub const fn with_ifindex(
+        policy_id: PolicyId,
+        proto: u8,
+        icmp_type: u8,
+        port: u16,
+        ifindex: u32,
+        dst: u32,
+    ) -> Self {
+        Self {
+            policy_id,
+            proto,
+            icmp_type,
+            ifindex,
+            port,
             dst,
         }
     }

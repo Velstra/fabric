@@ -604,6 +604,9 @@ message PortRule {
   // written before these fields existed means.
   string family = 10;
   string direction = 11;
+  // Scope the rule to one interface by name; empty = every interface the policy
+  // covers. Resolved to an ifindex where the maps are written.
+  string in_interface = 12;
 }
 
 message Route {
