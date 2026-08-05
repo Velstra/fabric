@@ -355,11 +355,20 @@ pub enum Counter {
     /// retries. It is only a fault when it rises for a device that *has* logged
     /// in, which means the session went and the portal did not say so.
     DroppedPortal = 40,
+
+    /// A departing SYN's Maximum Segment Size option was lowered to fit the link
+    /// (`mss` on an interface).
+    ///
+    /// Worth counting because the fault it prevents is invisible: a connection
+    /// whose MSS is too large carries small traffic perfectly and hangs on
+    /// anything big. A zero here on a tunnel that was configured to clamp says
+    /// the clamp is not running; a non-zero one says it is doing something.
+    MssClamped = 41,
 }
 
 impl Counter {
     /// Number of distinct counters — the `max_entries` of the `STATS` map.
-    pub const COUNT: u32 = 41;
+    pub const COUNT: u32 = 42;
 
     /// The array index of this counter.
     #[inline]
@@ -412,6 +421,7 @@ impl Counter {
             38 => Counter::SynproxyRejected,
             39 => Counter::SynproxySpliced,
             40 => Counter::DroppedPortal,
+            41 => Counter::MssClamped,
             _ => return None,
         };
         Some(counter)
@@ -468,6 +478,7 @@ impl Counter {
             Counter::SynproxyAdmitted => "synproxy_admitted",
             Counter::SynproxyRejected => "synproxy_rejected",
             Counter::SynproxySpliced => "synproxy_spliced",
+            Counter::MssClamped => "mss_clamped",
             Counter::DroppedPortal => "dropped_portal",
         }
     }

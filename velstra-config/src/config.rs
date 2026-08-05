@@ -615,6 +615,14 @@ pub struct InterfaceFile {
     /// single-tenant case); `0` ⇒ the interface is local-only (never tunneled).
     #[serde(default)]
     pub vni: Option<u32>,
+    /// Clamp the TCP MSS a departing SYN advertises to at most this, in bytes.
+    ///
+    /// For a link that takes bytes out of every packet — a tunnel, a PPPoE
+    /// session. Path MTU discovery is supposed to make this unnecessary; on a
+    /// path where the ICMP carrying that news is filtered, a connection carries
+    /// small traffic perfectly and hangs on anything large. Omitted ⇒ no clamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mss: Option<u16>,
     /// Masquerade (source NAT) traffic **leaving** this interface to its own
     /// public IPv4 — the classic WAN uplink. Off by default. The control plane
     /// reads the live address and programs the `MASQUERADE` map + the TC egress
@@ -1061,6 +1069,9 @@ pub struct ResolvedInterface {
     pub vni: u32,
     /// Masquerade (source NAT) traffic leaving this interface (`MASQUERADE`).
     pub masquerade: bool,
+    /// The MSS ceiling for SYNs leaving this interface (`MSS_CLAMP`), or `0` for
+    /// no clamp.
+    pub mss: u16,
     /// Deterministic CGNAT port-block layout for this egress, or a disabled layout.
     pub cgnat: CgnatLayout,
 }
@@ -1601,6 +1612,19 @@ impl FileConfig {
                 policy: iface.policy,
                 vni,
                 masquerade: iface.masquerade,
+                // 536 is the smallest MSS a sender may be asked for (RFC 1122's
+                // floor for IPv4); below it the clamp would be refusing to carry
+                // ordinary traffic rather than making it fit.
+                mss: match iface.mss {
+                    Some(m) if m < 536 => {
+                        bail!(
+                            "interface {:?}: mss {m} is below the RFC 1122 floor of 536",
+                            iface.name
+                        )
+                    }
+                    Some(m) => m,
+                    None => 0,
+                },
                 cgnat: CgnatLayout::new(iface.cgnat_base_port, iface.cgnat_block_size),
             });
         }
@@ -2789,6 +2813,7 @@ mod tests {
                     policy: 7,
                     vni: 7, // defaults to the policy id
                     masquerade: false,
+                    mss: 0,
                     cgnat: CgnatLayout::default(),
                 },
                 ResolvedInterface {
@@ -2796,6 +2821,7 @@ mod tests {
                     policy: 0,
                     vni: 0,
                     masquerade: false,
+                    mss: 0,
                     cgnat: CgnatLayout::default(),
                 },
             ]

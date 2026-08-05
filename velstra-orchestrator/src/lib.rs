@@ -1464,6 +1464,7 @@ impl Topology {
         for port in &self.ports {
             if port.host == host_id {
                 cfg.interfaces.push(InterfaceFile {
+                    mss: None,
                     name: port.tap.clone(),
                     // Decoupled from the VNI (M4): a port's security-group policy
                     // if set, else the VNI as the default single-tenant policy id.
