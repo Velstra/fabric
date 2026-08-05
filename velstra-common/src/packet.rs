@@ -137,6 +137,41 @@ pub type PolicyId = u32;
 /// one XDP program enforce a different policy per interface/tenant — the
 /// foundation for multi-tenant VM networking and multi-firewall hosts.
 ///
+/// Key for the source-MAC rule map: a policy and a hardware address.
+///
+/// A hash map rather than a trie, and its own map rather than a dimension on the
+/// firewall keys, for one reason: the rule tries are consulted twice per packet
+/// already, and a fifth lookup on that merge is what the verifier refuses. This
+/// is consulted **once**, from the Ethernet header, exactly as the blocklist is —
+/// which is also why a MAC rule is a verdict on its own rather than something
+/// that combines with a port.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct ScopedMac {
+    /// Policy id.
+    pub policy_id: PolicyId,
+    /// The source hardware address, as it sits on the wire.
+    pub mac: [u8; 6],
+    /// Explicit padding, always zero — a hash map compares the whole key, so a
+    /// struct with a hole in it would compare uninitialised bytes.
+    pub _pad: [u8; 2],
+}
+
+impl ScopedMac {
+    #[inline]
+    pub const fn new(policy_id: PolicyId, mac: [u8; 6]) -> Self {
+        Self {
+            policy_id,
+            mac,
+            _pad: [0; 2],
+        }
+    }
+}
+
+// SAFETY: `#[repr(C)]`, integer fields, padding zeroed — POD.
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ScopedMac {}
+
 /// The kernel LPM trie walks the key bytes from the start, so `policy_id` (at
 /// offset 0) is consumed first by its 32 prefix bits, then the address prefix —
 /// see [`ScopedAddr::POLICY_BITS`].

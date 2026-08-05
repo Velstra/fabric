@@ -1237,6 +1237,7 @@ mod tests {
                     blocklist: vec![],
                     rules: vec![PortRule {
                         icmp_type: None,
+                        src_mac: None,
                         family: None,
                         direction: None,
                         proto: ProtoName::Tcp,

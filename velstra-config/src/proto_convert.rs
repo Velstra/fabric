@@ -33,6 +33,7 @@ fn port_rule_to_proto(r: &PortRule) -> proto::PortRule {
 
 fn port_rule_from_proto(r: &proto::PortRule) -> PortRule {
     PortRule {
+        src_mac: None,
         proto: proto_from_proto(r.proto()),
         // The proto carries the port as u32; a value past 65535 is invalid. Saturate
         // rather than `as u16`-truncate, which would wrap (e.g. 65536 → 0, the

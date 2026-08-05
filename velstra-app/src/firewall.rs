@@ -29,7 +29,7 @@ use velstra_common::{
     GlobalConfig, IrbEndpoint, LocalMac, LocalMacKey, MAX_RULE_LIMITS, MacFdbKey, NdKey, Npt66,
     OverlayConfig, PORT_RULE_OUT_ONLY, PolicyId, PortFwd, PortalClientKey, PortalGate,
     PortalSeenKey, RateBucket, RouteEntry, ScopedAddr, ScopedAddr6, ScopedDstPortKey,
-    ScopedDstPortKey6, ScopedPortKey, ScopedSrcPortKey, ScopedSrcPortKey6, ServiceKey,
+    ScopedDstPortKey6, ScopedMac, ScopedPortKey, ScopedSrcPortKey, ScopedSrcPortKey6, ServiceKey,
     ServiceValue, Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, SynProxyCfg, SynProxyKey,
     TunnelEndpoint, TunnelKey, parse_cidr_v4, parse_cidr_v6, parse_mac, port_rule_value,
     port_rule_with_limit,
@@ -1524,6 +1524,7 @@ fn apply_config(ebpf: &mut Ebpf, cfg: &RuntimeConfig, old: Option<&RuntimeConfig
     program_synproxy(ebpf, &cfg.synproxy)?;
     program_masquerade(ebpf, &cfg.interfaces)?;
     program_mss_clamp(ebpf, &cfg.interfaces)?;
+    program_mac_rules(ebpf, &cfg.policies)?;
     program_cgnat(ebpf, &cfg.interfaces)?;
     program_npt66(ebpf, &cfg.npt66)?;
     program_overlay(
@@ -2153,6 +2154,32 @@ fn program_masquerade(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Resu
     for (ifindex, ip) in prepared {
         map.insert(ifindex, ip, 0)
             .with_context(|| format!("inserting masquerade ifindex {ifindex}"))?;
+    }
+    Ok(())
+}
+
+/// Write the `MAC_RULES` map: a policy's verdicts on sender hardware addresses.
+///
+/// One entry per (policy, MAC). Empty on a box with no MAC groups, so the
+/// datapath's single lookup misses immediately and costs nothing.
+fn program_mac_rules(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
+    let total: usize = policies.iter().map(|p| p.mac_rules.len()).sum();
+    if total == 0 {
+        return Ok(());
+    }
+    let mut map: HashMap<_, ScopedMac, u32> = HashMap::try_from(
+        ebpf.map_mut("MAC_RULES")
+            .ok_or_else(|| anyhow!("MAC_RULES map missing"))?,
+    )?;
+    for policy in policies {
+        for (mac, action) in &policy.mac_rules {
+            map.insert(
+                ScopedMac::new(policy.id, *mac),
+                port_rule_value(*action, false, 0),
+                0,
+            )
+            .with_context(|| format!("inserting mac rule for policy {}", policy.id))?;
+        }
     }
     Ok(())
 }

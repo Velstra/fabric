@@ -175,6 +175,14 @@ pub struct PortRule {
     /// Off by default.
     #[serde(default)]
     pub log: bool,
+    /// Match the sender's hardware address instead of an IP source.
+    ///
+    /// A MAC rule is a verdict on the device: it does not combine with a
+    /// protocol or a port, because the data plane consults it once from the
+    /// Ethernet header rather than as a dimension of the rule tries. Set it and
+    /// leave `port`/`src`/`dst` alone.
+    #[serde(default, rename = "src-mac", skip_serializing_if = "Option::is_none")]
+    pub src_mac: Option<String>,
     /// Optional source-address constraint (an IPv4 CIDR like `"10.0.0.0/24"` or a
     /// bare `"198.51.100.7"` host). Absent means "from any source". A rule with a
     /// more specific source wins over a `from any` rule on the same port.
@@ -969,6 +977,8 @@ pub struct PolicyConfig {
     /// Filled from the same TOML `blocklist` list — entries containing a `:` are
     /// parsed as IPv6.
     pub blocklist6: Vec<Cidr6>,
+    /// Hardware addresses this policy has a verdict for (`MAC_RULES`).
+    pub mac_rules: Vec<([u8; 6], Action)>,
     /// This policy's resolved firewall rules, for the `PORT_RULES` and `DST_RULES`
     /// tries.
     pub port_rules: Vec<ResolvedRule>,
@@ -1258,6 +1268,7 @@ impl RuntimeConfig {
             // passed too, matching this config's whole premise.
             fail_closed: false,
             policies: vec![PolicyConfig {
+                mac_rules: Vec::new(),
                 id: 0,
                 global: GlobalConfig::new(Action::Pass, 0),
                 portal: None,
@@ -1356,8 +1367,23 @@ fn resolve_firewall(
         }
     }
 
+    let mut mac_rules: Vec<([u8; 6], Action)> = Vec::new();
     let mut rules = Vec::with_capacity(port_rules.len());
     for rule in port_rules {
+        if let Some(mac) = &rule.src_mac {
+            // A device verdict, not a port rule: it never reaches the tries.
+            if rule.port != 0 || rule.src.is_some() || rule.dst.is_some() {
+                bail!(
+                    "policy {id}: a src-mac rule is a verdict on the device — it cannot \
+                     also carry a port or an address"
+                );
+            }
+            mac_rules.push((
+                parse_mac(mac).map_err(|e| anyhow::anyhow!("policy {id}: src-mac {mac:?}: {e}"))?,
+                rule.action.into(),
+            ));
+            continue;
+        }
         // A protocol with no ports is keyed at port 0 — that is what "matches
         // every packet of this protocol the rule scopes" compiles to, and the
         // data plane reads 0 off a packet that carries no ports. What is still
@@ -1492,6 +1518,7 @@ fn resolve_firewall(
         global,
         blocklist: cidrs,
         blocklist6: cidrs6,
+        mac_rules,
         port_rules: rules,
         portal,
     })
@@ -2154,6 +2181,13 @@ impl fmt::Display for RuntimeConfig {
             }
             for cidr in &policy.blocklist6 {
                 writeln!(f, "      block6 {cidr}")?;
+            }
+            // A MAC verdict never reaches the rule tries, so it would be absent
+            // from the lines below — and a summary that omits a rule cannot be
+            // used to check what was loaded.
+            for (mac, action) in &policy.mac_rules {
+                let mac = mac.map(|b| format!("{b:02x}")).join(":");
+                writeln!(f, "      mac {mac} -> {action:?}")?;
             }
             for rule in &policy.port_rules {
                 let (key, action) = (rule.key, rule.action);
