@@ -202,6 +202,20 @@ static PORT_FORWARDS: HashMap<ScopedPortKey, PortFwd> = HashMap::with_max_entrie
 #[map]
 static MASQUERADE: HashMap<u32, [u8; 4]> = HashMap::with_max_entries(64, 0);
 
+/// Egress interface index → the largest TCP MSS a SYN may advertise on it.
+///
+/// A tunnel takes bytes out of every packet, and a host that never learns this
+/// keeps sending full-size segments that cannot fit. Path MTU discovery is
+/// supposed to tell it; on a link where the ICMP that carries that news is
+/// filtered — which is most of the internet — the connection carries small
+/// traffic perfectly and hangs on anything large. Clamping the option as the SYN
+/// leaves is the fix that does not depend on anybody else's ICMP.
+///
+/// Empty by default. This used to be an nftables table rendered next to the data
+/// plane; it is the last packet-touching thing that was not eBPF.
+#[map]
+static MSS_CLAMP: HashMap<u32, u16> = HashMap::with_max_entries(64, 0);
+
 /// Per-interface NPTv6 (RFC 6296) prefix translation: boundary ifindex → the
 /// stateless mapping between an internal and an external IPv6 prefix. On TC egress
 /// of this interface an internal source is rewritten to the external prefix; on
@@ -953,6 +967,12 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
 
     // Egress policy is keyed by the *egress* interface index.
     let ifindex = unsafe { (*ctx.skb.skb).ifindex };
+
+    // Clamp before anything else looks at this packet: the MSS is advertised in
+    // the SYN, and whether the firewall passes it or the masquerade path takes
+    // it over, the option has to be right on the way out. It is not a verdict —
+    // nothing below depends on it — so it runs and the packet carries on.
+    clamp_mss_egress(ctx, ihl_bytes, proto, ifindex);
 
     // Masquerade takes over a packet leaving a masquerade (WAN) interface,
     // *before* and *instead of* the egress firewall: a router's outbound traffic
@@ -3859,6 +3879,103 @@ fn lookup_dst_rule6(
     match DST_RULES6.get(&*key) {
         Some(value) => *value,
         None => 0,
+    }
+}
+
+/// The furthest into the options the MSS is looked for. TCP allows 40 bytes of
+/// options; every sender in practice puts the MSS first, and a bound is what the
+/// verifier requires in any case.
+const MAX_TCP_OPTS: usize = 10;
+
+/// Clamp the MSS a departing SYN advertises, if this interface has a limit.
+///
+/// Only a SYN carries the option, and only the first IPv4 fragment carries the
+/// TCP header at all. `ihl` is required to be 20 for the same reason the NAT path
+/// requires it — the offsets below are computed from a fixed header, and an IPv4
+/// option would move everything. Packets with IP options keep their MSS; they are
+/// vanishingly rare and silently rewriting the wrong bytes would be worse.
+///
+/// Written with `bpf_skb_store_bytes` rather than a pointer, so the variable
+/// option offset never becomes a packet-pointer the verifier has to bound, and
+/// the checksum is fixed with `bpf_l4_csum_replace` from the two values.
+#[inline(always)]
+fn clamp_mss_egress(ctx: &TcContext, ihl_bytes: usize, proto: u8, ifindex: u32) {
+    if proto != ip_proto::TCP || ihl_bytes != Ipv4Hdr::LEN {
+        return;
+    }
+    let Some(limit) = (unsafe { MSS_CLAMP.get(&ifindex) }).copied() else {
+        return;
+    };
+    // Byte 13 of the TCP header holds the flags; byte 12's top nibble is the data
+    // offset in 32-bit words, which is where the options end.
+    let Ok(head) = (unsafe { ptr_at_tc::<[u8; 2]>(ctx, O_L4 + 12) }) else {
+        return;
+    };
+    let head = unsafe { *head };
+    const TCP_SYN: u8 = 0x02;
+    if head[1] & TCP_SYN == 0 {
+        return;
+    }
+    let doff = (head[0] >> 4) as usize * 4;
+    if doff <= Ipv4Hdr::LEN {
+        return; // no options at all
+    }
+    let opts_end = O_L4 + doff;
+    let mut off = O_L4 + 20;
+    for _ in 0..MAX_TCP_OPTS {
+        if off + 1 > opts_end {
+            return;
+        }
+        let Ok(kind) = (unsafe { ptr_at_tc::<u8>(ctx, off) }) else {
+            return;
+        };
+        match unsafe { *kind } {
+            // End of option list.
+            0 => return,
+            // A single-byte no-op pad; step one and keep looking.
+            1 => {
+                off += 1;
+                continue;
+            }
+            // Maximum Segment Size: kind 2, length 4, then the value.
+            2 => {
+                let Ok(opt) = (unsafe { ptr_at_tc::<[u8; 4]>(ctx, off) }) else {
+                    return;
+                };
+                let opt = unsafe { *opt };
+                if opt[1] != 4 {
+                    return;
+                }
+                let current = u16::from_be_bytes([opt[2], opt[3]]);
+                // Only ever downward. A clamp that raised the MSS would be
+                // advertising room the path does not have.
+                if current <= limit {
+                    return;
+                }
+                if ctx.store(off + 2, &limit.to_be_bytes(), 0).is_err() {
+                    return;
+                }
+                // The option is part of the TCP payload for checksum purposes,
+                // so this is an L4 replace with the old and new values as
+                // native-endian integers — the same shape the NAT path uses.
+                let _ = ctx.l4_csum_replace(O_L4 + 16, current as u64, limit as u64, 2);
+                bump(Counter::MssClamped);
+                return;
+            }
+            _ => {
+                // Every other option is length-prefixed. A length below two would
+                // not advance, and a walk that does not advance is a loop the
+                // verifier is right to refuse.
+                let Ok(len) = (unsafe { ptr_at_tc::<u8>(ctx, off + 1) }) else {
+                    return;
+                };
+                let len = unsafe { *len } as usize;
+                if len < 2 {
+                    return;
+                }
+                off += len;
+            }
+        }
     }
 }
 

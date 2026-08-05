@@ -28,11 +28,11 @@ use velstra_common::{
     ArpEntry, ArpKey, Backend, CgnatLayout, Cidr4, Cidr6, Counter, FloodSet, FlowKey, FlowState,
     GlobalConfig, IrbEndpoint, LocalMac, LocalMacKey, MAX_RULE_LIMITS, MacFdbKey, NdKey, Npt66,
     OverlayConfig, PORT_RULE_OUT_ONLY, PolicyId, PortFwd, PortalClientKey, PortalGate,
-    PortalSeenKey, RateBucket,
-    RouteEntry, ScopedAddr, ScopedAddr6, ScopedDstPortKey, ScopedDstPortKey6, ScopedPortKey,
-    ScopedSrcPortKey, ScopedSrcPortKey6, ServiceKey, ServiceValue, Srv6Config, Srv6Endpoint,
-    Srv6LocalSid, Srv6SidKey, SynProxyCfg, SynProxyKey, TunnelEndpoint, TunnelKey, parse_cidr_v4,
-    parse_cidr_v6, parse_mac, port_rule_value, port_rule_with_limit,
+    PortalSeenKey, RateBucket, RouteEntry, ScopedAddr, ScopedAddr6, ScopedDstPortKey,
+    ScopedDstPortKey6, ScopedPortKey, ScopedSrcPortKey, ScopedSrcPortKey6, ServiceKey,
+    ServiceValue, Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, SynProxyCfg, SynProxyKey,
+    TunnelEndpoint, TunnelKey, parse_cidr_v4, parse_cidr_v6, parse_mac, port_rule_value,
+    port_rule_with_limit,
 };
 use velstra_config::{
     PolicyConfig, ResolvedFloodVtep, ResolvedInterface, ResolvedIrbRoute, ResolvedMacRoute,
@@ -225,7 +225,10 @@ impl Firewall {
         // without needing `--egress`.
         let mut egress_ifaces: Vec<String> = if egress { ifaces.to_vec() } else { Vec::new() };
         for i in &cfg.interfaces {
-            if i.masquerade
+            // Clamping happens at this hook and nowhere else, so an interface
+            // that configures one brings the hook with it — the same reasoning
+            // masquerade already carries.
+            if (i.masquerade || i.mss != 0)
                 && !egress_ifaces.iter().any(|n| n == &i.name)
                 && if_nametoindex(&i.name).is_ok()
             {
@@ -1520,6 +1523,7 @@ fn apply_config(ebpf: &mut Ebpf, cfg: &RuntimeConfig, old: Option<&RuntimeConfig
     program_port_forwards(ebpf, &cfg.port_forwards, &cfg.interfaces)?;
     program_synproxy(ebpf, &cfg.synproxy)?;
     program_masquerade(ebpf, &cfg.interfaces)?;
+    program_mss_clamp(ebpf, &cfg.interfaces)?;
     program_cgnat(ebpf, &cfg.interfaces)?;
     program_npt66(ebpf, &cfg.npt66)?;
     program_overlay(
@@ -2149,6 +2153,29 @@ fn program_masquerade(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Resu
     for (ifindex, ip) in prepared {
         map.insert(ifindex, ip, 0)
             .with_context(|| format!("inserting masquerade ifindex {ifindex}"))?;
+    }
+    Ok(())
+}
+
+/// Write the `MSS_CLAMP` map: egress ifindex → the largest MSS a departing SYN
+/// may advertise. Only interfaces that configure one get an entry, so a box with
+/// no tunnels pays nothing and the datapath's lookup misses immediately.
+fn program_mss_clamp(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Result<()> {
+    let prepared: Vec<(u32, u16)> = interfaces
+        .iter()
+        .filter(|i| i.mss != 0)
+        .filter_map(|i| if_nametoindex(&i.name).ok().map(|idx| (idx, i.mss)))
+        .collect();
+    if prepared.is_empty() {
+        return Ok(());
+    }
+    let mut map: HashMap<_, u32, u16> = HashMap::try_from(
+        ebpf.map_mut("MSS_CLAMP")
+            .ok_or_else(|| anyhow!("MSS_CLAMP map missing"))?,
+    )?;
+    for (ifindex, mss) in prepared {
+        map.insert(ifindex, mss, 0)
+            .with_context(|| format!("inserting mss clamp for ifindex {ifindex}"))?;
     }
     Ok(())
 }
@@ -3037,6 +3064,7 @@ mod tests {
             policy: 100,
             vni: 100,
             masquerade: false,
+            mss: 0,
             cgnat: CgnatLayout::default(),
         });
         // An uplink with no tenant segment must not register VNI 0.
@@ -3045,6 +3073,7 @@ mod tests {
             policy: 0,
             vni: 0,
             masquerade: true,
+            mss: 0,
             cgnat: CgnatLayout::default(),
         });
         cfg.irb_routes.push(ResolvedIrbRoute {

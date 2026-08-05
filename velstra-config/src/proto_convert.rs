@@ -332,6 +332,7 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
             .interfaces
             .iter()
             .map(|i| InterfaceFile {
+                mss: None,
                 name: i.name.clone(),
                 policy: i.policy,
                 vni: i.vni,
