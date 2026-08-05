@@ -71,15 +71,16 @@ use velstra_common::{
     GlobalConfig, ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, ICMPV6_NEIGHBOR_SOLICIT,
     IrbEndpoint, IrbRewrite, LocalMac, LocalMacKey, MAX_BLOCKLIST, MAX_FLOOD_VTEPS,
     MAX_RULE_LIMITS, MacFdbKey, ND_NA_MSG_LEN, Nat, NdKey, Npt66, OVERLAY_OUTER_LEN, OverlayConfig,
-    PacketMeta, PolicyId, PortFwd, PortalClientKey, PortalGate, PortalSeenKey, RateBucket, Rewrite,
-    RouteEntry, SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6, ScopedDstPortKey, ScopedDstPortKey6,
-    ScopedPortKey, ScopedSrcPortKey, ScopedSrcPortKey6, ServiceKey, ServiceValue, SourceValidation,
-    Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, SynFlow, SynProxyCfg, SynProxyKey,
-    TcpSynth, TunnelEndpoint, TunnelKey, build_encap, build_srv6_encap, check_cookie,
-    csum_replace_u32, decide, decode_vni, epoch_of, gate_admits_unauthenticated, icmp,
-    icmp_checksum, ip_proto, ipv6_ext_len, is_ipv6_ext, is_overlay_dport, lpm_key_addr,
-    make_cookie, plan_arp_reply, plan_forward, plan_icmp_unreachable, plan_irb, plan_na_reply,
-    plan_nat, plan_server_ack, plan_server_syn, plan_syn_ack, plan_tcp_rst, port_rule_action,
+    PORT_RULE_IN_ONLY, PORT_RULE_OUT_ONLY, PORT_RULE_V4_ONLY, PORT_RULE_V6_ONLY, PacketMeta,
+    PolicyId, PortFwd, PortalClientKey, PortalGate, PortalSeenKey, RateBucket, Rewrite, RouteEntry,
+    SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6, ScopedDstPortKey, ScopedDstPortKey6, ScopedPortKey,
+    ScopedSrcPortKey, ScopedSrcPortKey6, ServiceKey, ServiceValue, SourceValidation, Srv6Config,
+    Srv6Endpoint, Srv6LocalSid, Srv6SidKey, SynFlow, SynProxyCfg, SynProxyKey, TcpSynth,
+    TunnelEndpoint, TunnelKey, build_encap, build_srv6_encap, check_cookie, csum_replace_u32,
+    decide, decode_vni, epoch_of, gate_admits_unauthenticated, icmp, icmp_checksum, ip_proto,
+    ipv6_ext_len, is_ipv6_ext, is_overlay_dport, lpm_key_addr, make_cookie, plan_arp_reply,
+    plan_forward, plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_server_ack,
+    plan_server_syn, plan_syn_ack, plan_tcp_rst, port_rule_action, port_rule_excluded,
     port_rule_limit, port_rule_logs, port_rule_present, port_rule_winner, select_backend,
     session_hash, tcp_flags, translate_to_client, translate_to_server,
 };
@@ -936,11 +937,17 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
     // Ports only from the first fragment; a non-first fragment's bytes there are
     // payload, not L4 (M1 — see the ingress path and `parse_frame`).
     let (mut src_port, mut dst_port) = (0u16, 0u16);
+    let mut icmp_type = 0u8;
     if (proto == ip_proto::TCP || proto == ip_proto::UDP) && ipv4.frag_offset() == 0 {
         if let Ok(ports) = unsafe { ptr_at_tc::<[u8; 4]>(ctx, EthHdr::LEN + ihl_bytes) } {
             let ports = unsafe { *ports };
             src_port = u16::from_be_bytes([ports[0], ports[1]]);
             dst_port = u16::from_be_bytes([ports[2], ports[3]]);
+        }
+    } else if proto == ip_proto::ICMP && ipv4.frag_offset() == 0 {
+        // See the ingress path: four bytes, because one does not verify.
+        if let Ok(head) = unsafe { ptr_at_tc::<[u8; 4]>(ctx, EthHdr::LEN + ihl_bytes) } {
+            icmp_type = unsafe { *head }[0];
         }
     }
 
@@ -976,9 +983,16 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
         .is_some();
     // Both address dimensions, each collapsed to a scalar at the call — see
     // `lookup_port_rule` for why an `Option` must not survive to this merge.
-    let rule = port_rule_winner(
-        lookup_port_rule(policy_id, proto, dst_port, lpm_key_addr(src_addr)),
-        lookup_dst_rule(policy_id, proto, dst_port, lpm_key_addr(dst_addr)),
+    // The egress hook: a rule scoped to arriving traffic does not apply here, and
+    // one scoped to IPv6 cannot — this path is IPv4 only.
+    let rule = rule_winner_v4(
+        policy_id,
+        proto,
+        icmp_type,
+        dst_port,
+        lpm_key_addr(src_addr),
+        lpm_key_addr(dst_addr),
+        PORT_RULE_IN_ONLY | PORT_RULE_V6_ONLY,
     );
     let rule_action = if port_rule_present(rule) {
         Some(port_rule_action(rule))
@@ -1396,6 +1410,11 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     // entry can match, so the fragment is neither misclassified nor rewritten
     // (M1 — mirrors `velstra_common::parse::parse_frame`).
     let (mut src_port, mut dst_port) = (0u16, 0u16);
+    // ICMP's first header byte is its type, where TCP and UDP carry a source
+    // port. A rule may name one, so it is read here under the same first-fragment
+    // guard: a later fragment's bytes are payload, and treating them as a type
+    // would let a rule be evaded by fragmenting.
+    let mut icmp_type = 0u8;
     if (proto == ip_proto::TCP || proto == ip_proto::UDP) && ipv4.frag_offset() == 0 {
         // The L4 header begins after the variable-length IPv4 header. We only
         // need the first four bytes (source + destination port).
@@ -1403,6 +1422,18 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
             let ports = unsafe { *ports };
             src_port = u16::from_be_bytes([ports[0], ports[1]]);
             dst_port = u16::from_be_bytes([ports[2], ports[3]]);
+        }
+    } else if proto == ip_proto::ICMP && ipv4.frag_offset() == 0 {
+        // The same four bytes the ports path reads, of which only the first is
+        // the type. A one-byte read is refused here: the bounds check the
+        // compiler emits for it establishes no readable *range* on a pointer
+        // whose offset is variable ("invalid access to packet, off=0 size=1,
+        // r=0"), while the four-byte form the ports already use does. An ICMP
+        // header is eight bytes, so four is always there — and when it is not,
+        // `ptr_at` fails and the type stays 0, which means "any type", exactly
+        // as a truncated TCP header leaves the ports at 0.
+        if let Ok(head) = unsafe { ptr_at::<[u8; 4]>(ctx, EthHdr::LEN + ihl_bytes) } {
+            icmp_type = unsafe { *head }[0];
         }
     }
 
@@ -1492,9 +1523,14 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
             ScopedAddr::new(policy_id, lpm_key_addr(src_addr)),
         ))
         .is_some();
-    let rule = port_rule_winner(
-        lookup_port_rule(policy_id, proto, dst_port, lpm_key_addr(src_addr)),
-        lookup_dst_rule(policy_id, proto, dst_port, lpm_key_addr(dst_addr)),
+    let rule = rule_winner_v4(
+        policy_id,
+        proto,
+        icmp_type,
+        dst_port,
+        lpm_key_addr(src_addr),
+        lpm_key_addr(dst_addr),
+        PORT_RULE_OUT_ONLY | PORT_RULE_V6_ONLY,
     );
     let rule_action = if port_rule_present(rule) {
         Some(port_rule_action(rule))
@@ -1946,11 +1982,22 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
     let upper = walk_ipv6_ext(ctx, next_hdr);
     let proto = upper.proto;
     let (mut src_port, mut dst_port) = (0u16, 0u16);
+    // ICMPv6's type byte sits where TCP's source port would: same read, same
+    // reason, and `l4_present` is what says the chain ended in a real header
+    // rather than in a fragment.
+    let mut icmp_type = 0u8;
     if upper.l4_present && (proto == ip_proto::TCP || proto == ip_proto::UDP) {
         if let Ok(ports) = unsafe { ptr_at::<[u8; 4]>(ctx, upper.off) } {
             let ports = unsafe { *ports };
             src_port = u16::from_be_bytes([ports[0], ports[1]]);
             dst_port = u16::from_be_bytes([ports[2], ports[3]]);
+        }
+    } else if upper.l4_present && proto == ip_proto::ICMPV6 {
+        // Four bytes, not one — and on this path it is not a preference: the
+        // offset is walked, so its `var_off` is wide, and a one-byte read there
+        // is exactly what the verifier refused.
+        if let Ok(head) = unsafe { ptr_at::<[u8; 4]>(ctx, upper.off) } {
+            icmp_type = unsafe { *head }[0];
         }
     }
 
@@ -2001,13 +2048,25 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
     // names a protocol and a port but no address still applies to both families
     // exactly as it reads.
     let rule = port_rule_winner(
-        port_rule_winner(
-            lookup_port_rule6(policy_id, proto, dst_port, &hdr),
-            lookup_dst_rule6(policy_id, proto, dst_port, &hdr),
+        rule_winner_v6(
+            policy_id,
+            proto,
+            icmp_type,
+            dst_port,
+            &hdr,
+            PORT_RULE_OUT_ONLY | PORT_RULE_V4_ONLY,
         ),
-        port_rule_winner(
-            lookup_port_rule(policy_id, proto, dst_port, 0),
-            lookup_dst_rule(policy_id, proto, dst_port, 0),
+        // The v4 tries with no address, for a rule that names a protocol and a
+        // port but no address — which applies to both families unless it says
+        // otherwise, and `PORT_RULE_V4_ONLY` is how it says otherwise.
+        rule_winner_v4(
+            policy_id,
+            proto,
+            icmp_type,
+            dst_port,
+            0,
+            0,
+            PORT_RULE_OUT_ONLY | PORT_RULE_V4_ONLY,
         ),
     );
     let rule_action = if port_rule_present(rule) {
@@ -3710,10 +3769,14 @@ fn forward(ctx: &XdpContext, rewrite: Rewrite, log: bool) -> Result<u32, ()> {
 /// map lookups to a merge point let LLVM fold their map-value pointers into one
 /// and null-check once, which the verifier rejects (see [`lookup_port_forward`]).
 #[inline(always)]
-fn lookup_port_rule(policy_id: PolicyId, proto: u8, dst_port: u16, src: u32) -> u32 {
+fn lookup_port_rule(policy_id: PolicyId, proto: u8, icmp_type: u8, dst_port: u16, src: u32) -> u32 {
     match PORT_RULES.get(Key::new(
         ScopedSrcPortKey::FULL_PREFIX,
-        ScopedSrcPortKey::new(policy_id, proto, dst_port, src),
+        if icmp_type == 0 {
+            ScopedSrcPortKey::new(policy_id, proto, dst_port, src)
+        } else {
+            ScopedSrcPortKey::with_icmp_type(policy_id, proto, icmp_type, src)
+        },
     )) {
         Some(value) => *value,
         None => 0,
@@ -3743,7 +3806,13 @@ static RULE6_DST_SCRATCH: PerCpuArray<Key<ScopedDstPortKey6>> = PerCpuArray::wit
 /// reason: two `Option`s carried to one merge point let LLVM fold their map-value
 /// pointers together, which the verifier rejects.
 #[inline(always)]
-fn lookup_port_rule6(policy_id: PolicyId, proto: u8, dst_port: u16, hdr: &[u8; 40]) -> u32 {
+fn lookup_port_rule6(
+    policy_id: PolicyId,
+    proto: u8,
+    icmp_type: u8,
+    dst_port: u16,
+    hdr: &[u8; 40],
+) -> u32 {
     let Some(slot) = RULE6_SRC_SCRATCH.get_ptr_mut(0) else {
         return 0;
     };
@@ -3753,7 +3822,7 @@ fn lookup_port_rule6(policy_id: PolicyId, proto: u8, dst_port: u16, hdr: &[u8; 4
     key.prefix_len = ScopedSrcPortKey6::FULL_PREFIX;
     key.data.policy_id = policy_id;
     key.data.proto = proto;
-    key.data._pad = 0;
+    key.data.icmp_type = icmp_type;
     key.data.port = dst_port;
     key.data.src.copy_from_slice(&hdr[8..24]);
     match PORT_RULES6.get(&*key) {
@@ -3769,7 +3838,13 @@ fn lookup_port_rule6(policy_id: PolicyId, proto: u8, dst_port: u16, hdr: &[u8; 4
 /// that is the difference between a program the verifier loads and one it does
 /// not. Copied straight from the header into the map slot instead.
 #[inline(always)]
-fn lookup_dst_rule6(policy_id: PolicyId, proto: u8, dst_port: u16, hdr: &[u8; 40]) -> u32 {
+fn lookup_dst_rule6(
+    policy_id: PolicyId,
+    proto: u8,
+    icmp_type: u8,
+    dst_port: u16,
+    hdr: &[u8; 40],
+) -> u32 {
     let Some(slot) = RULE6_DST_SCRATCH.get_ptr_mut(0) else {
         return 0;
     };
@@ -3778,12 +3853,86 @@ fn lookup_dst_rule6(policy_id: PolicyId, proto: u8, dst_port: u16, hdr: &[u8; 40
     key.prefix_len = ScopedDstPortKey6::FULL_PREFIX;
     key.data.policy_id = policy_id;
     key.data.proto = proto;
-    key.data._pad = 0;
+    key.data.icmp_type = icmp_type;
     key.data.port = dst_port;
     key.data.dst.copy_from_slice(&hdr[24..40]);
     match DST_RULES6.get(&*key) {
         Some(value) => *value,
         None => 0,
+    }
+}
+
+/// The winning rule for a packet, asking the typed tries first.
+///
+/// ICMP carries a type where TCP carries ports, and a rule may name one. A typed
+/// rule is a different entry in the same trie — the type lives in the byte that
+/// used to be padding — so finding it needs its own lookup, and a plain `icmp`
+/// rule still has to be found when no typed one matches. Hence twice, and only
+/// on the ICMP path: `icmp_type` is `0` for everything else, and the first
+/// lookup pair is then skipped entirely.
+///
+/// Returns a plain `u32` rather than an `Option` for the reason
+/// [`lookup_port_rule`] gives: two map-value pointers reaching one merge point
+/// is what the verifier refuses.
+#[inline(always)]
+fn rule_winner_v4(
+    policy_id: PolicyId,
+    proto: u8,
+    icmp_type: u8,
+    dst_port: u16,
+    src: u32,
+    dst: u32,
+    exclude: u32,
+) -> u32 {
+    if icmp_type != 0 {
+        let typed = port_rule_winner(
+            lookup_port_rule(policy_id, proto, icmp_type, 0, src),
+            lookup_dst_rule(policy_id, proto, icmp_type, 0, dst),
+        );
+        if port_rule_present(typed) && !port_rule_excluded(typed, exclude) {
+            return typed;
+        }
+    }
+    let found = port_rule_winner(
+        lookup_port_rule(policy_id, proto, 0, dst_port, src),
+        lookup_dst_rule(policy_id, proto, 0, dst_port, dst),
+    );
+    // A rule scoped to the other family or the other direction is not a match
+    // here. Zero is what "no rule" already means, so nothing downstream changes.
+    if port_rule_excluded(found, exclude) {
+        0
+    } else {
+        found
+    }
+}
+
+/// The IPv6 counterpart of [`rule_winner_v4`].
+#[inline(always)]
+fn rule_winner_v6(
+    policy_id: PolicyId,
+    proto: u8,
+    icmp_type: u8,
+    dst_port: u16,
+    hdr: &[u8; 40],
+    exclude: u32,
+) -> u32 {
+    if icmp_type != 0 {
+        let typed = port_rule_winner(
+            lookup_port_rule6(policy_id, proto, icmp_type, 0, hdr),
+            lookup_dst_rule6(policy_id, proto, icmp_type, 0, hdr),
+        );
+        if port_rule_present(typed) && !port_rule_excluded(typed, exclude) {
+            return typed;
+        }
+    }
+    let found = port_rule_winner(
+        lookup_port_rule6(policy_id, proto, 0, dst_port, hdr),
+        lookup_dst_rule6(policy_id, proto, 0, dst_port, hdr),
+    );
+    if port_rule_excluded(found, exclude) {
+        0
+    } else {
+        found
     }
 }
 
@@ -3817,10 +3966,14 @@ fn rate_limits_allow(slot: u32) -> bool {
 /// address. Pass `dst` as `0` on a non-IPv4 packet to match only rules with no
 /// destination constraint. `0` for a miss, for the reason given above.
 #[inline(always)]
-fn lookup_dst_rule(policy_id: PolicyId, proto: u8, dst_port: u16, dst: u32) -> u32 {
+fn lookup_dst_rule(policy_id: PolicyId, proto: u8, icmp_type: u8, dst_port: u16, dst: u32) -> u32 {
     match DST_RULES.get(Key::new(
         ScopedDstPortKey::FULL_PREFIX,
-        ScopedDstPortKey::new(policy_id, proto, dst_port, dst),
+        if icmp_type == 0 {
+            ScopedDstPortKey::new(policy_id, proto, dst_port, dst)
+        } else {
+            ScopedDstPortKey::with_icmp_type(policy_id, proto, icmp_type, dst)
+        },
     )) {
         Some(value) => *value,
         None => 0,

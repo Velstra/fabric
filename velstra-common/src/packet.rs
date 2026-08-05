@@ -225,8 +225,16 @@ pub struct ScopedSrcPortKey {
     pub policy_id: PolicyId,
     /// IP protocol number.
     pub proto: u8,
-    /// Explicit padding, always zero.
-    pub _pad: u8,
+    /// The ICMP type this rule matches, or `0` for "any type" — and for every
+    /// protocol that has no types at all, which is why it is exactly the byte
+    /// that used to be padding. It sits inside the exactly-matched head, so a
+    /// typed rule and an untyped one are different entries in the same trie and
+    /// no key grew by a byte to get here.
+    ///
+    /// A lookup therefore asks twice on the ICMP path: once with the packet's
+    /// own type, once with `0`. The first that answers wins, which is what makes
+    /// `icmp type echo-request` beat a plain `icmp` rule.
+    pub icmp_type: u8,
     /// Destination port, host byte order.
     pub port: u16,
     /// Source address in [`lpm_key_addr`] form, matched longest-prefix.
@@ -244,8 +252,22 @@ impl ScopedSrcPortKey {
         Self {
             policy_id,
             proto,
-            _pad: 0,
+            icmp_type: 0,
             port,
+            src,
+        }
+    }
+
+    /// The same key for a rule that names an ICMP type. `port` stays `0`:
+    /// ICMP has no ports, and keeping the two fields separate means a typed
+    /// rule cannot be confused with a port rule that happens to share a number.
+    #[inline]
+    pub const fn with_icmp_type(policy_id: PolicyId, proto: u8, icmp_type: u8, src: u32) -> Self {
+        Self {
+            policy_id,
+            proto,
+            icmp_type,
+            port: 0,
             src,
         }
     }
@@ -281,8 +303,16 @@ pub struct ScopedSrcPortKey6 {
     pub policy_id: PolicyId,
     /// IP protocol number (the upper-layer one, after the extension chain).
     pub proto: u8,
-    /// Explicit padding, always zero.
-    pub _pad: u8,
+    /// The ICMP type this rule matches, or `0` for "any type" — and for every
+    /// protocol that has no types at all, which is why it is exactly the byte
+    /// that used to be padding. It sits inside the exactly-matched head, so a
+    /// typed rule and an untyped one are different entries in the same trie and
+    /// no key grew by a byte to get here.
+    ///
+    /// A lookup therefore asks twice on the ICMP path: once with the packet's
+    /// own type, once with `0`. The first that answers wins, which is what makes
+    /// `icmp type echo-request` beat a plain `icmp` rule.
+    pub icmp_type: u8,
     /// Destination port, host byte order.
     pub port: u16,
     /// Source address, network-order octets, matched longest-prefix.
@@ -299,8 +329,27 @@ impl ScopedSrcPortKey6 {
         Self {
             policy_id,
             proto,
-            _pad: 0,
+            icmp_type: 0,
             port,
+            src,
+        }
+    }
+
+    /// The same key for a rule that names an ICMP type. `port` stays `0`:
+    /// ICMP has no ports, and keeping the two fields separate means a typed
+    /// rule cannot be confused with a port rule that happens to share a number.
+    #[inline]
+    pub const fn with_icmp_type(
+        policy_id: PolicyId,
+        proto: u8,
+        icmp_type: u8,
+        src: [u8; 16],
+    ) -> Self {
+        Self {
+            policy_id,
+            proto,
+            icmp_type,
+            port: 0,
             src,
         }
     }
@@ -329,8 +378,16 @@ pub struct ScopedDstPortKey6 {
     pub policy_id: PolicyId,
     /// IP protocol number.
     pub proto: u8,
-    /// Explicit padding, always zero.
-    pub _pad: u8,
+    /// The ICMP type this rule matches, or `0` for "any type" — and for every
+    /// protocol that has no types at all, which is why it is exactly the byte
+    /// that used to be padding. It sits inside the exactly-matched head, so a
+    /// typed rule and an untyped one are different entries in the same trie and
+    /// no key grew by a byte to get here.
+    ///
+    /// A lookup therefore asks twice on the ICMP path: once with the packet's
+    /// own type, once with `0`. The first that answers wins, which is what makes
+    /// `icmp type echo-request` beat a plain `icmp` rule.
+    pub icmp_type: u8,
     /// Destination port, host byte order.
     pub port: u16,
     /// Destination address, network-order octets, matched longest-prefix.
@@ -347,8 +404,27 @@ impl ScopedDstPortKey6 {
         Self {
             policy_id,
             proto,
-            _pad: 0,
+            icmp_type: 0,
             port,
+            dst,
+        }
+    }
+
+    /// The same key for a rule that names an ICMP type. `port` stays `0`:
+    /// ICMP has no ports, and keeping the two fields separate means a typed
+    /// rule cannot be confused with a port rule that happens to share a number.
+    #[inline]
+    pub const fn with_icmp_type(
+        policy_id: PolicyId,
+        proto: u8,
+        icmp_type: u8,
+        dst: [u8; 16],
+    ) -> Self {
+        Self {
+            policy_id,
+            proto,
+            icmp_type,
+            port: 0,
             dst,
         }
     }
@@ -384,8 +460,16 @@ pub struct ScopedDstPortKey {
     pub policy_id: PolicyId,
     /// IP protocol number.
     pub proto: u8,
-    /// Explicit padding, always zero.
-    pub _pad: u8,
+    /// The ICMP type this rule matches, or `0` for "any type" — and for every
+    /// protocol that has no types at all, which is why it is exactly the byte
+    /// that used to be padding. It sits inside the exactly-matched head, so a
+    /// typed rule and an untyped one are different entries in the same trie and
+    /// no key grew by a byte to get here.
+    ///
+    /// A lookup therefore asks twice on the ICMP path: once with the packet's
+    /// own type, once with `0`. The first that answers wins, which is what makes
+    /// `icmp type echo-request` beat a plain `icmp` rule.
+    pub icmp_type: u8,
     /// Destination port, host byte order.
     pub port: u16,
     /// Destination address in [`lpm_key_addr`] form, matched longest-prefix.
@@ -403,8 +487,22 @@ impl ScopedDstPortKey {
         Self {
             policy_id,
             proto,
-            _pad: 0,
+            icmp_type: 0,
             port,
+            dst,
+        }
+    }
+
+    /// The same key for a rule that names an ICMP type. `port` stays `0`:
+    /// ICMP has no ports, and keeping the two fields separate means a typed
+    /// rule cannot be confused with a port rule that happens to share a number.
+    #[inline]
+    pub const fn with_icmp_type(policy_id: PolicyId, proto: u8, icmp_type: u8, dst: u32) -> Self {
+        Self {
+            policy_id,
+            proto,
+            icmp_type,
+            port: 0,
             dst,
         }
     }

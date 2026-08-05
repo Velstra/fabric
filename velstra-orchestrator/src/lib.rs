@@ -2409,6 +2409,9 @@ mod tests {
     /// A `[[port_rule]]`-shaped rule for tests.
     fn rule(proto: velstra_config::ProtoName, port: u16, action: ActionName) -> PortRule {
         PortRule {
+            icmp_type: None,
+            family: None,
+            direction: None,
             proto,
             port,
             action,

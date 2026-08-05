@@ -990,6 +990,9 @@ fn config_rule_from_proto(r: &PortRule) -> ConfigPortRule {
         dst: (!r.dst.is_empty()).then(|| r.dst.clone()),
         limit: (r.limit != 0).then_some(r.limit),
         burst: (r.burst != 0).then_some(r.burst),
+        icmp_type: (r.icmp_type != 0).then(|| r.icmp_type.min(u8::MAX as u32) as u8),
+        family: (!r.family.is_empty()).then(|| r.family.clone()),
+        direction: (!r.direction.is_empty()).then(|| r.direction.clone()),
     }
 }
 
@@ -997,6 +1000,9 @@ fn proto_rule_from_config(r: &ConfigPortRule) -> PortRule {
     PortRule {
         proto: proto_to_proto(r.proto) as i32,
         port: r.port as u32,
+        icmp_type: u32::from(r.icmp_type.unwrap_or(0)),
+        family: r.family.clone().unwrap_or_default(),
+        direction: r.direction.clone().unwrap_or_default(),
         action: action_to_proto(r.action) as i32,
         log: r.log,
         src: r.src.clone().unwrap_or_default(),
@@ -2835,6 +2841,12 @@ fn parse_cli_rule(spec: &str, action: Action) -> Result<PortRule> {
     Ok(PortRule {
         proto: proto as i32,
         port: port as u32,
+        // The one-line rule spec names a protocol and a port; there is no place
+        // in it for a type, a family or a direction, so each means "all" like it
+        // always did.
+        icmp_type: 0,
+        family: String::new(),
+        direction: String::new(),
         action: action as i32,
         log: false,
         src: String::new(),

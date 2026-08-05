@@ -595,6 +595,15 @@ message PortRule {
   uint32 limit = 7;
   // Burst capacity in packets; 0 = one second's worth of `limit`.
   uint32 burst = 8;
+  // The ICMP/ICMPv6 type this rule matches; 0 = every type, which is what a rule
+  // naming only the protocol has always meant. Sent as a u32 for the same reason
+  // `port` is: proto3 has no narrower integer.
+  uint32 icmp_type = 9;
+  // Restrict the rule to one address family ("ipv4"/"ipv6") or one direction
+  // ("in"/"out"). Empty means both, which is the default and what every rule
+  // written before these fields existed means.
+  string family = 10;
+  string direction = 11;
 }
 
 message Route {
