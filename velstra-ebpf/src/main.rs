@@ -73,16 +73,16 @@ use velstra_common::{
     MAX_RULE_LIMITS, MacFdbKey, ND_NA_MSG_LEN, Nat, NdKey, Npt66, OVERLAY_OUTER_LEN, OverlayConfig,
     PORT_RULE_IN_ONLY, PORT_RULE_OUT_ONLY, PORT_RULE_V4_ONLY, PORT_RULE_V6_ONLY, PacketMeta,
     PolicyId, PortFwd, PortalClientKey, PortalGate, PortalSeenKey, RateBucket, Rewrite, RouteEntry,
-    SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6, ScopedDstPortKey, ScopedDstPortKey6, ScopedPortKey,
-    ScopedSrcPortKey, ScopedSrcPortKey6, ServiceKey, ServiceValue, SourceValidation, Srv6Config,
-    Srv6Endpoint, Srv6LocalSid, Srv6SidKey, SynFlow, SynProxyCfg, SynProxyKey, TcpSynth,
-    TunnelEndpoint, TunnelKey, build_encap, build_srv6_encap, check_cookie, csum_replace_u32,
-    decide, decode_vni, epoch_of, gate_admits_unauthenticated, icmp, icmp_checksum, ip_proto,
-    ipv6_ext_len, is_ipv6_ext, is_overlay_dport, lpm_key_addr, make_cookie, plan_arp_reply,
-    plan_forward, plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_server_ack,
-    plan_server_syn, plan_syn_ack, plan_tcp_rst, port_rule_action, port_rule_excluded,
-    port_rule_limit, port_rule_logs, port_rule_present, port_rule_winner, select_backend,
-    session_hash, tcp_flags, translate_to_client, translate_to_server,
+    SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6, ScopedDstPortKey, ScopedDstPortKey6, ScopedMac,
+    ScopedPortKey, ScopedSrcPortKey, ScopedSrcPortKey6, ServiceKey, ServiceValue, SourceValidation,
+    Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, SynFlow, SynProxyCfg, SynProxyKey,
+    TcpSynth, TunnelEndpoint, TunnelKey, build_encap, build_srv6_encap, check_cookie,
+    csum_replace_u32, decide, decode_vni, epoch_of, gate_admits_unauthenticated, icmp,
+    icmp_checksum, ip_proto, ipv6_ext_len, is_ipv6_ext, is_overlay_dport, lpm_key_addr,
+    make_cookie, plan_arp_reply, plan_forward, plan_icmp_unreachable, plan_irb, plan_na_reply,
+    plan_nat, plan_server_ack, plan_server_syn, plan_syn_ack, plan_tcp_rst, port_rule_action,
+    port_rule_excluded, port_rule_limit, port_rule_logs, port_rule_present, port_rule_winner,
+    select_backend, session_hash, tcp_flags, translate_to_client, translate_to_server,
 };
 
 /// Maps an ingress interface index to its policy id, so one XDP program can
@@ -201,6 +201,19 @@ static PORT_FORWARDS: HashMap<ScopedPortKey, PortFwd> = HashMap::with_max_entrie
 /// control plane (`program_masquerade`), which reads the live interface address.
 #[map]
 static MASQUERADE: HashMap<u32, [u8; 4]> = HashMap::with_max_entries(64, 0);
+
+/// A source hardware address this policy has a verdict for (`mac-group`).
+///
+/// Consulted once, from the Ethernet header, and folded into the decision the
+/// way the blocklist is — not as a dimension on the rule tries. Those are already
+/// asked twice per packet, and a fifth lookup reaching the same merge point is
+/// what the verifier refuses. The consequence is worth stating rather than
+/// hiding: a MAC rule is a verdict on the sender, not a condition that combines
+/// with a protocol and a port.
+///
+/// Empty by default, so a box with no MAC rules pays one missing lookup.
+#[map]
+static MAC_RULES: HashMap<ScopedMac, u32> = HashMap::with_max_entries(4096, 0);
 
 /// Egress interface index → the largest TCP MSS a SYN may advertise on it.
 ///
@@ -1543,6 +1556,17 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
             ScopedAddr::new(policy_id, lpm_key_addr(src_addr)),
         ))
         .is_some();
+    // A verdict on the sender's hardware address, if this policy has one for it.
+    // Read from the Ethernet header, which is always there — unlike an IP source,
+    // a MAC cannot be spoofed past the first switch, which is the whole reason to
+    // match on it.
+    let mac_rule = match unsafe { ptr_at::<[u8; 6]>(ctx, 6) } {
+        Ok(mac) => {
+            let key = ScopedMac::new(policy_id, unsafe { *mac });
+            unsafe { MAC_RULES.get(&key) }.copied().unwrap_or(0)
+        }
+        Err(_) => 0,
+    };
     let rule = rule_winner_v4(
         policy_id,
         proto,
@@ -1552,6 +1576,13 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
         lpm_key_addr(dst_addr),
         PORT_RULE_OUT_ONLY | PORT_RULE_V6_ONLY,
     );
+    // A MAC verdict outranks a port rule: it names the device, which is the more
+    // specific statement of the two.
+    let rule = if port_rule_present(mac_rule) {
+        mac_rule
+    } else {
+        rule
+    };
     let rule_action = if port_rule_present(rule) {
         Some(port_rule_action(rule))
     } else {

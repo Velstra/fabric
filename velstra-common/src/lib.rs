@@ -70,8 +70,8 @@ pub use overlay::{
 };
 pub use packet::{
     ETHERTYPE_IPV4, ETHERTYPE_IPV6, PacketMeta, PolicyId, PortKey, ScopedAddr, ScopedAddr6,
-    ScopedDstPortKey, ScopedDstPortKey6, ScopedPortKey, ScopedSrcPortKey, ScopedSrcPortKey6,
-    ip_proto, ipv6_ext_len, is_ipv6_ext, lpm_key_addr,
+    ScopedDstPortKey, ScopedDstPortKey6, ScopedMac, ScopedPortKey, ScopedSrcPortKey,
+    ScopedSrcPortKey6, ip_proto, ipv6_ext_len, is_ipv6_ext, lpm_key_addr,
 };
 pub use parse::{ParseResult, parse_frame};
 pub use policy::{

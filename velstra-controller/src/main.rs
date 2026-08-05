@@ -982,6 +982,7 @@ fn proto_to_proto(p: ProtoName) -> Proto {
 
 fn config_rule_from_proto(r: &PortRule) -> ConfigPortRule {
     ConfigPortRule {
+        src_mac: None,
         proto: proto_from_proto(r.proto()),
         port: r.port as u16,
         action: action_from_proto(r.action()),
