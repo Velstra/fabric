@@ -741,6 +741,16 @@ struct RuleReq {
     /// Burst capacity in packets; defaults to one second of `limit`.
     #[serde(default)]
     burst: Option<u32>,
+    /// The ICMP/ICMPv6 type; absent means every type. The agent refuses it on a
+    /// protocol that has none.
+    #[serde(default, rename = "icmp-type")]
+    icmp_type: Option<u8>,
+    /// Restrict the rule to one address family ("ipv4"/"ipv6"); absent = both.
+    #[serde(default)]
+    family: Option<String>,
+    /// Restrict the rule to one direction ("in"/"out"); absent = both.
+    #[serde(default)]
+    direction: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1328,6 +1338,9 @@ async fn create_security_group(
             dst: r.dst.clone().unwrap_or_default(),
             limit: r.limit.unwrap_or(0),
             burst: r.burst.unwrap_or(0),
+            icmp_type: u32::from(r.icmp_type.unwrap_or(0)),
+            family: r.family.clone().unwrap_or_default(),
+            direction: r.direction.clone().unwrap_or_default(),
         });
     }
     let spec = ProtoSgSpec {

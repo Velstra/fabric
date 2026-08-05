@@ -25,6 +25,9 @@ fn port_rule_to_proto(r: &PortRule) -> proto::PortRule {
         dst: r.dst.clone().unwrap_or_default(),
         limit: r.limit.unwrap_or(0),
         burst: r.burst.unwrap_or(0),
+        icmp_type: u32::from(r.icmp_type.unwrap_or(0)),
+        family: r.family.clone().unwrap_or_default(),
+        direction: r.direction.clone().unwrap_or_default(),
     }
 }
 
@@ -35,6 +38,11 @@ fn port_rule_from_proto(r: &proto::PortRule) -> PortRule {
         // rather than `as u16`-truncate, which would wrap (e.g. 65536 → 0, the
         // wildcard port) and silently open a rule the operator never wrote.
         port: r.port.min(u16::MAX as u32) as u16,
+        // Same saturation reasoning as `port`: a type past 255 is not a type,
+        // and truncating would turn it into a different one.
+        icmp_type: (r.icmp_type != 0).then(|| r.icmp_type.min(u8::MAX as u32) as u8),
+        family: (!r.family.is_empty()).then(|| r.family.clone()),
+        direction: (!r.direction.is_empty()).then(|| r.direction.clone()),
         action: action_from_proto(r.action()),
         log: r.log,
         src: if r.src.is_empty() {

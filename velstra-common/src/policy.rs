@@ -62,6 +62,38 @@ pub const PORT_RULE_LOG: u32 = 1 << 8;
 /// (see `lookup_port_forward`).
 pub const PORT_RULE_PRESENT: u32 = 1 << 31;
 
+/// Bits 9-12 of a packed value: which address family and which direction a rule
+/// applies to. Neither bit of a pair set means "both", which is what every rule
+/// written before these existed means — so an old value keeps its meaning and no
+/// map had to change shape.
+///
+/// They are read off a value the datapath has already loaded, so scoping a rule
+/// this way costs no second lookup. That is the whole reason the distinction
+/// lives here rather than in the key: a fifth trie on the hot path is what the
+/// verifier has repeatedly refused.
+pub const PORT_RULE_V4_ONLY: u32 = 1 << 9;
+/// See [`PORT_RULE_V4_ONLY`].
+pub const PORT_RULE_V6_ONLY: u32 = 1 << 10;
+/// Set when a rule applies only to traffic **arriving** on the policy's
+/// interface. See [`PORT_RULE_V4_ONLY`].
+pub const PORT_RULE_IN_ONLY: u32 = 1 << 11;
+/// Set when a rule applies only to traffic **leaving** the policy's interface —
+/// including traffic this box originated, which is the case an ingress-only
+/// firewall cannot describe at all. See [`PORT_RULE_V4_ONLY`].
+pub const PORT_RULE_OUT_ONLY: u32 = 1 << 12;
+
+/// Whether a packed value is disqualified by any of `mask`\'s bits.
+///
+/// The caller passes the bits that exclude a rule *here* — on the IPv6 path,
+/// [`PORT_RULE_V4_ONLY`]; at the egress hook, [`PORT_RULE_IN_ONLY`] — and a
+/// disqualified value is treated as a miss. There is nothing to fall back to: two
+/// rules with the same key are the same trie entry, so an excluded entry means no
+/// rule matched rather than a lesser one.
+#[inline]
+pub const fn port_rule_excluded(value: u32, mask: u32) -> bool {
+    value & mask != 0
+}
+
 /// Where the matched prefix length lives in a packed value.
 const PORT_RULE_BITS_SHIFT: u32 = 16;
 

@@ -33,7 +33,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use velstra_common::{
     Action, Backend, CgnatLayout, Cidr4, Cidr6, ConfigFlags, GENEVE_PORT, GlobalConfig,
-    MAX_BLOCKLIST, Npt66, PolicyId, PortKey, PortalGate, RouteEntry, ServiceKey, SourceValidation,
+    MAX_BLOCKLIST, Npt66, PORT_RULE_IN_ONLY, PORT_RULE_OUT_ONLY, PORT_RULE_V4_ONLY,
+    PORT_RULE_V6_ONLY, PolicyId, PortKey, PortalGate, RouteEntry, ServiceKey, SourceValidation,
     VXLAN_PORT, encap_kind, ip_proto, parse_cidr_v4, parse_cidr_v6, parse_mac,
 };
 
@@ -147,6 +148,25 @@ pub struct PortRule {
     pub proto: ProtoName,
     /// Destination port to match.
     pub port: u16,
+    /// The ICMP (or ICMPv6) type this rule matches. Absent means every type,
+    /// which is what a rule naming only the protocol has always meant.
+    ///
+    /// Only for protocols that carry a type. A typed rule outranks an untyped
+    /// one on the same protocol, the way a specific source outranks `from any`.
+    #[serde(default, rename = "icmp-type", skip_serializing_if = "Option::is_none")]
+    pub icmp_type: Option<u8>,
+    /// Restrict this rule to one address family (`"ipv4"` / `"ipv6"`). Absent
+    /// means both, which is what a rule with no address constraint has always
+    /// meant — the same rule is found from either family's path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    /// Restrict this rule to one direction (`"in"` / `"out"`). Absent means both.
+    ///
+    /// `out` is the only way to describe traffic this box **originates**: the
+    /// egress hook is where a locally-generated packet is seen, and an
+    /// ingress-only firewall cannot say anything about it at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
     /// What to do on a match. Defaults to `drop` — the common "block this
     /// service" case.
     #[serde(default = "default_rule_action")]
@@ -957,6 +977,14 @@ pub struct PolicyConfig {
 pub struct ResolvedRule {
     /// `(proto, destination port)`.
     pub key: PortKey,
+    /// The ICMP type, or `0` for "any type" — which is also every protocol that
+    /// has no types. It rides in the trie key's formerly-padding byte, so a
+    /// typed rule is a separate entry rather than a wider key.
+    pub icmp_type: u8,
+    /// Scope bits — family and direction — packed into the rule's map value, so
+    /// the datapath reads them off a value it has already loaded rather than
+    /// paying for another lookup. `0` means "every family, both directions".
+    pub scope: u32,
     /// Source-CIDR constraint, or `None` for "from any".
     pub src: Option<Cidr4>,
     /// Destination-CIDR constraint, or `None` for "to any".
@@ -1329,6 +1357,17 @@ fn resolve_firewall(
         // landed and this check was not, so the control plane emitted rules the
         // data plane's own loader then rejected — the feature never worked end
         // to end.
+        // A type belongs to ICMP the way a port belongs to TCP. Silently
+        // ignoring it on anything else would produce a rule that reads as
+        // narrow and matches everything of that protocol.
+        if rule.icmp_type.is_some()
+            && !matches!(rule.proto.number(), ip_proto::ICMP | ip_proto::ICMPV6)
+        {
+            bail!(
+                "policy {id}: icmp-type is only for icmp and icmpv6, not protocol {}",
+                rule.proto.number()
+            );
+        }
         if !rule.proto.has_ports() && rule.port != 0 {
             bail!(
                 "policy {id}: {} carries no ports, so port {} cannot match; drop the port",
@@ -1399,8 +1438,34 @@ fn resolve_firewall(
             }
             None => None,
         };
+        // Family and direction, resolved to the two bit pairs the data plane
+        // reads off the value. An unset field contributes nothing, which is how
+        // "both" stays the default without a third state to carry.
+        let mut scope = 0u32;
+        match rule.family.as_deref() {
+            None => {}
+            Some("ipv4") => scope |= PORT_RULE_V4_ONLY,
+            Some("ipv6") => scope |= PORT_RULE_V6_ONLY,
+            Some(other) => bail!("policy {id}: family {other:?} is not ipv4 or ipv6"),
+        }
+        match rule.direction.as_deref() {
+            None => {}
+            Some("in") => scope |= PORT_RULE_IN_ONLY,
+            Some("out") => scope |= PORT_RULE_OUT_ONLY,
+            Some(other) => bail!("policy {id}: direction {other:?} is not in or out"),
+        }
+        // The egress hook is IPv4 only, so an IPv6 rule scoped to `out` would be
+        // written and never consulted. Refusing beats enforcing nothing quietly.
+        if scope & PORT_RULE_V6_ONLY != 0 && scope & PORT_RULE_OUT_ONLY != 0 {
+            bail!(
+                "policy {id}: direction \"out\" is IPv4 only — an ipv6 rule on the \
+                 egress hook would never be consulted"
+            );
+        }
         rules.push(ResolvedRule {
             key: PortKey::new(rule.proto.number(), rule.port),
+            icmp_type: rule.icmp_type.unwrap_or(0),
+            scope,
             src,
             dst,
             src6,
@@ -2076,13 +2141,36 @@ impl fmt::Display for RuntimeConfig {
                     (_, Some(c)) => format!(" to {}", show(c)),
                     _ => String::new(),
                 };
+                // A rule that names an ICMP type has to say so here. A summary
+                // that shows two identical lines for a typed rule and an untyped
+                // one is a summary that cannot be used to check either.
+                let typed = if rule.icmp_type == 0 {
+                    String::new()
+                } else {
+                    format!(" type {}", rule.icmp_type)
+                };
+                // Family and direction, for the same reason: a rule scoped to
+                // one of them and one scoped to neither must not print alike.
+                let mut scope = String::new();
+                if rule.scope & PORT_RULE_V4_ONLY != 0 {
+                    scope.push_str(" ipv4");
+                }
+                if rule.scope & PORT_RULE_V6_ONLY != 0 {
+                    scope.push_str(" ipv6");
+                }
+                if rule.scope & PORT_RULE_IN_ONLY != 0 {
+                    scope.push_str(" in");
+                }
+                if rule.scope & PORT_RULE_OUT_ONLY != 0 {
+                    scope.push_str(" out");
+                }
                 let proto = match key.proto {
                     ip_proto::TCP => "tcp",
                     ip_proto::UDP => "udp",
                     other => {
                         writeln!(
                             f,
-                            "      proto {other} port {} ->{from} {action:?}",
+                            "      proto {other}{typed} port {} ->{from}{scope} {action:?}",
                             key.port
                         )?;
                         continue;
@@ -2093,7 +2181,7 @@ impl fmt::Display for RuntimeConfig {
                     Action::Drop => "drop",
                     Action::Reject => "reject",
                 };
-                writeln!(f, "      {proto}/{} ->{from} {verdict}", key.port)?;
+                writeln!(f, "      {proto}/{} ->{from}{scope} {verdict}", key.port)?;
             }
         }
 
@@ -2432,6 +2520,8 @@ mod tests {
         assert_eq!(
             p0.port_rules[0],
             ResolvedRule {
+                icmp_type: 0,
+                scope: 0,
                 key: PortKey::new(ip_proto::TCP, 443),
                 src6: None,
                 dst6: None,
@@ -2446,6 +2536,8 @@ mod tests {
         assert_eq!(
             p0.port_rules[1],
             ResolvedRule {
+                icmp_type: 0,
+                scope: 0,
                 key: PortKey::new(ip_proto::UDP, 53),
                 src6: None,
                 dst6: None,
@@ -2738,16 +2830,54 @@ mod tests {
         );
     }
 
+    /// A rule may name ICMP, and then it matches every ICMP packet — which is
+    /// what `port = 0` says. What is still refused is a *port* on it.
+    ///
+    /// This test used to assert the opposite, from before a rule could name a
+    /// port-less protocol at all.
     #[test]
-    fn rejects_icmp_port_rule() {
+    fn an_icmp_rule_matches_the_protocol_and_a_port_on_it_does_not() {
         let toml = r#"
             [[port_rule]]
             proto = "icmp"
             port = 0
         "#;
         let file: FileConfig = toml::from_str(toml).unwrap();
+        file.resolve().expect("an ICMP rule with no port is valid");
+
+        let with_port = r#"
+            [[port_rule]]
+            proto = "icmp"
+            port = 443
+        "#;
+        let file: FileConfig = toml::from_str(with_port).unwrap();
         let err = file.resolve().unwrap_err().to_string();
-        assert!(err.contains("ICMP"), "unexpected error: {err}");
+        assert!(err.contains("carries no ports"), "unexpected error: {err}");
+    }
+
+    /// A type is only meaningful where the protocol has types. Accepting it on
+    /// TCP would read as a narrow rule and match every TCP packet.
+    #[test]
+    fn an_icmp_type_belongs_to_icmp() {
+        let ok = r#"
+            [[port_rule]]
+            proto = "icmp"
+            port = 0
+            icmp-type = 8
+        "#;
+        let file: FileConfig = toml::from_str(ok).unwrap();
+        let cfg = file.resolve().expect("a typed ICMP rule is valid");
+        assert_eq!(cfg.policies[0].port_rules[0].icmp_type, 8);
+
+        let bad = r#"
+            [[port_rule]]
+            proto = "tcp"
+            port = 443
+            icmp-type = 8
+        "#;
+        let file: FileConfig = toml::from_str(bad).unwrap();
+        let err = file.resolve().unwrap_err().to_string();
+        assert!(err.contains("only for icmp"), "unexpected error: {err}");
     }
 
     #[test]

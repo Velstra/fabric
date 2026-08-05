@@ -1236,6 +1236,9 @@ mod tests {
                     stateful: true,
                     blocklist: vec![],
                     rules: vec![PortRule {
+                        icmp_type: None,
+                        family: None,
+                        direction: None,
                         proto: ProtoName::Tcp,
                         port: 80,
                         action: ActionName::Pass,
