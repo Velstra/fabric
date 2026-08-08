@@ -437,6 +437,11 @@ enum Proto {
   PROTO_ESP = 5;
   PROTO_AH = 6;
   PROTO_GRE = 7;
+  // OSPF (IANA 89) and PIM (IANA 103) ride directly on IP, so no TCP or UDP
+  // rule can describe them -- a router behind default-drop needs to name them
+  // to admit its own neighbours.
+  PROTO_OSPF = 8;
+  PROTO_PIM = 9;
 }
 
 // Forwarding behaviour for a route.

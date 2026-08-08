@@ -384,6 +384,8 @@ fn proto_name_str(p: ProtoName) -> &'static str {
         ProtoName::Esp => "esp",
         ProtoName::Ah => "ah",
         ProtoName::Gre => "gre",
+        ProtoName::Ospf => "ospf",
+        ProtoName::Pim => "pim",
     }
 }
 

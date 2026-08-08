@@ -106,6 +106,8 @@ fn proto_to_proto(p: ProtoName) -> proto::Proto {
         ProtoName::Esp => proto::Proto::Esp,
         ProtoName::Ah => proto::Proto::Ah,
         ProtoName::Gre => proto::Proto::Gre,
+        ProtoName::Ospf => proto::Proto::Ospf,
+        ProtoName::Pim => proto::Proto::Pim,
     }
 }
 
@@ -119,6 +121,8 @@ fn proto_from_proto(p: proto::Proto) -> ProtoName {
         proto::Proto::Esp => ProtoName::Esp,
         proto::Proto::Ah => ProtoName::Ah,
         proto::Proto::Gre => ProtoName::Gre,
+        proto::Proto::Ospf => ProtoName::Ospf,
+        proto::Proto::Pim => ProtoName::Pim,
     }
 }
 

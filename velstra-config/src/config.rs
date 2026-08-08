@@ -116,6 +116,14 @@ pub enum ProtoName {
     Ah,
     /// GRE (IANA 47).
     Gre,
+    /// OSPF (IANA 89) — the hellos and LSAs an OSPFv2/OSPFv3 adjacency is made
+    /// of. Without a name for it a box running an IGP behind `default-action
+    /// drop` has no way to admit its own neighbours: OSPF rides directly on IP,
+    /// so no TCP or UDP rule can describe it.
+    Ospf,
+    /// PIM (IANA 103) — the join/prune messages multicast routing is made of,
+    /// for the same reason: it is its own IP protocol, not a UDP service.
+    Pim,
 }
 
 impl ProtoName {
@@ -130,6 +138,8 @@ impl ProtoName {
             ProtoName::Esp => 50,
             ProtoName::Ah => 51,
             ProtoName::Gre => 47,
+            ProtoName::Ospf => 89,
+            ProtoName::Pim => 103,
         }
     }
 
@@ -2487,7 +2497,7 @@ mod tests {
                  [[policy.port_rule]]\nproto = \"{proto}\"\nport = {port}\naction = \"pass\"\n"
             )
         };
-        for proto in ["icmp", "icmpv6", "vrrp", "esp", "ah", "gre"] {
+        for proto in ["icmp", "icmpv6", "vrrp", "esp", "ah", "gre", "ospf", "pim"] {
             let good: FileConfig = toml::from_str(&cfg(proto, 0)).expect("parses");
             assert!(
                 good.resolve().is_ok(),
