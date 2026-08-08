@@ -964,6 +964,8 @@ fn proto_from_proto(p: Proto) -> ProtoName {
         Proto::Esp => ProtoName::Esp,
         Proto::Ah => ProtoName::Ah,
         Proto::Gre => ProtoName::Gre,
+        Proto::Ospf => ProtoName::Ospf,
+        Proto::Pim => ProtoName::Pim,
     }
 }
 
@@ -977,6 +979,8 @@ fn proto_to_proto(p: ProtoName) -> Proto {
         ProtoName::Esp => Proto::Esp,
         ProtoName::Ah => Proto::Ah,
         ProtoName::Gre => Proto::Gre,
+        ProtoName::Ospf => Proto::Ospf,
+        ProtoName::Pim => Proto::Pim,
     }
 }
 
