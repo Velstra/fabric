@@ -77,7 +77,7 @@ use velstra_common::{
     ScopedPortKey, ScopedSrcPortKey, ScopedSrcPortKey6, ServiceKey, ServiceValue, SourceValidation,
     Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, SynFlow, SynProxyCfg, SynProxyKey,
     TcpSynth, TunnelEndpoint, TunnelKey, build_encap, build_srv6_encap, check_cookie,
-    csum_replace_u32, decide, decode_vni, epoch_of, gate_admits_unauthenticated, icmp,
+    csum_replace_u32, decide, decide_egress, decode_vni, epoch_of, gate_admits_unauthenticated, icmp,
     icmp_checksum, ip_proto, ipv6_ext_len, is_ipv6_ext, is_overlay_dport, lpm_key_addr,
     make_cookie, plan_arp_reply, plan_forward, plan_icmp_unreachable, plan_irb, plan_na_reply,
     plan_nat, plan_server_ack, plan_server_syn, plan_syn_ack, plan_tcp_rst, port_rule_action,
@@ -1041,7 +1041,7 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
         dst_port,
         ipv4.tot_len(),
     );
-    let verdict = decide(&meta, &cfg, blocklisted, rule_action);
+    let verdict = decide_egress(&meta, &cfg, blocklisted, rule_action);
 
     // On egress we can't bounce a RST back the way the XDP ingress path does, so
     // an active reject degrades to a silent drop here.

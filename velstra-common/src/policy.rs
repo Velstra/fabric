@@ -563,9 +563,81 @@ pub fn decide(
     }
 }
 
+/// The same decision for a packet **leaving** an interface.
+///
+/// It differs in exactly one place, and that place is load-bearing: when no rule
+/// matches, egress passes rather than falling back to the policy's default
+/// action. A zone's `default-action` is a statement about what the box will
+/// *accept*, and a firewall has never taken "deny by default" to mean the box
+/// may not speak. Applying it to the egress hook made the ingress posture
+/// silently govern outbound traffic, so the moment anything caused that hook to
+/// attach — a rule carrying `direction out`, NAT, a shaper — a deny-by-default
+/// zone dropped every packet the box itself sent, including the replies keeping
+/// its own administrative session alive. On real hardware that took the whole
+/// appliance off the network from one unrelated rule, recoverable only by
+/// commit-confirm's auto-revert or a console.
+///
+/// Everything that is an explicit statement still applies: the destination
+/// blocklist, `block-icmp`, and any egress rule the operator wrote — a rule that
+/// says `drop` still drops. Only the *absence* of a statement changed meaning.
+#[inline]
+pub fn decide_egress(
+    meta: &PacketMeta,
+    cfg: &GlobalConfig,
+    blocklisted: bool,
+    rule: Option<Action>,
+) -> Verdict {
+    match rule {
+        // An explicit egress verdict, and the two prohibitions, are the operator
+        // speaking about outbound traffic; those keep their meaning verbatim.
+        Some(_) => decide(meta, cfg, blocklisted, rule),
+        None if blocklisted => decide(meta, cfg, blocklisted, rule),
+        None => {
+            let is_icmp = meta.proto == ip_proto::ICMP || meta.proto == ip_proto::ICMPV6;
+            if is_icmp && cfg.has_flag(ConfigFlags::DROP_ICMP) {
+                return Verdict::new(Action::Drop, Counter::DroppedIcmp);
+            }
+            Verdict::new(Action::Pass, Counter::PassedDefault)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deny-by-default is a statement about what the box accepts, not a gag
+    /// order. A packet leaving with no egress rule to its name has to pass, or
+    /// the box stops answering the moment the egress hook attaches — which is
+    /// what took a live appliance off the network from one unrelated rule
+    /// carrying `direction out`.
+    #[test]
+    fn egress_passes_what_no_rule_speaks_about_even_under_deny_by_default() {
+        let meta = PacketMeta::new([10, 0, 0, 1], [10, 0, 0, 2], ip_proto::TCP, 22, 51000, 60);
+        let deny = GlobalConfig {
+            default_action: Action::Drop.as_u32(),
+            flags: ConfigFlags::STATEFUL,
+        };
+        // Ingress keeps its meaning: unasked-for traffic is refused.
+        assert_eq!(decide(&meta, &deny, false, None).action, Action::Drop);
+        // Egress does not inherit it.
+        assert_eq!(decide_egress(&meta, &deny, false, None).action, Action::Pass);
+
+        // What the operator did say still holds, in both directions.
+        assert_eq!(
+            decide_egress(&meta, &deny, false, Some(Action::Drop)).action,
+            Action::Drop
+        );
+        assert_eq!(decide_egress(&meta, &deny, true, None).action, Action::Drop);
+
+        // And a prohibition that names a protocol still applies with no rule.
+        let no_icmp = GlobalConfig {
+            default_action: Action::Drop.as_u32(),
+            flags: ConfigFlags::DROP_ICMP,
+        };
+        let ping = PacketMeta::new([10, 0, 0, 1], [10, 0, 0, 2], ip_proto::ICMP, 0, 0, 60);
+        assert_eq!(decide_egress(&ping, &no_icmp, false, None).action, Action::Drop);
+    }
 
     fn pkt(proto: u8, dst_port: u16) -> PacketMeta {
         PacketMeta::new([203, 0, 113, 5], [10, 0, 0, 1], proto, 1234, dst_port, 60)

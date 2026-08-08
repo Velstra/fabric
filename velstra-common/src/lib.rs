@@ -76,7 +76,7 @@ pub use packet::{
 pub use parse::{ParseResult, parse_frame};
 pub use policy::{
     Action, Counter, MAX_BLOCKLIST, MAX_RULE_LIMITS, PORT_RULE_IN_ONLY, PORT_RULE_LOG,
-    PORT_RULE_OUT_ONLY, PORT_RULE_PRESENT, PORT_RULE_V4_ONLY, PORT_RULE_V6_ONLY, Verdict, decide,
+    PORT_RULE_OUT_ONLY, PORT_RULE_PRESENT, PORT_RULE_V4_ONLY, PORT_RULE_V6_ONLY, Verdict, decide, decide_egress,
     port_rule_action, port_rule_bits, port_rule_excluded, port_rule_limit, port_rule_logs,
     port_rule_present, port_rule_value, port_rule_winner, port_rule_with_limit,
 };
