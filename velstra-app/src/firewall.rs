@@ -25,10 +25,10 @@ use clap::ValueEnum;
 use log::warn;
 use tokio::sync::Mutex;
 use velstra_common::{
-    ArpEntry, ArpKey, Backend, CgnatLayout, Cidr4, Cidr6, Counter, FloodSet, FlowKey, FlowState,
-    GlobalConfig, IrbEndpoint, LocalMac, LocalMacKey, MAX_RULE_LIMITS, MacFdbKey, NdKey, Npt66,
-    OverlayConfig, PORT_RULE_OUT_ONLY, PolicyId, PortFwd, PortalClientKey, PortalGate,
-    PortalSeenKey, RateBucket, RouteEntry, ScopedAddr, ScopedAddr6, ScopedDstPortKey,
+    Action, ArpEntry, ArpKey, Backend, CgnatLayout, Cidr4, Cidr6, ConfigFlags, Counter, FloodSet,
+    FlowKey, FlowState, GlobalConfig, IrbEndpoint, LocalMac, LocalMacKey, MAX_RULE_LIMITS,
+    MacFdbKey, NdKey, Npt66, OverlayConfig, PORT_RULE_OUT_ONLY, PolicyId, PortFwd, PortalClientKey,
+    PortalGate, PortalSeenKey, RateBucket, RouteEntry, ScopedAddr, ScopedAddr6, ScopedDstPortKey,
     ScopedDstPortKey6, ScopedMac, ScopedPortKey, ScopedSrcPortKey, ScopedSrcPortKey6, ServiceKey,
     ServiceValue, Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, SynProxyCfg, SynProxyKey,
     TunnelEndpoint, TunnelKey, parse_cidr_v4, parse_cidr_v6, parse_mac, port_rule_value,
@@ -218,55 +218,13 @@ impl Firewall {
             attached.push((iface.clone(), chosen));
         }
 
-        // The TC egress hook is needed by two features: the opt-in egress
-        // firewall (`--egress`, applied to the `--iface` set) and masquerade
-        // (applied to every present `masquerade` interface, which does SNAT
-        // there). Attach to the union so a config-driven appliance masquerades
-        // without needing `--egress`.
-        let mut egress_ifaces: Vec<String> = if egress { ifaces.to_vec() } else { Vec::new() };
-        for i in &cfg.interfaces {
-            // Clamping happens at this hook and nowhere else, so an interface
-            // that configures one brings the hook with it — the same reasoning
-            // masquerade already carries.
-            if (i.masquerade || i.mss != 0)
-                && !egress_ifaces.iter().any(|n| n == &i.name)
-                && if_nametoindex(&i.name).is_ok()
-            {
-                egress_ifaces.push(i.name.clone());
-            }
-        }
-        // A rule scoped to the way *out* is enforced at this hook and nowhere
-        // else, so a policy carrying one has to bring the hook with it. Without
-        // this the rule loads, matches nothing, and says nothing — the operator
-        // writes `direction out` and gets silence.
-        let out_scoped: Vec<PolicyId> = cfg
-            .policies
-            .iter()
-            .filter(|p| {
-                p.port_rules
-                    .iter()
-                    .any(|r| r.scope & PORT_RULE_OUT_ONLY != 0)
-            })
-            .map(|p| p.id)
+        // Which interfaces need the TC egress hook, and why — see
+        // [`egress_interfaces`]. Kept out of here so the rule can be read and
+        // tested without loading an eBPF object.
+        let egress_ifaces: Vec<String> = egress_interfaces(cfg, ifaces, egress)
+            .into_iter()
+            .filter(|n| if_nametoindex(n).is_ok())
             .collect();
-        for i in &cfg.interfaces {
-            if out_scoped.contains(&i.policy)
-                && !egress_ifaces.iter().any(|n| n == &i.name)
-                && if_nametoindex(&i.name).is_ok()
-            {
-                egress_ifaces.push(i.name.clone());
-            }
-        }
-        // C16: an NPTv6 boundary interface also needs the TC egress hook, where the
-        // source prefix is translated on the way out (the ingress/destination half
-        // rides the XDP hook already attached to every config interface).
-        for r in &cfg.npt66 {
-            if !egress_ifaces.iter().any(|n| n == &r.interface)
-                && if_nametoindex(&r.interface).is_ok()
-            {
-                egress_ifaces.push(r.interface.clone());
-            }
-        }
         if !egress_ifaces.is_empty() {
             attach_egress(&mut ebpf, &egress_ifaces)?;
         }
@@ -2957,6 +2915,71 @@ fn read_iface_mac(iface: &str) -> Result<[u8; 6]> {
     parse_mac(text.trim()).map_err(|e| anyhow!("MAC of {iface}: {e}"))
 }
 
+/// The interfaces the TC **egress** hook has to be attached to.
+///
+/// The XDP ingress hook is attached to every configured interface; this one is
+/// attached only where something needs it, because it is a second verdict stage
+/// in the path of traffic nobody asked us to filter. Five things need it:
+///
+/// * `--egress`, the opt-in egress firewall, over the `--iface` set;
+/// * an interface that **masquerades** (the SNAT happens here) or **clamps MSS**
+///   (the option is rewritten here and nowhere else);
+/// * a policy carrying a rule scoped to the way **out** — otherwise the rule
+///   loads, matches nothing and says nothing, and the operator who wrote
+///   `direction out` gets silence;
+/// * a **stateful** policy that does not pass by default. The ingress hook
+///   records a flow when it admits one, so a reply to something that *arrived*
+///   is covered — but a connection the box itself starts never crosses that hook
+///   on the way out, so nothing vouches for its reply and the default action
+///   drops it. That is the whole of DNS, NTP, ACME, the update channel, dyndns,
+///   alert webhooks and config-sync: on real hardware the box could send and
+///   never hear an answer, while `stateful = true` said otherwise;
+/// * an NPTv6 boundary interface (C16), where the source prefix is translated.
+///
+/// Names may repeat across the reasons; the result is deduplicated and keeps the
+/// order the reasons are listed in.
+fn egress_interfaces(cfg: &RuntimeConfig, ifaces: &[String], egress: bool) -> Vec<String> {
+    let mut out: Vec<String> = if egress { ifaces.to_vec() } else { Vec::new() };
+    let push = |name: &str, out: &mut Vec<String>| {
+        if !out.iter().any(|n| n == name) {
+            out.push(name.to_string());
+        }
+    };
+    for i in &cfg.interfaces {
+        if i.masquerade || i.mss != 0 {
+            push(&i.name, &mut out);
+        }
+    }
+    let out_scoped: Vec<PolicyId> = cfg
+        .policies
+        .iter()
+        .filter(|p| {
+            p.port_rules
+                .iter()
+                .any(|r| r.scope & PORT_RULE_OUT_ONLY != 0)
+        })
+        .map(|p| p.id)
+        .collect();
+    let needs_reply_state: Vec<PolicyId> = cfg
+        .policies
+        .iter()
+        .filter(|p| {
+            p.global.has_flag(ConfigFlags::STATEFUL)
+                && p.global.default_action != Action::Pass as u32
+        })
+        .map(|p| p.id)
+        .collect();
+    for i in &cfg.interfaces {
+        if out_scoped.contains(&i.policy) || needs_reply_state.contains(&i.policy) {
+            push(&i.name, &mut out);
+        }
+    }
+    for r in &cfg.npt66 {
+        push(&r.interface, &mut out);
+    }
+    out
+}
+
 /// Load the `velstra_egress` TC classifier and attach it at **egress** on each
 /// interface. Requires a `clsact` qdisc, which we create first (ignoring the
 /// "already exists" case so a restart is idempotent).
@@ -3129,6 +3152,60 @@ mod tests {
         assert!(vnis.contains(&50100), "the tenant's routed VNI");
         assert!(!vnis.contains(&0), "VNI 0 is not a segment");
         assert_eq!(vnis.len(), 2);
+    }
+
+    /// A stateful deny-by-default policy has to bring the egress hook with it.
+    ///
+    /// The ingress hook records a flow when it admits one, so a reply to
+    /// something that arrived is covered. A connection the *box* starts never
+    /// crosses that hook on the way out — nothing vouches for its reply, and the
+    /// default action drops it. On hardware that was DNS, NTP, ACME, the update
+    /// channel, webhooks and config-sync all failing while `stateful = true`
+    /// claimed otherwise, and nothing in the configuration hinted at why.
+    #[test]
+    fn a_stateful_deny_by_default_policy_brings_the_egress_hook() {
+        let iface = |name: &str, policy: PolicyId| ResolvedInterface {
+            name: name.into(),
+            policy,
+            vni: 0,
+            masquerade: false,
+            mss: 0,
+            cgnat: CgnatLayout::default(),
+        };
+        let policy = |id: PolicyId, action: Action, stateful: bool| PolicyConfig {
+            mac_rules: Vec::new(),
+            id,
+            global: GlobalConfig::new(action, if stateful { ConfigFlags::STATEFUL } else { 0 }),
+            portal: None,
+            blocklist: Vec::new(),
+            blocklist6: Vec::new(),
+            port_rules: Vec::new(),
+        };
+
+        // Deny by default and stateful: the hook comes along.
+        let mut cfg = RuntimeConfig::passthrough();
+        cfg.policies = vec![policy(1, Action::Drop, true)];
+        cfg.interfaces = vec![iface("eth0", 1)];
+        assert_eq!(egress_interfaces(&cfg, &[], false), ["eth0"]);
+
+        // Deny by default but NOT stateful: nothing is tracked, so there is
+        // nothing for the hook to record.
+        cfg.policies = vec![policy(1, Action::Drop, false)];
+        assert!(egress_interfaces(&cfg, &[], false).is_empty());
+
+        // Stateful but passing by default: the reply gets through on its own, and
+        // a hook that is not needed is a verdict stage nobody asked for.
+        cfg.policies = vec![policy(1, Action::Pass, true)];
+        assert!(egress_interfaces(&cfg, &[], false).is_empty());
+
+        // The other reasons still hold, and a name is listed once however many
+        // reasons name it.
+        cfg.policies = vec![policy(1, Action::Drop, true)];
+        cfg.interfaces = vec![ResolvedInterface {
+            masquerade: true,
+            ..iface("eth0", 1)
+        }];
+        assert_eq!(egress_interfaces(&cfg, &["eth0".into()], true), ["eth0"]);
     }
 
     #[test]

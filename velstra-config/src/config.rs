@@ -1526,7 +1526,7 @@ fn resolve_firewall(
         }
         rules.push(ResolvedRule {
             key: PortKey::new(rule.proto.number(), rule.port),
-            icmp_type: rule.icmp_type.unwrap_or(0),
+            icmp_type: velstra_common::icmp_type_key(rule.icmp_type),
             in_interface: rule.in_interface.clone().unwrap_or_default(),
             scope,
             src,
@@ -2231,7 +2231,7 @@ impl fmt::Display for RuntimeConfig {
                 let typed = if rule.icmp_type == 0 {
                     String::new()
                 } else {
-                    format!(" type {}", rule.icmp_type)
+                    format!(" type {}", rule.icmp_type - 1)
                 };
                 // Family and direction, for the same reason: a rule scoped to
                 // one of them and one scoped to neither must not print alike.
@@ -2955,7 +2955,29 @@ mod tests {
         "#;
         let file: FileConfig = toml::from_str(ok).unwrap();
         let cfg = file.resolve().expect("a typed ICMP rule is valid");
-        assert_eq!(cfg.policies[0].port_rules[0].icmp_type, 8);
+        // Stored one higher than the wire type, so that key `0` can keep meaning
+        // "every type" without swallowing echo-reply, which *is* type 0.
+        assert_eq!(cfg.policies[0].port_rules[0].icmp_type, 9);
+
+        // The case the bias exists for: a rule naming echo-reply must not
+        // compile to the same key as a rule naming no type at all.
+        let reply = r#"
+            [[port_rule]]
+            proto = "icmp"
+            port = 0
+            icmp-type = 0
+        "#;
+        let any = r#"
+            [[port_rule]]
+            proto = "icmp"
+            port = 0
+        "#;
+        let reply: FileConfig = toml::from_str(reply).unwrap();
+        let any: FileConfig = toml::from_str(any).unwrap();
+        let reply = reply.resolve().expect("echo-reply is a valid constraint");
+        let any = any.resolve().expect("an untyped ICMP rule is valid");
+        assert_eq!(reply.policies[0].port_rules[0].icmp_type, 1);
+        assert_eq!(any.policies[0].port_rules[0].icmp_type, 0);
 
         let bad = r#"
             [[port_rule]]

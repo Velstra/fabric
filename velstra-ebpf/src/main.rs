@@ -77,12 +77,13 @@ use velstra_common::{
     ScopedPortKey, ScopedSrcPortKey, ScopedSrcPortKey6, ServiceKey, ServiceValue, SourceValidation,
     Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, SynFlow, SynProxyCfg, SynProxyKey,
     TcpSynth, TunnelEndpoint, TunnelKey, build_encap, build_srv6_encap, check_cookie,
-    csum_replace_u32, decide, decide_egress, decode_vni, epoch_of, gate_admits_unauthenticated, icmp,
-    icmp_checksum, ip_proto, ipv6_ext_len, is_ipv6_ext, is_overlay_dport, lpm_key_addr,
-    make_cookie, plan_arp_reply, plan_forward, plan_icmp_unreachable, plan_irb, plan_na_reply,
-    plan_nat, plan_server_ack, plan_server_syn, plan_syn_ack, plan_tcp_rst, port_rule_action,
-    port_rule_excluded, port_rule_limit, port_rule_logs, port_rule_present, port_rule_winner,
-    select_backend, session_hash, tcp_flags, translate_to_client, translate_to_server,
+    csum_replace_u32, decide, decide_egress, decode_vni, epoch_of, gate_admits_unauthenticated,
+    icmp, icmp_checksum, icmp_reply_probe, icmp_type_probe, ip_proto, ipv6_ext_len, is_ipv6_ext,
+    is_overlay_dport, lpm_key_addr, make_cookie, plan_arp_reply, plan_forward,
+    plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_server_ack, plan_server_syn,
+    plan_syn_ack, plan_tcp_rst, port_rule_action, port_rule_excluded, port_rule_limit,
+    port_rule_logs, port_rule_present, port_rule_winner, select_backend, session_hash, tcp_flags,
+    translate_to_client, translate_to_server,
 };
 
 /// Maps an ingress interface index to its policy id, so one XDP program can
@@ -974,7 +975,10 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
     } else if proto == ip_proto::ICMP && ipv4.frag_offset() == 0 {
         // See the ingress path: four bytes, because one does not verify.
         if let Ok(head) = unsafe { ptr_at_tc::<[u8; 4]>(ctx, EthHdr::LEN + ihl_bytes) } {
-            icmp_type = unsafe { *head }[0];
+            // Biased to match how a rule's type constraint is stored: key 0 is
+            // reserved for "any type", so echo-reply (type 0) needs a slot of
+            // its own. See `icmp_type_key`.
+            icmp_type = icmp_type_probe(unsafe { *head }[0]);
         }
     }
 
@@ -1067,13 +1071,29 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
 
     // Allowed: on a stateful policy, record the flow (and its reverse) so the
     // reply is permitted when it arrives at the XDP ingress hook.
+    //
+    // ICMP is included, keyed like the ingress path keys it — ports zero, so the
+    // echo reply's reversed 4-tuple is exactly the key recorded here. Leaving it
+    // out meant a box under deny-by-default could not ping its own gateway, and
+    // the first thing anyone does when a link looks wrong is ping the gateway.
+    // The key is per address pair rather than per echo id, so any ICMP we sent
+    // admits the answer — a stateful firewall's usual bargain for a protocol
+    // with no connection to track.
     let stateful = cfg.has_flag(ConfigFlags::STATEFUL)
-        && (proto == ip_proto::TCP || proto == ip_proto::UDP)
+        && (proto == ip_proto::TCP || proto == ip_proto::UDP || proto == ip_proto::ICMP)
         && ihl_bytes == Ipv4Hdr::LEN;
     if stateful {
-        let fkey = FlowKey::new(policy_id, src_addr, dst_addr, src_port, dst_port, proto);
+        // ICMP carries its type where a port would be, so the entry names what
+        // it is waiting for: our echo request records the echo *reply*, and a
+        // fresh request from that host still has to face the policy.
+        let (fs, fd, rs, rd) = if proto == ip_proto::ICMP {
+            (0, icmp_type as u16, 0, icmp_reply_probe(icmp_type) as u16)
+        } else {
+            (src_port, dst_port, dst_port, src_port)
+        };
+        let fkey = FlowKey::new(policy_id, src_addr, dst_addr, fs, fd, proto);
         let _ = FW_FLOWS.insert(&fkey, &1u8, 0);
-        let rkey = FlowKey::new(policy_id, dst_addr, src_addr, dst_port, src_port, proto);
+        let rkey = FlowKey::new(policy_id, dst_addr, src_addr, rs, rd, proto);
         let _ = FW_FLOWS.insert(&rkey, &1u8, 0);
     }
 
@@ -1467,7 +1487,10 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
         // `ptr_at` fails and the type stays 0, which means "any type", exactly
         // as a truncated TCP header leaves the ports at 0.
         if let Ok(head) = unsafe { ptr_at::<[u8; 4]>(ctx, EthHdr::LEN + ihl_bytes) } {
-            icmp_type = unsafe { *head }[0];
+            // Biased to match how a rule's type constraint is stored: key 0 is
+            // reserved for "any type", so echo-reply (type 0) needs a slot of
+            // its own. See `icmp_type_key`.
+            icmp_type = icmp_type_probe(unsafe { *head }[0]);
         }
     }
 
@@ -1613,9 +1636,17 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     // Stateful firewall: track allowed TCP/UDP flows so replies are permitted in
     // either direction, even under deny-by-default. The blocklist still wins.
     let stateful = cfg.has_flag(ConfigFlags::STATEFUL)
-        && (proto == ip_proto::TCP || proto == ip_proto::UDP)
+        && (proto == ip_proto::TCP || proto == ip_proto::UDP || proto == ip_proto::ICMP)
         && ihl_bytes == Ipv4Hdr::LEN;
-    let fkey = FlowKey::new(policy_id, src_addr, dst_addr, src_port, dst_port, proto);
+    // ICMP is keyed by type rather than by ports it does not have — the same
+    // shape the egress hook records, so the reply to something this box sent
+    // finds its entry and a fresh request does not.
+    let (key_sport, key_dport) = if proto == ip_proto::ICMP {
+        (0, icmp_type as u16)
+    } else {
+        (src_port, dst_port)
+    };
+    let fkey = FlowKey::new(policy_id, src_addr, dst_addr, key_sport, key_dport, proto);
     // Only the tenant-scoped namespace is consulted here, and that is a deliberate
     // limit rather than an oversight. A router-NAT reply — from a port-forward's
     // internal host or a cross-zone load-balanced backend — arrives under a
@@ -1708,7 +1739,12 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     // reply is permitted regardless of the reverse direction's policy.
     if stateful && !established {
         let _ = FW_FLOWS.insert(&fkey, &1u8, 0);
-        let rkey = FlowKey::new(policy_id, dst_addr, src_addr, dst_port, src_port, proto);
+        let (rs, rd) = if proto == ip_proto::ICMP {
+            (0, icmp_reply_probe(icmp_type) as u16)
+        } else {
+            (dst_port, src_port)
+        };
+        let rkey = FlowKey::new(policy_id, dst_addr, src_addr, rs, rd, proto);
         let _ = FW_FLOWS.insert(&rkey, &1u8, 0);
     }
 
@@ -2050,7 +2086,10 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
         // offset is walked, so its `var_off` is wide, and a one-byte read there
         // is exactly what the verifier refused.
         if let Ok(head) = unsafe { ptr_at::<[u8; 4]>(ctx, upper.off) } {
-            icmp_type = unsafe { *head }[0];
+            // Biased to match how a rule's type constraint is stored: key 0 is
+            // reserved for "any type", so echo-reply (type 0) needs a slot of
+            // its own. See `icmp_type_key`.
+            icmp_type = icmp_type_probe(unsafe { *head }[0]);
         }
     }
 

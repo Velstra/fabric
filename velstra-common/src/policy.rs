@@ -621,7 +621,10 @@ mod tests {
         // Ingress keeps its meaning: unasked-for traffic is refused.
         assert_eq!(decide(&meta, &deny, false, None).action, Action::Drop);
         // Egress does not inherit it.
-        assert_eq!(decide_egress(&meta, &deny, false, None).action, Action::Pass);
+        assert_eq!(
+            decide_egress(&meta, &deny, false, None).action,
+            Action::Pass
+        );
 
         // What the operator did say still holds, in both directions.
         assert_eq!(
@@ -636,7 +639,10 @@ mod tests {
             flags: ConfigFlags::DROP_ICMP,
         };
         let ping = PacketMeta::new([10, 0, 0, 1], [10, 0, 0, 2], ip_proto::ICMP, 0, 0, 60);
-        assert_eq!(decide_egress(&ping, &no_icmp, false, None).action, Action::Drop);
+        assert_eq!(
+            decide_egress(&ping, &no_icmp, false, None).action,
+            Action::Drop
+        );
     }
 
     fn pkt(proto: u8, dst_port: u16) -> PacketMeta {

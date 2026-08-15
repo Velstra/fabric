@@ -284,6 +284,56 @@ pub struct ScopedSrcPortKey {
     pub src: u32,
 }
 
+/// The key encoding for a rule's ICMP-type constraint.
+///
+/// `0` in the key means "every type", which is also what a rule naming no type
+/// at all compiles to — so a *named* type is stored one higher. Without that
+/// bias, `icmp-type echo-reply` (type **0**) was indistinguishable from "any
+/// ICMP": a rule written to admit ping *answers* admitted ping itself, and every
+/// other ICMP message with it. A rule that matches more than it says is worse
+/// than a rule that was refused.
+///
+/// The cost is type 255, which is reserved and has never been assignable.
+#[inline]
+pub const fn icmp_type_key(constraint: Option<u8>) -> u8 {
+    match constraint {
+        Some(t) => t.wrapping_add(1),
+        None => 0,
+    }
+}
+
+/// The value a lookup probes with for a packet carrying ICMP type `t`. The
+/// counterpart of [`icmp_type_key`]: the data plane asks once with this, then
+/// once with `0`, so a typed rule beats an untyped one.
+#[inline]
+pub const fn icmp_type_probe(t: u8) -> u8 {
+    t.wrapping_add(1)
+}
+
+/// The conntrack "port" a flow key carries for an ICMP packet of probed type
+/// `probe` (see [`icmp_type_probe`]), and the one its **answer** will carry.
+///
+/// ICMP has no ports, so a flow key that leaves them zero cannot tell a reply
+/// from a fresh request: after the box pings a host, that host could ping back
+/// and be admitted by the entry — including where `block-icmp` says otherwise.
+/// Carrying the type instead makes the entry name what it is waiting for, so
+/// only the echo *reply* to an echo request we sent matches.
+///
+/// Types with no reply keep their own value: the entry then admits the same
+/// type back, which is what a symmetric exchange (an unsolicited error, say)
+/// needs, and nothing else.
+#[inline]
+pub const fn icmp_reply_probe(probe: u8) -> u8 {
+    match probe {
+        // Probed values are `type + 1`: echo request 8 → 9, echo reply 0 → 1.
+        9 => 1,   // echo request → echo reply
+        14 => 15, // timestamp → timestamp reply
+        16 => 17, // information request → information reply
+        18 => 19, // address mask request → address mask reply
+        other => other,
+    }
+}
+
 impl ScopedSrcPortKey {
     /// Prefix bits covering the exactly-matched head (`policy_id` + `proto` +
     /// `_pad` + `port` = 32 + 8 + 8 + 16).
@@ -796,6 +846,26 @@ impl PacketMeta {
 
 #[cfg(test)]
 mod tests {
+    /// An ICMP conntrack entry has to name the answer it is waiting for.
+    ///
+    /// With the type left out of the key, a host this box pinged could ping it
+    /// back through the same entry — past a `block-icmp` that says otherwise.
+    #[test]
+    fn an_icmp_entry_expects_the_reply_and_not_another_request() {
+        // Probed values are `type + 1` (see `icmp_type_probe`).
+        assert_eq!(icmp_reply_probe(icmp_type_probe(8)), icmp_type_probe(0));
+        // And what it waits for is not another request: that is the whole
+        // point — a host we pinged cannot ping us back through this entry.
+        assert_ne!(icmp_reply_probe(icmp_type_probe(8)), icmp_type_probe(8));
+        // The request/reply pairs that have one.
+        assert_eq!(icmp_reply_probe(icmp_type_probe(13)), icmp_type_probe(14));
+        assert_eq!(icmp_reply_probe(icmp_type_probe(15)), icmp_type_probe(16));
+        assert_eq!(icmp_reply_probe(icmp_type_probe(17)), icmp_type_probe(18));
+        // A type with no reply keeps its own, so a symmetric exchange still
+        // works and nothing else is admitted.
+        assert_eq!(icmp_reply_probe(icmp_type_probe(3)), icmp_type_probe(3));
+    }
+
     use super::*;
 
     #[test]
