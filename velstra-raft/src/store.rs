@@ -192,6 +192,15 @@ pub enum TopoRequest {
         port_id: String,
         group: Option<String>,
     },
+    /// Give a port a send ceiling in Mbit/s, or take it away (`mbit = None`).
+    ///
+    /// Replicated like any other decision about a port: the ceiling ends up in
+    /// the interface assignment every agent is handed, so a follower that
+    /// becomes leader must already know it or the ceiling quietly comes off.
+    SetPortRateLimit {
+        port_id: String,
+        mbit: Option<u32>,
+    },
     // --- Tenant IP-VRFs (B7) ------------------------------------------------
     /// Define a tenant's routed context over a set of L2 segments.
     AddIpVrf(IpVrfSpec),
@@ -266,6 +275,11 @@ pub struct PortRecord {
     pub ip: String,
     pub mac: String,
     pub tap: String,
+    /// The send ceiling in Mbit/s, `None` when there is none. Carried so the
+    /// answer to `LimitPort` is the port as it now stands rather than the port
+    /// as it was before the decision it just made.
+    #[serde(default)]
+    pub rate_limit_mbit: Option<u32>,
 }
 
 /// The result of applying a [`TopoRequest`].
@@ -273,7 +287,8 @@ pub struct PortRecord {
 pub struct TopoResponse {
     pub ok: bool,
     pub error: Option<String>,
-    /// The created/updated port, for `CreatePort`/`MigratePort`/`SetPortSecurityGroup`.
+    /// The created/updated port, for `CreatePort`/`MigratePort`/
+    /// `SetPortSecurityGroup`/`SetPortRateLimit`.
     pub port: Option<PortRecord>,
     /// The allocated address, for `AllocateAddress`/`BindPortSubnet` (D2).
     #[serde(default)]
@@ -444,6 +459,7 @@ fn port_record(p: &velstra_orchestrator::Port) -> PortRecord {
         ip: p.ip.to_string(),
         mac: fmt_mac(p.mac),
         tap: p.tap.clone(),
+        rate_limit_mbit: p.rate_limit_mbit,
     }
 }
 
@@ -516,6 +532,10 @@ pub fn apply(topo: &mut Topology, req: &TopoRequest) -> TopoResponse {
         }
         TopoRequest::SetPortSecurityGroup { port_id, group } => {
             let p = topo.set_port_security_group(port_id, group.as_deref())?;
+            Ok(TopoResponse::ok_port(port_record(&p)))
+        }
+        TopoRequest::SetPortRateLimit { port_id, mbit } => {
+            let p = topo.limit_port(port_id, *mbit)?;
             Ok(TopoResponse::ok_port(port_record(&p)))
         }
         // --- Tenant IP-VRFs (B7) --------------------------------------------
@@ -1205,6 +1225,123 @@ mod tests {
         assert!(apply(&mut t, &TopoRequest::RemoveIpVrf { l3_vni: 50100 }).ok);
         assert!(t.ip_vrf_of_network(5001).is_none());
         assert_eq!(t.networks().count(), 2);
+    }
+
+    /// A ceiling asked for over the wire reaches the interface assignment the
+    /// agent is handed.
+    ///
+    /// The orchestrator could already hold one and already put it in the derived
+    /// config — and **nothing outside its own tests ever called `limit_port`**.
+    /// There was no RPC and no REST route, so `port.rateLimitMbit` in the cloud
+    /// was carried, stored, echoed and inexpressible: built, tested and inert,
+    /// the same shape as `securityGroups` before it. This is the path that was
+    /// missing, tested where the decision is replicated rather than only where
+    /// it is computed.
+    #[test]
+    fn apply_port_rate_limit_reaches_the_interface_an_agent_is_handed() {
+        let mut t = Topology::new();
+        assert!(apply(&mut t, &TopoRequest::AddHost(host_spec("h1", "10.0.0.1"))).ok);
+        assert!(
+            apply(
+                &mut t,
+                &TopoRequest::AddNetwork(NetworkSpec {
+                    vni: 5000,
+                    name: "blue".into(),
+                    subnet: "192.168.100.0/24".into(),
+                    default_action: ActionName::Pass,
+                    drop_icmp: false,
+                })
+            )
+            .ok
+        );
+        let port = apply(
+            &mut t,
+            &TopoRequest::CreatePort {
+                vni: 5000,
+                host: "h1".into(),
+                tap: "tapA".into(),
+                ip: None,
+                policy: None,
+                mac: None,
+            },
+        )
+        .port
+        .expect("create returns a port");
+        // A port is created without one: creating and deciding what it may send
+        // are two decisions, and a create that carried both would make the
+        // second unaskable on its own.
+        assert_eq!(port.rate_limit_mbit, None);
+
+        let limited = apply(
+            &mut t,
+            &TopoRequest::SetPortRateLimit {
+                port_id: port.id.clone(),
+                mbit: Some(250),
+            },
+        );
+        assert!(limited.ok, "{:?}", limited.error);
+        // The answer is the port as it now stands. A ceiling that cannot be read
+        // back is a ceiling nobody can check is on.
+        assert_eq!(
+            limited.port.as_ref().unwrap().rate_limit_mbit,
+            Some(250),
+            "the answer does not carry the decision it just made"
+        );
+
+        let rt = t
+            .derive("h1")
+            .unwrap()
+            .resolve()
+            .expect("derived config resolves");
+        assert_eq!(
+            rt.interfaces
+                .iter()
+                .find(|i| i.name == "tapA")
+                .unwrap()
+                .rate_limit_mbit,
+            Some(250),
+            "the ceiling never reached the agent's interface"
+        );
+
+        // Zero is not "may send nothing". It is what an unset number looks like
+        // coming off a wire, and a guest that silently stopped passing traffic
+        // because a field defaulted is the worst reading of it.
+        let cleared = apply(
+            &mut t,
+            &TopoRequest::SetPortRateLimit {
+                port_id: port.id.clone(),
+                mbit: Some(0),
+            },
+        );
+        assert!(cleared.ok);
+        assert_eq!(cleared.port.unwrap().rate_limit_mbit, None);
+        assert_eq!(
+            t.derive("h1")
+                .unwrap()
+                .resolve()
+                .unwrap()
+                .interfaces
+                .iter()
+                .find(|i| i.name == "tapA")
+                .unwrap()
+                .rate_limit_mbit,
+            None
+        );
+
+        // A ceiling on a port that is not there is a mistake, not a no-op: a
+        // refusal the caller can ignore is how an unenforced ceiling becomes
+        // invisible.
+        let missing = apply(
+            &mut t,
+            &TopoRequest::SetPortRateLimit {
+                port_id: "port-does-not-exist".into(),
+                mbit: Some(100),
+            },
+        );
+        assert!(
+            !missing.ok,
+            "a ceiling was set on a port that does not exist"
+        );
     }
 
     #[test]

@@ -53,7 +53,7 @@ use velstra_proto::{
     Ack, Action, AllocateAddressRequest, AllocateAddressResponse, AllocateFloatingIpRequest,
     AssociateFloatingIpRequest, BindPortSecurityGroupRequest, BindPortSubnetRequest,
     CreatePortRequest, DisassociateFloatingIpRequest, Encap, FloatingIpInfo, HostSpec, IpVrfSpec,
-    LbMember, ListFloatingIpsRequest, ListFloatingIpsResponse, ListIpVrfsRequest,
+    LbMember, LimitPortRequest, ListFloatingIpsRequest, ListFloatingIpsResponse, ListIpVrfsRequest,
     ListIpVrfsResponse, ListLoadBalancersRequest, ListLoadBalancersResponse, ListNodesRequest,
     ListNodesResponse, ListPortsRequest, ListPortsResponse, ListSecurityGroupsRequest,
     ListSecurityGroupsResponse, ListSubnetsRequest, ListSubnetsResponse, LoadBalancerSpec,
@@ -1118,6 +1118,7 @@ fn port_record_to_info(p: velstra_raft::PortRecord) -> PortInfo {
         ip: p.ip,
         mac: p.mac,
         tap: p.tap,
+        rate_limit_mbit: p.rate_limit_mbit,
     }
 }
 
@@ -1227,6 +1228,7 @@ fn port_to_info(p: &velstra_orchestrator::Port) -> PortInfo {
         ip: p.ip.to_string(),
         mac: fmt_mac(p.mac),
         tap: p.tap.clone(),
+        rate_limit_mbit: p.rate_limit_mbit,
     }
 }
 
@@ -1318,6 +1320,35 @@ impl VelstraOrchestrator for OrchestratorSvc {
         info!("RemovePort({id:?})");
         let resp = propose(&self.shared, velstra_raft::TopoRequest::RemovePort { id }).await?;
         Ok(Response::new(Ack { ok: resp.ok }))
+    }
+
+    async fn limit_port(
+        &self,
+        request: Request<LimitPortRequest>,
+    ) -> Result<Response<PortInfo>, Status> {
+        let caller = caller_of(&request);
+        // A port id doesn't name its owning host here, so a ceiling is
+        // admin-only (same rationale as RemovePort).
+        if !self.authz.allow_admin(&caller) {
+            return Err(deny("set port rate limits (admin only)"));
+        }
+        let req = request.into_inner();
+        info!("LimitPort({:?} -> {:?})", req.id, req.rate_limit_mbit);
+        let resp = propose(
+            &self.shared,
+            velstra_raft::TopoRequest::SetPortRateLimit {
+                port_id: req.id,
+                mbit: req.rate_limit_mbit,
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(Status::invalid_argument(resp.error.unwrap_or_default()));
+        }
+        let port = resp
+            .port
+            .ok_or_else(|| Status::internal("limit_port returned no port"))?;
+        Ok(Response::new(port_record_to_info(port)))
     }
 
     async fn migrate_port(

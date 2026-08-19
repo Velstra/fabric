@@ -1007,20 +1007,25 @@ impl Topology {
     }
 
     /// Give a port a send ceiling in megabits per second, or take it away with
-    /// `None` (roadmap B13). Returns whether the port existed.
+    /// `None` (roadmap B13). Returns the port as it now stands.
     ///
     /// A ceiling of `0` is taken as no ceiling rather than as "may send
     /// nothing": zero is what an unset number looks like coming from a wire
     /// format, and a port that silently stopped passing traffic because a field
     /// defaulted is the worst reading of it.
-    pub fn limit_port(&mut self, id: &str, mbit: Option<u32>) -> bool {
-        match self.ports.iter_mut().find(|p| p.id == id) {
-            Some(port) => {
-                port.rate_limit_mbit = mbit.filter(|m| *m > 0);
-                true
-            }
-            None => false,
-        }
+    ///
+    /// It answers with the port, and refuses an id it does not have, for the
+    /// same reason [`Self::set_port_security_group`] does: a caller asking for a
+    /// ceiling on a port that is not there has made a mistake, and a `false` it
+    /// can ignore is how an unenforced ceiling becomes invisible.
+    pub fn limit_port(&mut self, id: &str, mbit: Option<u32>) -> Result<Port> {
+        let port = self
+            .ports
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or_else(|| anyhow::anyhow!("unknown port {id:?}"))?;
+        port.rate_limit_mbit = mbit.filter(|m| *m > 0);
+        Ok(port.clone())
     }
 
     /// Remove a port by id, releasing any IPAM addresses bound to it back to
@@ -3985,9 +3990,10 @@ mod tests {
             .unwrap();
         let p = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
 
-        assert!(t.limit_port(&p.id, Some(100)), "the port was not found");
+        t.limit_port(&p.id, Some(100))
+            .expect("the port was not found");
         assert!(
-            !t.limit_port("port-does-not-exist", Some(100)),
+            t.limit_port("port-does-not-exist", Some(100)).is_err(),
             "limiting an unknown port reported success"
         );
 
@@ -4002,7 +4008,7 @@ mod tests {
 
         // Taking the ceiling away must reach the config too, or a port stays
         // throttled after the operator lifted the limit.
-        assert!(t.limit_port(&p.id, None));
+        t.limit_port(&p.id, None).unwrap();
         let iface = t
             .derive("h1")
             .unwrap()
@@ -4024,7 +4030,7 @@ mod tests {
             .unwrap();
         let p = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
 
-        assert!(t.limit_port(&p.id, Some(0)));
+        t.limit_port(&p.id, Some(0)).unwrap();
         assert_eq!(
             t.ports()
                 .iter()
@@ -4053,7 +4059,7 @@ mod tests {
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         let p = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
-        t.limit_port(&p.id, Some(250));
+        t.limit_port(&p.id, Some(250)).unwrap();
 
         let restored = Topology::from_snapshot(&t.to_snapshot());
         assert_eq!(

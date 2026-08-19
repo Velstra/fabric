@@ -48,6 +48,9 @@ service VelstraOrchestrator {
   rpc CreatePort(CreatePortRequest) returns (PortInfo);
   // Remove a port by id.
   rpc RemovePort(RemovePortRequest) returns (Ack);
+  // Give a port a send ceiling in Mbit/s, or take it away (B13). Returns the
+  // port as it now stands.
+  rpc LimitPort(LimitPortRequest) returns (PortInfo);
   // Move a port to another host, keeping its IP/MAC/id (live migration).
   rpc MigratePort(MigratePortRequest) returns (PortInfo);
   // List all ports in the fabric.
@@ -167,10 +170,23 @@ message PortInfo {
   string ip = 4;
   string mac = 5;
   string tap = 6;
+  // The send ceiling in Mbit/s, absent when there is none. Reported because a
+  // ceiling that cannot be read back is a ceiling nobody can check is on — and
+  // it was set through an RPC that did not exist until it was needed here.
+  optional uint32 rate_limit_mbit = 7;
 }
 
 message RemovePortRequest {
   string id = 1;
+}
+
+message LimitPortRequest {
+  string id = 1;
+  // Send ceiling in megabits per second. Absent **or zero** = no ceiling: zero
+  // is what an unset number looks like coming off a wire, and a port that
+  // silently stopped passing traffic because a field defaulted is the worst
+  // reading of it.
+  optional uint32 rate_limit_mbit = 2;
 }
 
 message RemoveHostRequest {
