@@ -52,13 +52,14 @@ use velstra_orchestrator::Topology;
 use velstra_proto::{
     Ack, Action, AllocateAddressRequest, AllocateAddressResponse, AllocateFloatingIpRequest,
     AssociateFloatingIpRequest, BindPortSecurityGroupRequest, BindPortSubnetRequest,
-    CreatePortRequest, DisassociateFloatingIpRequest, Encap, FloatingIpInfo, HostSpec, IpVrfSpec,
-    LbMember, LimitPortRequest, ListFloatingIpsRequest, ListFloatingIpsResponse, ListIpVrfsRequest,
+    Counter as ProtoCounter, CreatePortRequest, DisassociateFloatingIpRequest, Encap,
+    FloatingIpInfo, GetStatsRequest, GetStatsResponse, HostSpec, IpVrfSpec, LbMember,
+    LimitPortRequest, ListFloatingIpsRequest, ListFloatingIpsResponse, ListIpVrfsRequest,
     ListIpVrfsResponse, ListLoadBalancersRequest, ListLoadBalancersResponse, ListNodesRequest,
     ListNodesResponse, ListPortsRequest, ListPortsResponse, ListSecurityGroupsRequest,
     ListSecurityGroupsResponse, ListSubnetsRequest, ListSubnetsResponse, LoadBalancerSpec,
-    MigratePortRequest, NetworkSpec, NodeConfig, NodeRequest, NodeSummary, PortAddrInfo, PortInfo,
-    PortRule, Proto, ReleaseAddressRequest, ReleaseFloatingIpRequest, RemoveHostRequest,
+    MigratePortRequest, NetworkSpec, NodeConfig, NodeRequest, NodeStats, NodeSummary, PortAddrInfo,
+    PortInfo, PortRule, Proto, ReleaseAddressRequest, ReleaseFloatingIpRequest, RemoveHostRequest,
     RemoveIpVrfRequest, RemoveLoadBalancerRequest, RemoveNetworkRequest, RemovePortRequest,
     RemoveSecurityGroupRequest, RemoveSubnetRequest, SecurityGroupInfo, SecurityGroupSpec,
     SetConfigRequest, StatsReport, SubnetInfo, SubnetSpec, UnbindPortAddressRequest,
@@ -552,6 +553,14 @@ struct Shared {
     /// into `state.derived` by `re_derive`. Empty (and unused) unless
     /// `--wren-socket` is set.
     evpn_learned: RwLock<EvpnLearned>,
+    /// The most recent counters each node reported, keyed by node id.
+    ///
+    /// A sample, not state: never replicated, never persisted, and dropped with
+    /// the process. Bounded by the number of nodes, because a node replaces its
+    /// own entry rather than appending — this is "what is it doing now", not a
+    /// time series, and a controller that grew a history in memory would be a
+    /// controller that eventually stops.
+    stats: RwLock<BTreeMap<String, (u64, Vec<ProtoCounter>)>>,
     generation: AtomicU64,
     notify: watch::Sender<u64>,
 }
@@ -565,6 +574,7 @@ impl Shared {
             topology_path: if raft.is_some() { None } else { topology_path },
             raft,
             evpn_learned: RwLock::new(EvpnLearned::default()),
+            stats: RwLock::new(BTreeMap::new()),
             generation: AtomicU64::new(0),
             notify: watch::channel(0).0,
         }
@@ -813,6 +823,21 @@ impl VelstraControl for ControlSvc {
             .map(|c| format!("{}={}", c.name, c.value))
             .collect();
         info!("stats from {:?}: {}", report.node_id, active.join(" "));
+        // Kept, not only logged. This used to end here, so every node reported
+        // on a timer into a log line and nothing could be *asked* about a
+        // running fabric. The node replaces its own entry: the question is what
+        // it is doing now, and a history held in a controller's memory is a
+        // controller that eventually stops.
+        self.shared.stats.write().await.insert(
+            report.node_id,
+            (
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+                report.counters,
+            ),
+        );
         Ok(Response::new(Ack { ok: true }))
     }
 }
@@ -865,6 +890,32 @@ impl VelstraAdmin for AdminSvc {
             self.shared.recompute(&mut state);
         }
         Ok(Response::new(Ack { ok: existed }))
+    }
+
+    async fn get_stats(
+        &self,
+        request: Request<GetStatsRequest>,
+    ) -> Result<Response<GetStatsResponse>, Status> {
+        let caller = caller_of(&request);
+        if !self.authz.allow_admin(&caller) {
+            return Err(deny("read node statistics (admin only)"));
+        }
+        let wanted = request.into_inner().node_id;
+        let stats = self.shared.stats.read().await;
+        let nodes = stats
+            .iter()
+            // An empty id is "every node I have heard from". A named one that
+            // has never reported comes back empty rather than as an error: a
+            // node that exists and has said nothing is an ordinary thing to be,
+            // and it is exactly what a reader is trying to find out.
+            .filter(|(node_id, _)| wanted.is_empty() || *node_id == &wanted)
+            .map(|(node_id, (at, counters))| NodeStats {
+                node_id: node_id.clone(),
+                counters: counters.clone(),
+                reported_at_ms: *at,
+            })
+            .collect();
+        Ok(Response::new(GetStatsResponse { nodes }))
     }
 
     async fn list_nodes(

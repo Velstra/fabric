@@ -31,7 +31,7 @@
 //! (or add mTLS later) for transport confidentiality.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -263,6 +263,8 @@ pub fn router(state: Arc<RestState>) -> Router {
         .route("/healthz", get(healthz))
         .route("/version", get(version))
         .route("/v1/audit", get(list_audit))
+        .route("/v1/stats", get(list_stats))
+        .route("/v1/stats/:node_id", get(get_stats))
         .route("/v1/events", get(events))
         .route("/v1/hosts", get(list_hosts).post(create_host))
         .route("/v1/hosts/:id", get(get_host).delete(delete_host))
@@ -980,6 +982,58 @@ async fn list_audit(
     Query(q): Query<AuditQuery>,
 ) -> Json<Vec<AuditEntry>> {
     Json(state.audit.recent(q.limit))
+}
+
+// ---------------------------------------------------------------------------
+// Node statistics
+// ---------------------------------------------------------------------------
+
+/// One node's most recent report, as JSON.
+///
+/// A **sample**, not state — see `NodeStats` in the proto. `counters` is a plain
+/// object because that is what every dashboard and every `jq` expects; the wire
+/// form is a repeated message because proto3 maps cannot be ordered and an
+/// operator reading this wants them in a stable order.
+#[derive(Debug, Serialize)]
+pub struct NodeStatsJson {
+    pub node_id: String,
+    pub counters: BTreeMap<String, u64>,
+    /// Milliseconds since the Unix epoch. Reported so a reader can tell a quiet
+    /// node from a dead one — all-zero counters read identically either way.
+    pub reported_at_ms: u64,
+}
+
+async fn read_stats(shared: &Arc<Shared>) -> Vec<NodeStatsJson> {
+    shared
+        .stats
+        .read()
+        .await
+        .iter()
+        .map(|(node_id, (at, counters))| NodeStatsJson {
+            node_id: node_id.clone(),
+            counters: counters.iter().map(|c| (c.name.clone(), c.value)).collect(),
+            reported_at_ms: *at,
+        })
+        .collect()
+}
+
+async fn list_stats(State(state): State<Arc<RestState>>) -> Json<Vec<NodeStatsJson>> {
+    Json(read_stats(&state.shared).await)
+}
+
+async fn get_stats(
+    State(state): State<Arc<RestState>>,
+    Path(node_id): Path<String>,
+) -> Result<Json<NodeStatsJson>, ApiError> {
+    read_stats(&state.shared)
+        .await
+        .into_iter()
+        .find(|s| s.node_id == node_id)
+        .map(Json)
+        // A node that exists and has never reported is not the same as a node
+        // that does not exist, and this route can only answer the second — so
+        // it says which question it is answering.
+        .ok_or_else(|| ApiError::not_found(format!("no node {node_id:?} has reported statistics")))
 }
 
 // ---------------------------------------------------------------------------

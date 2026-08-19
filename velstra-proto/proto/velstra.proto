@@ -34,6 +34,38 @@ service VelstraAdmin {
 
   // List the nodes the controller currently serves.
   rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+
+  // The most recent counters each node reported. Nodes report them on a timer
+  // over `ReportStats`; until this existed the controller logged them and threw
+  // them away, so a whole reporting channel ended in a log line and nothing
+  // could be asked about a running fabric at all.
+  rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
+}
+
+message GetStatsRequest {
+  // One node, or every node the controller has heard from when empty.
+  string node_id = 1;
+}
+
+// One node's most recent report.
+//
+// A **sample**, not state: it is what that node last said, not a fact the
+// controller derived and not something it can reconstruct. Deliberately not
+// replicated through Raft — a counter arriving every few seconds would make
+// every sample a consensus round to agree on a number that is already stale,
+// and a follower that has never heard from a node has nothing to say about it
+// rather than something wrong.
+message NodeStats {
+  string node_id = 1;
+  repeated Counter counters = 2;
+  // Milliseconds since the Unix epoch, as the controller saw it. Reported so a
+  // reader can tell a quiet node from a dead one — counters alone cannot, and
+  // "all zero" reads identically either way.
+  uint64 reported_at_ms = 3;
+}
+
+message GetStatsResponse {
+  repeated NodeStats nodes = 1;
 }
 
 // High-level fabric orchestration: declare hosts, networks, and ports at
