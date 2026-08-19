@@ -558,8 +558,32 @@ impl Topology {
                 EVPN_RESERVED_VNI_BASE
             );
         }
-        if self.networks.contains_key(&network.vni) {
-            bail!("network vni {} already exists", network.vni);
+        // A **restatement**, not a create. The caller above this is a
+        // level-triggered reconciler that says what should be true on every
+        // pass; refusing the second pass with "already exists" would make the
+        // first pass the only one that ever worked, and every pass after it an
+        // error somebody has to learn to ignore. Same reasoning as
+        // `add_security_group` and `create_port`.
+        //
+        // The one change that is refused is the one that strands what already
+        // exists: moving a network's subnet out from under ports allocated from
+        // it. Those ports would fail `subnet_contains` on their next
+        // restatement — the network would look configured and its guests would
+        // be unreachable, which is worse than being told no.
+        if let Some(existing) = self.networks.get(&network.vni)
+            && existing.subnet != network.subnet
+        {
+            let stranded = self.ports.iter().filter(|p| p.vni == network.vni).count();
+            if stranded > 0 {
+                bail!(
+                    "network {} already holds {stranded} port(s) allocated from {}/{};                      changing its subnet to {}/{} would put them outside it",
+                    network.vni,
+                    Ipv4Addr::from(existing.subnet.octets),
+                    existing.subnet.prefix,
+                    Ipv4Addr::from(network.subnet.octets),
+                    network.subnet.prefix
+                );
+            }
         }
         self.networks.insert(network.vni, network);
         Ok(())
@@ -685,7 +709,14 @@ impl Topology {
                 vrf.l3_vni
             );
         }
-        if let Some(existing) = self.ip_vrfs.get(&vrf.l3_vni) {
+        // A **restatement**, like `add_network` and `add_security_group`: the
+        // caller above is a level-triggered reconciler saying what should be
+        // true on every pass, and refusing the second one would make the first
+        // the only one that worked. What is still refused is a genuine
+        // collision — a *different* VRF reaching for a number this one holds.
+        if let Some(existing) = self.ip_vrfs.get(&vrf.l3_vni)
+            && existing.name != vrf.name
+        {
             bail!(
                 "ip-vrf {:?} reuses l3_vni {} already held by {:?}",
                 vrf.name,
@@ -711,7 +742,13 @@ impl Topology {
                     vrf.name
                 );
             }
-            if let Some(other) = self.ip_vrfs.values().find(|v| v.networks.contains(vni)) {
+            // Already routed by somebody *else* is the conflict; already routed
+            // by this same VRF is what a restatement looks like.
+            if let Some(other) = self
+                .ip_vrfs
+                .values()
+                .find(|v| v.name != vrf.name && v.networks.contains(vni))
+            {
                 bail!(
                     "network {vni} is already routed by ip-vrf {:?}; a network belongs to one",
                     other.name
@@ -1053,8 +1090,32 @@ impl Topology {
         if subnet.id.is_empty() {
             bail!("subnet id must not be empty");
         }
-        if self.subnets.contains_key(&subnet.id) {
-            bail!("subnet {:?} already exists", subnet.id);
+        // A **restatement**, like `add_network` and `add_ip_vrf`: the caller
+        // above is a level-triggered reconciler. What is still refused is the
+        // one restatement that cannot be honoured — moving the range out from
+        // under addresses already handed out of it, which would leave every one
+        // of them outside the subnet they were allocated from.
+        if let Some(existing) = self.subnets.get(&subnet.id)
+            && existing.cidr != subnet.cidr
+        {
+            let held = self
+                .ipam
+                .get(&subnet.id)
+                .map(|a| {
+                    a.values()
+                        .filter(|o| !matches!(o, IpAllocOwner::Gateway))
+                        .count()
+                })
+                .unwrap_or(0);
+            if held > 0 {
+                bail!(
+                    "subnet {:?} already holds {held} address(es) out of {:?}; changing its \
+                     CIDR to {:?} would put every one of them outside it",
+                    subnet.id,
+                    existing.cidr,
+                    subnet.cidr
+                );
+            }
         }
         if !self.networks.contains_key(&subnet.vni) {
             bail!("unknown network vni {}", subnet.vni);
@@ -1089,6 +1150,11 @@ impl Topology {
         let gateway = subnet.gateway;
         self.subnets.insert(id.clone(), subnet);
         let allocs = self.ipam.entry(id).or_default();
+        // A restatement may move the gateway. Drop the reservation the previous
+        // one held, or the old address stays out of the pool forever with
+        // nothing holding it — a leak that only shows up as a subnet filling
+        // faster than it should.
+        allocs.retain(|_, owner| !matches!(owner, IpAllocOwner::Gateway));
         if let Some(gw) = gateway {
             allocs.insert(ip_to_u128(gw), IpAllocOwner::Gateway);
         }
@@ -2224,6 +2290,64 @@ mod tests {
         }
     }
 
+    /// Declaring a network again is how a reconciler works, not an error.
+    ///
+    /// The caller above this states what should be true on every pass. When
+    /// `add_network` refused the second one with "already exists", the first
+    /// pass was the only one that ever worked — which is why nothing above the
+    /// fabric ever mirrored a network at all, and every cloud port was refused
+    /// with "unknown network vni".
+    #[test]
+    fn declaring_a_network_again_restates_it_rather_than_failing() {
+        let mut t = Topology::new();
+        t.add_network(network(100, "blue", "10.0.0.0/24")).unwrap();
+
+        // The same statement twice: no-op, no error.
+        t.add_network(network(100, "blue", "10.0.0.0/24"))
+            .expect("restating a network must not fail");
+
+        // Policy may be restated differently — that is a change an operator
+        // makes and the whole point of saying it again.
+        let mut renamed = network(100, "green", "10.0.0.0/24");
+        renamed.default_action = ActionName::Drop;
+        t.add_network(renamed)
+            .expect("changing policy must be allowed");
+        assert_eq!(t.networks.get(&100).unwrap().name, "green");
+        assert_eq!(
+            t.networks.get(&100).unwrap().default_action,
+            ActionName::Drop
+        );
+    }
+
+    /// Moving the subnet out from under existing ports is the one restatement
+    /// that is refused.
+    ///
+    /// Those ports would fail `subnet_contains` on their next pass: the network
+    /// would read as configured and its guests would be unreachable. Being told
+    /// no is better than that.
+    #[test]
+    fn a_network_subnet_cannot_move_out_from_under_its_ports() {
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.10.0.1", 0x11));
+        t.add_network(network(100, "blue", "10.0.0.0/24")).unwrap();
+
+        // With no ports, the subnet may still be corrected.
+        t.add_network(network(100, "blue", "10.1.0.0/24"))
+            .expect("an empty network's subnet may be corrected");
+
+        t.create_port(100, "h1", "tap0", None, None, None).unwrap();
+        let error = t
+            .add_network(network(100, "blue", "10.2.0.0/24"))
+            .expect_err("the subnet moved out from under an allocated port");
+        let said = error.to_string();
+        assert!(
+            said.contains("port") && said.contains("10.2.0.0"),
+            "the refusal must say what it would strand and where to: {said}"
+        );
+        // And the network is unchanged: a refused restatement changes nothing.
+        assert_eq!(t.networks.get(&100).unwrap().subnet.octets, [10, 1, 0, 0]);
+    }
+
     fn network(vni: u32, name: &str, subnet: &str) -> Network {
         Network {
             vni,
@@ -2821,6 +2945,51 @@ mod tests {
 
     use velstra_common::parse_cidr_v6;
 
+    /// Declaring a subnet again is how a reconciler works, and moving its
+    /// gateway must not leak the old one out of the pool.
+    #[test]
+    fn declaring_a_subnet_again_restates_it_rather_than_failing() {
+        let mut t = topo_with_segments();
+        let mut s1 = v4_subnet("s1", 10100, "192.168.50.0/24");
+        s1.gateway = Some(ip("192.168.50.1"));
+        t.add_subnet(s1.clone()).unwrap();
+        t.add_subnet(s1).expect("restating a subnet must not fail");
+
+        // Move the gateway. The address the old one held has to come back, or a
+        // subnet fills faster than it should with nothing holding the gap.
+        let mut moved = v4_subnet("s1", 10100, "192.168.50.0/24");
+        moved.gateway = Some(ip("192.168.50.254"));
+        t.add_subnet(moved).unwrap();
+        assert_eq!(
+            t.allocate("s1", Some(ip("192.168.50.1"))).unwrap(),
+            ip("192.168.50.1"),
+            "the previous gateway's reservation outlived the gateway"
+        );
+        assert!(
+            t.allocate("s1", Some(ip("192.168.50.254"))).is_err(),
+            "the new gateway was handed out"
+        );
+    }
+
+    /// The one restatement that cannot be honoured: moving the range out from
+    /// under addresses already allocated from it.
+    #[test]
+    fn a_subnet_cidr_cannot_move_out_from_under_its_addresses() {
+        let mut t = topo_with_segments();
+        t.add_subnet(v4_subnet("s1", 10100, "192.168.50.0/24"))
+            .unwrap();
+        // With nothing allocated, a re-range is fine — this is a subnet an
+        // operator is still setting up.
+        t.add_subnet(v4_subnet("s1", 10100, "192.168.60.0/24"))
+            .expect("an empty subnet may be re-ranged");
+
+        t.allocate("s1", Some(ip("192.168.60.5"))).unwrap();
+        let err = t
+            .add_subnet(v4_subnet("s1", 10100, "192.168.70.0/24"))
+            .expect_err("the range moved out from under an allocated address");
+        assert!(err.to_string().contains("outside it"), "{err}");
+    }
+
     fn v4_subnet(id: &str, vni: u32, cidr: &str) -> Subnet {
         Subnet {
             id: id.to_string(),
@@ -2853,7 +3022,8 @@ mod tests {
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
 
-        // Empty id, unknown network, duplicate id.
+        // Empty id and unknown network. A duplicate id is *not* here: adding a
+        // subnet again is a restatement, covered by its own test below.
         assert!(t.add_subnet(v4_subnet("", 100, "10.0.0.0/24")).is_err());
         assert!(
             t.add_subnet(v4_subnet("s-ghost", 999, "10.0.0.0/24"))
@@ -2861,10 +3031,8 @@ mod tests {
         );
         t.add_subnet(v4_subnet("s1", 100, "192.168.50.0/24"))
             .unwrap();
-        assert!(
-            t.add_subnet(v4_subnet("s1", 100, "192.168.50.0/24"))
-                .is_err()
-        );
+        t.add_subnet(v4_subnet("s1", 100, "192.168.50.0/24"))
+            .expect("restating a subnet must not fail");
 
         // Gateway outside the CIDR (and wrong-family gateway) are rejected.
         let mut bad_gw = v4_subnet("s2", 100, "192.168.60.0/24");
@@ -3483,6 +3651,52 @@ mod tests {
         );
         assert!(t.remove_load_balancer("web").unwrap());
         assert!(!t.remove_load_balancer("web").unwrap());
+    }
+
+    /// Declaring an IP-VRF again is how a reconciler works.
+    ///
+    /// It was create-only in two ways at once — it refused its own `l3_vni` and
+    /// its own networks on the second pass — so a level-triggered mirror above
+    /// it could not work at all. Same change, and same reason, as `add_network`.
+    #[test]
+    fn declaring_an_ip_vrf_again_restates_it_rather_than_failing() {
+        let mut t = topo_with_segments();
+        t.add_ip_vrf(vrf(900_001, "tenant-a", vec![10100, 10200]))
+            .unwrap();
+
+        // The same statement twice.
+        t.add_ip_vrf(vrf(900_001, "tenant-a", vec![10100, 10200]))
+            .expect("restating an ip-vrf must not fail");
+
+        // And a membership change is a restatement too — that is how a network
+        // joins or leaves a router.
+        t.add_ip_vrf(vrf(900_001, "tenant-a", vec![10100]))
+            .expect("narrowing an ip-vrf's networks must not fail");
+        assert_eq!(t.ip_vrfs.get(&900_001).unwrap().networks, vec![10100]);
+    }
+
+    /// The collisions that are still refused: somebody else's number, and
+    /// somebody else's network.
+    #[test]
+    fn an_ip_vrf_may_not_take_another_ones_number_or_network() {
+        let mut t = topo_with_segments();
+        t.add_ip_vrf(vrf(900_001, "tenant-a", vec![10100])).unwrap();
+
+        let same_number = t
+            .add_ip_vrf(vrf(900_001, "tenant-b", vec![10200]))
+            .expect_err("two tenants took one routed VNI");
+        assert!(
+            same_number.to_string().contains("tenant-a"),
+            "{same_number}"
+        );
+
+        let same_network = t
+            .add_ip_vrf(vrf(900_002, "tenant-b", vec![10100]))
+            .expect_err("one network was routed by two ip-vrfs");
+        assert!(
+            same_network.to_string().contains("belongs to one"),
+            "{same_network}"
+        );
     }
 
     fn vrf(l3_vni: u32, name: &str, networks: Vec<u32>) -> IpVrf {
