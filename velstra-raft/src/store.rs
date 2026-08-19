@@ -158,6 +158,14 @@ pub enum TopoRequest {
         /// Explicit security-group policy, or `None` to default to the VNI (M4).
         #[serde(default)]
         policy: Option<u32>,
+        /// The workload's hardware address, when the caller has already chosen
+        /// one. `None` derives it from the address, as it always did.
+        ///
+        /// `serde(default)` so a log written before this field existed still
+        /// replays: a replica that could not read its own history is a replica
+        /// that cannot restart.
+        #[serde(default)]
+        mac: Option<String>,
     },
     RemovePort {
         id: String,
@@ -469,12 +477,17 @@ pub fn apply(topo: &mut Topology, req: &TopoRequest) -> TopoResponse {
             tap,
             ip,
             policy,
+            mac,
         } => {
             let ip = match ip {
                 Some(s) => Some(s.parse().map_err(|_| anyhow!("invalid ip {s:?}"))?),
                 None => None,
             };
-            let p = topo.create_port(*vni, host, tap, ip, *policy)?;
+            let mac = match mac {
+                Some(s) => Some(parse_mac(s)?),
+                None => None,
+            };
+            let p = topo.create_port(*vni, host, tap, ip, *policy, mac)?;
             Ok(TopoResponse::ok_port(port_record(&p)))
         }
         TopoRequest::RemovePort { id } => {
@@ -1100,6 +1113,7 @@ mod tests {
                 tap: "tapA".into(),
                 ip: None,
                 policy: None,
+                mac: None,
             },
         )
         .port
@@ -1220,6 +1234,7 @@ mod tests {
                 tap: "tapA".into(),
                 ip: None,
                 policy: None,
+                mac: None,
             },
         )
         .port
@@ -1254,9 +1269,11 @@ mod tests {
             )
             .ok
         );
-        // A duplicate name is a failed response, not a panic.
+        // Restating a group under the same name replaces it. It used to be
+        // refused, which left "these are the rules now" inexpressible for
+        // anything declarative above this — see `Topology::add_security_group`.
         assert!(
-            !apply(
+            apply(
                 &mut t,
                 &TopoRequest::AddSecurityGroup(SecurityGroupSpec {
                     name: "web".into(),
@@ -1427,6 +1444,7 @@ mod tests {
                 tap: "tapA".into(),
                 ip: None,
                 policy: None,
+                mac: None,
             },
         )
         .port
@@ -1526,6 +1544,7 @@ mod tests {
                 tap: "tapA".into(),
                 ip: None,
                 policy: None,
+                mac: None,
             },
         )
         .port

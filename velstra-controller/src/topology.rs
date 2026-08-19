@@ -220,6 +220,12 @@ struct PortFile {
     /// `policy`; resolved to the group's deterministic policy id at build time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     security_group: Option<String>,
+    /// The workload's hardware address. Omitted ⇒ derived from the address,
+    /// which is right for a port this file declares: nothing above a topology
+    /// file has already chosen one. It is settable so a file can describe a
+    /// workload whose address was fixed elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mac: Option<String>,
 }
 
 /// Resolve a `[[load_balancer]]` block against the ports already built.
@@ -337,7 +343,16 @@ fn build(tf: &TopologyFile) -> Result<Topology> {
         } else {
             p.policy
         };
-        let created = topo.create_port(p.network, &p.host, &p.tap, ip, policy)?;
+        // A MAC the caller chose, or one derived from the address. See
+        // `CreatePortRequest.mac` for why the caller sometimes has to be the
+        // one to say.
+        let mac = match &p.mac {
+            Some(mac) => Some(
+                velstra_common::parse_mac(mac).map_err(|e| anyhow::anyhow!("mac {mac:?}: {e}"))?,
+            ),
+            None => None,
+        };
+        let created = topo.create_port(p.network, &p.host, &p.tap, ip, policy, mac)?;
         if let Some(group) = &p.security_group {
             topo.set_port_security_group(&created.id, Some(group))?;
         }
@@ -666,6 +681,11 @@ fn to_file(topo: &Topology) -> TopologyFile {
                 host: p.host.clone(),
                 tap: p.tap.clone(),
                 ip: Some(p.ip.to_string()),
+                // Written out only when it is not what this orchestrator would
+                // derive: a file that repeats a derived value invites somebody
+                // to change the address and wonder why the MAC did not follow.
+                mac: (p.mac != velstra_orchestrator::mac_for(p.ip))
+                    .then(|| velstra_orchestrator::fmt_mac(p.mac)),
                 // A group-bound port serialises by name; an unnamed raw policy
                 // keeps its numeric id.
                 policy: if security_group.is_some() {

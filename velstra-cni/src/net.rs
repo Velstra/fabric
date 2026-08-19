@@ -55,7 +55,16 @@ fn xdp_attached(host_veth: &str) -> bool {
     if !out.status.success() {
         return false;
     }
-    String::from_utf8_lossy(&out.stdout).contains("xdp")
+    shows_xdp(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The parse half of [`xdp_attached`], split out so the one decision that gates
+/// admitting a pod can be tested without a kernel. `ip -details link show` names
+/// the attached program with a `prog/xdp` (or `xdpgeneric`/`xdpoffload`) token;
+/// an interface with nothing attached prints no `xdp` anywhere. Host veth names
+/// are `vel` + hex, so the interface's own name can never spell it.
+fn shows_xdp(link_show_output: &str) -> bool {
+    link_show_output.contains("xdp")
 }
 
 /// Block until the agent has attached its XDP firewall to `host_veth`, or
@@ -180,6 +189,53 @@ pub fn teardown(host_veth: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// If this fails, the poll that gates pod admission has stopped recognising
+    /// an attached XDP program (kubelet then starts the pod's containers with no
+    /// firewall on its veth), or started seeing one where there is none (the
+    /// M3 fail-closed wait becomes a no-op).
+    #[test]
+    fn an_interface_with_no_program_attached_does_not_read_as_enforced() {
+        // Real `ip -details link show dev vel1a2b3c4d` for a plain veth.
+        let bare = "7: vel1a2b3c4d@if6: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 \
+                    qdisc noqueue state UP mode DEFAULT group default \n    \
+                    link/ether 3a:9c:11:22:33:44 brd ff:ff:ff:ff:ff:ff link-netns cni-1 \n    \
+                    veth addrgenmode eui64 numtxqueues 1 numrxqueues 1";
+        assert!(
+            !shows_xdp(bare),
+            "an unenforced pod interface read as firewalled"
+        );
+
+        // The same interface once the agent attached its program.
+        for attached in [
+            "prog/xdp id 214 tag 8f9c0f2a1b3d4e5f jited",
+            "xdpgeneric/id:214",
+            "xdpoffload/id:214",
+        ] {
+            assert!(
+                shows_xdp(&format!("{bare}\n    {attached}")),
+                "an enforced pod interface read as unenforced: {attached}"
+            );
+        }
+    }
+
+    /// If this fails, controller-mode ADD no longer fails closed: it would
+    /// return success for a pod whose veth the agent never firewalled, and
+    /// kubelet would start the containers on an unenforced interface.
+    #[test]
+    fn waiting_on_an_interface_that_never_gets_a_program_gives_up_rather_than_admitting_it() {
+        let err = wait_for_xdp(
+            // A name no interface can have: `ip` reports "does not exist".
+            "vel-no-such-if",
+            Duration::from_millis(150),
+        )
+        .expect_err("the wait returned success for an interface with no firewall");
+        assert!(
+            err.to_string()
+                .contains("refusing to admit an unenforced pod"),
+            "the failure does not say why the pod was refused: {err}"
+        );
+    }
 
     #[test]
     fn veth_name_is_deterministic_and_short() {

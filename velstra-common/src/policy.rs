@@ -364,11 +364,24 @@ pub enum Counter {
     /// anything big. A zero here on a tunnel that was configured to clamp says
     /// the clamp is not running; a non-zero one says it is doing something.
     MssClamped = 41,
+    /// Dropped because the port sent from an identity it was not given: a
+    /// source MAC or address that is not bound to this tap.
+    ///
+    /// Separate from `DroppedSpoofed`, which is uRPF asking whether an address
+    /// is *routable* back this way. Both are anti-spoofing and they catch
+    /// different things: uRPF cannot tell two guests on one subnet apart,
+    /// because both their addresses route there perfectly well.
+    DroppedNotYours = 42,
+    /// A frame refused because its port was over the ceiling it was given
+    /// (roadmap B13). Counted apart from every other drop: "the tenant is being
+    /// throttled" and "the tenant is being filtered" are different
+    /// conversations.
+    DroppedPortRate = 43,
 }
 
 impl Counter {
     /// Number of distinct counters — the `max_entries` of the `STATS` map.
-    pub const COUNT: u32 = 42;
+    pub const COUNT: u32 = 44;
 
     /// The array index of this counter.
     #[inline]
@@ -416,6 +429,8 @@ impl Counter {
             33 => Counter::IrbRouted,
             34 => Counter::DroppedRateLimit,
             35 => Counter::DroppedSpoofed,
+            42 => Counter::DroppedNotYours,
+            43 => Counter::DroppedPortRate,
             36 => Counter::SynproxyChallenged,
             37 => Counter::SynproxyAdmitted,
             38 => Counter::SynproxyRejected,
@@ -474,6 +489,8 @@ impl Counter {
             Counter::IrbRouted => "irb_routed",
             Counter::DroppedRateLimit => "dropped_rate_limit",
             Counter::DroppedSpoofed => "dropped_spoofed",
+            Counter::DroppedNotYours => "dropped_not_yours",
+            Counter::DroppedPortRate => "dropped_port_rate",
             Counter::SynproxyChallenged => "synproxy_challenged",
             Counter::SynproxyAdmitted => "synproxy_admitted",
             Counter::SynproxyRejected => "synproxy_rejected",

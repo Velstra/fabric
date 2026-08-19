@@ -145,34 +145,73 @@ impl PortalClientKey {
 /// may have been poisoned by another device on the link, and does not exist at
 /// all for an IPv6 client the appliance has not itself talked to.
 ///
-/// IPv4 addresses occupy the first four bytes with the rest zero, so one table
-/// serves both families.
+/// One table serves both families, and how the two are told apart is a
+/// security decision, not an encoding convenience. IPv4 used to occupy the
+/// first four bytes with the rest zero — which made `10.0.0.1` the same key as
+/// the IPv6 source `a00:1::`, an address nothing stops an *unauthenticated*
+/// portal client from writing on the wire. The portal exists precisely for
+/// devices nothing has bound yet, so an attacker behind it could source such a
+/// packet, put their own MAC into the seen table under the victim's IPv4 key,
+/// and be admitted by the victim's login.
+///
+/// IPv4 is therefore keyed in its RFC 4291 §2.5.5.2 v4-mapped form,
+/// `::ffff:a.b.c.d` — and the data plane refuses to learn from a wire-IPv6
+/// packet whose source lies in `::ffff:0:0/96` (see
+/// [`v6_source_is_v4_mapped`]): mapped addresses represent IPv4 nodes and are
+/// never legitimate as an on-wire IPv6 source, so the one bit pattern IPv4
+/// keys occupy is exactly the pattern no IPv6 packet may claim.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PortalSeenKey {
     /// The policy the packet arrived under.
     pub policy_id: u32,
-    /// The sender's address: 16 bytes for IPv6, or 4 followed by zeros for IPv4.
+    /// The sender's address: 16 bytes for IPv6, or the v4-mapped form for IPv4.
     pub addr: [u8; 16],
 }
 
 impl PortalSeenKey {
-    /// A key for an IPv4 sender.
+    /// A key for an IPv4 sender, in the v4-mapped form — see the type doc.
     #[inline]
     pub const fn v4(policy_id: u32, addr: [u8; 4]) -> Self {
         Self {
             policy_id,
             addr: [
-                addr[0], addr[1], addr[2], addr[3], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, addr[0], addr[1], addr[2], addr[3],
             ],
         }
     }
 
     /// A key for an IPv6 sender.
+    ///
+    /// The caller is expected to have refused a mapped source first — the data
+    /// plane's learn path does — so this cannot manufacture a v4 key.
     #[inline]
     pub const fn v6(policy_id: u32, addr: [u8; 16]) -> Self {
         Self { policy_id, addr }
     }
+}
+
+/// Whether a wire-IPv6 source address lies in `::ffff:0:0/96`, the v4-mapped
+/// range.
+///
+/// Shared between the data plane (which refuses to learn from such a packet)
+/// and anything else that handles the seen table, so the two sides cannot
+/// drift: the collision this guards against comes back the moment one side
+/// refuses and the other does not.
+#[inline]
+pub const fn v6_source_is_v4_mapped(addr: &[u8; 16]) -> bool {
+    addr[0] == 0
+        && addr[1] == 0
+        && addr[2] == 0
+        && addr[3] == 0
+        && addr[4] == 0
+        && addr[5] == 0
+        && addr[6] == 0
+        && addr[7] == 0
+        && addr[8] == 0
+        && addr[9] == 0
+        && addr[10] == 0xff
+        && addr[11] == 0xff
 }
 
 /// Whether an unadmitted packet may pass the gate on its own merits.
@@ -262,17 +301,52 @@ mod tests {
         assert_eq!(a._pad, [0, 0]);
     }
 
-    /// One seen-table for both families: an IPv4 address is the same 16 bytes
-    /// with zeros after it, and can never collide with a real IPv6 address (no
-    /// global v6 address begins with a v4 address and ends in twelve zero
-    /// bytes — that pattern is the unspecified address with a prefix).
+    /// One seen-table for both families, and an IPv4 key can never be forged by
+    /// an IPv6 source.
+    ///
+    /// The comment this replaces argued the collision was impossible because
+    /// "no global v6 address begins with a v4 address and ends in twelve zero
+    /// bytes". That was the wrong test: the addr sat at the *front*, so IPv4
+    /// `10.0.0.1` was the key `0a000001` + zeros, which is exactly the IPv6
+    /// address `a00:1::` — an address an unauthenticated portal client can put
+    /// on the wire, learning its MAC under a victim's IPv4 key. IPv4 now lives
+    /// in the v4-mapped range, and the data plane refuses to learn from a
+    /// wire-IPv6 packet that claims that range.
     #[test]
     fn one_seen_table_serves_both_families() {
         assert_eq!(core::mem::size_of::<PortalSeenKey>(), 20);
         let v4 = PortalSeenKey::v4(1, [192, 168, 50, 33]);
-        assert_eq!(&v4.addr[..4], &[192, 168, 50, 33]);
-        assert_eq!(&v4.addr[4..], &[0u8; 12]);
+        // v4-mapped: ::ffff:192.168.50.33
+        assert_eq!(&v4.addr[..10], &[0u8; 10]);
+        assert_eq!(&v4.addr[10..12], &[0xff, 0xff]);
+        assert_eq!(&v4.addr[12..], &[192, 168, 50, 33]);
         assert_ne!(v4, PortalSeenKey::v4(2, [192, 168, 50, 33]));
+    }
+
+    /// The forgery the re-keying closes: the IPv6 address that used to alias an
+    /// IPv4 key is now (a) a different key and (b) refused at the learn path.
+    #[test]
+    fn a_v6_source_cannot_forge_a_v4_seen_key() {
+        let v4 = PortalSeenKey::v4(1, [10, 0, 0, 1]);
+        // The address bytes an attacker would put on the wire to hit the old
+        // front-loaded key: 0a 00 00 01 followed by zeros — i.e. `a00:1::`.
+        let forged_src = [0x0a, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_ne!(
+            v4,
+            PortalSeenKey::v6(1, forged_src),
+            "a wire-IPv6 source still shares a key with an IPv4 sender"
+        );
+        // And the mapped range an attacker would use to hit the *new* key is
+        // exactly what the learn path refuses.
+        let mapped = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 1];
+        assert!(
+            v6_source_is_v4_mapped(&mapped),
+            "the guard does not recognise the range IPv4 keys occupy"
+        );
+        assert!(
+            !v6_source_is_v4_mapped(&forged_src),
+            "an ordinary global source was mistaken for the mapped range"
+        );
     }
 
     /// A session is scoped to the zone it was granted in — the same device on

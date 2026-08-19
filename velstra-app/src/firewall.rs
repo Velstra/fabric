@@ -27,18 +27,18 @@ use tokio::sync::Mutex;
 use velstra_common::{
     Action, ArpEntry, ArpKey, Backend, CgnatLayout, Cidr4, Cidr6, ConfigFlags, Counter, FloodSet,
     FlowKey, FlowState, GlobalConfig, IrbEndpoint, LocalMac, LocalMacKey, MAX_RULE_LIMITS,
-    MacFdbKey, NdKey, Npt66, OverlayConfig, PORT_RULE_OUT_ONLY, PolicyId, PortFwd, PortalClientKey,
-    PortalGate, PortalSeenKey, RateBucket, RouteEntry, ScopedAddr, ScopedAddr6, ScopedDstPortKey,
-    ScopedDstPortKey6, ScopedMac, ScopedPortKey, ScopedSrcPortKey, ScopedSrcPortKey6, ServiceKey,
-    ServiceValue, Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, SynProxyCfg, SynProxyKey,
-    TunnelEndpoint, TunnelKey, parse_cidr_v4, parse_cidr_v6, parse_mac, port_rule_value,
-    port_rule_with_limit,
+    MacFdbKey, NdKey, Npt66, OverlayConfig, PORT_RULE_OUT_ONLY, PolicyId, PortAddr4, PortAddr6,
+    PortBinding, PortFwd, PortalClientKey, PortalGate, PortalSeenKey, RateBucket, RouteEntry,
+    ScopedAddr, ScopedAddr6, ScopedDstPortKey, ScopedDstPortKey6, ScopedMac, ScopedPortKey,
+    ScopedSrcPortKey, ScopedSrcPortKey6, ServiceKey, ServiceValue, Srv6Config, Srv6Endpoint,
+    Srv6LocalSid, Srv6SidKey, SynProxyCfg, SynProxyKey, TunnelEndpoint, TunnelKey, parse_cidr_v4,
+    parse_cidr_v6, parse_mac, port_rule_value, port_rule_with_limit,
 };
 use velstra_config::{
-    PolicyConfig, ResolvedFloodVtep, ResolvedInterface, ResolvedIrbRoute, ResolvedMacRoute,
-    ResolvedNd6, ResolvedNeighbor, ResolvedNpt66, ResolvedOverlay, ResolvedPortForward,
-    ResolvedRoute, ResolvedService, ResolvedSrv6, ResolvedSrv6LocalSid, ResolvedSrv6Route,
-    ResolvedSynProxy, ResolvedTunnel, RuntimeConfig,
+    PolicyConfig, PortIdentity, ResolvedFloodVtep, ResolvedInterface, ResolvedIrbRoute,
+    ResolvedMacRoute, ResolvedNd6, ResolvedNeighbor, ResolvedNpt66, ResolvedOverlay,
+    ResolvedPortForward, ResolvedRoute, ResolvedService, ResolvedSrv6, ResolvedSrv6LocalSid,
+    ResolvedSrv6Route, ResolvedSynProxy, ResolvedTunnel, RuntimeConfig,
 };
 
 /// How to attach the XDP program to the interface.
@@ -84,6 +84,23 @@ pub struct Firewall {
     ///
     /// [`reconfigure`]: Firewall::reconfigure
     applied: RuntimeConfig,
+    /// The configuration as it arrived, before the advertised rules were merged
+    /// into it.
+    ///
+    /// Kept apart from [`Self::applied`] because the two sources change
+    /// independently: a config push must not lose the FlowSpec rules in force,
+    /// and a FlowSpec update must not re-apply a config the operator has since
+    /// replaced. Both paths rebuild the merge from these two, so whichever
+    /// arrives last, the answer is the same.
+    base: RuntimeConfig,
+    /// The rules a BGP peer has asked this box to enforce (roadmap A3), already
+    /// translated. Empty unless the FlowSpec task is running.
+    flowspec: Vec<velstra_config::ResolvedRule>,
+    /// What arrived over the same feed and is **not** being enforced, with the
+    /// reason. Kept beside the rules rather than only logged: "a rule was
+    /// advertised and is doing nothing" is the question somebody asks during an
+    /// attack, and a journal that has rotated cannot answer it.
+    flowspec_refused: Vec<(String, String)>,
     /// Interfaces attached dynamically by auto-attach, tracked separately so they
     /// can be dropped again when the interface disappears (a VM tap going away).
     auto_attached: HashSet<String>,
@@ -194,6 +211,26 @@ impl Firewall {
                 .try_into()?;
             flow.fd()?.try_clone()?
         };
+        // Same again for `velstra_main`, the datapath itself. Only the small
+        // port-security gate (`velstra`) is attached to an interface; it tail-
+        // calls straight into this one. The split exists because a call chain's
+        // stack frames are summed against a single 512-byte limit and the two
+        // together came to 528 — a tail call starts a fresh frame.
+        {
+            let main: &mut Xdp = ebpf
+                .program_mut("velstra_main")
+                .ok_or_else(|| anyhow!("eBPF object has no `velstra_main` program"))?
+                .try_into()?;
+            main.load()
+                .context("loading XDP datapath program into the kernel")?;
+        }
+        let main_fd = {
+            let main: &Xdp = ebpf
+                .program("velstra_main")
+                .ok_or_else(|| anyhow!("eBPF object has no `velstra_main` program"))?
+                .try_into()?;
+            main.fd()?.try_clone()?
+        };
         {
             let mut prog_array = ProgramArray::try_from(
                 ebpf.map_mut("VELSTRA_PROGS")
@@ -202,6 +239,11 @@ impl Firewall {
             prog_array
                 .set(0, &flow_fd, 0)
                 .context("registering velstra_forward in VELSTRA_PROGS")?;
+            // Registered before the gate is attached, so the very first packet
+            // already has somewhere to jump.
+            prog_array
+                .set(1, &main_fd, 0)
+                .context("registering velstra_main in VELSTRA_PROGS")?;
         }
 
         let program: &mut Xdp = ebpf
@@ -253,6 +295,9 @@ impl Firewall {
             ebpf,
             attached,
             applied: cfg.clone(),
+            base: cfg.clone(),
+            flowspec: Vec::new(),
+            flowspec_refused: Vec::new(),
             auto_attached: HashSet::new(),
             config_attached: HashSet::new(),
             conntrack: None,
@@ -443,8 +488,107 @@ impl Firewall {
     /// is owned by the data plane), so existing flows keep working across a
     /// reconfigure. This is what the controller-driven live updates call.
     pub fn reconfigure(&mut self, cfg: &RuntimeConfig) -> Result<()> {
-        apply_config(&mut self.ebpf, cfg, Some(&self.applied))?;
-        self.applied = cfg.clone();
+        self.base = cfg.clone();
+        self.reprogram()
+    }
+
+    /// Replace the advertised (FlowSpec) rules and put the merged set in force.
+    ///
+    /// Separate from [`Self::reconfigure`] and not a variant of it: the two
+    /// sources arrive on their own schedules, and each has to be able to change
+    /// without knowing what the other last said.
+    pub fn set_flowspec(
+        &mut self,
+        rules: Vec<velstra_config::ResolvedRule>,
+        refused: Vec<(String, String)>,
+    ) -> Result<()> {
+        self.flowspec_refused = refused;
+        // Only when the rules themselves moved. A rule that arrived and cannot
+        // be enforced changes what an operator should be told and nothing about
+        // the maps, and rewriting the whole policy set to record that would be
+        // work for its own sake.
+        if self.flowspec == rules {
+            return Ok(());
+        }
+        self.flowspec = rules;
+        self.reprogram()?;
+        // A rule that only stops flows which have not started yet is not a
+        // mitigation: a flood with a stable five-tuple keeps being admitted by
+        // the stateful fast path for as long as its entry lives, which is
+        // exactly the traffic somebody advertised the rule to stop.
+        //
+        // Best-effort on purpose. The entries are an optimisation, so failing to
+        // clear one costs that flow its mitigation and nothing else — where
+        // refusing to program the rules over it would cost every flow theirs.
+        if let Err(e) = self.purge_discarded_flows() {
+            log::warn!("flowspec: could not clear the flows it discards ({e:#})");
+        }
+        Ok(())
+    }
+
+    /// What the FlowSpec feed has come to: the rules in force and, beside them,
+    /// what arrived and is not being enforced.
+    pub fn flowspec_state(&self) -> (&[velstra_config::ResolvedRule], &[(String, String)]) {
+        (&self.flowspec, &self.flowspec_refused)
+    }
+
+    /// Remove the `FW_FLOWS` entries the advertised discards match.
+    ///
+    /// Narrow by construction — see `crate::flowspec::flow_is_discarded`. The map
+    /// may have been taken by the C9 sync task, in which case there is nothing
+    /// here to clear and that is not an error.
+    fn purge_discarded_flows(&mut self) -> Result<()> {
+        let drops: Vec<_> = self
+            .flowspec
+            .iter()
+            .filter(|r| r.action == Action::Drop)
+            .cloned()
+            .collect();
+        if drops.is_empty() {
+            return Ok(());
+        }
+        let Some(map) = self.ebpf.map_mut("FW_FLOWS") else {
+            return Ok(());
+        };
+        // An LRU hash map is read and written through the same userspace handle
+        // as an ordinary one; the eviction policy is the kernel's business.
+        let mut flows: HashMap<_, FlowKey, u8> = HashMap::try_from(map)?;
+        // Collected first: deleting while iterating a BPF map is how a scan
+        // silently skips entries.
+        let doomed: Vec<FlowKey> = flows
+            .keys()
+            .flatten()
+            .filter(|key| {
+                drops
+                    .iter()
+                    .any(|r| crate::flowspec::flow_is_discarded(r, key))
+            })
+            .collect();
+        let count = doomed.len();
+        for key in doomed {
+            let _ = flows.remove(&key);
+        }
+        if count > 0 {
+            log::info!("flowspec: cleared {count} flow(s) an advertised rule discards");
+        }
+        Ok(())
+    }
+
+    /// Put `base` + `flowspec` in force as one set.
+    ///
+    /// The whole policy set is rewritten rather than the changed rules alone,
+    /// which is what makes there be exactly one writer of the rule tries — see
+    /// `crate::flowspec`. `remove_stale` runs against the previously *merged*
+    /// config, so a withdrawn advertised rule is taken out as surely as a
+    /// deleted configured one.
+    fn reprogram(&mut self) -> Result<()> {
+        let merged = if self.flowspec.is_empty() {
+            self.base.clone()
+        } else {
+            crate::flowspec::merge_into(&self.base, &self.flowspec)
+        };
+        apply_config(&mut self.ebpf, &merged, Some(&self.applied))?;
+        self.applied = merged;
         Ok(())
     }
 
@@ -1200,7 +1344,7 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
                         } else {
                             0
                         },
-                        rule_ifindex(&rule.in_interface),
+                        stale_ifindex(&rule.in_interface),
                         addr,
                     ),
                 ));
@@ -1229,7 +1373,7 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
                         } else {
                             0
                         },
-                        rule_ifindex(&rule.in_interface),
+                        stale_ifindex(&rule.in_interface),
                         addr,
                     ),
                 ));
@@ -1255,7 +1399,7 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
                         } else {
                             0
                         },
-                        rule_ifindex(&rule.in_interface),
+                        stale_ifindex(&rule.in_interface),
                         addr,
                     ),
                 ));
@@ -1281,7 +1425,7 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
                         } else {
                             0
                         },
-                        rule_ifindex(&rule.in_interface),
+                        stale_ifindex(&rule.in_interface),
                         addr,
                     ),
                 ));
@@ -1490,6 +1634,8 @@ fn apply_config(ebpf: &mut Ebpf, cfg: &RuntimeConfig, old: Option<&RuntimeConfig
     program_synproxy(ebpf, &cfg.synproxy)?;
     program_masquerade(ebpf, &cfg.interfaces)?;
     program_mss_clamp(ebpf, &cfg.interfaces)?;
+    program_port_bindings(ebpf, &cfg.interfaces)?;
+    program_port_limits(ebpf, &cfg.interfaces)?;
     program_mac_rules(ebpf, &cfg.policies)?;
     program_cgnat(ebpf, &cfg.interfaces)?;
     program_npt66(ebpf, &cfg.npt66)?;
@@ -1673,7 +1819,7 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
                                 } else {
                                     0
                                 },
-                                rule_ifindex(&rule.in_interface),
+                                rule_ifindex(&rule.in_interface)?,
                                 addr,
                             ),
                         ),
@@ -1718,7 +1864,7 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
                                 } else {
                                     0
                                 },
-                                rule_ifindex(&rule.in_interface),
+                                rule_ifindex(&rule.in_interface)?,
                                 addr,
                             ),
                         ),
@@ -1761,7 +1907,7 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
                                 } else {
                                     0
                                 },
-                                rule_ifindex(&rule.in_interface),
+                                rule_ifindex(&rule.in_interface)?,
                                 addr,
                             ),
                         ),
@@ -1805,7 +1951,7 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
                                 } else {
                                     0
                                 },
-                                rule_ifindex(&rule.in_interface),
+                                rule_ifindex(&rule.in_interface)?,
                                 addr,
                             ),
                         ),
@@ -1994,9 +2140,9 @@ fn program_port_forwards(
     forwards: &[ResolvedPortForward],
     interfaces: &[ResolvedInterface],
 ) -> Result<()> {
-    if forwards.is_empty() {
-        return Ok(());
-    }
+    // Deliberately no early return: deleting the last port forward is the case
+    // where leaving the map untouched kept forwarding it inward.
+    //
     // Resolve each target's reply policy before borrowing the map (the lookup reads
     // the OS). A config that states one explicitly wins: it can name a zone reached
     // over a route, which no interface subnet contains.
@@ -2015,10 +2161,12 @@ fn program_port_forwards(
             )
         })
         .collect();
+    let keep: HashSet<ScopedPortKey> = prepared.iter().map(|(k, _)| *k).collect();
     let mut map: HashMap<_, ScopedPortKey, PortFwd> = HashMap::try_from(
         ebpf.map_mut("PORT_FORWARDS")
             .ok_or_else(|| anyhow!("PORT_FORWARDS map missing"))?,
     )?;
+    drop_unlisted(&mut map, &keep)?;
     for (key, value) in &prepared {
         map.insert(key, value, 0)
             .context("inserting port-forward")?;
@@ -2039,10 +2187,9 @@ fn program_port_forwards(
 /// mid-handshake would have its ACK rejected. So it is written once, when it is
 /// still zero.
 fn program_synproxy(ebpf: &mut Ebpf, ports: &[ResolvedSynProxy]) -> Result<()> {
-    if ports.is_empty() {
-        return Ok(());
-    }
-    {
+    // The cookie key is drawn only when a port actually uses it; the port map is
+    // reconciled either way, so unprotecting the last port takes effect.
+    if !ports.is_empty() {
         let mut secret: Array<_, u64> = Array::try_from(
             ebpf.map_mut("SYN_SECRET")
                 .ok_or_else(|| anyhow!("SYN_SECRET map missing"))?,
@@ -2066,10 +2213,12 @@ fn program_synproxy(ebpf: &mut Ebpf, ports: &[ResolvedSynProxy]) -> Result<()> {
         }
     }
 
+    let keep: HashSet<SynProxyKey> = ports.iter().map(|p| SynProxyKey::tcp(p.port)).collect();
     let mut map: HashMap<_, SynProxyKey, SynProxyCfg> = HashMap::try_from(
         ebpf.map_mut("SYNPROXY")
             .ok_or_else(|| anyhow!("SYNPROXY map missing"))?,
     )?;
+    drop_unlisted(&mut map, &keep)?;
     for port in ports {
         map.insert(SynProxyKey::tcp(port.port), SynProxyCfg::new(port.mss), 0)
             .context("inserting a synproxy port")?;
@@ -2119,7 +2268,45 @@ fn program_masquerade(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Resu
 /// it match everywhere, so the failure is a rule that is too broad rather than
 /// one that is silently inert, and the reconfigure that follows a NIC appearing
 /// narrows it.
-fn rule_ifindex(name: &str) -> u32 {
+/// Resolve a rule's `in-interface` to the ifindex the data plane keys on.
+///
+/// An empty name is the *unscoped* rule and resolves to `0`, which the data
+/// plane reads as "on any interface". That is the whole difficulty: `0` is a
+/// meaning, not an absence. This function used to answer `unwrap_or(0)`, so an
+/// operator who mistyped an interface name got the unscoped sentinel — and
+/// `allow ssh in on mgmt0` silently became `allow ssh in on every interface,
+/// WAN included`, with a green apply and nothing in the log.
+///
+/// There is no safe value to guess. Widening opens a hole on a `pass` rule;
+/// dropping the rule opens one on a `deny`. A name that does not resolve cannot
+/// be expressed in the map at all, so the honest answer is to refuse the apply
+/// and leave the previous configuration in force — the fail-closed direction for
+/// a firewall, and the one the operator will notice.
+fn rule_ifindex(name: &str) -> Result<u32> {
+    if name.is_empty() {
+        return Ok(0);
+    }
+    if_nametoindex(name).map_err(|e| {
+        anyhow!(
+            "a firewall rule is scoped to interface `{name}`, which does not exist on this \
+             host ({e}); refusing the configuration rather than applying the rule to every \
+             interface"
+        )
+    })
+}
+
+/// The same resolution during the stale sweep, where a missing interface is
+/// expected rather than an error.
+///
+/// The sweep runs over the *previous* configuration, and an interface named
+/// there may since have been removed — that is a normal reconfigure, not an
+/// operator mistake, so it must not fail the apply. Falling back to `0` can
+/// remove more than it should, which is harmless in this one position:
+/// `remove_stale` runs immediately before `program_policies` rewrites every rule
+/// of the new configuration, so an over-broad removal is refilled in the same
+/// pass. Under-removal is the failure that matters here, and it is why this is a
+/// separate function rather than a flag on the one above.
+fn stale_ifindex(name: &str) -> u32 {
     if name.is_empty() {
         return 0;
     }
@@ -2131,14 +2318,21 @@ fn rule_ifindex(name: &str) -> u32 {
 /// One entry per (policy, MAC). Empty on a box with no MAC groups, so the
 /// datapath's single lookup misses immediately and costs nothing.
 fn program_mac_rules(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
-    let total: usize = policies.iter().map(|p| p.mac_rules.len()).sum();
-    if total == 0 {
-        return Ok(());
-    }
+    // No early return on an empty set: lifting the last quarantine must clear
+    // the map, not skip it and leave the device blocked.
+    let keep: HashSet<ScopedMac> = policies
+        .iter()
+        .flat_map(|p| {
+            p.mac_rules
+                .iter()
+                .map(move |(mac, _)| ScopedMac::new(p.id, *mac))
+        })
+        .collect();
     let mut map: HashMap<_, ScopedMac, u32> = HashMap::try_from(
         ebpf.map_mut("MAC_RULES")
             .ok_or_else(|| anyhow!("MAC_RULES map missing"))?,
     )?;
+    drop_unlisted(&mut map, &keep)?;
     for policy in policies {
         for (mac, action) in &policy.mac_rules {
             map.insert(
@@ -2161,16 +2355,146 @@ fn program_mss_clamp(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Resul
         .filter(|i| i.mss != 0)
         .filter_map(|i| if_nametoindex(&i.name).ok().map(|idx| (idx, i.mss)))
         .collect();
-    if prepared.is_empty() {
-        return Ok(());
-    }
+    // No early return: removing the last entry must empty the map, not skip it.
+    let keep: HashSet<u32> = prepared.iter().map(|(idx, _)| *idx).collect();
     let mut map: HashMap<_, u32, u16> = HashMap::try_from(
         ebpf.map_mut("MSS_CLAMP")
             .ok_or_else(|| anyhow!("MSS_CLAMP map missing"))?,
     )?;
+    drop_unlisted(&mut map, &keep)?;
     for (ifindex, mss) in prepared {
         map.insert(ifindex, mss, 0)
             .with_context(|| format!("inserting mss clamp for ifindex {ifindex}"))?;
+    }
+    Ok(())
+}
+
+/// Delete every key of `map` that the new configuration does not name.
+///
+/// The writers below used to only ever `insert`, and `remove_stale` — which
+/// reconstructs the old keys from the previous configuration — covered 22 of the
+/// 41 maps an apply writes. The port-security maps, the port forwards and the
+/// MAC verdicts were among the 19 it did not, so *removing* something from the
+/// configuration left it in force in the data plane:
+///
+/// * take an address off a port and the workload keeps sending under it;
+/// * delete a port forward and the box keeps forwarding it inward;
+/// * lift a MAC quarantine and the device stays blocked.
+///
+/// Each of those reported a successful apply. Worse, the writers returned early
+/// when their input was empty, so removing the *last* entry of a kind skipped
+/// the map altogether — the one case where the operator is most certain the rule
+/// is gone.
+///
+/// Reconciling against the desired set is what fixes it, rather than another
+/// hand-written sweep beside the existing one. It needs no memory of the
+/// previous configuration, so it is also correct after a crash mid-apply and
+/// after an agent restart, and there is one list to keep in step instead of two.
+fn drop_unlisted<K, V>(map: &mut HashMap<&mut MapData, K, V>, keep: &HashSet<K>) -> Result<()>
+where
+    K: aya::Pod + Eq + std::hash::Hash,
+    V: aya::Pod,
+{
+    // Collected before removing: the iterator borrows the map.
+    let stale: Vec<K> = map.keys().flatten().filter(|k| !keep.contains(k)).collect();
+    for key in stale {
+        map.remove(&key).context("removing a stale map entry")?;
+    }
+    Ok(())
+}
+
+/// Write the port-security maps (B12): which identity each tenant port is bound
+/// to, and which addresses it may send from.
+///
+/// Only bound interfaces get entries, so a box with no tenant ports pays one
+/// missing lookup per frame and nothing else. An interface that has gone away is
+/// skipped with a warning rather than failing the whole apply: the rest of the
+/// policy is still worth installing, and a port that does not exist cannot be
+/// spoofed from.
+fn program_port_bindings(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Result<()> {
+    let bound: Vec<(u32, &PortIdentity)> = interfaces
+        .iter()
+        .filter_map(|i| {
+            let identity = i.binding.as_ref()?;
+            match if_nametoindex(&i.name) {
+                Ok(idx) => Some((idx, identity)),
+                Err(_) => {
+                    warn!("port binding skipped: no interface named {}", i.name);
+                    None
+                }
+            }
+        })
+        .collect();
+
+    // No early return on an empty set. Unbinding the last port is exactly when
+    // the map must be emptied, and returning here left every binding in force.
+    let keep_ports: HashSet<u32> = bound.iter().map(|(idx, _)| *idx).collect();
+    let keep_v4: HashSet<PortAddr4> = bound
+        .iter()
+        .flat_map(|(idx, id)| {
+            id.v4
+                .iter()
+                .map(move |a| PortAddr4::new(*idx, u32::from_ne_bytes(a.octets())))
+        })
+        .collect();
+    let keep_v6: HashSet<PortAddr6> = bound
+        .iter()
+        .flat_map(|(idx, id)| id.v6.iter().map(move |a| PortAddr6::new(*idx, a.octets())))
+        .collect();
+
+    {
+        let mut bindings: HashMap<_, u32, PortBinding> = HashMap::try_from(
+            ebpf.map_mut("PORT_BINDINGS")
+                .ok_or_else(|| anyhow!("PORT_BINDINGS map missing"))?,
+        )?;
+        drop_unlisted(&mut bindings, &keep_ports)?;
+        for (ifindex, identity) in &bound {
+            bindings
+                .insert(
+                    ifindex,
+                    PortBinding::new(identity.mac.unwrap_or([0; 6]), identity.flags()),
+                    0,
+                )
+                .with_context(|| format!("binding port {ifindex}"))?;
+        }
+        // The handle borrows `ebpf` mutably, and the next one cannot be taken until
+        // that borrow ends. A block says so; `drop` of a type with no `Drop` impl
+        // only looks like it does.
+    }
+
+    {
+        let mut v4: HashMap<_, PortAddr4, u8> = HashMap::try_from(
+            ebpf.map_mut("PORT_ADDRS_V4")
+                .ok_or_else(|| anyhow!("PORT_ADDRS_V4 map missing"))?,
+        )?;
+        drop_unlisted(&mut v4, &keep_v4)?;
+        for (ifindex, identity) in &bound {
+            for addr in &identity.v4 {
+                // Network order, exactly as it sits in the header the data plane
+                // reads: converting on one side only is how a binding silently
+                // matches nothing.
+                v4.insert(
+                    PortAddr4::new(*ifindex, u32::from_ne_bytes(addr.octets())),
+                    1,
+                    0,
+                )
+                .with_context(|| format!("binding {addr} to port {ifindex}"))?;
+            }
+        }
+    }
+
+    {
+        let mut v6: HashMap<_, PortAddr6, u8> = HashMap::try_from(
+            ebpf.map_mut("PORT_ADDRS_V6")
+                .ok_or_else(|| anyhow!("PORT_ADDRS_V6 map missing"))?,
+        )?;
+        drop_unlisted(&mut v6, &keep_v6)?;
+        for (ifindex, identity) in &bound {
+            for addr in &identity.v6 {
+                v6.insert(PortAddr6::new(*ifindex, addr.octets()), 1, 0)
+                    .with_context(|| format!("binding {addr} to port {ifindex}"))?;
+            }
+        }
     }
     Ok(())
 }
@@ -2197,13 +2521,13 @@ fn program_cgnat(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Result<()
             }
         })
         .collect();
-    if prepared.is_empty() {
-        return Ok(());
-    }
+    // No early return: removing the last entry must empty the map, not skip it.
+    let keep: HashSet<u32> = prepared.iter().map(|(idx, _)| *idx).collect();
     let mut map: HashMap<_, u32, CgnatLayout> = HashMap::try_from(
         ebpf.map_mut("CGNAT")
             .ok_or_else(|| anyhow!("CGNAT map missing"))?,
     )?;
+    drop_unlisted(&mut map, &keep)?;
     for (ifindex, layout) in prepared {
         map.insert(ifindex, layout, 0)
             .with_context(|| format!("inserting cgnat layout for ifindex {ifindex}"))?;
@@ -2225,13 +2549,13 @@ fn program_npt66(ebpf: &mut Ebpf, rules: &[ResolvedNpt66]) -> Result<()> {
             }
         })
         .collect();
-    if prepared.is_empty() {
-        return Ok(());
-    }
+    // No early return: removing the last entry must empty the map, not skip it.
+    let keep: HashSet<u32> = prepared.iter().map(|(idx, _)| *idx).collect();
     let mut map: HashMap<_, u32, Npt66> = HashMap::try_from(
         ebpf.map_mut("NPTV6")
             .ok_or_else(|| anyhow!("NPTV6 map missing"))?,
     )?;
+    drop_unlisted(&mut map, &keep)?;
     for (ifindex, npt) in prepared {
         map.insert(ifindex, npt, 0)
             .with_context(|| format!("inserting npt66 ifindex {ifindex}"))?;
@@ -2742,11 +3066,18 @@ fn program_srv6(
 
     // B9 decap: every service SID this host instantiates → its (vni, behaviour).
     // A packet whose outer IPv6 destination matches is decapsulated and bridged.
-    if !local_sids.is_empty() {
+    {
+        // Reconciled unconditionally: a SID left in this map keeps decapsulating
+        // traffic addressed to it after the operator withdrew it.
+        let keep: HashSet<Srv6SidKey> = local_sids
+            .iter()
+            .map(|ls| Srv6SidKey::new(ls.sid))
+            .collect();
         let mut sids: HashMap<_, Srv6SidKey, Srv6LocalSid> = HashMap::try_from(
             ebpf.map_mut("SRV6_LOCAL_SIDS")
                 .ok_or_else(|| anyhow!("SRV6_LOCAL_SIDS map missing"))?,
         )?;
+        drop_unlisted(&mut sids, &keep)?;
         for ls in local_sids {
             sids.insert(
                 Srv6SidKey::new(ls.sid),
@@ -2757,10 +3088,9 @@ fn program_srv6(
         }
     }
 
-    if routes.is_empty() {
-        return Ok(());
-    }
-
+    // No early return on an empty route set: withdrawing the last SRv6 route has
+    // to empty the FDB, and returning here left every entry forwarding.
+    //
     // Resolve every route's egress ifindex (needs the OS). Each becomes an
     // exact-match SRv6-FDB key `(vni, inner dst MAC)` → remote-SID endpoint. Skip
     // (defer) a route whose out_iface isn't present yet rather than hard-aborting
@@ -2783,10 +3113,12 @@ fn program_srv6(
         .collect();
 
     {
+        let keep: HashSet<MacFdbKey> = prepared.iter().map(|(k, _)| *k).collect();
         let mut fdb: HashMap<_, MacFdbKey, Srv6Endpoint> = HashMap::try_from(
             ebpf.map_mut("SRV6_FDB")
                 .ok_or_else(|| anyhow!("SRV6_FDB map missing"))?,
         )?;
+        drop_unlisted(&mut fdb, &keep)?;
         for (key, endpoint) in &prepared {
             fdb.insert(key, endpoint, 0)
                 .context("inserting SRv6-FDB entry")?;
@@ -3126,6 +3458,8 @@ mod tests {
             masquerade: false,
             mss: 0,
             cgnat: CgnatLayout::default(),
+            binding: None,
+            rate_limit_mbit: None,
         });
         // An uplink with no tenant segment must not register VNI 0.
         cfg.interfaces.push(ResolvedInterface {
@@ -3135,6 +3469,8 @@ mod tests {
             masquerade: true,
             mss: 0,
             cgnat: CgnatLayout::default(),
+            binding: None,
+            rate_limit_mbit: None,
         });
         cfg.irb_routes.push(ResolvedIrbRoute {
             vni: 100,
@@ -3171,6 +3507,8 @@ mod tests {
             masquerade: false,
             mss: 0,
             cgnat: CgnatLayout::default(),
+            binding: None,
+            rate_limit_mbit: None,
         };
         let policy = |id: PolicyId, action: Action, stateful: bool| PolicyConfig {
             mac_rules: Vec::new(),
@@ -3242,5 +3580,307 @@ mod tests {
         let rendered = stats.render();
         assert!(rendered.contains("dropped_blocklist"));
         assert!(rendered.contains("25.00%"), "drop rate; got:\n{rendered}");
+    }
+}
+
+/// Write the B13 `PORT_LIMITS` map: ingress ifindex → the port's send ceiling as
+/// a byte bucket.
+///
+/// A port that had a ceiling and no longer does is **removed**, not zeroed: an
+/// entry with `rate == 0` allows everything, so either would work, but leaving
+/// dead entries behind makes the map's size a function of how often the config
+/// changed rather than of how many ports have ceilings.
+///
+/// The bucket starts full, so a port is not throttled for the first instant
+/// after a config apply — a limiter that made the first frames wait would look
+/// exactly like packet loss whenever anything was committed.
+fn program_port_limits(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Result<()> {
+    // The loop below clears the ceiling of an interface still in the
+    // configuration whose limit was taken away. It cannot see an interface
+    // deleted from the configuration outright, which kept its ceiling — hence
+    // the reconcile as well.
+    let keep: HashSet<u32> = interfaces
+        .iter()
+        .filter(|i| i.rate_limit_mbit.is_some())
+        .filter_map(|i| if_nametoindex(&i.name).ok())
+        .collect();
+    let mut limits: HashMap<_, u32, RateBucket> = HashMap::try_from(
+        ebpf.map_mut("PORT_LIMITS")
+            .ok_or_else(|| anyhow!("PORT_LIMITS map missing"))?,
+    )?;
+    drop_unlisted(&mut limits, &keep)?;
+    for iface in interfaces {
+        let Ok(ifindex) = if_nametoindex(&iface.name) else {
+            // Not present yet — a tap that has not been created. The next apply
+            // picks it up; programming a ceiling for an ifindex that does not
+            // exist would be a ceiling on whatever gets that number next.
+            continue;
+        };
+        match iface.rate_limit_mbit {
+            Some(mbit) => {
+                let bucket = port_rate_bucket(mbit);
+                limits
+                    .insert(ifindex, bucket, 0)
+                    .with_context(|| format!("limiting port {} to {mbit} Mbit/s", iface.name))?;
+            }
+            None => {
+                let _ = limits.remove(&ifindex);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The byte bucket a megabit ceiling comes to.
+///
+/// The burst is **one tenth of a second's worth**, floored at a jumbo frame.
+/// Both halves matter: a burst smaller than one frame can never pass one, so a
+/// ceiling below about 0.7 Mbit would black-hole the port rather than throttle
+/// it; and a burst measured in time rather than bytes means the same
+/// configuration behaves the same way at 10 Mbit and at 10 Gbit.
+fn port_rate_bucket(mbit: u32) -> RateBucket {
+    const JUMBO: u32 = 9_216;
+    let bytes_per_sec = mbit.saturating_mul(125_000);
+    let burst = (bytes_per_sec / 10).max(JUMBO);
+    RateBucket::new(bytes_per_sec, burst)
+}
+
+#[cfg(test)]
+mod port_limit_tests {
+    use super::*;
+
+    #[test]
+    fn a_megabit_is_a_hundred_and_twenty_five_thousand_bytes() {
+        assert_eq!(port_rate_bucket(1).rate, 125_000);
+        assert_eq!(port_rate_bucket(1000).rate, 125_000_000);
+    }
+
+    #[test]
+    fn even_the_smallest_ceiling_can_pass_a_frame() {
+        // A burst below one frame is a blackhole, not a limit: the bucket can
+        // never hold enough to spend on anything.
+        let mut b = port_rate_bucket(1);
+        assert!(
+            b.take_n(1_000, 9_216),
+            "a 1 Mbit port could not pass a jumbo frame"
+        );
+    }
+
+    #[test]
+    fn the_burst_is_a_tenth_of_a_second_once_that_exceeds_a_frame() {
+        assert_eq!(port_rate_bucket(1000).burst, 12_500_000);
+    }
+
+    #[test]
+    fn a_ceiling_actually_bites() {
+        // 10 Mbit = 1_250_000 bytes/s, burst 125_000. Spending the burst and one
+        // more frame in the same instant must refuse.
+        let mut b = port_rate_bucket(10);
+        let mut spent = 0;
+        while spent < 125_000 {
+            assert!(
+                b.take_n(1_000, 1_250),
+                "the burst refused a frame it could hold"
+            );
+            spent += 1_250;
+        }
+        assert!(!b.take_n(1_000, 1_250), "the ceiling did not bite");
+    }
+}
+
+#[cfg(test)]
+mod interface_scoping {
+    //! An `in-interface` that does not resolve must not become "every interface".
+
+    use super::*;
+
+    /// The unscoped rule keeps its meaning: no name, index `0`, matches anywhere.
+    #[test]
+    fn an_unnamed_interface_is_the_unscoped_rule() {
+        assert_eq!(rule_ifindex("").expect("the empty name is not an error"), 0);
+    }
+
+    /// The loopback exists on every host this ever runs on, so it is the one
+    /// name a unit test may resolve for real — and it must not come back as the
+    /// unscoped sentinel.
+    #[test]
+    fn a_real_interface_resolves_to_its_own_index() {
+        let idx = rule_ifindex("lo").expect("lo does not resolve on this host");
+        assert_ne!(
+            idx, 0,
+            "a named interface resolved to the any-interface sentinel"
+        );
+    }
+
+    /// The defect this module exists for. Before the fix this returned `0`, so a
+    /// rule scoped to a mistyped interface was applied to every interface —
+    /// including the WAN — and the apply reported success.
+    #[test]
+    fn a_mistyped_interface_is_refused_rather_than_widened() {
+        let error =
+            rule_ifindex("nosuchif0").expect_err("an interface that does not exist was accepted");
+        let text = error.to_string();
+        assert!(
+            text.contains("nosuchif0"),
+            "the refusal must name the interface, got: {text}"
+        );
+    }
+
+    /// The sweep is deliberately lenient, and this is the asymmetry that makes
+    /// the pair correct: an interface removed since the last apply is a normal
+    /// reconfigure, and failing there would block the very apply that cleans up.
+    #[test]
+    fn the_stale_sweep_tolerates_an_interface_that_is_gone() {
+        assert_eq!(stale_ifindex("nosuchif0"), 0);
+        assert_eq!(stale_ifindex(""), 0);
+    }
+}
+
+#[cfg(test)]
+mod every_map_is_reconciled {
+    //! A map an apply writes must also be a map an apply can empty.
+    //!
+    //! On 2026-08-18 `apply_config` wrote 41 maps and `remove_stale` cleared 22.
+    //! The 19 in between were write-only, so *removing* something from the
+    //! configuration left it in force: an address taken off a port, a port
+    //! forward deleted, a MAC quarantine lifted. Every one of those reported a
+    //! successful apply, and nothing in the log said otherwise.
+    //!
+    //! Counting them by hand is what let it drift that far, so this test counts
+    //! them from the source. It reads this very file, pairs each map handle a
+    //! `program_*` function takes with the reconcile or sweep that covers it, and
+    //! fails on anything left over that is not listed below with a reason.
+    //!
+    //! It is a source-text test rather than a runtime one because programming a
+    //! map needs a loaded eBPF object, and therefore root. That would put the
+    //! check in the VM suite, where it would run in ten minutes rather than ten
+    //! milliseconds — and this defect is about a map somebody *adds*, which is
+    //! exactly the moment a fast test earns its place. The VM suite proves the
+    //! behaviour; this proves the coverage.
+
+    const SOURCE: &str = include_str!("firewall.rs");
+
+    /// Maps that need no reconcile, each with the reason it does not.
+    ///
+    /// Everything here is an `Array` or a `DevMap`: fixed-size and index-keyed,
+    /// so there is no key to go stale — only a slot that may hold an old value.
+    /// A slot is safe when it is either always rewritten, or only ever reached
+    /// through a map that *is* reconciled.
+    const EXEMPT: &[(&str, &str)] = &[
+        (
+            "FAIL_CLOSED",
+            "slot 0 is written on every apply, including the false default",
+        ),
+        (
+            "SYN_SECRET",
+            "a cookie key, not a rule; keeping the installed one across an apply is the point",
+        ),
+        (
+            "OVERLAY_CONFIG",
+            "slot 0 is written on every apply — OverlayConfig::DISABLED when no overlay is \
+             configured, so turning it off takes effect",
+        ),
+        (
+            "SRV6_CONFIG",
+            "slot 0 is written on every apply — Srv6Config::DISABLED when no SRv6 is \
+             configured, so turning it off takes effect",
+        ),
+        (
+            "RULE_LIMITS",
+            "slot-indexed token buckets, reachable only from a rule that names the slot; the \
+             rules are reconciled, so an unreferenced slot is never read",
+        ),
+        (
+            "BACKENDS",
+            "slot-indexed backends, reachable only from a service entry carrying the count; the \
+             services are rewritten, so a slot past the count is never read",
+        ),
+        (
+            "TX_PORTS",
+            "a DevMap of redirect targets keyed by ifindex, reachable only from a route the \
+             datapath resolved out of a map that is reconciled",
+        ),
+    ];
+
+    /// Every map name a function takes a handle to, in source order.
+    fn handles_in(body: &str) -> Vec<&str> {
+        body.match_indices("map_mut(\"")
+            .filter_map(|(at, _)| {
+                let rest = &body[at + "map_mut(\"".len()..];
+                rest.find('"').map(|end| &rest[..end])
+            })
+            .collect()
+    }
+
+    /// The body of every function whose name starts with `prefix`.
+    fn bodies(prefix: &str) -> Vec<&'static str> {
+        SOURCE
+            .match_indices(prefix)
+            .filter(|(at, _)| *at == 0 || SOURCE.as_bytes()[at - 1] == b'\n')
+            .map(|(at, _)| {
+                let rest = &SOURCE[at..];
+                // A top-level `}` in the first column closes the function.
+                let end = rest.find("\n}\n").map(|e| e + 2).unwrap_or(rest.len());
+                &rest[..end]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_map_an_apply_writes_can_also_be_emptied() {
+        let mut written: Vec<&str> = Vec::new();
+        let mut covered: Vec<&str> = Vec::new();
+
+        for body in bodies("fn program_") {
+            let handles = handles_in(body);
+            written.extend(&handles);
+            // A handle is reconciled when `drop_unlisted` appears after it and
+            // before the next handle is taken — the map is borrowed until then,
+            // so no other order is even expressible.
+            for (i, name) in handles.iter().enumerate() {
+                let from = body.match_indices("map_mut(\"").nth(i).map(|(a, _)| a);
+                let to = body
+                    .match_indices("map_mut(\"")
+                    .nth(i + 1)
+                    .map(|(a, _)| a)
+                    .unwrap_or(body.len());
+                if let Some(from) = from
+                    && body[from..to].contains("drop_unlisted")
+                {
+                    covered.push(name);
+                }
+            }
+        }
+        for body in bodies("fn remove_stale") {
+            covered.extend(handles_in(body));
+        }
+
+        let exempt: Vec<&str> = EXEMPT.iter().map(|(n, _)| *n).collect();
+        let mut orphans: Vec<&str> = written
+            .iter()
+            .filter(|n| !covered.contains(n) && !exempt.contains(n))
+            .copied()
+            .collect();
+        orphans.sort_unstable();
+        orphans.dedup();
+
+        assert!(
+            orphans.is_empty(),
+            "these maps are written by an apply and never emptied by one, so removing the \
+             configuration that created their entries leaves those entries in force: {orphans:?}. \
+             Reconcile the map with `drop_unlisted`, or add it to EXEMPT with the reason it \
+             needs none."
+        );
+    }
+
+    /// The exempt list is a set of claims, and a claim needs a reason attached.
+    #[test]
+    fn every_exemption_carries_its_reason() {
+        for (name, reason) in EXEMPT {
+            assert!(
+                reason.len() > 30,
+                "{name} is exempt without saying why; the next reader has to re-derive it"
+            );
+        }
     }
 }

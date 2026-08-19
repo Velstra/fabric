@@ -27,8 +27,19 @@ impl Ipam {
     /// Open (creating if needed) the IPAM state for `network` over `subnet`.
     pub fn open(network: &str, subnet: &str, state_root: &Path) -> Result<Self> {
         let cidr = parse_cidr_v4(subnet).map_err(|e| anyhow::anyhow!("invalid subnet: {e}"))?;
-        if cidr.prefix >= 31 {
-            bail!("subnet {subnet} is too small to allocate from");
+        // The upper bound keeps at least one usable host after the network,
+        // gateway and broadcast are taken; the lower bound is not cosmetic.
+        // `size()` computes `1 << (32 - prefix)`, and a `/0` — which the CIDR
+        // parser accepts — makes that `1 << 32`: a panic in debug, and on x86
+        // in release a shift-by-`32 % 32 = 0` that silently returns 1, so the
+        // allocator would hand out a single address for the whole IPv4 space.
+        // A CNI subnet shorter than /8 is a configuration error regardless, and
+        // the cheapest correct guard is to name a floor.
+        if cidr.prefix < 8 || cidr.prefix >= 31 {
+            bail!(
+                "subnet {subnet} (/{}) is out of range for allocation; use /8 through /30",
+                cidr.prefix
+            );
         }
         let dir = state_root.join(network);
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -141,6 +152,26 @@ mod tests {
         p
     }
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// A subnet the allocator cannot compute a size for is refused, not opened.
+    ///
+    /// `/0` is the sharp one: the CIDR parser accepts it, and `size()` would
+    /// evaluate `1 << 32` — undefined-behaviour-shaped, a debug panic and a
+    /// release value of 1. Whichever way it lands, it is reached from a config
+    /// field, so it is refused at the door rather than depended on downstream.
+    #[test]
+    fn a_degenerate_subnet_is_refused_rather_than_panicking() {
+        let root = temp_root();
+        for bad in ["0.0.0.0/0", "10.0.0.0/1", "10.0.0.0/31", "10.0.0.0/32"] {
+            assert!(
+                Ipam::open("net", bad, &root).is_err(),
+                "{bad} was opened for allocation"
+            );
+        }
+        // The endpoints of the allowed range still open.
+        assert!(Ipam::open("net", "10.0.0.0/8", &root).is_ok());
+        assert!(Ipam::open("net", "10.0.0.0/30", &root).is_ok());
+    }
 
     #[test]
     fn allocates_sequentially_skipping_reserved() {

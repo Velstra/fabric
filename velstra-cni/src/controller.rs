@@ -123,6 +123,9 @@ pub fn create_port(
             // CNI-created pod ports default their firewall policy to the VNI (M4);
             // a distinct security-group policy is a K8s NetworkPolicy follow-up.
             policy: None,
+            // A pod's veth gets whatever address this orchestrator derives: the
+            // CNI has no opinion, and nothing above it has already chosen one.
+            mac: None,
         };
         async move {
             let info: PortInfo = client

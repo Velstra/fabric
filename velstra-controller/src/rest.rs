@@ -548,6 +548,10 @@ struct CreatePortReq {
     ip: Option<String>,
     #[serde(default)]
     policy: Option<u32>,
+    /// The workload's hardware address, when the caller has already chosen one.
+    /// Absent derives it from the address.
+    #[serde(default)]
+    mac: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -726,6 +730,12 @@ fn default_lb_proto() -> String {
 
 #[derive(Debug, Deserialize)]
 struct RuleReq {
+    /// Match the sender's hardware address instead of an IP source — a verdict
+    /// on the device, which is how a compromised one is quarantined. Was absent
+    /// here as well as on the wire, so the REST surface could not express it at
+    /// all.
+    #[serde(default)]
+    src_mac: Option<String>,
     proto: String,
     port: u16,
     action: String,
@@ -1185,6 +1195,7 @@ async fn create_port(
             tap: body.tap,
             ip: body.ip.filter(|s| !s.is_empty()),
             policy: body.policy,
+            mac: body.mac.filter(|s| !s.is_empty()),
         },
         StatusCode::BAD_REQUEST,
     )
@@ -1347,6 +1358,7 @@ async fn create_security_group(
             family: r.family.clone().unwrap_or_default(),
             direction: r.direction.clone().unwrap_or_default(),
             in_interface: r.in_interface.clone().unwrap_or_default(),
+            src_mac: r.src_mac.clone().unwrap_or_default(),
         });
     }
     let spec = ProtoSgSpec {

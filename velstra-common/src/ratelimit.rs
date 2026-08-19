@@ -57,6 +57,20 @@ impl RateBucket {
     /// timestamp lags another's) refills nothing rather than draining the bucket.
     #[inline]
     pub fn take(&mut self, now_ns: u64) -> bool {
+        self.take_n(now_ns, 1)
+    }
+
+    /// Account for `now` and decide whether `n` units may pass.
+    ///
+    /// The bucket is deliberately **unit-agnostic**: `rate` and `burst` are per
+    /// second and in whatever the thing being limited is counted in, and the map
+    /// the bucket lives in is what names that. A per-rule limiter spends one unit
+    /// per packet and its numbers are packets; a per-port limiter spends the
+    /// frame's length and its numbers are bytes. One arithmetic, tested once —
+    /// and the alternative, a second bucket type differing only in a comment,
+    /// is how two limiters end up disagreeing about what a burst means.
+    #[inline]
+    pub fn take_n(&mut self, now_ns: u64, n: u32) -> bool {
         if self.rate == 0 {
             return true;
         }
@@ -87,10 +101,17 @@ impl RateBucket {
         // clock*: rewinding would make the next packet measure the same gap twice
         // and bank credit the bucket never earned. Timestamps come from whichever
         // CPU handled the packet, so this is a normal occurrence, not a fault.
-        if self.tokens >= NANOS_PER_SEC {
-            self.tokens -= NANOS_PER_SEC;
+        // `n` is at most a frame length and `NANOS_PER_SEC` is 1e9, so the
+        // product is ~1e13 at worst — nowhere near u64, and no checked multiply
+        // (which the BPF target cannot lower: see the `__multi3` note above).
+        let want = (n as u64) * NANOS_PER_SEC;
+        if self.tokens >= want {
+            self.tokens -= want;
             true
         } else {
+            // Not "spend what there is": a partial spend would let a stream of
+            // over-budget frames drain the bucket for ever and never pass one,
+            // which is a limiter that has turned into a blackhole.
             false
         }
     }
@@ -197,5 +218,72 @@ mod tests {
         assert!(b.take(t));
         assert!(b.take(t));
         assert!(!b.take(t));
+    }
+}
+
+#[cfg(test)]
+mod byte_tests {
+    use super::*;
+
+    /// A megabit ceiling, as a per-port limiter programs it: bytes per second.
+    fn port_bucket(mbit: u32, burst_bytes: u32) -> RateBucket {
+        RateBucket::new(mbit * 125_000, burst_bytes)
+    }
+
+    #[test]
+    fn a_frame_costs_its_own_length() {
+        let mut b = port_bucket(1, 3_000);
+        assert!(
+            b.take_n(1_000, 1_500),
+            "the first frame did not fit the burst"
+        );
+        assert!(
+            b.take_n(1_000, 1_500),
+            "the burst was not spendable in full"
+        );
+        assert!(
+            !b.take_n(1_000, 1_500),
+            "a third frame fitted a two-frame burst"
+        );
+    }
+
+    #[test]
+    fn an_oversized_frame_does_not_drain_the_bucket_for_ever() {
+        // Spending what there is and still refusing would mean a stream of
+        // over-budget frames never passes one — a limiter turned blackhole.
+        let mut b = port_bucket(1, 1_000);
+        assert!(
+            !b.take_n(1_000, 9_000),
+            "a jumbo frame fitted a 1000-byte burst"
+        );
+        assert!(b.take_n(1_000, 900), "the refusal spent the bucket anyway");
+    }
+
+    #[test]
+    fn the_refill_is_in_the_same_unit_as_the_rate() {
+        // 1 Mbit/s = 125_000 bytes/s, so a tenth of a second buys 12_500 bytes.
+        let mut b = port_bucket(1, 1_500);
+        assert!(b.take_n(1_000_000_000, 1_500));
+        assert!(!b.take_n(1_000_000_000, 1_500));
+        assert!(
+            b.take_n(1_100_000_000, 1_500),
+            "100ms at 1 Mbit did not refill one 1500-byte frame"
+        );
+    }
+
+    #[test]
+    fn a_packet_limiter_still_spends_one_per_packet() {
+        // The unit is the caller's; `take` must keep meaning what it meant.
+        let mut b = RateBucket::new(10, 2);
+        assert!(b.take(1_000));
+        assert!(b.take(1_000));
+        assert!(!b.take(1_000));
+    }
+
+    #[test]
+    fn a_zero_rate_allows_whatever_the_unit_is() {
+        // An unprogrammed slot must never silently black-hole a port.
+        let mut b = RateBucket::new(0, 0);
+        assert!(b.take_n(1_000, 9_000));
     }
 }

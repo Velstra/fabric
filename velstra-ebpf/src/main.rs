@@ -71,8 +71,9 @@ use velstra_common::{
     GlobalConfig, ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, ICMPV6_NEIGHBOR_SOLICIT,
     IrbEndpoint, IrbRewrite, LocalMac, LocalMacKey, MAX_BLOCKLIST, MAX_FLOOD_VTEPS,
     MAX_RULE_LIMITS, MacFdbKey, ND_NA_MSG_LEN, Nat, NdKey, Npt66, OVERLAY_OUTER_LEN, OverlayConfig,
-    PORT_RULE_IN_ONLY, PORT_RULE_OUT_ONLY, PORT_RULE_V4_ONLY, PORT_RULE_V6_ONLY, PacketMeta,
-    PolicyId, PortFwd, PortalClientKey, PortalGate, PortalSeenKey, RateBucket, Rewrite, RouteEntry,
+    PORT_ENFORCE_MAC, PORT_ENFORCE_V4, PORT_ENFORCE_V6, PORT_RULE_IN_ONLY, PORT_RULE_OUT_ONLY,
+    PORT_RULE_V4_ONLY, PORT_RULE_V6_ONLY, PacketMeta, PolicyId, PortAddr4, PortAddr6, PortBinding,
+    PortFwd, PortalClientKey, PortalGate, PortalSeenKey, RateBucket, Rewrite, RouteEntry,
     SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6, ScopedDstPortKey, ScopedDstPortKey6, ScopedMac,
     ScopedPortKey, ScopedSrcPortKey, ScopedSrcPortKey6, ServiceKey, ServiceValue, SourceValidation,
     Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, SynFlow, SynProxyCfg, SynProxyKey,
@@ -83,7 +84,7 @@ use velstra_common::{
     plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_server_ack, plan_server_syn,
     plan_syn_ack, plan_tcp_rst, port_rule_action, port_rule_excluded, port_rule_limit,
     port_rule_logs, port_rule_present, port_rule_winner, select_backend, session_hash, tcp_flags,
-    translate_to_client, translate_to_server,
+    translate_to_client, translate_to_server, v6_source_is_v4_mapped,
 };
 
 /// Maps an ingress interface index to its policy id, so one XDP program can
@@ -215,6 +216,31 @@ static MASQUERADE: HashMap<u32, [u8; 4]> = HashMap::with_max_entries(64, 0);
 /// Empty by default, so a box with no MAC rules pays one missing lookup.
 #[map]
 static MAC_RULES: HashMap<ScopedMac, u32> = HashMap::with_max_entries(4096, 0);
+
+/// Ingress ifindex → the identity that port was given (B12, port security).
+///
+/// The one thing a guest cannot forge is which tap its frame arrived on, so that
+/// is the key. Everything else in the frame is under its control, which is the
+/// whole reason this exists: uRPF asks whether a source address is *routable*
+/// back this way and cannot tell two guests on one subnet apart, because both
+/// their addresses route there perfectly.
+///
+/// Empty by default, so a box with no tenant ports pays one missing lookup on
+/// the Ethernet header and nothing else.
+#[map]
+static PORT_BINDINGS: HashMap<u32, PortBinding> = HashMap::with_max_entries(4096, 0);
+
+/// The IPv4 addresses each port may send from: `(ifindex, addr) → 1`.
+///
+/// A set, because one port legitimately has several — its own address, a
+/// floating one just attached — and a binding that held only one would break the
+/// moment a second was assigned.
+#[map]
+static PORT_ADDRS_V4: HashMap<PortAddr4, u8> = HashMap::with_max_entries(8192, 0);
+
+/// The IPv6 half of [`PORT_ADDRS_V4`].
+#[map]
+static PORT_ADDRS_V6: HashMap<PortAddr6, u8> = HashMap::with_max_entries(8192, 0);
 
 /// Egress interface index → the largest TCP MSS a SYN may advertise on it.
 ///
@@ -460,7 +486,14 @@ fn portal_admits_v6(
             hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15], hdr[16], hdr[17],
             hdr[18], hdr[19], hdr[20], hdr[21], hdr[22], hdr[23],
         ];
-        portal_learn(ctx, &PortalSeenKey::v6(policy_id, src));
+        // Refuse to learn from a v4-mapped source. IPv4 seen-keys live in that
+        // range, so a wire-IPv6 packet claiming `::ffff:a.b.c.d` — which is
+        // never a legitimate on-wire IPv6 source (RFC 4291 §2.5.5.2: it
+        // represents an IPv4 node) — could otherwise write its MAC under a
+        // victim's IPv4 key and be admitted by the victim's login.
+        if !v6_source_is_v4_mapped(&src) {
+            portal_learn(ctx, &PortalSeenKey::v6(policy_id, src));
+        }
     }
     if gate_admits_unauthenticated(to_portal, meta.proto, meta.src_port, meta.dst_port, true) {
         return true;
@@ -589,6 +622,19 @@ static STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(Counter::COUNT, 0
 #[map]
 static FIB_SCRATCH: PerCpuArray<bpf_fib_lookup> = PerCpuArray::with_max_entries(1, 0);
 
+/// This CPU's key slot for the per-port address lookup.
+///
+/// Same reasoning as [`FIB_SCRATCH`], for a much smaller struct: the entry
+/// point's own frame is within a hundred bytes of the verifier's 512-byte
+/// combined limit, so even eight bytes of key are worth not spending there.
+#[map]
+static PORT_KEY: PerCpuArray<PortAddr4> = PerCpuArray::with_max_entries(1, 0);
+
+/// The IPv6 half of [`PORT_KEY`]. Twenty-four bytes rather than eight, and the
+/// same reason applies three times over.
+#[map]
+static PORT_KEY6: PerCpuArray<PortAddr6> = PerCpuArray::with_max_entries(1, 0);
+
 /// This CPU's zeroed [`bpf_fib_lookup`] slot, or `None` if the map is somehow
 /// missing (in which case the caller must not claim the packet is spoofed).
 #[inline(always)]
@@ -650,19 +696,80 @@ struct ForwardScratch {
 #[map]
 static SCRATCH: PerCpuArray<ForwardScratch> = PerCpuArray::with_max_entries(1, 0);
 
+/// Per-port send ceiling (roadmap B13), keyed by ingress ifindex.
+///
+/// A **byte** bucket: `rate` and `burst` are bytes per second and bytes, and a
+/// frame spends its own length. The per-rule limiter next door counts packets;
+/// the same [`RateBucket`] does both because the arithmetic is the same and only
+/// the unit differs — which is the map's business, not the bucket's.
+///
+/// It limits what a port *sends into the box*, which is the direction a noisy
+/// neighbour congests. A missing entry is no limit, so an unprogrammed port is
+/// never throttled by an accident of ordering.
+#[map]
+static PORT_LIMITS: HashMap<u32, RateBucket> = HashMap::with_max_entries(4096, 0);
+
 /// Tail-call jump table. Slot [`PROG_FORWARD`] holds [`velstra_forward`]; the
 /// control plane populates it at load time (see `firewall.rs`).
 #[map]
-static VELSTRA_PROGS: ProgramArray = ProgramArray::with_max_entries(1, 0);
+static VELSTRA_PROGS: ProgramArray = ProgramArray::with_max_entries(2, 0);
 
 /// Index of [`velstra_forward`] in [`VELSTRA_PROGS`].
 const PROG_FORWARD: u32 = 0;
 
-/// XDP entry point. Kept tiny: it delegates to [`try_velstra`] and turns a parse
-/// failure into `XDP_PASS` (fail-open) or `XDP_DROP` (fail-closed), per the
-/// host-wide [`FAIL_CLOSED`] flag, rather than aborting.
+/// Index of [`velstra_main`] in [`VELSTRA_PROGS`].
+const PROG_MAIN: u32 = 1;
+
+/// XDP entry point: port security, then the datapath.
+///
+/// The split is not decoration. The datapath's own frame is 408 of the
+/// verifier's 512 bytes, and a call chain's frames are summed against that one
+/// limit — adding this check to it landed at 528 and was refused. Two
+/// formulations before that failed differently and are worth not retrying:
+/// inlining the check pushed the datapath past the inliner's threshold so it
+/// became a subprogram, and the verifier rejects `tail_call is not allowed in
+/// subprog`; keeping it out of line instead cost the sixteen bytes above.
+///
+/// A tail call starts a fresh stack frame, so the gate and the datapath each get
+/// the full budget and neither constrains the other. It also puts identity
+/// where it belongs semantically: the first question, before parsing, before
+/// the firewall, before ARP.
 #[xdp]
 pub fn velstra(ctx: XdpContext) -> u32 {
+    if !port_identity_ok(&ctx) {
+        bump(Counter::DroppedNotYours);
+        return xdp_action::XDP_DROP;
+    }
+    // B13, and after identity on purpose: a frame nobody may send is not one to
+    // spend a port's budget on, or a spoofing neighbour could exhaust the
+    // ceiling of the port it is impersonating.
+    if !port_rate_ok(&ctx) {
+        bump(Counter::DroppedPortRate);
+        return xdp_action::XDP_DROP;
+    }
+    // Does not return when it succeeds: control jumps into `velstra_main` and
+    // this frame is gone.
+    let _ = unsafe { VELSTRA_PROGS.tail_call(&ctx, PROG_MAIN) };
+    // Reached only if the jump table has no datapath in it — userspace loads it
+    // before attaching, so this means something is badly wrong. Treat it like
+    // any other case where the filter cannot form an opinion, which is what
+    // `FAIL_CLOSED` is for. Counted, so a silently defanged data plane is
+    // visible rather than merely quiet.
+    bump(Counter::Malformed);
+    if fail_closed() {
+        xdp_action::XDP_DROP
+    } else {
+        xdp_action::XDP_PASS
+    }
+}
+
+/// The datapath proper, entered by tail call from [`velstra`] and never attached
+/// to an interface directly.
+///
+/// Turns a parse failure into `XDP_PASS` (fail-open) or `XDP_DROP`
+/// (fail-closed), per the host-wide [`FAIL_CLOSED`] flag, rather than aborting.
+#[xdp]
+pub fn velstra_main(ctx: XdpContext) -> u32 {
     match try_velstra(&ctx) {
         Ok(action) => action,
         // A `ptr_at` bounds failure lands here. Count it, then either let the
@@ -1414,6 +1521,174 @@ fn apply_nat(ctx: &XdpContext, nat: &Nat, reverse: bool, proto: u8) -> Result<()
 /// Parse and classify one packet. Mirrors `velstra_common::parse::parse_frame`
 /// (its unit-tested reference implementation) but on raw, verifier-friendly
 /// pointers.
+/// Whether this frame's source MAC is the one its port was given.
+///
+/// Its own function returning a plain `bool` on purpose. Holding the map's
+/// `Option<&PortBinding>` across the rest of `try_velstra` made LLVM give that
+/// function an aggregate return — `{ i32, i32 }` — which the BPF backend
+/// refuses outright. Two small lookups on a bound port cost less than an hour
+/// spent reading "aggregate returns are not supported".
+/// Whether this frame is coming from the identity its port was given (B12).
+///
+/// uRPF already asks whether a source address is *routable* back out of the
+/// interface it arrived on. That is a different question: two guests on one
+/// subnet both pass it while impersonating each other, because both their
+/// addresses route there perfectly. This asks whether the sender is who its tap
+/// says it is — keyed by ingress ifindex, the one thing in the frame a guest
+/// cannot forge.
+///
+/// Reads the headers itself rather than taking them from the caller, so the
+/// caller stays the tiny function it has to be.
+/// Out of line, and the comment that used to sit here said the opposite.
+///
+/// It was written before the gate was split from the datapath: back then this
+/// ran inside the program that tail-calls, and a bpf2bpf subprogram beside a
+/// tail call is the combination the kernel restricts — the datapath loaded and
+/// forwarded nothing. The split gave the gate its own program and its own
+/// 512-byte budget, after which `inline(never)` is what keeps this check's
+/// locals out of the caller's frame. The attribute has been right since; the
+/// comment had not caught up.
+#[inline(never)]
+fn port_identity_ok(ctx: &XdpContext) -> bool {
+    let ingress_if = ctx.ingress_ifindex() as u32;
+    let Some(bound) = (unsafe { PORT_BINDINGS.get(&ingress_if) }) else {
+        // No binding: not a tenant port, and not our question.
+        return true;
+    };
+    let flags = bound.flags;
+    let Ok(eth) = (unsafe { ptr_at::<EthHdr>(ctx, 0) }) else {
+        return true;
+    };
+    if flags & PORT_ENFORCE_MAC != 0 && unsafe { (*eth).src_addr } != bound.mac {
+        return false;
+    }
+    let ether_type = u16::from_be(unsafe { (*eth).ether_type });
+
+    // IPv6, and it was not enforced at all until now. `PORT_ENFORCE_V6` was
+    // computed by the control plane, written into the binding, imported here —
+    // and never read. So a port that declared IPv6 addresses reported source
+    // enforcement it did not have, and a workload could claim any IPv6 address
+    // it liked. A check that says it is in force and is not is worse than no
+    // check, because nobody goes looking.
+    if flags & PORT_ENFORCE_V6 != 0 && ether_type == ETHERTYPE_IPV6 {
+        return v6_source_bound(ctx, ingress_if);
+    }
+
+    if flags & PORT_ENFORCE_V4 == 0 {
+        return true;
+    }
+    if ether_type != ETHERTYPE_IPV4 {
+        return true;
+    }
+    let Ok(ipv4) = (unsafe { ptr_at::<Ipv4Hdr>(ctx, EthHdr::LEN) }) else {
+        return true;
+    };
+    let src = unsafe { (*ipv4).src_addr };
+    // A guest with no address yet must be able to ask for one: `0.0.0.0` is what
+    // DHCP discovery carries, and refusing it would mean a bound port could
+    // never obtain the address that makes it valid.
+    if src == [0u8; 4] {
+        return true;
+    }
+    // The key goes in a per-CPU slot rather than on the stack. Eight bytes
+    // sounds like nothing, but this subprogram's frame adds to the entry
+    // point's along the same call chain, and that sum is what the verifier
+    // measures against 512.
+    let Some(key) = PORT_KEY.get_ptr_mut(0) else {
+        return true;
+    };
+    unsafe {
+        (*key).ifindex = ingress_if;
+        (*key).addr = u32::from_ne_bytes(src);
+        PORT_ADDRS_V4.get(&*key).is_some()
+    }
+}
+
+/// Whether this frame's IPv6 source is one this port was given.
+///
+/// Split out of [`port_identity_ok`] for readability and **inlined back into
+/// it**, which is not a contradiction: the split is for whoever reads this, and
+/// the attribute is for the verifier.
+///
+/// `inline(never)` here does not load. A packet pointer does not survive the
+/// boundary into a *nested* bpf2bpf subprogram — `port_identity_ok` is already
+/// one, and reading the header inside a second produced
+///
+///     R2 pointer arithmetic on pkt_end prohibited
+///
+/// with a stack depth of `8+8+0+8`, so it was never about the 512-byte budget.
+/// Inlined, the read happens in the frame that already owns the pointers, and
+/// the twenty-four byte key still goes in a per-CPU slot so nothing lands on the
+/// stack that does not have to.
+#[inline(always)]
+fn v6_source_bound(ctx: &XdpContext, ingress_if: u32) -> bool {
+    // The address is at offset 8 of the fixed header. Read as raw bytes rather
+    // than through `Ipv6Hdr`, whose `in6_addr` unions this program avoids
+    // everywhere else for the same reason.
+    let Ok(src) = (unsafe { ptr_at::<[u8; 16]>(ctx, EthHdr::LEN + 8) }) else {
+        return true;
+    };
+    let src = unsafe { *src };
+    // The unspecified address is what duplicate-address detection sends before a
+    // workload has an address at all. Refusing it would mean a bound port could
+    // never acquire the address that makes it valid — the same reason `0.0.0.0`
+    // is let through on the v4 path.
+    if src == [0u8; 16] {
+        return true;
+    }
+    // Link-local (`fe80::/10`) is let through, and this is the one place IPv6
+    // genuinely differs from IPv4 rather than merely having longer addresses.
+    //
+    // A host does neighbour discovery — router solicitation, neighbour
+    // solicitation and advertisement — from a link-local address it derived for
+    // itself. No platform assigned it, so no platform can have put it in the
+    // bound set, and a port enforcing the bound set strictly would drop the
+    // packets that make IPv6 work at all. A security feature that turns into an
+    // outage is not a security feature.
+    //
+    // What still binds identity on the link is the MAC, which is enforced on the
+    // same frame a few lines above and covers every ethertype. So a workload may
+    // choose its own link-local address and may not pretend to be its
+    // neighbour — which is the property this whole check exists for.
+    if src[0] == 0xfe && (src[1] & 0xc0) == 0x80 {
+        return true;
+    }
+    let Some(key) = PORT_KEY6.get_ptr_mut(0) else {
+        return true;
+    };
+    unsafe {
+        (*key).ifindex = ingress_if;
+        (*key)._pad = [0; 4];
+        (*key).addr = src;
+        PORT_ADDRS_V6.get(&*key).is_some()
+    }
+}
+
+/// Whether this port may send this frame, spending its length from the port's
+/// bucket (roadmap B13).
+///
+/// Out of line for the same reason [`port_identity_ok`] is: the gate must stay
+/// small enough that its body inlines into the generated entry point, or the
+/// tail call below it lands in a subprogram and the verifier refuses it.
+#[inline(never)]
+fn port_rate_ok(ctx: &XdpContext) -> bool {
+    let ingress_if = ctx.ingress_ifindex() as u32;
+    let Some(ptr) = PORT_LIMITS.get_ptr_mut(&ingress_if) else {
+        // No ceiling on this port, which is every port nobody set one on.
+        return true;
+    };
+    // SAFETY: the pointer is a valid, exclusive reference to this map value for
+    // the duration of this program run. Shared across CPUs and updated without
+    // synchronisation for the reason `rate_limits_allow` gives: two packets
+    // racing may spend the same token, which costs a small overshoot and never
+    // an under-count, and a per-CPU map would multiply every limit by the core
+    // count — a ceiling that silently means something else on every machine.
+    let bucket = unsafe { &mut *ptr };
+    let frame_len = (ctx.data_end() - ctx.data()) as u32;
+    let now = unsafe { bpf_ktime_get_ns() };
+    bucket.take_n(now, frame_len)
+}
+
 fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     let frame_len = (ctx.data_end() - ctx.data()) as u64;
     bump(Counter::RxPackets);
@@ -1421,6 +1696,15 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
 
     // --- Ethernet -----------------------------------------------------------
     let eth: *const EthHdr = unsafe { ptr_at(ctx, 0)? };
+
+    // Port security (B12) is **not** here. It runs in the gate program, before
+    // the tail call that reaches this one, which is what gives it its own
+    // verifier budget — see `velstra` and `port_identity_ok`. This comment used
+    // to say it happened at this line, and an `ingress_ifindex` nobody read sat
+    // under it as evidence: both were left behind when the check moved, and a
+    // comment describing a check that is somewhere else is how somebody removes
+    // it twice or adds it back a second time.
+    //
     // `EtherType` constants in `network-types` are stored already byte-swapped,
     // so we normalise the wire value to host order and compare against our own
     // host-order constant. (The previous code double-swapped and never matched.)
@@ -1454,6 +1738,12 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     let src_addr = ipv4.src_addr;
     let dst_addr = ipv4.dst_addr;
     let ttl = ipv4.ttl;
+
+    // The address half of port security. Separate from the MAC half above
+    // because a port can legitimately have one and not the other: during a
+    // migration, or before IPAM has assigned anything, enforcing addresses that
+    // were never given would black-hole the guest rather than protect anybody
+    // from it.
     let checksum = ipv4.checksum();
 
     // --- L4 ports (TCP/UDP, best effort, first fragment only) ---------------

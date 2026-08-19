@@ -146,6 +146,18 @@ message CreatePortRequest {
   // Security-group policy, decoupled from the VNI (M4). Absent ⇒ default to the
   // VNI (single-tenant: one number names both segment and ruleset).
   optional uint32 policy = 5;
+  // The hardware address this port's workload will use, as `aa:bb:cc:dd:ee:ff`.
+  // Absent ⇒ derived from the address, which is what a caller with no opinion
+  // gets and what every caller got before this field existed.
+  //
+  // It exists because the workload's MAC is not always this orchestrator's to
+  // choose. A platform above it may already have decided — Velstra Cloud derives
+  // one from the port's uid so that a lost-and-retried write cannot change a
+  // running guest's NIC — and two allocators for one identity is not a
+  // disagreement that shows up as a warning. Port security matches the source
+  // MAC, so a guest using one address while the data plane expects another has
+  // every frame dropped, silently, and looks like a network that does not work.
+  optional string mac = 6;
 }
 
 message PortInfo {
@@ -583,6 +595,37 @@ message InterfaceAssignment {
   // verbatim (0 = local-only, never tunneled). `optional` so "unset" and
   // "explicitly 0" stay distinct across the wire.
   optional uint32 vni = 3;
+
+  // Everything below was in `InterfaceFile` and not on this wire, so an agent
+  // driven by a controller received an interface with a policy and a VNI and
+  // nothing else. Five features were built, tested and inert in that path:
+  //
+  //   * port security (B12) — `bind_mac` / `bind_addresses`. The orchestrator
+  //     derives both for every tenant tap and says why: without them a guest
+  //     can send as its neighbour. Dropped here, every controller-managed node
+  //     ran with port security off.
+  //   * the per-port send ceiling (B13) — `rate_limit_mbit`.
+  //   * MSS clamping, masquerading, and deterministic CGNAT.
+  //
+  // It survived because the VM checks configure an appliance through its own
+  // CLI, which writes the node's TOML directly; the controller path was the
+  // one nothing exercised. `interface_round_trips_every_field` now fails to
+  // compile if a field is added to `InterfaceFile` and forgotten here.
+
+  // Clamp TCP MSS on this interface. 0 = no clamping.
+  optional uint32 mss = 4;
+  // Port security: the one hardware address this interface may send as.
+  optional string bind_mac = 5;
+  // Port security: the addresses it may source from. Empty = unenforced.
+  repeated string bind_addresses = 6;
+  // Send ceiling in megabits per second. 0 = no ceiling.
+  optional uint32 rate_limit_mbit = 7;
+  // Source-NAT traffic leaving this interface to its own public address.
+  bool masquerade = 8;
+  // Deterministic CGNAT: the first WAN port handed out, and how many each
+  // internal address gets. Both zero = plain hash-spread NAPT.
+  uint32 cgnat_base_port = 9;
+  uint32 cgnat_block_size = 10;
 }
 
 message PortRule {
@@ -612,6 +655,13 @@ message PortRule {
   // Scope the rule to one interface by name; empty = every interface the policy
   // covers. Resolved to an ifindex where the maps are written.
   string in_interface = 12;
+  // Match the sender's hardware address instead of an IP source — a verdict on
+  // the device, which is how a compromised one is quarantined.
+  //
+  // Was not on this wire, so a controller-served rule arrived without it: an
+  // operator quarantining a device got a green apply and an empty MAC_RULES.
+  // The rule *validated* on the way through, which is what made it look fine.
+  string src_mac = 13;
 }
 
 message Route {

@@ -6,6 +6,20 @@ on:
     branches: [master, main]
     tags: ["v*"]
   pull_request:
+  schedule:
+    # Nightly, for the datapath suite below — it needs root and a real kernel,
+    # so it is not something to put in front of a merge.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege by default. The one job that needs more (fabric's image
+# push) asks for it on the job itself.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,9 +31,10 @@ jobs:
   # is needed to compile the controller's `.proto`.
   logic:
     name: host crates — fmt, clippy, test
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt, clippy
@@ -33,19 +48,24 @@ jobs:
       # rest is the host control plane: common/config/proto/controller/cni/
       # orchestrator/raft.
       - name: clippy (host crates)
-        run: cargo clippy --workspace --exclude velstra-ebpf --exclude velstra --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude velstra-ebpf --exclude velstra --all-targets --locked -- -D warnings
       - name: test (host crates)
-        run: cargo test --workspace --exclude velstra-ebpf --exclude velstra
+        run: cargo test --workspace --exclude velstra-ebpf --exclude velstra --locked
+      # The end-to-end suite is shell, and shell fails at runtime or not at all.
+      # `--severity=error` only: these scripts are clean at that level today.
+      - name: shellcheck
+        run: git ls-files -z '*.sh' | xargs -0 shellcheck --severity=error
 
   # Full lane: builds the eBPF data plane (needs nightly rust-src + bpf-linker)
   # and the control plane, then runs the control-plane tests.
   build:
     name: ebpf + control plane — build & test
+    if: github.event_name != 'schedule'
     # Pinned to match the images' `ubuntu:24.04` base: the COPY-prebuilt binaries
     # are dynamically linked against the runner's glibc, so runner == image base.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
         with:
           # `rust-src` is required to cross-compile std for the BPF target;
@@ -60,11 +80,11 @@ jobs:
         # The eBPF crate is only ever built for the bpf target via the app's
         # build script, so it is intentionally excluded from host clippy
         # (it is `no_std`/`no_main` and cannot link against the host std).
-        run: cargo clippy -p velstra --all-targets -- -D warnings
+        run: cargo clippy -p velstra --all-targets --locked -- -D warnings
       - name: Build (release, embeds the eBPF object)
-        run: cargo build --release
+        run: cargo build --release --locked
       - name: Test control plane
-        run: cargo test -p velstra
+        run: cargo test -p velstra --locked
       - name: Smoke-test the agent CLI (no root needed)
         run: |
           # Agent-side policy files only; topology.toml is a controller file.
@@ -75,16 +95,14 @@ jobs:
       # NOTE: the `cargo build --release` step above is what gates the eBPF data
       # plane — velstra-app's build.rs cross-compiles `velstra-ebpf` for the BPF
       # target via aya-build, so a data-plane compile error fails this job (on
-      # PRs too). The datapath *end-to-end* suite (`tests/e2e/run.sh`), which
-      # loads the real XDP/TC programs, needs root + CAP_BPF and a recent kernel;
-      # it is intentionally NOT run here (hosted runners lack the privileges and
-      # would flake). Run it on a self-hosted/privileged runner or locally with
-      # `make e2e`.
+      # PRs too). What it does not prove is that the loaded programs *do*
+      # anything: that is the `datapath` job at the bottom of this file, which
+      # needs root and therefore runs nightly rather than here.
       # Hand the freshly-built binaries to the `images` job so it doesn't repeat
       # the (slow) eBPF release build. Only on push — PRs don't publish.
       - name: Upload release binaries
         if: github.event_name == 'push'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: velstra-binaries
           path: |
@@ -106,17 +124,17 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Download release binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: velstra-binaries
           path: target/release
       - name: Restore the executable bit
         run: chmod +x target/release/velstra target/release/velstra-controller target/release/velstra-cni
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -137,3 +155,45 @@ jobs:
             echo "building ${c}: ${TAGS}"
             docker buildx build --push -f "deploy/docker/Dockerfile.${c}" ${TAGS} .
           done
+
+  # The datapath itself: `tests/e2e/run.sh` loads the real XDP and TC programs
+  # into throwaway netns/veth topologies and asserts on what the kernel then does
+  # with the packets. Everything above it proves the code compiles and the
+  # host-side logic is right; only this proves the firewall filters.
+  #
+  # Nightly rather than per-PR because it wants root — a hosted runner grants
+  # that through passwordless sudo, so the privilege is not the obstacle the
+  # older comment in this file suggested; the obstacle is that a kernel-loading
+  # suite is the wrong thing to put between a maintainer and a merge.
+  #
+  # HONESTY NOTE: this job has never run on GitHub's runners. It runs locally on
+  # a developer box with `make e2e`. What is unproven here is whether the hosted
+  # kernel loads these programs — the verifier is version-sensitive, and the
+  # runner's kernel is not the one this is developed against. If it turns out it
+  # cannot, the fix is a self-hosted runner with `runs-on: [self-hosted, linux,
+  # ebpf]`, not deleting the job: the first nightly failure is information.
+  datapath:
+    name: e2e datapath (nightly, needs root)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc and iproute2
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler iproute2 ethtool iputils-arping
+      - name: Install bpf-linker
+        run: cargo install bpf-linker --locked
+      - name: Say what kernel this is
+        # The verifier's answer depends on it, so a failure report that does not
+        # name the kernel is a failure report nobody can act on.
+        run: |
+          uname -a
+          grep -E "^BPF|BPF_SYSCALL|^CONFIG_XDP" /boot/config-"$(uname -r)" 2>/dev/null || true
+      - name: Build the agent (release, embeds the eBPF object)
+        run: cargo build --release --locked
+      - name: Run the end-to-end datapath suite
+        run: sudo -E ./tests/e2e/run.sh

@@ -16,6 +16,7 @@ mod conntrack_sync;
 mod controller_client;
 mod firewall;
 mod flows;
+mod flowspec;
 mod ipfix;
 mod mapping;
 mod portal;
@@ -163,6 +164,24 @@ struct RunArgs {
     /// B4b). Unset ⇒ the whole learn-and-advertise task is inert.
     #[arg(long)]
     wren_socket: Option<PathBuf>,
+
+    /// Enforce the BGP FlowSpec rules the co-located Wren advertises (roadmap
+    /// A3). Needs `--wren-socket`, which is the same socket the feed comes over.
+    ///
+    /// Off by default, and deliberately: enforcing it means letting a BGP peer
+    /// drop traffic on this box, which is a decision an operator makes rather
+    /// than one they discover.
+    #[arg(long)]
+    flowspec: bool,
+
+    /// The broadest prefix an advertised FlowSpec rule may carry; anything
+    /// broader is refused and named in the log.
+    ///
+    /// A `/0` from a peer having a bad day would otherwise take the site off the
+    /// air, and that is a failure mode worth a floor rather than a post-mortem.
+    /// `0` accepts anything, for an operator who means it.
+    #[arg(long, default_value_t = 8)]
+    flowspec_min_prefix: u8,
 }
 
 #[derive(Debug, Args)]
@@ -364,6 +383,30 @@ async fn run(args: RunArgs) -> Result<()> {
                 ));
             }
             Err(e) => warn!("could not start local-MAC learning: {e:#}"),
+        }
+    }
+
+    // A3: enforce what a BGP peer asks this box to drop. Same socket as the EVPN
+    // advertisement above — it is one daemon — but its own opt-in, because
+    // advertising what this box has learned and letting a peer filter its
+    // traffic are different decisions.
+    if args.flowspec {
+        match args.wren_socket.clone() {
+            Some(socket) => {
+                info!(
+                    "flowspec: enforcing rules from {} (floor /{})",
+                    socket.display(),
+                    args.flowspec_min_prefix
+                );
+                tokio::spawn(flowspec::enforce(
+                    socket,
+                    firewall.clone(),
+                    args.flowspec_min_prefix,
+                ));
+            }
+            // Said out loud rather than ignored: an operator who asked for
+            // enforcement and got silence would believe it was happening.
+            None => warn!("--flowspec needs --wren-socket; nothing is being enforced"),
         }
     }
 

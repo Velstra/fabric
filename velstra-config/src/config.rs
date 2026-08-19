@@ -630,7 +630,7 @@ pub struct PortalCfg {
 
 /// Maps an interface to a policy and (optionally) an overlay segment
 /// (`[[interface]]`).
-#[derive(Debug, Deserialize)]
+#[derive(Default, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InterfaceFile {
     /// Interface name (resolved to an ifindex at load time).
@@ -653,6 +653,41 @@ pub struct InterfaceFile {
     /// small traffic perfectly and hangs on anything large. Omitted ⇒ no clamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mss: Option<u16>,
+    /// Bind this port to one hardware address: frames arriving with any other
+    /// source MAC are dropped (roadmap B12, port security).
+    ///
+    /// For a tenant port — a VM's tap, a container veth — where the thing on the
+    /// far end is not trusted to say who it is. uRPF already asks whether a
+    /// source *address* is routable back this way; it cannot tell two guests on
+    /// one subnet apart, because both their addresses route there perfectly.
+    /// This asks the other question: is the sender the one this port was given
+    /// to. Omitted ⇒ not enforced, which is right for an uplink.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_mac: Option<String>,
+    /// What this port may **send** into the box, in megabits per second
+    /// (roadmap B13). Unset ⇒ no ceiling.
+    ///
+    /// The send direction, and only that one, because it is the direction a
+    /// noisy neighbour congests: a tenant that floods costs every other tenant
+    /// on the same fabric. Traffic *to* the port is shaped by the qdisc on its
+    /// link, which is a different mechanism in a different place and should not
+    /// be made to look like this one by sharing its name.
+    #[serde(
+        default,
+        rename = "rate-limit-mbit",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub rate_limit_mbit: Option<u32>,
+    /// The addresses this port may send from. Empty ⇒ not enforced.
+    ///
+    /// A list because one port legitimately has several — its own IPv4, a
+    /// link-local, a floating address just attached — and a binding that held
+    /// only one would break the moment a second was assigned. IPv4 and IPv6 may
+    /// be mixed; each family is enforced only if at least one address of that
+    /// family is listed, so binding a v4 address does not silently black-hole a
+    /// dual-stack guest's IPv6.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bind_addresses: Vec<String>,
     /// Masquerade (source NAT) traffic **leaving** this interface to its own
     /// public IPv4 — the classic WAN uplink. Off by default. The control plane
     /// reads the live address and programs the `MASQUERADE` map + the TC egress
@@ -1092,6 +1127,35 @@ pub struct ResolvedNd6 {
     pub mac: [u8; 6],
 }
 
+/// What a tenant port is allowed to be, resolved and ready to program.
+///
+/// Each family is enforced only when at least one address of that family was
+/// given: binding a guest's IPv4 must not silently black-hole its IPv6, which is
+/// the mistake that turns a security feature into an outage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortIdentity {
+    pub mac: Option<[u8; 6]>,
+    pub v4: Vec<std::net::Ipv4Addr>,
+    pub v6: Vec<std::net::Ipv6Addr>,
+}
+
+impl PortIdentity {
+    /// The flag byte the data plane reads.
+    pub fn flags(&self) -> u8 {
+        let mut flags = 0;
+        if self.mac.is_some() {
+            flags |= velstra_common::PORT_ENFORCE_MAC;
+        }
+        if !self.v4.is_empty() {
+            flags |= velstra_common::PORT_ENFORCE_V4;
+        }
+        if !self.v6.is_empty() {
+            flags |= velstra_common::PORT_ENFORCE_V6;
+        }
+        flags
+    }
+}
+
 /// A resolved interface assignment: which firewall policy *and* which overlay
 /// segment (VNI) an interface's traffic belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1107,6 +1171,12 @@ pub struct ResolvedInterface {
     /// The MSS ceiling for SYNs leaving this interface (`MSS_CLAMP`), or `0` for
     /// no clamp.
     pub mss: u16,
+    /// The identity this port is bound to (`PORT_BINDINGS`, `PORT_ADDRS_*`), if
+    /// it is a tenant port. See [`InterfaceFile::bind_mac`].
+    pub binding: Option<PortIdentity>,
+    /// The port's send ceiling in megabits per second (`PORT_LIMITS`), or `None`
+    /// for no ceiling. See [`InterfaceFile::rate_limit_mbit`].
+    pub rate_limit_mbit: Option<u32>,
     /// Deterministic CGNAT port-block layout for this egress, or a disabled layout.
     pub cgnat: CgnatLayout,
 }
@@ -1645,6 +1715,14 @@ impl FileConfig {
         }
 
         let overlay_present = self.overlay.is_some();
+        // What an encapsulated frame has left over, per encapsulation this box
+        // is configured for. Read once, because it is a property of the box and
+        // not of any one interface.
+        let overlay_mtu = self
+            .overlay
+            .as_ref()
+            .map(|o| o.underlay_mtu.unwrap_or(1500));
+        let srv6_mtu = self.srv6.as_ref().map(|s| s.underlay_mtu.unwrap_or(1500));
         let mut interfaces = Vec::with_capacity(self.interfaces.len());
         for iface in &self.interfaces {
             if !policies.iter().any(|p| p.id == iface.policy) {
@@ -1675,10 +1753,14 @@ impl FileConfig {
                             iface.name
                         )
                     }
+                    // An operator who types a number means it, including one that
+                    // is smaller than the derivation below would pick.
                     Some(m) => m,
-                    None => 0,
+                    None => derived_overlay_mss(vni, overlay_mtu, srv6_mtu),
                 },
                 cgnat: CgnatLayout::new(iface.cgnat_base_port, iface.cgnat_block_size),
+                binding: resolve_binding(iface)?,
+                rate_limit_mbit: iface.rate_limit_mbit.filter(|m| *m > 0),
             });
         }
 
@@ -2877,6 +2959,8 @@ mod tests {
                     masquerade: false,
                     mss: 0,
                     cgnat: CgnatLayout::default(),
+                    binding: None,
+                    rate_limit_mbit: None,
                 },
                 ResolvedInterface {
                     name: "tap1".into(),
@@ -2885,6 +2969,8 @@ mod tests {
                     masquerade: false,
                     mss: 0,
                     cgnat: CgnatLayout::default(),
+                    binding: None,
+                    rate_limit_mbit: None,
                 },
             ]
         );
@@ -3545,5 +3631,273 @@ mod tests {
     fn rejects_unknown_field() {
         let toml = r#"defaultaction = "drop""#; // typo: should be deny_unknown_fields
         assert!(toml::from_str::<FileConfig>(toml).is_err());
+    }
+}
+
+/// The largest MSS a SYN leaving an **overlay** interface may advertise, or `0`
+/// when this interface is not one.
+///
+/// Derived rather than asked for. The clamp already existed and was a number an
+/// operator typed per interface, which quietly assumed they knew the
+/// encapsulation overhead by heart. Almost nobody does, and the failure is the
+/// worst-behaved one in an overlay: small traffic works perfectly, anything
+/// large hangs, and nothing anywhere says why. The platform already knows the
+/// underlay MTU and how many bytes each encapsulation takes, so it should not
+/// ask a second time — the same rule the rest of this codebase follows for
+/// anything derivable.
+///
+/// Subtracting 40 for the inner IPv4 and TCP headers on top of the outer stack:
+/// the MSS is what is left for payload, not for the segment.
+///
+/// **When both encapsulations are configured, the larger overhead wins.** A
+/// clamp that is a little too small costs a few bytes per segment; one that is
+/// too large restores exactly the blackhole this exists to prevent, and nothing
+/// here knows which encapsulation a given flow will take.
+fn derived_overlay_mss(vni: u32, overlay_mtu: Option<u16>, srv6_mtu: Option<u16>) -> u16 {
+    if vni == 0 {
+        return 0;
+    }
+    // VXLAN/Geneve: outer L2 is already on the wire, so only IP+UDP+shim count.
+    const VXLAN_OUTER: u16 = (velstra_common::OVERLAY_OUTER_LEN - 14) as u16;
+    const SRV6_OUTER: u16 = 40;
+    const INNER_IP_TCP: u16 = 40;
+
+    let candidates = [
+        overlay_mtu.map(|mtu| mtu.saturating_sub(VXLAN_OUTER + INNER_IP_TCP)),
+        srv6_mtu.map(|mtu| mtu.saturating_sub(SRV6_OUTER + INNER_IP_TCP)),
+    ];
+    let derived = candidates.into_iter().flatten().min().unwrap_or(0);
+    // Below the RFC 1122 floor the clamp would be refusing to carry ordinary
+    // traffic rather than making it fit; an underlay that small is a
+    // misconfiguration to look at, not one to paper over.
+    if derived < 536 { 0 } else { derived }
+}
+
+#[cfg(test)]
+mod overlay_mss_tests {
+    use super::derived_overlay_mss;
+
+    /// An overlay port gets a clamp without anybody typing one.
+    ///
+    /// This is the whole point: the number was configurable and defaulted to
+    /// "no clamp", so an operator who did not know the encapsulation overhead by
+    /// heart got an overlay where small traffic worked and large traffic hung.
+    #[test]
+    fn an_overlay_interface_is_clamped_from_what_the_box_already_knows() {
+        // 1500 underlay − 36 outer − 40 inner IP/TCP.
+        assert_eq!(derived_overlay_mss(100, Some(1500), None), 1424);
+        // SRv6's outer IPv6 costs four bytes more.
+        assert_eq!(derived_overlay_mss(100, None, Some(1500)), 1420);
+        // Jumbo underlay, jumbo clamp — nothing is capped at an Ethernet MTU.
+        assert_eq!(derived_overlay_mss(100, Some(9000), None), 8924);
+    }
+
+    #[test]
+    fn a_port_that_is_not_on_the_overlay_is_left_alone() {
+        assert_eq!(derived_overlay_mss(0, Some(1500), None), 0);
+        assert_eq!(derived_overlay_mss(100, None, None), 0);
+    }
+
+    /// With both encapsulations configured the larger overhead wins.
+    ///
+    /// Nothing here knows which one a given flow will take, and the two costs
+    /// differ. Guessing the smaller one restores the blackhole for every SRv6
+    /// flow; guessing the larger one costs four bytes per segment on the VXLAN
+    /// ones. That is not a close call.
+    #[test]
+    fn the_more_expensive_encapsulation_decides() {
+        assert_eq!(derived_overlay_mss(100, Some(1500), Some(1500)), 1420);
+    }
+
+    /// An underlay too small to carry ordinary traffic is not clamped into
+    /// silence — it is left for somebody to look at.
+    #[test]
+    fn an_impossible_underlay_is_not_papered_over() {
+        assert_eq!(derived_overlay_mss(100, Some(600), None), 0);
+    }
+}
+
+/// Turn an interface's `bind_mac` / `bind_addresses` into what the data plane
+/// programs, or `None` when this port is not bound at all.
+///
+/// Refuses rather than skips: a MAC that does not parse is an operator who
+/// believes a port is locked down and is wrong about it, and that is the one
+/// mistake this feature must not make quietly.
+fn resolve_binding(iface: &InterfaceFile) -> anyhow::Result<Option<PortIdentity>> {
+    if iface.bind_mac.is_none() && iface.bind_addresses.is_empty() {
+        return Ok(None);
+    }
+    let mac = match &iface.bind_mac {
+        None => None,
+        Some(text) => {
+            let bytes: Vec<u8> = text
+                .split(':')
+                .map(|part| u8::from_str_radix(part, 16))
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|_| {
+                    anyhow::anyhow!("interface {:?}: {text:?} is not a MAC address", iface.name)
+                })?;
+            let mac: [u8; 6] = bytes.try_into().map_err(|_| {
+                anyhow::anyhow!(
+                    "interface {:?}: {text:?} is not a MAC address (six octets, colon-separated)",
+                    iface.name
+                )
+            })?;
+            Some(mac)
+        }
+    };
+    let mut v4 = Vec::new();
+    let mut v6 = Vec::new();
+    for text in &iface.bind_addresses {
+        match text.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(a)) => v4.push(a),
+            Ok(std::net::IpAddr::V6(a)) => v6.push(a),
+            Err(_) => anyhow::bail!("interface {:?}: {text:?} is not an IP address", iface.name),
+        }
+    }
+    Ok(Some(PortIdentity { mac, v4, v6 }))
+}
+
+#[cfg(test)]
+mod port_binding_tests {
+    use super::*;
+
+    fn iface(mac: Option<&str>, addrs: &[&str]) -> InterfaceFile {
+        InterfaceFile {
+            name: "tap0".into(),
+            bind_mac: mac.map(str::to_string),
+            bind_addresses: addrs.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_port_with_nothing_bound_is_left_alone() {
+        assert_eq!(resolve_binding(&iface(None, &[])).unwrap(), None);
+    }
+
+    /// Each family is enforced only when it was given an address.
+    ///
+    /// The mistake this prevents: binding a guest's IPv4 and thereby dropping
+    /// every IPv6 packet it sends, turning a security feature into an outage
+    /// that looks like a network fault.
+    #[test]
+    fn binding_one_family_does_not_silently_forbid_the_other() {
+        let only_v4 = resolve_binding(&iface(None, &["10.0.0.5"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            only_v4.flags() & velstra_common::PORT_ENFORCE_V4,
+            velstra_common::PORT_ENFORCE_V4
+        );
+        assert_eq!(only_v4.flags() & velstra_common::PORT_ENFORCE_V6, 0);
+
+        let both = resolve_binding(&iface(Some("52:54:00:12:34:56"), &["10.0.0.5", "fd00::5"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(both.mac, Some([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]));
+        assert_eq!(both.v4.len(), 1);
+        assert_eq!(both.v6.len(), 1);
+    }
+
+    /// A port may carry several addresses, because in practice it does.
+    #[test]
+    fn a_port_may_be_bound_to_more_than_one_address() {
+        let many = resolve_binding(&iface(None, &["10.0.0.5", "10.0.0.6", "192.0.2.9"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(many.v4.len(), 3);
+    }
+
+    /// Refused, not ignored: an operator who mistypes a MAC believes the port is
+    /// locked down. Silently leaving it open is the worst of the three options.
+    #[test]
+    fn a_binding_that_does_not_parse_is_refused() {
+        assert!(resolve_binding(&iface(Some("not-a-mac"), &[])).is_err());
+        assert!(resolve_binding(&iface(Some("52:54:00:12:34"), &[])).is_err());
+        assert!(resolve_binding(&iface(None, &["10.0.0.256"])).is_err());
+    }
+}
+
+/// The per-rule token bucket (C15 rate limits): the two claims the schema makes
+/// about `limit`/`burst` that decide whether a bucket is sized as the operator
+/// wrote it, and whether a limit that can never fire is refused.
+#[cfg(test)]
+mod rule_limit_tests {
+    use super::*;
+
+    fn policy_with(rule_body: &str) -> Result<RuntimeConfig> {
+        let toml = format!(
+            "default_action = \"drop\"\n\
+             [[policy]]\nid = 1\nname = \"wan\"\ndefault_action = \"drop\"\n\
+             [[policy.port_rule]]\nproto = \"tcp\"\nport = 443\n{rule_body}"
+        );
+        toml::from_str::<FileConfig>(&toml)
+            .expect("parses")
+            .resolve()
+    }
+
+    fn only_rule(cfg: &RuntimeConfig) -> &ResolvedRule {
+        let policy = cfg
+            .policies
+            .iter()
+            .find(|p| p.id == 1)
+            .expect("policy 1 resolved");
+        policy.port_rules.first().expect("one rule")
+    }
+
+    /// If this fails, a plain `limit = 100` compiles to a bucket of one packet:
+    /// the rule admits a single packet and then meters every following one, so a
+    /// service the operator meant to cap at 100 new flows a second is throttled
+    /// to a crawl and looks like packet loss.
+    #[test]
+    fn a_limit_with_no_burst_banks_one_seconds_worth_rather_than_one_packet() {
+        let cfg = policy_with("action = \"pass\"\nlimit = 100\n").expect("resolves");
+        assert_eq!(only_rule(&cfg).limit, Some((100, 100)));
+
+        // An explicit burst is honoured verbatim…
+        let cfg = policy_with("action = \"pass\"\nlimit = 100\nburst = 500\n").expect("resolves");
+        assert_eq!(only_rule(&cfg).limit, Some((100, 500)));
+
+        // …and an explicit `0` burst is the unset case, not a bucket that holds
+        // nothing (which would meter the very first packet).
+        let cfg = policy_with("action = \"pass\"\nlimit = 100\nburst = 0\n").expect("resolves");
+        assert_eq!(only_rule(&cfg).limit, Some((100, 100)));
+    }
+
+    /// If this fails, `limit` on a `drop` rule is accepted. The data plane only
+    /// meters traffic a rule admits, so the limit does nothing at all — and an
+    /// operator who wrote "drop, but at most 10/s" reads their config as
+    /// rate-limiting something it is in fact dropping outright, or vice versa.
+    #[test]
+    fn a_rate_limit_on_a_rule_that_admits_nothing_is_refused_not_ignored() {
+        for action in ["drop", "reject"] {
+            let err = policy_with(&format!("action = \"{action}\"\nlimit = 100\n"))
+                .expect_err("a limit on a non-pass action was accepted");
+            assert!(
+                err.to_string().contains("rate limit"),
+                "the refusal does not say what is wrong: {err}"
+            );
+        }
+        // `limit = 0` is "no limit", so it is not a limit on a drop rule at all.
+        assert!(policy_with("action = \"drop\"\nlimit = 0\n").is_ok());
+    }
+
+    /// If this fails, an `ipv6` rule scoped to `direction = "out"` is written
+    /// into the maps and never consulted — the egress hook is IPv4 only. An
+    /// operator blocking outbound IPv6 to a destination would believe it was
+    /// blocked while every packet went out.
+    #[test]
+    fn an_ipv6_rule_on_the_egress_hook_is_refused_because_nothing_would_consult_it() {
+        let err = policy_with("action = \"pass\"\nfamily = \"ipv6\"\ndirection = \"out\"\n")
+            .expect_err("an ipv6 egress rule was accepted");
+        assert!(
+            err.to_string().contains("IPv4 only"),
+            "the refusal does not say what is wrong: {err}"
+        );
+        // The three neighbouring combinations stay legal.
+        assert!(policy_with("action = \"pass\"\nfamily = \"ipv6\"\ndirection = \"in\"\n").is_ok());
+        assert!(policy_with("action = \"pass\"\nfamily = \"ipv4\"\ndirection = \"out\"\n").is_ok());
+        assert!(policy_with("action = \"pass\"\ndirection = \"out\"\n").is_ok());
     }
 }

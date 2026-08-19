@@ -16,6 +16,7 @@
 //! top [limit]       → hosts ranked by the traffic volume attributed to them
 //! cgnat <ip>        → the WAN port block an internal address holds
 //! blocks            → sources blocked at run time, and for how much longer
+//! flowspec          → the BGP FlowSpec rules in force, and what was refused
 //! block <cidr> [s]  → block a source for a while (roadmap C11)
 //! unblock <cidr>    → lift one early (`all` lifts every one)
 //! ```
@@ -83,7 +84,10 @@ pub async fn serve(path: PathBuf, firewall: Arc<Mutex<Firewall>>) {
         let _ = std::fs::remove_file(&path);
     }
     let listener = match UnixListener::bind(&path) {
-        Ok(l) => l,
+        Ok(l) => {
+            pin_socket_permissions(&path);
+            l
+        }
         Err(e) => {
             // Diagnostics must never take the data plane with them.
             warn!("query socket {} unavailable: {e}", path.display());
@@ -197,6 +201,45 @@ async fn respond(line: &str, firewall: &Arc<Mutex<Firewall>>) -> String {
                 out
             }
         }
+        // A3. Both halves, always: a feed that is being consumed and enforcing
+        // nothing looks exactly like one that is not being consumed, and the
+        // difference is what somebody needs during an attack.
+        "flowspec" => {
+            let fw = firewall.lock().await;
+            let (rules, refused) = fw.flowspec_state();
+            let mut out = String::new();
+            if rules.is_empty() {
+                out.push_str("no flowspec rules in force\n");
+            } else {
+                out.push_str(&format!("{} rule(s) in force\n", rules.len()));
+                for rule in rules {
+                    let end = match (rule.src, rule.dst) {
+                        (Some(src), _) => format!("from {src}"),
+                        (_, Some(dst)) => format!("to {dst}"),
+                        _ => "from anywhere".to_string(),
+                    };
+                    let port = if rule.key.port == 0 {
+                        String::new()
+                    } else {
+                        format!("/{}", rule.key.port)
+                    };
+                    out.push_str(&format!(
+                        "  {:?} proto {}{} {}\n",
+                        rule.action, rule.key.proto, port, end
+                    ));
+                }
+            }
+            if !refused.is_empty() {
+                out.push_str(&format!(
+                    "{} advertised rule(s) NOT enforced\n",
+                    refused.len()
+                ));
+                for (spec, why) in refused {
+                    out.push_str(&format!("  [{spec}]: {why}\n"));
+                }
+            }
+            out
+        }
         "block" => {
             let Some(cidr) = args.first() else {
                 return "usage: block <cidr> [seconds]\n".to_string();
@@ -274,5 +317,48 @@ mod tests {
         // Garbage means "you get the default", not an error page.
         assert_eq!(parse_limit(Some("lots")), None);
         assert_eq!(parse_limit(Some("-3")), None);
+    }
+}
+
+/// Pin the socket's permissions instead of inheriting the process umask.
+///
+/// `bind` creates the file with `0666 & !umask`, so what a caller may do with
+/// this socket depended on how the service manager happened to launch us — a
+/// `umask 0` override (not exotic under systemd drop-ins) left it connectable
+/// by every local user, and behind it sit the firewall's internals. Root-only,
+/// explicitly: the deployment that wants a broader audience grants it through
+/// group ownership on the parent directory, which is a decision made where the
+/// users are defined rather than defaulted here.
+fn pin_socket_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        // The socket still works for root; saying so beats failing the agent.
+        log::warn!("could not pin permissions on {}: {e}", path.display());
+    }
+}
+
+#[cfg(test)]
+mod socket_permissions {
+    use std::os::unix::fs::PermissionsExt;
+
+    /// The socket's mode is this code's decision, not the launcher's.
+    ///
+    /// Whatever umask this test process happens to run under, the pinned mode
+    /// comes out 0600 — which is the whole point: before the pin, the answer to
+    /// "who may talk to the firewall's control socket" was whatever
+    /// `0666 & !umask` came to under the service manager of the day.
+    #[tokio::test]
+    async fn the_socket_mode_is_pinned_not_inherited() {
+        let dir = std::env::temp_dir().join(format!("velstra-sock-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("query.sock");
+        let _listener = tokio::net::UnixListener::bind(&path).unwrap();
+        super::pin_socket_permissions(&path);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            mode, 0o600,
+            "the control socket's permissions are back to depending on the umask"
+        );
     }
 }

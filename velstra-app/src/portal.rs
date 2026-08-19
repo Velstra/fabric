@@ -80,7 +80,10 @@ pub async fn serve(path: PathBuf, firewall: Arc<Mutex<Firewall>>) {
         let _ = std::fs::remove_file(&path);
     }
     let listener = match UnixListener::bind(&path) {
-        Ok(l) => l,
+        Ok(l) => {
+            pin_socket_permissions(&path);
+            l
+        }
         Err(e) => {
             warn!("portal socket {} unavailable: {e}", path.display());
             return;
@@ -378,6 +381,14 @@ fn render_policies(policies: &[PolicyId]) -> String {
     } else {
         let ids: Vec<String> = policies.iter().map(|id| id.to_string()).collect();
         format!("policies {}", ids.join(", "))
+    }
+}
+
+/// See `query::pin_socket_permissions` — same reasoning, same value.
+fn pin_socket_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        log::warn!("could not pin permissions on {}: {e}", path.display());
     }
 }
 

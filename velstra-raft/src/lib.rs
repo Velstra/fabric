@@ -302,6 +302,7 @@ mod tests {
                 tap: "tapA".into(),
                 ip: None,
                 policy: None,
+                mac: None,
             })
             .await
             .unwrap();
@@ -409,6 +410,7 @@ mod tests {
                 tap: "tapA".into(),
                 ip: None,
                 policy: None,
+                mac: None,
             })
             .await
             .unwrap();

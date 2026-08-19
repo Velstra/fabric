@@ -308,6 +308,10 @@ enum OrchAction {
         /// Security-group policy id (M4); omitted ⇒ defaults to the network VNI.
         #[arg(long)]
         policy: Option<u32>,
+        /// The workload's hardware address. Omitted ⇒ derived from the address,
+        /// which is right unless something above has already chosen one.
+        #[arg(long)]
+        mac: Option<String>,
     },
     /// Remove a port by id.
     RemovePort {
@@ -1016,6 +1020,7 @@ fn proto_rule_from_config(r: &ConfigPortRule) -> PortRule {
         dst: r.dst.clone().unwrap_or_default(),
         limit: r.limit.unwrap_or(0),
         burst: r.burst.unwrap_or(0),
+        src_mac: r.src_mac.clone().unwrap_or_default(),
     }
 }
 
@@ -1286,6 +1291,7 @@ impl VelstraOrchestrator for OrchestratorSvc {
                 tap: req.tap,
                 ip: (!req.ip.is_empty()).then_some(req.ip),
                 policy: req.policy,
+                mac: req.mac,
             },
         )
         .await?;
@@ -2435,6 +2441,7 @@ async fn orch(args: OrchArgs) -> Result<()> {
             tap,
             ip,
             policy,
+            mac,
         } => {
             let port = client
                 .create_port(CreatePortRequest {
@@ -2443,6 +2450,7 @@ async fn orch(args: OrchArgs) -> Result<()> {
                     tap,
                     ip: ip.unwrap_or_default(),
                     policy,
+                    mac,
                 })
                 .await?
                 .into_inner();
@@ -2846,6 +2854,7 @@ fn parse_cli_rule(spec: &str, action: Action) -> Result<PortRule> {
         .parse()
         .with_context(|| format!("bad port in rule {spec:?}"))?;
     Ok(PortRule {
+        src_mac: String::new(),
         proto: proto as i32,
         port: port as u32,
         // The one-line rule spec names a protocol and a port; there is no place

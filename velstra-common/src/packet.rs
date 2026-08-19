@@ -956,3 +956,103 @@ mod tests {
         assert_eq!(m.blocklist_key(), lpm_key_addr([192, 168, 1, 9]));
     }
 }
+
+/// What a tenant port is allowed to *be*.
+///
+/// uRPF (source validation) already asks whether a source address is routable
+/// back out of the interface it arrived on. That is a different question from
+/// the one multi-tenancy needs answered: two guests on the same subnet both pass
+/// uRPF while impersonating each other, because both addresses are perfectly
+/// routable there. This binds a port to the identity it was given.
+///
+/// Keyed by **ingress ifindex** — the tap — because that is the one thing a
+/// guest cannot forge. Everything else in the frame is under its control.
+///
+/// The MAC lives here rather than in a second map so the common case is one
+/// lookup: a frame whose port has no binding misses once and pays nothing more.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct PortBinding {
+    /// The only source hardware address this port may use.
+    pub mac: [u8; 6],
+    /// Which halves are enforced. A port may have a MAC binding and no address
+    /// binding — during a migration, or before IPAM has assigned one — and
+    /// enforcing addresses that were never assigned would black-hole the guest
+    /// rather than protect anybody from it.
+    pub flags: u8,
+    /// Explicit padding, always zero: a hash map compares the whole value.
+    pub _pad: u8,
+}
+
+/// Enforce the source MAC on this port.
+pub const PORT_ENFORCE_MAC: u8 = 1 << 0;
+/// Enforce the source IPv4 against [`PortAddr4`].
+pub const PORT_ENFORCE_V4: u8 = 1 << 1;
+/// Enforce the source IPv6 against [`PortAddr6`].
+pub const PORT_ENFORCE_V6: u8 = 1 << 2;
+
+impl PortBinding {
+    #[inline]
+    pub const fn new(mac: [u8; 6], flags: u8) -> Self {
+        Self {
+            mac,
+            flags,
+            _pad: 0,
+        }
+    }
+
+    #[inline]
+    pub const fn enforces(&self, what: u8) -> bool {
+        self.flags & what != 0
+    }
+}
+
+/// An address a port is allowed to send from: `(ifindex, address)`.
+///
+/// A set rather than a single value because one port legitimately has several —
+/// an IPv4, a link-local, a floating address that was just attached — and a
+/// binding that held only one would break the moment a second was assigned.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct PortAddr4 {
+    pub ifindex: u32,
+    /// Network byte order, exactly as it sits in the header.
+    pub addr: u32,
+}
+
+impl PortAddr4 {
+    #[inline]
+    pub const fn new(ifindex: u32, addr: u32) -> Self {
+        Self { ifindex, addr }
+    }
+}
+
+/// The IPv6 half of [`PortAddr4`].
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct PortAddr6 {
+    pub ifindex: u32,
+    /// Explicit padding, always zero, so the 16-byte address is aligned and the
+    /// key has no hole in it to compare.
+    pub _pad: [u8; 4],
+    pub addr: [u8; 16],
+}
+
+impl PortAddr6 {
+    #[inline]
+    pub const fn new(ifindex: u32, addr: [u8; 16]) -> Self {
+        Self {
+            ifindex,
+            _pad: [0; 4],
+            addr,
+        }
+    }
+}
+
+// SAFETY: `#[repr(C)]`, integer/byte fields, padding zeroed — POD.
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for PortBinding {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for PortAddr4 {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for PortAddr6 {}

@@ -252,6 +252,10 @@ pub struct Port {
     pub mac: [u8; 6],
     /// The tap/veth interface name on the host that carries this port.
     pub tap: String,
+    /// What this port may send, in megabits per second (roadmap B13). `None` for
+    /// no ceiling — which is what a port nobody has given one has, and what the
+    /// data plane reads an absent map entry as.
+    pub rate_limit_mbit: Option<u32>,
 }
 
 impl Port {
@@ -461,12 +465,17 @@ pub struct Topology {
 
 /// Derive a locally-administered, deterministic MAC for an inner IPv4: `02:00`
 /// then the four address octets. Unique per address, stable across recomputes.
-fn mac_for(ip: Ipv4Addr) -> [u8; 6] {
+///
+/// Public because it is now part of the contract rather than an internal
+/// detail: a caller may supply a MAC instead, and the only way to tell a
+/// supplied one from a derived one — which is what decides whether it has to be
+/// written down — is to ask what would have been derived.
+pub fn mac_for(ip: Ipv4Addr) -> [u8; 6] {
     let o = ip.octets();
     [0x02, 0x00, o[0], o[1], o[2], o[3]]
 }
 
-fn fmt_mac(mac: [u8; 6]) -> String {
+pub fn fmt_mac(mac: [u8; 6]) -> String {
     let [a, b, c, d, e, f] = mac;
     format!("{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}")
 }
@@ -610,15 +619,34 @@ impl Topology {
     /// name, or the (vanishingly rare) case of its derived `policy_id` colliding
     /// with an already-registered group's — mirroring the "reject rather than
     /// silently overwrite" stance of [`add_network`](Self::add_network).
+    /// Declare a security group. A name that already exists is **replaced**,
+    /// not refused.
+    ///
+    /// It used to refuse, and that made this API create-only: the rules of a
+    /// group could be stated once and never restated. Anything declarative above
+    /// it then has no way to say "these are the rules now" — and a control plane
+    /// that resolves group membership into addresses has to say exactly that
+    /// every time a member gains or loses one. The alternative it was left with
+    /// is unbind, remove, add, rebind: four round trips, and a window in the
+    /// middle where the port falls back to its network's default policy.
+    ///
+    /// Replacing is safe here for one specific reason: a group's `policy_id` is
+    /// derived from its **name**, so restating the rules under the same name
+    /// keeps the same id. Ports stay bound, the data plane sees new rules under
+    /// the id it is already using, and there is no window at all.
+    ///
+    /// Two *different* names that hash to one id is still a refusal — that is a
+    /// collision, not a restatement.
     pub fn add_security_group(&mut self, sg: SecurityGroup) -> Result<()> {
         if sg.name.is_empty() {
             bail!("security group name must not be empty");
         }
-        if self.security_groups.contains_key(&sg.name) {
-            bail!("security group {:?} already exists", sg.name);
-        }
         let pid = sg.policy_id();
-        if let Some(existing) = self.security_groups.values().find(|g| g.policy_id() == pid) {
+        if let Some(existing) = self
+            .security_groups
+            .values()
+            .find(|g| g.policy_id() == pid && g.name != sg.name)
+        {
             bail!(
                 "security group {:?} hashes to the same policy_id {pid} as {:?}; rename one",
                 sg.name,
@@ -840,6 +868,14 @@ impl Topology {
 
     /// Create a port on `vni`/`host`, allocating an IP (the next free address in
     /// the network's subnet unless `requested_ip` is given) and a MAC.
+    /// `requested_mac` is for a caller that has already chosen the workload's
+    /// hardware address. `None` derives one from the address, which is what
+    /// every caller got before the parameter existed.
+    ///
+    /// Two allocators for one identity is not a disagreement that announces
+    /// itself: port security matches the source MAC, so a workload using one
+    /// address while the data plane expects another has every frame dropped and
+    /// looks like a network that simply does not work.
     pub fn create_port(
         &mut self,
         vni: u32,
@@ -847,6 +883,7 @@ impl Topology {
         tap: &str,
         requested_ip: Option<Ipv4Addr>,
         policy: Option<u32>,
+        requested_mac: Option<[u8; 6]>,
     ) -> Result<Port> {
         if !self.networks.contains_key(&vni) {
             bail!("unknown network vni {vni}");
@@ -854,12 +891,32 @@ impl Topology {
         if !self.hosts.contains_key(host) {
             bail!("unknown host {host:?}");
         }
-        // A (host, tap) pair maps to exactly one host interface. Two ports bound
-        // to the same tap would resolve to the same ifindex on the agent, where
-        // the second silently overwrites the first's IFACE_POLICY/IFACE_VNI — one
-        // port left unfirewalled/mis-VNI'd with no error. Reject it here.
-        if self.ports.iter().any(|p| p.host == host && p.tap == tap) {
-            bail!("tap {tap:?} on host {host:?} is already bound to another port");
+        // A (host, tap) pair maps to exactly one host interface. Two *different*
+        // ports bound to the same tap would resolve to the same ifindex on the
+        // agent, where the second silently overwrites the first's
+        // IFACE_POLICY/IFACE_VNI — one port left unfirewalled or mis-VNI'd, with
+        // no error anywhere.
+        //
+        // Restating the *same* port is a different thing entirely, and it used
+        // to be refused along with the conflict. A declarative control plane
+        // above this says what should be true on every pass — that is what makes
+        // it recover from a crash without remembering anything — so the second
+        // pass failed on a port the first had just created correctly. Returning
+        // what is already there is the answer; a genuine conflict still is one.
+        if let Some(existing) = self.ports.iter().find(|p| p.host == host && p.tap == tap) {
+            let same_segment = existing.vni == vni;
+            let same_address = requested_ip.is_none_or(|ip| existing.ip == ip);
+            let same_mac = requested_mac.is_none_or(|mac| existing.mac == mac);
+            if same_segment && same_address && same_mac {
+                return Ok(existing.clone());
+            }
+            bail!(
+                "tap {tap:?} on host {host:?} carries {} on vni {} at {}; this asks for a \
+                 different port on the same device",
+                existing.id,
+                existing.vni,
+                existing.ip
+            );
         }
         let ip = match requested_ip {
             Some(ip) => {
@@ -873,17 +930,60 @@ impl Topology {
             }
             None => self.alloc_ip(vni)?,
         };
+        let mac = match requested_mac {
+            Some(mac) => {
+                // A multicast bit in a source address is not a workload's
+                // address at all, and the data plane would refuse every frame
+                // from it. Refused here, where there is somebody to tell.
+                if mac[0] & 0x01 != 0 {
+                    bail!(
+                        "{} is a group address; a port needs a unicast one",
+                        fmt_mac(mac)
+                    );
+                }
+                // Two ports on one segment answering to one address is an
+                // outage for both, and neither of them says why. Cheap to
+                // check, and the only place that can.
+                if self.ports.iter().any(|p| p.vni == vni && p.mac == mac) {
+                    bail!("{} is already in use on network {vni}", fmt_mac(mac));
+                }
+                mac
+            }
+            None => mac_for(ip),
+        };
         let port = Port {
             id: format!("port-{vni}-{ip}"),
             vni,
             policy,
             host: host.to_string(),
             ip,
-            mac: mac_for(ip),
+            mac,
             tap: tap.to_string(),
+            // Set afterwards by `limit_port`: creating a port and deciding what
+            // it may send are separate asks, and threading a ceiling through
+            // every caller of `add_port` would make every one of them state a
+            // policy it has no opinion about.
+            rate_limit_mbit: None,
         };
         self.ports.push(port.clone());
         Ok(port)
+    }
+
+    /// Give a port a send ceiling in megabits per second, or take it away with
+    /// `None` (roadmap B13). Returns whether the port existed.
+    ///
+    /// A ceiling of `0` is taken as no ceiling rather than as "may send
+    /// nothing": zero is what an unset number looks like coming from a wire
+    /// format, and a port that silently stopped passing traffic because a field
+    /// defaulted is the worst reading of it.
+    pub fn limit_port(&mut self, id: &str, mbit: Option<u32>) -> bool {
+        match self.ports.iter_mut().find(|p| p.id == id) {
+            Some(port) => {
+                port.rate_limit_mbit = mbit.filter(|m| *m > 0);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Remove a port by id, releasing any IPAM addresses bound to it back to
@@ -1465,6 +1565,45 @@ impl Topology {
             if port.host == host_id {
                 cfg.interfaces.push(InterfaceFile {
                     mss: None,
+                    // B13: the port's own send ceiling, carried straight
+                    // through. Unset on a port nobody gave one.
+                    rate_limit_mbit: port.rate_limit_mbit,
+                    // Port security (B12), on by default for every tenant tap.
+                    //
+                    // Not a knob, because the orchestrator already knows the
+                    // answer: it allocated this port's MAC and address itself.
+                    // Asking an operator to repeat them would be asking for the
+                    // one thing that must not be got wrong, and leaving it off
+                    // by default would mean a guest can send as its neighbour
+                    // until somebody remembers to turn it on. uRPF does not
+                    // cover this: two guests on one subnet both pass it while
+                    // impersonating each other.
+                    bind_mac: Some(
+                        port.mac
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<Vec<_>>()
+                            .join(":"),
+                    ),
+                    bind_addresses: {
+                        // The port's own address, plus any floating address
+                        // associated with it — a guest reached through a
+                        // floating IP answers *from* it, so a binding that
+                        // listed only the fixed address would drop every reply
+                        // and look like the floating IP simply not working.
+                        let mut addrs = vec![port.ip.to_string()];
+                        addrs.extend(
+                            self.floating_ips
+                                .values()
+                                .filter(|fip| {
+                                    fip.association
+                                        .as_ref()
+                                        .is_some_and(|a| a.port_id == port.id)
+                                })
+                                .map(|fip| fip.addr.to_string()),
+                        );
+                        addrs
+                    },
                     name: port.tap.clone(),
                     // Decoupled from the VNI (M4): a port's security-group policy
                     // if set, else the VNI as the default single-tenant policy id.
@@ -1741,6 +1880,13 @@ pub struct PortRec {
     pub ip: [u8; 4],
     pub mac: [u8; 6],
     pub tap: String,
+    /// The port's send ceiling (roadmap B13). `#[serde(default)]` so a snapshot
+    /// written before this field existed restores as "no ceiling" rather than
+    /// refusing to load — which is the same reading a fresh port has, and the
+    /// only safe one: a snapshot that failed to parse would take the whole
+    /// fabric's IPAM with it.
+    #[serde(default)]
+    pub rate_limit_mbit: Option<u32>,
 }
 
 impl Topology {
@@ -1783,6 +1929,7 @@ impl Topology {
                     ip: p.ip.octets(),
                     mac: p.mac,
                     tap: p.tap.clone(),
+                    rate_limit_mbit: p.rate_limit_mbit,
                 })
                 .collect(),
             security_groups: self
@@ -1938,6 +2085,7 @@ impl Topology {
                 ip: Ipv4Addr::from(p.ip),
                 mac: p.mac,
                 tap: p.tap.clone(),
+                rate_limit_mbit: p.rate_limit_mbit,
             });
         }
         for g in &snap.security_groups {
@@ -2087,16 +2235,49 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_tap_binding() {
+    fn a_tap_carries_one_port_and_restating_it_is_not_a_conflict() {
         let mut t = Topology::new();
         t.add_host(host("h1", "10.0.0.1", 1));
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
-        t.create_port(100, "h1", "tap0", None, None).unwrap();
-        // Same (host, tap) → rejected, even on a different IP/allocation.
-        assert!(t.create_port(100, "h1", "tap0", None, None).is_err());
+        let first = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
+
+        // Restating the same port returns what is already there. A control
+        // plane that says what should be true on every pass — which is what lets
+        // it recover from a crash without remembering anything — would otherwise
+        // fail on the second pass over a port the first created correctly.
+        let again = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
+        assert_eq!(again.id, first.id);
+        assert_eq!(
+            again.ip, first.ip,
+            "a restatement allocated a second address"
+        );
+        assert_eq!(t.ports().len(), 1, "a restatement made a second port");
+
+        // A *different* port on the same device is still refused: both would
+        // resolve to one ifindex on the agent, and the second would silently
+        // overwrite the first's policy and VNI.
+        let conflict = t.create_port(
+            100,
+            "h1",
+            "tap0",
+            Some("192.168.50.99".parse().unwrap()),
+            None,
+            None,
+        );
+        assert!(conflict.is_err(), "one tap took two ports");
+        assert!(
+            conflict.unwrap_err().to_string().contains("different port"),
+            "the refusal does not say what is wrong"
+        );
+
+        // Another segment on the same device is a different port too.
+        t.add_network(network(200, "green", "192.168.60.0/24"))
+            .unwrap();
+        assert!(t.create_port(200, "h1", "tap0", None, None, None).is_err());
+
         // A different tap on the same host is fine.
-        assert!(t.create_port(100, "h1", "tap1", None, None).is_ok());
+        assert!(t.create_port(100, "h1", "tap1", None, None, None).is_ok());
     }
 
     #[test]
@@ -2105,7 +2286,7 @@ mod tests {
         t.add_host(host("h1", "10.0.0.1", 1));
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
-        let p = t.create_port(100, "h1", "tap0", None, None).unwrap();
+        let p = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
         // Both are blocked while the port exists.
         assert!(t.remove_host("h1").is_err());
         assert!(t.remove_network(100).is_err());
@@ -2124,8 +2305,8 @@ mod tests {
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
 
-        let p1 = t.create_port(100, "h1", "tap0", None, None).unwrap();
-        let p2 = t.create_port(100, "h1", "tap1", None, None).unwrap();
+        let p1 = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
+        let p2 = t.create_port(100, "h1", "tap1", None, None, None).unwrap();
         assert_eq!(p1.ip, "192.168.50.1".parse::<Ipv4Addr>().unwrap());
         assert_eq!(p2.ip, "192.168.50.2".parse::<Ipv4Addr>().unwrap());
         // MAC is locally-administered + the address octets.
@@ -2139,10 +2320,11 @@ mod tests {
                 "tap2",
                 Some("192.168.50.9".parse::<Ipv4Addr>().unwrap()),
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(p3.ip, "192.168.50.9".parse::<Ipv4Addr>().unwrap());
-        let p4 = t.create_port(100, "h1", "tap3", None, None).unwrap();
+        let p4 = t.create_port(100, "h1", "tap3", None, None, None).unwrap();
         assert_eq!(p4.ip, "192.168.50.3".parse::<Ipv4Addr>().unwrap()); // skips .9
     }
 
@@ -2158,6 +2340,7 @@ mod tests {
             "tap0",
             Some("192.168.50.5".parse::<Ipv4Addr>().unwrap()),
             None,
+            None,
         )
         .unwrap();
         assert!(
@@ -2166,6 +2349,7 @@ mod tests {
                 "h1",
                 "tap1",
                 Some("192.168.50.5".parse::<Ipv4Addr>().unwrap()),
+                None,
                 None,
             )
             .is_err()
@@ -2177,6 +2361,7 @@ mod tests {
                 "tap2",
                 Some("10.0.0.5".parse::<Ipv4Addr>().unwrap()),
                 None,
+                None,
             )
             .is_err()
         );
@@ -2186,10 +2371,13 @@ mod tests {
     fn rejects_unknown_network_or_host_and_bad_vni() {
         let mut t = Topology::new();
         t.add_host(host("h1", "10.0.0.1", 1));
-        assert!(t.create_port(100, "h1", "tap0", None, None).is_err()); // no network
+        assert!(t.create_port(100, "h1", "tap0", None, None, None).is_err()); // no network
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
-        assert!(t.create_port(100, "ghost", "tap0", None, None).is_err()); // no host
+        assert!(
+            t.create_port(100, "ghost", "tap0", None, None, None)
+                .is_err()
+        ); // no host
         assert!(t.add_network(network(0, "bad", "10.0.0.0/24")).is_err()); // vni 0
     }
 
@@ -2221,8 +2409,8 @@ mod tests {
         t.add_network(network(5000, "blue", "192.168.100.0/24"))
             .unwrap();
 
-        let pa = t.create_port(5000, "h1", "tapA", None, None).unwrap(); // .1 on h1
-        let pb = t.create_port(5000, "h2", "tapB", None, None).unwrap(); // .2 on h2
+        let pa = t.create_port(5000, "h1", "tapA", None, None, None).unwrap(); // .1 on h1
+        let pb = t.create_port(5000, "h2", "tapB", None, None, None).unwrap(); // .2 on h2
 
         // --- h1's derived config ---
         let cfg = t.derive("h1").unwrap();
@@ -2270,8 +2458,8 @@ mod tests {
         t.add_host(host("h3", "10.10.0.3", 0x33));
         t.add_network(network(5000, "blue", "192.168.100.0/24"))
             .unwrap();
-        t.create_port(5000, "h1", "tapA", None, None).unwrap();
-        t.create_port(5000, "h2", "tapB", None, None).unwrap();
+        t.create_port(5000, "h1", "tapA", None, None, None).unwrap();
+        t.create_port(5000, "h2", "tapB", None, None, None).unwrap();
 
         // h3 has no port on network 5000 → it gets no policy, no tunnels.
         let cfg3 = t.derive("h3").unwrap().resolve().unwrap();
@@ -2289,7 +2477,7 @@ mod tests {
         t.add_host(host("h1", "10.10.0.1", 0x11));
         t.add_network(network(5000, "blue", "192.168.100.0/24"))
             .unwrap();
-        let p = t.create_port(5000, "h1", "tapA", None, None).unwrap();
+        let p = t.create_port(5000, "h1", "tapA", None, None, None).unwrap();
 
         let snap = t.to_snapshot();
         let restored = Topology::from_snapshot(&snap);
@@ -2315,8 +2503,8 @@ mod tests {
         t.add_host(host("h2", "10.10.0.2", 0x22));
         t.add_network(network(5000, "blue", "192.168.100.0/24"))
             .unwrap();
-        t.create_port(5000, "h1", "tapA", None, None).unwrap();
-        let pb = t.create_port(5000, "h2", "tapB", None, None).unwrap();
+        t.create_port(5000, "h1", "tapA", None, None, None).unwrap();
+        let pb = t.create_port(5000, "h2", "tapB", None, None, None).unwrap();
 
         assert_eq!(t.derive("h1").unwrap().resolve().unwrap().tunnels.len(), 1);
         assert!(t.remove_port(&pb.id));
@@ -2335,8 +2523,8 @@ mod tests {
         t.add_network(network(5000, "blue", "192.168.100.0/24"))
             .unwrap();
         // pa lives on h1; pc gives h3 a port on the network so it tunnels to pa.
-        let pa = t.create_port(5000, "h1", "tapA", None, None).unwrap();
-        t.create_port(5000, "h3", "tapC", None, None).unwrap();
+        let pa = t.create_port(5000, "h1", "tapA", None, None, None).unwrap();
+        t.create_port(5000, "h3", "tapC", None, None, None).unwrap();
 
         // Before: h3 tunnels to pa via h1's VTEP.
         let h3 = t.derive("h3").unwrap().resolve().unwrap();
@@ -2380,7 +2568,9 @@ mod tests {
             .unwrap();
 
         // Explicit security-group policy 42, on VNI 5000.
-        let p = t.create_port(5000, "h1", "tapSG", None, Some(42)).unwrap();
+        let p = t
+            .create_port(5000, "h1", "tapSG", None, Some(42), None)
+            .unwrap();
         assert_eq!(p.effective_policy(), 42);
 
         let cfg = t.derive("h1").unwrap();
@@ -2396,7 +2586,9 @@ mod tests {
         );
 
         // The default (policy = None) still collapses to the VNI.
-        let d = t.create_port(5000, "h1", "tapDef", None, None).unwrap();
+        let d = t
+            .create_port(5000, "h1", "tapDef", None, None, None)
+            .unwrap();
         assert_eq!(d.effective_policy(), 5000);
 
         // Survives a snapshot round-trip.
@@ -2465,11 +2657,18 @@ mod tests {
     }
 
     #[test]
-    fn add_security_group_rejects_empty_and_duplicate_names() {
+    fn add_security_group_refuses_an_empty_name_and_restates_an_existing_one() {
         let mut t = Topology::new();
         assert!(t.add_security_group(sg("", vec![])).is_err()); // empty name
         t.add_security_group(sg("web", vec![])).unwrap();
-        assert!(t.add_security_group(sg("web", vec![])).is_err()); // duplicate
+        // Restating is how a declarative control plane keeps a group current;
+        // refusing it left "these are the rules now" inexpressible.
+        t.add_security_group(sg("web", vec![])).unwrap();
+        assert_eq!(
+            t.security_groups().count(),
+            1,
+            "a restatement made a second group"
+        );
         // A distinct name is accepted and both are retrievable.
         t.add_security_group(sg("db", vec![])).unwrap();
         assert!(t.security_group("web").is_some());
@@ -2484,7 +2683,7 @@ mod tests {
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         t.add_security_group(sg("web", vec![])).unwrap();
-        let p = t.create_port(100, "h1", "tap0", None, None).unwrap();
+        let p = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
         assert_eq!(p.effective_policy(), 100); // defaults to the VNI
 
         // Bind → the port's policy is the group's deterministic id.
@@ -2521,7 +2720,7 @@ mod tests {
         ))
         .unwrap();
 
-        let p = t.create_port(5000, "h1", "tapW", None, None).unwrap();
+        let p = t.create_port(5000, "h1", "tapW", None, None, None).unwrap();
         t.set_port_security_group(&p.id, Some("web")).unwrap();
         let pid = security_group_policy_id("web");
 
@@ -2560,7 +2759,7 @@ mod tests {
             .unwrap();
         t.add_security_group(sg("web", vec![])).unwrap();
         for tap in ["tapA", "tapB", "tapC"] {
-            let p = t.create_port(5000, "h1", tap, None, None).unwrap();
+            let p = t.create_port(5000, "h1", tap, None, None, None).unwrap();
             t.set_port_security_group(&p.id, Some("web")).unwrap();
         }
         let pid = security_group_policy_id("web");
@@ -2579,7 +2778,7 @@ mod tests {
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         t.add_security_group(sg("web", vec![])).unwrap();
-        let p = t.create_port(100, "h1", "tap0", None, None).unwrap();
+        let p = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
         t.set_port_security_group(&p.id, Some("web")).unwrap();
 
         // Bound → removal refused.
@@ -2602,7 +2801,7 @@ mod tests {
         let mut g = sg("web", vec![rule(ProtoName::Tcp, 443, ActionName::Pass)]);
         g.blocklist = vec!["203.0.113.0/24".to_string()];
         t.add_security_group(g.clone()).unwrap();
-        let p = t.create_port(5000, "h1", "tapW", None, None).unwrap();
+        let p = t.create_port(5000, "h1", "tapW", None, None, None).unwrap();
         t.set_port_security_group(&p.id, Some("web")).unwrap();
 
         let restored = Topology::from_snapshot(&t.to_snapshot());
@@ -2746,7 +2945,7 @@ mod tests {
         t.add_subnet(s4).unwrap();
         t.add_subnet(s6).unwrap();
 
-        let p = t.create_port(100, "h1", "tap0", None, None).unwrap();
+        let p = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
 
         // Bind a v4 and a v6 address → a dual-stack port.
         let a4 = t.bind_port_subnet(&p.id, "s4", None).unwrap();
@@ -2779,7 +2978,7 @@ mod tests {
             .unwrap();
         t.add_subnet(v4_subnet("s4", 100, "192.168.50.0/24"))
             .unwrap();
-        let p = t.create_port(100, "h1", "tap0", None, None).unwrap();
+        let p = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
         let a = t.bind_port_subnet(&p.id, "s4", None).unwrap();
 
         // Unbind only succeeds for the owning port; a wrong owner is a no-op.
@@ -2851,7 +3050,7 @@ mod tests {
         t.add_subnet(s4.clone()).unwrap();
         t.add_subnet(s6).unwrap();
 
-        let p = t.create_port(100, "h1", "tap0", None, None).unwrap();
+        let p = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
         let a4 = t.bind_port_subnet(&p.id, "s4", None).unwrap(); // .10 (pool start)
         let a6 = t.bind_port_subnet(&p.id, "s6", None).unwrap(); // ::2
         let reserved = t.allocate("s4", Some(ip("192.168.50.15"))).unwrap();
@@ -2957,6 +3156,7 @@ mod tests {
                 "tap0",
                 Some("192.168.50.10".parse().unwrap()),
                 None,
+                None,
             )
             .unwrap();
         let f = t.allocate_floating_ip("ext", None).unwrap(); // .2
@@ -3022,7 +3222,7 @@ mod tests {
         t.add_subnet(v4_subnet("ext", 100, "203.0.113.0/29"))
             .unwrap();
 
-        let p = t.create_port(100, "h1", "tap0", None, None).unwrap();
+        let p = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
         let bound = t.bind_port_subnet(&p.id, "tenant", None).unwrap(); // .1
         let f = t.allocate_floating_ip("ext", None).unwrap();
 
@@ -3046,6 +3246,7 @@ mod tests {
                 "h1",
                 "tap0",
                 Some("192.168.50.10".parse().unwrap()),
+                None,
                 None,
             )
             .unwrap();
@@ -3079,6 +3280,7 @@ mod tests {
                 "tap0",
                 Some("192.168.50.10".parse().unwrap()),
                 None,
+                None,
             )
             .unwrap();
         let f = t.allocate_floating_ip("ext", None).unwrap();
@@ -3109,6 +3311,7 @@ mod tests {
                 "h1",
                 "tap0",
                 Some("192.168.50.10".parse().unwrap()),
+                None,
                 None,
             )
             .unwrap();
@@ -3157,8 +3360,8 @@ mod tests {
         t.add_host(host("h1", "10.0.0.1", 0x11));
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
-        let a = t.create_port(100, "h1", "tap0", None, None).unwrap();
-        let b = t.create_port(100, "h1", "tap1", None, None).unwrap();
+        let a = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
+        let b = t.create_port(100, "h1", "tap1", None, None, None).unwrap();
         (t, a.id, b.id)
     }
 
@@ -3210,7 +3413,7 @@ mod tests {
         // A member on another network is a tenant-isolation break, not a quirk.
         t.add_network(network(200, "green", "192.168.60.0/24"))
             .unwrap();
-        let other = t.create_port(200, "h1", "tap9", None, None).unwrap();
+        let other = t.create_port(200, "h1", "tap9", None, None, None).unwrap();
         let err = t
             .add_load_balancer(lb("cross", "192.168.50.202", vec![member(&other.id)]))
             .unwrap_err()
@@ -3382,5 +3585,346 @@ mod tests {
         json.as_object_mut().unwrap().remove("ip_vrfs");
         let old: FabricSnapshot = serde_json::from_value(json).unwrap();
         assert_eq!(Topology::from_snapshot(&old).ip_vrfs().count(), 0);
+    }
+
+    #[test]
+    fn a_caller_may_choose_the_ports_hardware_address() {
+        // The reason this exists: a platform above may already have decided.
+        // Velstra Cloud derives a MAC from the port's uid so a lost-and-retried
+        // write cannot change a running guest's NIC — and two allocators for one
+        // identity is not a disagreement that announces itself. Port security
+        // matches the source MAC, so a workload using one address while the data
+        // plane expects another has every frame dropped and looks like a network
+        // that does not work.
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+        let chosen = [0x02, 0xab, 0xcd, 0xef, 0x00, 0x01];
+        let p = t
+            .create_port(100, "h1", "tap0", None, None, Some(chosen))
+            .unwrap();
+        assert_eq!(p.mac, chosen);
+
+        // And without one, nothing changed: derived from the address, as always.
+        let q = t.create_port(100, "h1", "tap1", None, None, None).unwrap();
+        assert_eq!(q.mac, mac_for(q.ip));
+    }
+
+    #[test]
+    fn one_address_cannot_answer_for_two_ports_on_a_segment() {
+        // Two workloads answering to one address is an outage for both, and
+        // neither of them says why. This is the only place that can notice.
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+        let chosen = [0x02, 0xab, 0xcd, 0xef, 0x00, 0x02];
+        t.create_port(100, "h1", "tap0", None, None, Some(chosen))
+            .unwrap();
+        let again = t.create_port(100, "h1", "tap1", None, None, Some(chosen));
+        assert!(again.is_err(), "one address was given to two ports");
+        assert!(
+            again.unwrap_err().to_string().contains("already in use"),
+            "the refusal does not say what is wrong"
+        );
+    }
+
+    #[test]
+    fn a_group_address_is_refused_rather_than_programmed() {
+        // A multicast bit in a *source* address is not a workload's address at
+        // all; the data plane would refuse every frame from it. Refused here,
+        // where there is somebody to tell.
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+        let group = [0x01, 0x00, 0x5e, 0x00, 0x00, 0x01];
+        let refused = t.create_port(100, "h1", "tap0", None, None, Some(group));
+        assert!(refused.is_err());
+        assert!(
+            refused.unwrap_err().to_string().contains("group address"),
+            "the refusal does not say why"
+        );
+    }
+
+    #[test]
+    fn restating_a_group_keeps_the_ports_bound_to_it() {
+        // The property that makes replacing safe rather than merely convenient:
+        // a group's policy id comes from its name, so new rules land under the
+        // id the data plane is already using. Nothing unbinds, and there is no
+        // moment where the port falls back to its network's default policy.
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+        t.add_security_group(sg("web", vec![])).unwrap();
+        let pid = t.security_group("web").unwrap().policy_id();
+
+        let p = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
+        let bound = t.set_port_security_group(&p.id, Some("web")).unwrap();
+        assert_eq!(bound.policy, Some(pid));
+
+        // A member gained an address, so the rules are restated.
+        t.add_security_group(sg(
+            "web",
+            vec![rule(velstra_config::ProtoName::Tcp, 443, ActionName::Pass)],
+        ))
+        .unwrap();
+
+        assert_eq!(
+            t.security_group("web").unwrap().policy_id(),
+            pid,
+            "restating a group moved its policy id, so every bound port points at nothing"
+        );
+        assert_eq!(t.security_group("web").unwrap().rules.len(), 1);
+        let still = t.ports().iter().find(|q| q.id == p.id).unwrap();
+        assert_eq!(still.policy, Some(pid), "the port came unbound");
+    }
+    // ---- Port security (B12) reaches the derived config --------------------
+
+    #[test]
+    fn a_tap_is_derived_locked_to_its_own_mac_and_its_own_addresses() {
+        // If this fails, `derive()` stopped emitting the B12 port-security
+        // binding for tenant taps. In the real world that means a guest can put
+        // its neighbour's MAC or IP in the frames it sends and the data plane
+        // will forward them: two VMs on one segment can impersonate each other,
+        // which is the exact hole uRPF does *not* close. Nothing else in this
+        // crate asserted that the binding is emitted at all.
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+        t.add_subnet(v4_subnet("ext", 100, "203.0.113.0/29"))
+            .unwrap();
+        let p = t
+            .create_port(
+                100,
+                "h1",
+                "tap0",
+                Some("192.168.50.10".parse().unwrap()),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let cfg = t.derive("h1").expect("h1 derives");
+        let iface = cfg
+            .interfaces
+            .iter()
+            .find(|i| i.name == "tap0")
+            .expect("the local tap is in its host's config");
+        assert_eq!(
+            iface.bind_mac.as_deref(),
+            Some(fmt_mac(p.mac).as_str()),
+            "the tap is not bound to the MAC the orchestrator allocated it"
+        );
+        assert!(
+            iface.bind_addresses.iter().any(|a| a == "192.168.50.10"),
+            "the tap is not bound to its own fixed address: {:?}",
+            iface.bind_addresses
+        );
+
+        // A floating address the guest answers *from* must be in the binding
+        // too, or every reply through the floating IP is dropped as a spoof and
+        // the floating IP looks like it simply does not work.
+        let f = t.allocate_floating_ip("ext", None).unwrap();
+        t.associate_floating_ip(&f.id, &p.id, ip("192.168.50.10"))
+            .unwrap();
+        let cfg = t.derive("h1").expect("h1 derives");
+        let iface = cfg.interfaces.iter().find(|i| i.name == "tap0").unwrap();
+        assert!(
+            iface
+                .bind_addresses
+                .iter()
+                .any(|a| a == &f.addr.to_string()),
+            "the associated floating address is missing from the binding: {:?}",
+            iface.bind_addresses
+        );
+
+        // Disassociating takes it away again — a binding that kept a stale
+        // floating address would let the next tenant to hold it spoof from here.
+        t.disassociate_floating_ip(&f.id).unwrap();
+        let cfg = t.derive("h1").expect("h1 derives");
+        let iface = cfg.interfaces.iter().find(|i| i.name == "tap0").unwrap();
+        assert!(
+            !iface
+                .bind_addresses
+                .iter()
+                .any(|a| a == &f.addr.to_string()),
+            "a disassociated floating address is still bound: {:?}",
+            iface.bind_addresses
+        );
+    }
+
+    // ---- B13 port send ceilings --------------------------------------------
+
+    #[test]
+    fn a_send_ceiling_set_on_a_port_reaches_the_config_of_the_host_that_holds_it() {
+        // If this fails, `limit_port` has become a decision nobody carries out:
+        // an operator caps a noisy tenant at 100 Mbit/s, the API says yes, and
+        // the agent never programs a token bucket — one guest can still starve
+        // the whole host's NIC.
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+        let p = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
+
+        assert!(t.limit_port(&p.id, Some(100)), "the port was not found");
+        assert!(
+            !t.limit_port("port-does-not-exist", Some(100)),
+            "limiting an unknown port reported success"
+        );
+
+        let iface = t
+            .derive("h1")
+            .unwrap()
+            .interfaces
+            .into_iter()
+            .find(|i| i.name == "tap0")
+            .expect("the local tap is in its host's config");
+        assert_eq!(iface.rate_limit_mbit, Some(100));
+
+        // Taking the ceiling away must reach the config too, or a port stays
+        // throttled after the operator lifted the limit.
+        assert!(t.limit_port(&p.id, None));
+        let iface = t
+            .derive("h1")
+            .unwrap()
+            .interfaces
+            .into_iter()
+            .find(|i| i.name == "tap0")
+            .unwrap();
+        assert_eq!(iface.rate_limit_mbit, None);
+    }
+
+    #[test]
+    fn a_zero_send_ceiling_is_no_ceiling_rather_than_a_silent_blackhole() {
+        // If this fails, a `0` arriving from a wire format where the field was
+        // simply unset would be read as "may send nothing" and the port would
+        // stop passing traffic for no reason anybody can see.
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+        let p = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
+
+        assert!(t.limit_port(&p.id, Some(0)));
+        assert_eq!(
+            t.ports()
+                .iter()
+                .find(|q| q.id == p.id)
+                .unwrap()
+                .rate_limit_mbit,
+            None,
+            "a zero ceiling was stored as a real ceiling"
+        );
+        let iface = t
+            .derive("h1")
+            .unwrap()
+            .interfaces
+            .into_iter()
+            .find(|i| i.name == "tap0")
+            .unwrap();
+        assert_eq!(iface.rate_limit_mbit, None);
+    }
+
+    #[test]
+    fn a_send_ceiling_survives_a_snapshot_round_trip() {
+        // If this fails, every port ceiling in the fabric is quietly lifted the
+        // next time the controller restarts from its snapshot.
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+        let p = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
+        t.limit_port(&p.id, Some(250));
+
+        let restored = Topology::from_snapshot(&t.to_snapshot());
+        assert_eq!(
+            restored
+                .ports()
+                .iter()
+                .find(|q| q.id == p.id)
+                .unwrap()
+                .rate_limit_mbit,
+            Some(250)
+        );
+    }
+
+    // ---- migrate_port ------------------------------------------------------
+
+    #[test]
+    fn migrating_onto_a_tap_another_port_already_holds_is_refused() {
+        // If this fails, two ports end up naming one device on the destination
+        // host. Both resolve to the same ifindex on the agent, so the second
+        // binding silently overwrites the first's policy and VNI — one workload
+        // left unfirewalled or on the wrong tenant segment, with no error
+        // anywhere. `create_port` guards this; migration must too.
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h2", "10.0.0.2", 2));
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+        let a = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
+        t.create_port(100, "h2", "tap9", None, None, None).unwrap();
+
+        let err = t
+            .migrate_port(&a.id, "h2", "tap9")
+            .expect_err("migrated onto an occupied tap");
+        assert!(
+            err.to_string().contains("already bound"),
+            "the refusal does not say what is wrong: {err}"
+        );
+        // The port did not move.
+        let still = t.ports().iter().find(|q| q.id == a.id).unwrap();
+        assert_eq!((still.host.as_str(), still.tap.as_str()), ("h1", "tap0"));
+
+        // A free tap on the same host is fine, and a port may always keep its
+        // own tap (the guard ignores the port being migrated).
+        t.migrate_port(&a.id, "h2", "tap1").unwrap();
+        t.migrate_port(&a.id, "h2", "tap1").unwrap();
+        let moved = t.ports().iter().find(|q| q.id == a.id).unwrap();
+        assert_eq!((moved.host.as_str(), moved.tap.as_str()), ("h2", "tap1"));
+    }
+
+    // ---- derive over a partial snapshot ------------------------------------
+
+    #[test]
+    fn a_port_whose_host_vanished_is_skipped_instead_of_taking_the_whole_derive_down() {
+        // If this fails, one dangling reference in a restored snapshot panics
+        // the re-derive loop. The controller then serves every host in the
+        // fabric its last good config forever, so no policy change lands
+        // anywhere — a fabric-wide outage caused by one broken record.
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_network(network(100, "blue", "192.168.50.0/24"))
+            .unwrap();
+        t.create_port(100, "h1", "tap0", None, None, None).unwrap();
+
+        let mut snap = t.to_snapshot();
+        // A remote port on a host that is no longer in the fabric.
+        snap.ports.push(PortRec {
+            id: "port-100-192.168.50.99".to_string(),
+            vni: 100,
+            policy: None,
+            host: "host-that-is-gone".to_string(),
+            ip: [192, 168, 50, 99],
+            mac: [0x02, 0, 0xc0, 0xa8, 0x32, 0x63],
+            tap: "tap7".to_string(),
+            rate_limit_mbit: None,
+        });
+        let broken = Topology::from_snapshot(&snap);
+
+        let cfg = broken.derive("h1").expect("h1 still derives");
+        // The healthy local port is still there…
+        assert!(cfg.interfaces.iter().any(|i| i.name == "tap0"));
+        // …and the dangling one produced neither a tunnel nor a neighbour, which
+        // would have pointed at a VTEP that does not exist.
+        assert!(
+            !cfg.neighbors.iter().any(|n| n.ip == "192.168.50.99"),
+            "a port with no host produced a neighbour entry"
+        );
     }
 }

@@ -69,7 +69,8 @@ pub use overlay::{
     plan_irb, plan_na_reply,
 };
 pub use packet::{
-    ETHERTYPE_IPV4, ETHERTYPE_IPV6, PacketMeta, PolicyId, PortKey, ScopedAddr, ScopedAddr6,
+    ETHERTYPE_IPV4, ETHERTYPE_IPV6, PORT_ENFORCE_MAC, PORT_ENFORCE_V4, PORT_ENFORCE_V6, PacketMeta,
+    PolicyId, PortAddr4, PortAddr6, PortBinding, PortKey, ScopedAddr, ScopedAddr6,
     ScopedDstPortKey, ScopedDstPortKey6, ScopedMac, ScopedPortKey, ScopedSrcPortKey,
     ScopedSrcPortKey6, icmp_reply_probe, icmp_type_key, icmp_type_probe, ip_proto, ipv6_ext_len,
     is_ipv6_ext, lpm_key_addr,
@@ -81,7 +82,9 @@ pub use policy::{
     decide_egress, port_rule_action, port_rule_bits, port_rule_excluded, port_rule_limit,
     port_rule_logs, port_rule_present, port_rule_value, port_rule_winner, port_rule_with_limit,
 };
-pub use portal::{PortalClientKey, PortalGate, PortalSeenKey, gate_admits_unauthenticated};
+pub use portal::{
+    PortalClientKey, PortalGate, PortalSeenKey, gate_admits_unauthenticated, v6_source_is_v4_mapped,
+};
 pub use ratelimit::RateBucket;
 pub use reject::{
     ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, IcmpUnreach, TcpRst, icmp, icmp_checksum,

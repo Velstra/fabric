@@ -85,7 +85,10 @@ pub async fn serve(path: PathBuf, firewall: Arc<Mutex<Firewall>>) {
         let _ = std::fs::remove_file(&path);
     }
     let listener = match UnixListener::bind(&path) {
-        Ok(l) => l,
+        Ok(l) => {
+            pin_socket_permissions(&path);
+            l
+        }
         Err(e) => {
             warn!("mapping socket {} unavailable: {e}", path.display());
             return;
@@ -289,6 +292,14 @@ async fn respond(line: &str, firewall: &Arc<Mutex<Firewall>>) -> String {
                unmap <tcp|udp> <port> <policy>\n"
             .to_string(),
         other => format!("error: unknown command {other:?}; try: mappings | map | unmap\n"),
+    }
+}
+
+/// See `query::pin_socket_permissions` — same reasoning, same value.
+fn pin_socket_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        log::warn!("could not pin permissions on {}: {e}", path.display());
     }
 }
 

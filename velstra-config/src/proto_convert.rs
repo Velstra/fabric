@@ -29,12 +29,16 @@ fn port_rule_to_proto(r: &PortRule) -> proto::PortRule {
         family: r.family.clone().unwrap_or_default(),
         direction: r.direction.clone().unwrap_or_default(),
         in_interface: r.in_interface.clone().unwrap_or_default(),
+        // A verdict on the device, and it used to stop here. An operator
+        // quarantining a compromised machine got a green apply and an empty
+        // MAC_RULES, because the rule *validated* on the way through.
+        src_mac: r.src_mac.clone().unwrap_or_default(),
     }
 }
 
 fn port_rule_from_proto(r: &proto::PortRule) -> PortRule {
     PortRule {
-        src_mac: None,
+        src_mac: (!r.src_mac.is_empty()).then(|| r.src_mac.clone()),
         in_interface: (!r.in_interface.is_empty()).then(|| r.in_interface.clone()),
         proto: proto_from_proto(r.proto()),
         // The proto carries the port as u32; a value past 65535 is invalid. Saturate
@@ -189,6 +193,13 @@ pub fn file_config_to_proto(cfg: &FileConfig, version: u64) -> proto::NodeConfig
                 name: i.name.clone(),
                 policy: i.policy,
                 vni: i.vni,
+                mss: i.mss.map(u32::from),
+                bind_mac: i.bind_mac.clone(),
+                bind_addresses: i.bind_addresses.clone(),
+                rate_limit_mbit: i.rate_limit_mbit,
+                masquerade: i.masquerade,
+                cgnat_base_port: u32::from(i.cgnat_base_port),
+                cgnat_block_size: u32::from(i.cgnat_block_size),
             })
             .collect(),
         routes: cfg
@@ -339,16 +350,22 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
             .interfaces
             .iter()
             .map(|i| InterfaceFile {
-                mss: None,
+                mss: i.mss.map(|v| v as u16),
+                // Port security, carried at last. This used to say the proto had
+                // no field for it — true, and its consequence was never written
+                // down beside it: the orchestrator derives a binding for every
+                // tenant tap precisely so a guest cannot send as its neighbour,
+                // and dropping it here meant every controller-managed node ran
+                // with the feature off.
+                bind_mac: i.bind_mac.clone(),
+                bind_addresses: i.bind_addresses.clone(),
+                rate_limit_mbit: i.rate_limit_mbit,
                 name: i.name.clone(),
                 policy: i.policy,
                 vni: i.vni,
-                // The gRPC interface message has no masquerade field (NAT is a
-                // file-config / appliance concept); default it off, and with it the
-                // CGNAT port-block layout that only means anything under it.
-                masquerade: false,
-                cgnat_base_port: 0,
-                cgnat_block_size: 0,
+                masquerade: i.masquerade,
+                cgnat_base_port: i.cgnat_base_port as u16,
+                cgnat_block_size: i.cgnat_block_size as u16,
             })
             .collect(),
         routes: cfg
@@ -768,5 +785,151 @@ mod tests {
         };
         let file = file_config_from_proto(&wire);
         assert_eq!(file.services[0].backends[0].port, None);
+    }
+}
+
+#[cfg(test)]
+mod every_field_survives {
+    //! Round trips that fail to **compile** when a field is added and forgotten.
+    //!
+    //! This module exists because of what was found on 2026-08-18: `InterfaceFile`
+    //! carried ten fields and the wire carried three. Port security, the per-port
+    //! send ceiling, MSS clamping, masquerading and CGNAT were all built, tested
+    //! and inert on every controller-managed node — the VM checks drive an
+    //! appliance through its own CLI, which writes the node's TOML directly, so
+    //! the one path nothing exercised was the one production uses.
+    //!
+    //! A round-trip test that constructs a value field by field would not have
+    //! caught it either: adding an eleventh field and leaving it at its default
+    //! keeps such a test green. **Destructuring** is what makes it a compile
+    //! error — `let Struct { a, b, .. } = x` with no `..` cannot miss a field.
+
+    use super::*;
+
+    fn interface() -> InterfaceFile {
+        InterfaceFile {
+            name: "tap0".into(),
+            policy: 4711,
+            vni: Some(5001),
+            mss: Some(1400),
+            bind_mac: Some("02:00:00:00:00:01".into()),
+            rate_limit_mbit: Some(100),
+            bind_addresses: vec!["10.0.0.5".into(), "fd00::5".into()],
+            masquerade: true,
+            cgnat_base_port: 20000,
+            cgnat_block_size: 512,
+        }
+    }
+
+    /// Every field of an interface reaches an agent through the controller.
+    #[test]
+    fn interface_round_trips_every_field() {
+        let before = interface();
+        let cfg = FileConfig {
+            interfaces: vec![interface()],
+            ..Default::default()
+        };
+        let there = file_config_to_proto(&cfg, 0);
+        let back = file_config_from_proto(&there);
+        let after = back.interfaces.first().expect("the interface vanished");
+
+        // No `..` — adding a field to `InterfaceFile` breaks this line, which is
+        // the whole point. Assert each one rather than `assert_eq!` on the
+        // struct, so a failure names the field that was dropped.
+        let InterfaceFile {
+            name,
+            policy,
+            vni,
+            mss,
+            bind_mac,
+            rate_limit_mbit,
+            bind_addresses,
+            masquerade,
+            cgnat_base_port,
+            cgnat_block_size,
+        } = after;
+        assert_eq!(*name, before.name, "name");
+        assert_eq!(*policy, before.policy, "policy");
+        assert_eq!(*vni, before.vni, "vni");
+        assert_eq!(*mss, before.mss, "mss — TCP clamping is off on this node");
+        assert_eq!(
+            *bind_mac, before.bind_mac,
+            "bind_mac — port security is off, a guest may send as its neighbour"
+        );
+        assert_eq!(
+            *rate_limit_mbit, before.rate_limit_mbit,
+            "rate_limit_mbit — the port has no send ceiling"
+        );
+        assert_eq!(
+            *bind_addresses, before.bind_addresses,
+            "bind_addresses — port security is off, a guest may claim any address"
+        );
+        assert_eq!(*masquerade, before.masquerade, "masquerade — NAT is off");
+        assert_eq!(*cgnat_base_port, before.cgnat_base_port, "cgnat_base_port");
+        assert_eq!(
+            *cgnat_block_size, before.cgnat_block_size,
+            "cgnat_block_size"
+        );
+    }
+
+    fn rule() -> PortRule {
+        PortRule {
+            proto: ProtoName::Tcp,
+            port: 443,
+            icmp_type: Some(8),
+            family: Some("ipv4".into()),
+            direction: Some("in".into()),
+            action: ActionName::Pass,
+            log: true,
+            src_mac: Some("02:de:ad:be:ef:01".into()),
+            in_interface: Some("eth1".into()),
+            src: Some("10.0.0.0/24".into()),
+            dst: Some("10.1.0.0/24".into()),
+            limit: Some(50),
+            burst: Some(100),
+        }
+    }
+
+    /// Every field of a firewall rule reaches an agent through the controller.
+    #[test]
+    fn a_rule_round_trips_every_field() {
+        let before = rule();
+        // A rule carrying both `src` and `dst` is refused by the data plane, so
+        // the round trip is asserted on the fields rather than through a
+        // `resolve()` that would rightly reject this one.
+        let there = port_rule_to_proto(&before);
+        let after = port_rule_from_proto(&there);
+
+        let PortRule {
+            proto,
+            port,
+            icmp_type,
+            family,
+            direction,
+            action,
+            log,
+            src_mac,
+            in_interface,
+            src,
+            dst,
+            limit,
+            burst,
+        } = &after;
+        assert_eq!(*proto, before.proto, "proto");
+        assert_eq!(*port, before.port, "port");
+        assert_eq!(*icmp_type, before.icmp_type, "icmp_type");
+        assert_eq!(*family, before.family, "family");
+        assert_eq!(*direction, before.direction, "direction");
+        assert_eq!(*action, before.action, "action");
+        assert_eq!(*log, before.log, "log");
+        assert_eq!(
+            *src_mac, before.src_mac,
+            "src_mac — a device quarantine is silently discarded"
+        );
+        assert_eq!(*in_interface, before.in_interface, "in_interface");
+        assert_eq!(*src, before.src, "src");
+        assert_eq!(*dst, before.dst, "dst");
+        assert_eq!(*limit, before.limit, "limit");
+        assert_eq!(*burst, before.burst, "burst");
     }
 }
