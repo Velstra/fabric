@@ -142,6 +142,15 @@ struct RunArgs {
     #[arg(long, value_enum, default_value_t = EncapArg::Vxlan)]
     encap: EncapArg,
 
+    /// This host's SRv6 locator as `prefix/len` (e.g. `fc00:0:1::/64`), advertised
+    /// in self-registration. Required with `--encap srv6` and refused without it:
+    /// every service SID this host instantiates, and the outer source it sends
+    /// from, are derived from it, so an SRv6 host without one has an endpoint that
+    /// encapsulates nowhere. The controller refuses the mismatch either way rather
+    /// than defaulting one from the other.
+    #[arg(long)]
+    srv6_locator: Option<String>,
+
     /// XDP attach mode.
     #[arg(long, value_enum, default_value_t = AttachMode::Auto)]
     xdp_mode: AttachMode,
@@ -196,6 +205,7 @@ enum EncapArg {
     #[default]
     Vxlan,
     Geneve,
+    Srv6,
 }
 
 impl EncapArg {
@@ -204,6 +214,7 @@ impl EncapArg {
         match self {
             EncapArg::Vxlan => velstra_proto::Encap::Vxlan as i32,
             EncapArg::Geneve => velstra_proto::Encap::Geneve as i32,
+            EncapArg::Srv6 => velstra_proto::Encap::Srv6 as i32,
         }
     }
 }
@@ -658,6 +669,10 @@ fn build_host_spec(args: &RunArgs) -> Result<velstra_proto::HostSpec> {
         encap: args.encap.as_proto(),
         udp_port: 0,     // encap default
         underlay_mtu: 0, // default (1500)
+        // Stated, never derived: a locator is a fabric-level address plan, has to
+        // be routable in the underlay and unique per host, and nothing on the
+        // machine knows any of that.
+        srv6_locator: args.srv6_locator.clone().unwrap_or_default(),
     })
 }
 

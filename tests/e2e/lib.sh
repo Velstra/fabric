@@ -156,6 +156,19 @@ assert_zero() { # log name msg
   fi
 }
 
+# Passes when a counter has NOT moved since `want` was read. Distinct from
+# `assert_zero`, which only works for a counter that was never meant to fire at
+# all: a gate that must refuse *some* traffic while still passing the rest leaves
+# the counter non-zero, and "it did not go up" is then the only true statement.
+assert_unchanged() { # log name want msg
+  local v
+  v="$(counter "$1" "$2")"
+  if [ "${v:-0}" -eq "$3" ] 2>/dev/null; then ok "$4 [$2 still $v]"; else
+    bad "$4 [$2=$v, expected it to stay $3]"
+    _dump "$1"
+  fi
+}
+
 assert_cmd() { # msg -- cmd...   (passes if cmd succeeds)
   local msg=$1
   shift
@@ -172,7 +185,20 @@ assert_fail() { # msg -- cmd...  (passes if cmd FAILS, e.g. traffic was dropped)
 
 _dump() {
   echo "       --- last stats table ---" >&2
-  grep -E '^[[:space:]]*(counter|[a-z_]+ +[0-9]+|drop rate)' "$1" 2>/dev/null | tail -30 | sed 's/^/       /' >&2
+  # `[a-z0-9_]+`, not `[a-z_]+`: every counter with a digit in its name was being
+  # filtered out of this dump — srv6_encap, srv6_decap, srv6_drop_untrusted,
+  # srv6_bum_replicated, npt66_* — which is precisely the set you need to read
+  # when an SRv6 or IPv6 assertion fails. The dump looked complete, so nobody
+  # noticed it was answering a different question than the one being asked.
+  grep -E '^[[:space:]]*(counter|[a-z0-9_]+ +[0-9]+|drop rate)' "$1" 2>/dev/null \
+    | tail -40 | sed 's/^/       /' >&2
+}
+
+# Print every counter whose name matches $2, from log $1. For the moments when
+# the failing assertion names one number and the answer is in its neighbours.
+dump_matching() { # log pattern label
+  echo "       --- $3 ---" >&2
+  grep -E "^[[:space:]]*$2 +[0-9]+" "$1" 2>/dev/null | tail -12 | sed 's/^/       /' >&2
 }
 
 # --- cleanup ----------------------------------------------------------------

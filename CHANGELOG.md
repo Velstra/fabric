@@ -2,6 +2,80 @@
 
 ## [Unreleased]
 
+### Added
+
+- **SRv6 is a complete overlay, not a unicast-only one.** `End.DT2M` frames are
+  decapsulated (they were refused outright, so every ARP, ND and DHCP frame on an
+  SRv6 segment died), BUM traffic is head-end replicated over SRv6 at the TC layer
+  (`SRV6_FLOOD_LIST`, mirroring the VXLAN `FLOOD_LIST` path), and symmetric IRB
+  routes over SRv6 (`SRV6_IRB_ROUTES`).
+- **SRv6 reaches the wire protocol.** `NodeConfig` carries five new messages —
+  `Srv6`, `Srv6Route`, `Srv6LocalSid`, `Srv6Flood`, `Srv6IrbRoute` — and
+  `HostSpec` carries an `srv6_locator`. `Encap` gains `ENCAP_SRV6`. Until now the
+  agent's config conversion hardcoded `srv6: None` on the way back in, so a
+  controller could not have served an SRv6 config even if one had been asked for.
+- **The orchestrator derives the whole SRv6 table set** from the same topology
+  that drives VXLAN: this host's endpoint, both service SIDs of every segment it
+  serves, a unicast entry toward each remote workload, a flood target per remote
+  host, and the trusted decap peers.
+
+  Every SID is *derived* — `locator ++ discriminator(1) ++ vni(3)`, the layout
+  wren already uses — so nothing is allocated, stored or replicated, and a
+  controller failover cannot renumber a running tenant. A peer is addressable the
+  moment it exists in the topology, before BGP has converged.
+- `--encap srv6 --srv6-locator <prefix/len>` on `velstra-controller orch
+  add-host`, `"encap": "srv6"` + `"srv6_locator"` over REST, and a new
+  `srv6_bum_replicated` counter.
+
+### Fixed
+
+- **An SRv6 EVPN fabric learned nothing.** wren emits
+  `+ evpn vni V mac M vtep VT srv6 SID` once an `srv6-locator` is configured —
+  ten tokens, the same count as the `... ip IP vtep VT` form. The monitor parser
+  matched on token *count* and required `t[6] == "ip"`, so every type-2 MAC route
+  was discarded with no log line and no counter: the MAC-FDB simply never filled.
+  The bridging lines now read their tail as keyword/value pairs, which is what the
+  type-5 lines two functions below already did.
+- **A type-5 route's SRv6 SID was parsed and thrown away**, on the grounds that
+  the datapath was VXLAN-only. It no longer is.
+- **`add_ip_vrf`-style validation for hosts.** A host whose encapsulation and SRv6
+  locator disagree is refused in both directions, rather than silently coming up
+  as VXLAN — an operator who believes they enabled SRv6 and did not is the failure
+  this prevents.
+- **The BUM classifier is attached on an SRv6 host.** `attach_bum_ingress` was
+  gated on a VXLAN `[overlay]` being configured, so an SRv6 box had its flood set
+  programmed, its counters present, and no classifier — nothing was ever
+  replicated. Both halves of the flood path were dead independently, which is why
+  neither looked half-working.
+- **A VNI's 24-bit ceiling is checked for SRv6 hosts too.** It was gated on
+  `[overlay]`, and on SRv6 the VNI goes into a service SID's 3-byte function
+  field — the same width — so an over-wide VNI would have been silently truncated
+  by `build_service_sid`, putting two segments on one SID.
+- **ARP and IPv6 ND suppression no longer require an `[overlay]` section.** They
+  are keyed by `(vni, ip)` and answered before any encapsulation, so an `[srv6]`
+  host satisfies them too; requiring VXLAN specifically made an SRv6 host's
+  derived config fail to resolve.
+
+### Notes
+
+The eBPF object changed (two new maps and three new datapath branches), so an
+appliance pinning it needs an `ebpfHash` bump.
+
+Verified by `checks.srv6` in the sentinel repository: two VMs, a real IPv6
+underlay, a real eBPF load and real frames, asserting the End.DT2U round-trip,
+head-end replication *and* acceptance of an End.DT2M flood copy, symmetric IRB
+over SRv6, the gateway-MAC gate, and decap source authentication. Two new
+scenarios (`srv6_flood`, `srv6_irb`) cover the same ground in `tests/e2e/run.sh`
+for a root shell without Nix.
+
+RFC 9252 §6 specifies `End.DT4`/`End.DT6` for type-5 routes and this deliberately
+deviates: that payload is a bare IP packet, which has to be delivered into the
+tenant's own L3 device to be routed in the right VRF, and this host model has a
+single shared kernel bridge. Symmetric IRB therefore rides an `End.DT2U` SID on
+the L3 VNI — exactly what the VXLAN path does — and the controller derives that
+SID rather than using the advertised `End.DT4` one. Interop with a third-party PE
+needs the L3 behaviours, and those need per-tenant L3 devices first.
+
 ## [0.4.1] — 2026-08-01
 
 A build fix. 0.4.0 is sound, but its CI lane was red — and had been since

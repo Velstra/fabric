@@ -333,7 +333,15 @@ pub struct ServiceCfg {
     pub reply_policy: PolicyId,
 }
 
-/// Tunnel encapsulation as written in TOML (`"vxlan"` / `"geneve"`).
+/// Tunnel encapsulation as written in TOML (`"vxlan"` / `"geneve"` / `"srv6"`).
+///
+/// `Srv6` is the odd one out and deliberately so: it selects a different *wire
+/// family*, not another UDP shim. A host set to `srv6` carries no `[overlay]`
+/// section at all — it gets an `[srv6]` one — so [`Self::kind`] and
+/// [`Self::default_port`] have nothing to answer for it. Keeping all three in one
+/// enum is what lets a control plane express "which overlay does this host run"
+/// as one field rather than two mutually-exclusive optional sections whose
+/// invalid combinations nobody checks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EncapName {
@@ -342,21 +350,33 @@ pub enum EncapName {
     Vxlan,
     /// Geneve (RFC 8926), UDP/6081.
     Geneve,
+    /// SRv6 (RFC 8986 network programming), reduced encapsulation with a single
+    /// service SID in the outer IPv6 destination. No UDP, no shim, no SRH.
+    Srv6,
 }
 
 impl EncapName {
-    /// The [`encap_kind`] code.
+    /// Whether this is the SRv6 wire family rather than a UDP shim over IPv4.
+    /// The `[overlay]`/`[srv6]` split follows from it.
+    pub fn is_srv6(self) -> bool {
+        matches!(self, EncapName::Srv6)
+    }
+
+    /// The [`encap_kind`] code. SRv6 has none — it is not a shim format — and
+    /// falls back to the VXLAN code, which is never read because an SRv6 host's
+    /// `OverlayConfig` is disabled.
     fn kind(self) -> u8 {
         match self {
-            EncapName::Vxlan => encap_kind::VXLAN,
+            EncapName::Vxlan | EncapName::Srv6 => encap_kind::VXLAN,
             EncapName::Geneve => encap_kind::GENEVE,
         }
     }
 
-    /// The default UDP destination port for this encapsulation.
+    /// The default UDP destination port for this encapsulation. SRv6 uses no UDP
+    /// port; the value is unread for the same reason as [`Self::kind`].
     fn default_port(self) -> u16 {
         match self {
-            EncapName::Vxlan => VXLAN_PORT,
+            EncapName::Vxlan | EncapName::Srv6 => VXLAN_PORT,
             EncapName::Geneve => GENEVE_PORT,
         }
     }
@@ -572,9 +592,65 @@ pub struct Srv6LocalSidCfg {
     /// Tenant VNI this SID terminates into.
     pub vni: u32,
     /// Endpoint behaviour: `end.dt2u` (L2 unicast, default) or `end.dt2m` (L2
-    /// flood). Only `end.dt2u` is decapsulated by the datapath today.
+    /// flood). Both are decapsulated by the datapath — they differ only at the
+    /// head end, where `end.dt2m` is the SID a flood copy is addressed to.
     #[serde(default)]
     pub behavior: Option<String>,
+}
+
+/// One SRv6 BUM head-end replication entry (`[[srv6_flood]]`, B9): a remote
+/// `End.DT2M` service SID that broadcast/unknown-unicast/multicast traffic on
+/// `vni` must be flooded to. The SRv6 analogue of [`FloodVtepCfg`] — one row per
+/// `(vni, remote_sid)`, grouped by the agent into one per-VNI `Srv6FloodSet`.
+///
+/// The SID here must be the peer's **`End.DT2M`** SID, not the `End.DT2U` one a
+/// `[[srv6_route]]` names: RFC 9252 binds a SID to exactly one behaviour, so a
+/// flood copy sent to a unicast SID is bridged to a single MAC on arrival instead
+/// of flooded, which loses every BUM frame to all but one workload.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Srv6FloodCfg {
+    /// Tenant VNI (24-bit) whose BUM traffic floods to this SID.
+    pub vni: u32,
+    /// Remote `End.DT2M` service SID (the outer IPv6 destination).
+    pub remote_sid: String,
+    /// Next-hop MAC on the underlay toward the remote SID.
+    pub via_mac: String,
+    /// Underlay egress interface name.
+    pub out_iface: String,
+}
+
+/// One SRv6 symmetric-IRB route (`[[srv6_irb_route]]`, B9): a remote tenant
+/// subnet reached by **routing** rather than bridging, over SRv6. The SRv6
+/// analogue of [`IrbRouteCfg`], and keyed the same way — on the **ingress** VNI,
+/// because that is what the datapath knows when the packet arrives.
+///
+/// `remote_sid` is the peer's `End.DT2U` SID **for the tenant's L3 VNI**, not for
+/// the ingress segment: RFC 9136 symmetric IRB puts a rewritten Ethernet frame on
+/// the wire under the L3 VNI, so its SRv6 form is an L2 SID derived from that L3
+/// VNI. `l3_vni` is carried alongside for the same reason the VXLAN entry carries
+/// it — so an operator reading the config can see which VRF the packet lands in
+/// without decoding a SID.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Srv6IrbRouteCfg {
+    /// The tenant segment a packet must arrive on for this route to apply.
+    pub vni: u32,
+    /// Remote tenant subnet this entry matches (longest-prefix).
+    pub inner_dst: String,
+    /// The tenant's routed VNI — the VNI whose `End.DT2U` SID `remote_sid` is.
+    pub l3_vni: u32,
+    /// Remote `End.DT2U` service SID for the tenant's L3 VNI.
+    pub remote_sid: String,
+    /// Next-hop MAC on the underlay toward the remote SID.
+    pub via_mac: String,
+    /// Underlay egress interface name.
+    pub out_iface: String,
+    /// The egress router's IRB MAC (RFC 9135) — the rewritten inner destination.
+    pub router_mac: String,
+    /// This tenant's anycast gateway MAC — the rewritten inner source, and the
+    /// destination a local VM addresses to have its packet routed at all.
+    pub gateway_mac: String,
 }
 
 /// A named tenant policy (`[[policy]]`): the same firewall fields as the
@@ -795,6 +871,12 @@ pub struct FileConfig {
     /// B9 SRv6 local-SID instantiations. Spelled `[[srv6_local_sid]]` in TOML.
     #[serde(default, rename = "srv6_local_sid")]
     pub srv6_local_sids: Vec<Srv6LocalSidCfg>,
+    /// B9 SRv6 BUM head-end replication entries. Spelled `[[srv6_flood]]` in TOML.
+    #[serde(default, rename = "srv6_flood")]
+    pub srv6_floods: Vec<Srv6FloodCfg>,
+    /// B9 SRv6 symmetric-IRB routes. Spelled `[[srv6_irb_route]]` in TOML.
+    #[serde(default, rename = "srv6_irb_route")]
+    pub srv6_irb_routes: Vec<Srv6IrbRouteCfg>,
 }
 
 /// A NPTv6 (RFC 6296) prefix-translation rule: on the boundary `interface`, an
@@ -1305,6 +1387,44 @@ pub struct ResolvedSrv6LocalSid {
     pub behavior: u16,
 }
 
+/// A resolved SRv6 BUM head-end replication entry (B9). The agent groups every
+/// entry sharing a `vni` into one `Srv6FloodSet` for the `SRV6_FLOOD_LIST` map.
+/// The SRv6 analogue of [`ResolvedFloodVtep`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSrv6Flood {
+    /// Tenant VNI whose BUM traffic floods to this endpoint.
+    pub vni: u32,
+    /// Remote `End.DT2M` service SID (outer IPv6 destination, network-order).
+    pub remote_sid: [u8; 16],
+    /// Next-hop MAC on the underlay toward the remote SID.
+    pub outer_dst_mac: [u8; 6],
+    /// Underlay egress interface name.
+    pub out_iface: String,
+}
+
+/// A resolved SRv6 symmetric-IRB route (B9). The SRv6 analogue of
+/// [`ResolvedIrbRoute`]; see [`Srv6IrbRouteCfg`] for why `remote_sid` is the L3
+/// VNI's `End.DT2U` SID rather than an `End.DT4` one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSrv6IrbRoute {
+    /// Tenant segment a packet must arrive on.
+    pub vni: u32,
+    /// Remote tenant subnet, as a longest-prefix match key.
+    pub inner_dst: Cidr4,
+    /// The routed VNI whose `End.DT2U` SID this entry points at.
+    pub l3_vni: u32,
+    /// Remote `End.DT2U` service SID for that L3 VNI (network-order octets).
+    pub remote_sid: [u8; 16],
+    /// Next-hop MAC on the underlay toward the remote SID.
+    pub outer_dst_mac: [u8; 6],
+    /// Underlay egress interface name.
+    pub out_iface: String,
+    /// Rewritten inner destination MAC (the egress router).
+    pub router_mac: [u8; 6],
+    /// Rewritten inner source MAC (this tenant's anycast gateway).
+    pub gateway_mac: [u8; 6],
+}
+
 /// Fully-resolved, validated configuration ready to be written into BPF maps.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -1348,6 +1468,11 @@ pub struct RuntimeConfig {
     pub srv6_routes: Vec<ResolvedSrv6Route>,
     /// SRv6 local-SID instantiations for the `SRV6_LOCAL_SIDS` map (B9 decap).
     pub srv6_local_sids: Vec<ResolvedSrv6LocalSid>,
+    /// B9 SRv6 BUM head-end replication entries for the `SRV6_FLOOD_LIST` map.
+    /// The agent groups these by `vni` into one `Srv6FloodSet` per segment.
+    pub srv6_floods: Vec<ResolvedSrv6Flood>,
+    /// B9 SRv6 symmetric-IRB routes for the `SRV6_IRB_ROUTES` trie.
+    pub srv6_irb_routes: Vec<ResolvedSrv6IrbRoute>,
     /// Host-wide fail-closed switch for the `FAIL_CLOSED` map: drop a packet the
     /// data plane cannot parse instead of passing it. `false` (the default) keeps
     /// the historical fail-open behaviour.
@@ -1389,6 +1514,8 @@ impl RuntimeConfig {
             srv6: None,
             srv6_routes: Vec::new(),
             srv6_local_sids: Vec::new(),
+            srv6_floods: Vec::new(),
+            srv6_irb_routes: Vec::new(),
         }
     }
 }
@@ -1714,7 +1841,12 @@ impl FileConfig {
             }
         }
 
-        let overlay_present = self.overlay.is_some();
+        // "This box encapsulates" — true for either wire family. It gates the
+        // 24-bit VNI check below, which is a property of the segment identifier
+        // and not of the encapsulation carrying it: an SRv6 host's VNI goes into
+        // a service SID's 3-byte function field, so it has exactly the same
+        // ceiling.
+        let overlay_present = self.overlay.is_some() || self.srv6.is_some();
         // What an encapsulated frame has left over, per encapsulation this box
         // is configured for. Read once, because it is a property of the box and
         // not of any one interface.
@@ -2057,8 +2189,15 @@ impl FileConfig {
             });
         }
 
-        if !self.neighbors.is_empty() && overlay.is_none() {
-            bail!("`[[neighbor]]` entries require an `[overlay]` section");
+        // ARP suppression is a property of the *segment*, not of the wire format:
+        // `ARP_TABLE` is keyed by `(vni, ip)` and the datapath answers from it
+        // before either encapsulation is reached. Requiring `[overlay]`
+        // specifically made an SRv6 host's derived config fail to resolve, so
+        // either overlay satisfies it — but neither being present still does not,
+        // because a host with no overlay at all has no remote segment to suppress
+        // for and the entries would be answering for addresses nobody can reach.
+        if !self.neighbors.is_empty() && overlay.is_none() && self.srv6.is_none() {
+            bail!("`[[neighbor]]` entries require an `[overlay]` or `[srv6]` section");
         }
         let mut neighbors = Vec::with_capacity(self.neighbors.len());
         for n in &self.neighbors {
@@ -2077,8 +2216,10 @@ impl FileConfig {
             });
         }
 
-        if !self.nd_neighbors.is_empty() && overlay.is_none() {
-            bail!("`[[nd_neighbor]]` entries require an `[overlay]` section");
+        // Same reasoning as `[[neighbor]]` above: IPv6 ND suppression is keyed by
+        // `(vni, ip)` and is answered before any encapsulation.
+        if !self.nd_neighbors.is_empty() && overlay.is_none() && self.srv6.is_none() {
+            bail!("`[[nd_neighbor]]` entries require an `[overlay]` or `[srv6]` section");
         }
         let mut nd_neighbors = Vec::with_capacity(self.nd_neighbors.len());
         for n in &self.nd_neighbors {
@@ -2122,6 +2263,17 @@ impl FileConfig {
         // are mutually exclusive per host (one overlay wire format at a time).
         if self.srv6.is_some() && overlay.is_some() {
             bail!("`[srv6]` and `[overlay]` are mutually exclusive (one overlay format per host)");
+        }
+        // `encap = "srv6"` inside an `[overlay]` section is a contradiction, not a
+        // selection: SRv6 is a different wire family and is configured by an
+        // `[srv6]` section. Silently treating it as VXLAN (which is what the
+        // `kind`/`default_port` fallbacks would do) would build a working VXLAN
+        // tunnel on a host the operator asked to run SRv6 — encapsulated traffic
+        // going out in a format the peer does not terminate, with nothing to say so.
+        if self.overlay.as_ref().is_some_and(|o| o.encap.is_srv6()) {
+            bail!(
+                "`[overlay] encap = \"srv6\"` is not a thing: configure an `[srv6]` section instead"
+            );
         }
         let srv6 = match &self.srv6 {
             Some(s) => {
@@ -2204,6 +2356,65 @@ impl FileConfig {
             });
         }
 
+        if !self.srv6_floods.is_empty() && srv6.is_none() {
+            bail!("`[[srv6_flood]]` entries require an `[srv6]` section");
+        }
+        let mut srv6_floods = Vec::with_capacity(self.srv6_floods.len());
+        for f in &self.srv6_floods {
+            if f.vni > 0xFF_FFFF {
+                bail!("srv6_flood vni {} exceeds 24 bits", f.vni);
+            }
+            let remote_sid: Ipv6Addr = f
+                .remote_sid
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid srv6_flood remote_sid {:?}", f.remote_sid))?;
+            let outer_dst_mac = parse_mac(&f.via_mac)
+                .map_err(|e| anyhow::anyhow!("invalid srv6_flood via_mac {:?}: {e}", f.via_mac))?;
+            srv6_floods.push(ResolvedSrv6Flood {
+                vni: f.vni,
+                remote_sid: remote_sid.octets(),
+                outer_dst_mac,
+                out_iface: f.out_iface.clone(),
+            });
+        }
+
+        if !self.srv6_irb_routes.is_empty() && srv6.is_none() {
+            bail!("`[[srv6_irb_route]]` entries require an `[srv6]` section");
+        }
+        let mut srv6_irb_routes = Vec::with_capacity(self.srv6_irb_routes.len());
+        for r in &self.srv6_irb_routes {
+            for (label, vni) in [("vni", r.vni), ("l3_vni", r.l3_vni)] {
+                if vni > 0xFF_FFFF {
+                    bail!("srv6_irb_route {label} {vni} exceeds 24 bits");
+                }
+            }
+            let inner_dst = parse_cidr_v4(&r.inner_dst).map_err(|e| {
+                anyhow::anyhow!("invalid srv6_irb_route inner_dst {:?}: {e}", r.inner_dst)
+            })?;
+            let remote_sid: Ipv6Addr = r.remote_sid.parse().map_err(|_| {
+                anyhow::anyhow!("invalid srv6_irb_route remote_sid {:?}", r.remote_sid)
+            })?;
+            let mut macs = [[0u8; 6]; 3];
+            for (slot, (label, text)) in macs.iter_mut().zip([
+                ("via_mac", &r.via_mac),
+                ("router_mac", &r.router_mac),
+                ("gateway_mac", &r.gateway_mac),
+            ]) {
+                *slot = parse_mac(text)
+                    .map_err(|e| anyhow::anyhow!("invalid srv6_irb_route {label} {text:?}: {e}"))?;
+            }
+            srv6_irb_routes.push(ResolvedSrv6IrbRoute {
+                vni: r.vni,
+                inner_dst,
+                l3_vni: r.l3_vni,
+                remote_sid: remote_sid.octets(),
+                outer_dst_mac: macs[0],
+                out_iface: r.out_iface.clone(),
+                router_mac: macs[1],
+                gateway_mac: macs[2],
+            });
+        }
+
         Ok(RuntimeConfig {
             fail_closed: self.fail_closed,
             policies,
@@ -2247,6 +2458,8 @@ impl FileConfig {
             srv6,
             srv6_routes,
             srv6_local_sids,
+            srv6_floods,
+            srv6_irb_routes,
         })
     }
 }
@@ -3217,6 +3430,40 @@ mod tests {
         // typo'd config validates sources when it does not.
         let err = toml::from_str::<FileConfig>(r#"source_validation = "rpf""#).unwrap_err();
         assert!(err.to_string().contains("source_validation"), "{err}");
+    }
+
+    /// A VNI's 24-bit ceiling belongs to the segment identifier, not to the
+    /// encapsulation carrying it: on SRv6 it goes into a service SID's 3-byte
+    /// function field, which is exactly the same width. The check used to be
+    /// gated on `[overlay]` alone, so an SRv6 host could declare a VNI that no
+    /// SID can express — and `build_service_sid` would silently truncate it,
+    /// putting two segments on one SID.
+    #[test]
+    fn an_srv6_interface_vni_still_has_to_fit_24_bits() {
+        let too_big = r#"
+            [srv6]
+            local_src = "fc00:0:1::1"
+            underlay_iface = "eth0"
+
+            [[interface]]
+            name = "tap0"
+            policy = 0
+            vni = 16777216
+        "#;
+        let err = toml::from_str::<FileConfig>(too_big)
+            .unwrap()
+            .resolve()
+            .expect_err("a VNI past 24 bits has no SID that can carry it")
+            .to_string();
+        assert!(err.contains("exceeds 24 bits"), "unexpected: {err}");
+
+        // The largest that does fit is accepted, so the boundary is the boundary
+        // and not an off-by-one.
+        let ok = too_big.replace("16777216", "16777215");
+        toml::from_str::<FileConfig>(&ok)
+            .unwrap()
+            .resolve()
+            .expect("the widest representable VNI must still be allowed");
     }
 
     #[test]

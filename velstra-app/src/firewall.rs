@@ -17,7 +17,7 @@ use aya::{
         lpm_trie::{Key, LpmTrie},
     },
     programs::{
-        Xdp, XdpMode,
+        ProgramError, Xdp, XdpMode,
         tc::{SchedClassifier, TcAttachType, qdisc_add_clsact},
     },
 };
@@ -31,14 +31,16 @@ use velstra_common::{
     PortBinding, PortFwd, PortalClientKey, PortalGate, PortalSeenKey, RateBucket, RouteEntry,
     ScopedAddr, ScopedAddr6, ScopedDstPortKey, ScopedDstPortKey6, ScopedMac, ScopedPortKey,
     ScopedSrcPortKey, ScopedSrcPortKey6, ServiceKey, ServiceValue, Srv6Config, Srv6Endpoint,
-    Srv6LocalSid, Srv6SidKey, SynProxyCfg, SynProxyKey, TunnelEndpoint, TunnelKey, parse_cidr_v4,
-    parse_cidr_v6, parse_mac, port_rule_value, port_rule_with_limit,
+    Srv6FloodSet, Srv6IrbEndpoint, Srv6LocalSid, Srv6SidKey, SynProxyCfg, SynProxyKey,
+    TunnelEndpoint, TunnelKey, parse_cidr_v4, parse_cidr_v6, parse_mac, port_rule_value,
+    port_rule_with_limit,
 };
 use velstra_config::{
     PolicyConfig, PortIdentity, ResolvedFloodVtep, ResolvedInterface, ResolvedIrbRoute,
     ResolvedMacRoute, ResolvedNd6, ResolvedNeighbor, ResolvedNpt66, ResolvedOverlay,
-    ResolvedPortForward, ResolvedRoute, ResolvedService, ResolvedSrv6, ResolvedSrv6LocalSid,
-    ResolvedSrv6Route, ResolvedSynProxy, ResolvedTunnel, RuntimeConfig,
+    ResolvedPortForward, ResolvedRoute, ResolvedService, ResolvedSrv6, ResolvedSrv6Flood,
+    ResolvedSrv6IrbRoute, ResolvedSrv6LocalSid, ResolvedSrv6Route, ResolvedSynProxy,
+    ResolvedTunnel, RuntimeConfig,
 };
 
 /// How to attach the XDP program to the interface.
@@ -101,6 +103,11 @@ pub struct Firewall {
     /// advertised and is doing nothing" is the question somebody asks during an
     /// attack, and a journal that has rotated cannot answer it.
     flowspec_refused: Vec<(String, String)>,
+    /// Tenant taps already carrying the TC BUM-replication classifier. Tracked
+    /// because the attach is now re-tried on every reprogram — a tap that appears
+    /// after startup has to be picked up — and attaching twice would put two
+    /// classifiers on one ingress, replicating every broadcast frame twice.
+    bum_attached: HashSet<String>,
     /// Interfaces attached dynamically by auto-attach, tracked separately so they
     /// can be dropped again when the interface disappears (a VM tap going away).
     auto_attached: HashSet<String>,
@@ -271,27 +278,7 @@ impl Firewall {
             attach_egress(&mut ebpf, &egress_ifaces)?;
         }
 
-        // B2: attach the BUM head-end replication classifier at TC **ingress**
-        // on the tenant taps (config interfaces on a real overlay segment,
-        // `vni != 0`, that are present). Best-effort: `velstra_bum` is a
-        // compile-verified-only datapath pending kernel-load iteration, so a
-        // load/verifier failure is logged and swallowed rather than taking the
-        // agent down — the flood-set maps are already programmed either way.
-        if cfg.overlay.is_some() {
-            let bum_ifaces: Vec<String> = cfg
-                .interfaces
-                .iter()
-                .filter(|i| i.vni != 0 && if_nametoindex(&i.name).is_ok())
-                .map(|i| i.name.clone())
-                .collect();
-            if !bum_ifaces.is_empty()
-                && let Err(e) = attach_bum_ingress(&mut ebpf, &bum_ifaces)
-            {
-                warn!("B2 BUM replication attach failed (load-iterate pending): {e:#}");
-            }
-        }
-
-        Ok(Self {
+        let mut fw = Self {
             ebpf,
             attached,
             applied: cfg.clone(),
@@ -300,11 +287,63 @@ impl Firewall {
             flowspec_refused: Vec::new(),
             auto_attached: HashSet::new(),
             config_attached: HashSet::new(),
+            bum_attached: HashSet::new(),
             conntrack: None,
             runtime_blocks: BTreeMap::new(),
             portal_sessions: BTreeMap::new(),
             runtime_mappings: BTreeMap::new(),
-        })
+        };
+        fw.sync_bum_attachments(cfg);
+        Ok(fw)
+    }
+
+    /// Attach the BUM head-end replication classifier to every tenant tap the
+    /// config names that is present and not already carrying it.
+    ///
+    /// **Called on every reprogram, not only at startup**, and that is the whole
+    /// point. A config-file agent is restarted by `sentinel commit`, so its taps
+    /// are always present when it loads; a controller-driven agent is
+    /// reconfigured *live* and its taps arrive minutes later, when a tenant is
+    /// placed on it. Attaching only at load therefore left every controller-driven
+    /// fabric with its flood set programmed, its counters present, and no
+    /// classifier to read them — `bum_replicated` and `srv6_bum_replicated` stuck
+    /// at zero for the life of the process, on both overlays.
+    ///
+    /// That failure is invisible from the box: nothing errors, the maps are
+    /// correct, and the only symptom is that broadcast traffic does not cross —
+    /// so a tenant cannot ARP or get a DHCP lease, which reads like a tenant
+    /// problem rather than an agent one.
+    ///
+    /// Best-effort by design: a load or attach failure costs replication and
+    /// nothing else, where taking the agent down would cost the firewall.
+    fn sync_bum_attachments(&mut self, cfg: &RuntimeConfig) {
+        // Either overlay: `velstra_bum` dispatches on whichever is enabled, and
+        // gating the attach on the VXLAN one alone left an SRv6 host without a
+        // classifier at all.
+        if cfg.overlay.is_none() && cfg.srv6.is_none() {
+            return;
+        }
+        // Forget taps whose netdev has gone (the TC classifier detached with it).
+        // Without this, a VM restart that brings the tap back under the same name
+        // leaves the stale name in the set, so the `wanted` filter below skips it
+        // and it never gets a classifier again — `bum_replicated`/`srv6_bum_replicated`
+        // stall until the agent restarts. Mirrors how `reconcile_auto_attach` and
+        // `reconcile_config_interfaces` prune their attach sets.
+        self.bum_attached.retain(|n| if_nametoindex(n).is_ok());
+        let wanted: Vec<String> = cfg
+            .interfaces
+            .iter()
+            .filter(|i| i.vni != 0 && !self.bum_attached.contains(&i.name))
+            .filter(|i| if_nametoindex(&i.name).is_ok())
+            .map(|i| i.name.clone())
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        match attach_bum_ingress(&mut self.ebpf, &wanted) {
+            Ok(()) => self.bum_attached.extend(wanted),
+            Err(e) => warn!("BUM replication attach failed: {e:#}"),
+        }
     }
 
     /// Attach the (already-loaded) program to one more interface and assign it a
@@ -588,6 +627,11 @@ impl Firewall {
             crate::flowspec::merge_into(&self.base, &self.flowspec)
         };
         apply_config(&mut self.ebpf, &merged, Some(&self.applied))?;
+        // After the maps, not before: a classifier attached to a tap whose flood
+        // set has not been written yet would replicate to an empty set, which is
+        // harmless but means the first frames after a reconfigure are the ones
+        // that go missing.
+        self.sync_bum_attachments(&merged);
         self.applied = merged;
         Ok(())
     }
@@ -1583,6 +1627,25 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
             let _ = peers.remove(&fv.remote_vtep_ip);
         }
     }
+    {
+        // B9 SRV6_IRB_ROUTES is an LpmTrie keyed exactly like IRB_ROUTES, and needs
+        // the same treatment for the same reason: a withdrawn prefix that lingers
+        // keeps routing a tenant's traffic to a peer that no longer owns it.
+        // (`program_srv6` reconciles the flood set by key, but a trie cannot be
+        // enumerated, so its stale keys are removed from the *old* config here.)
+        let mut irb: LpmTrie<_, TunnelKey, Srv6IrbEndpoint> = LpmTrie::try_from(
+            ebpf.map_mut("SRV6_IRB_ROUTES")
+                .ok_or_else(|| anyhow!("SRV6_IRB_ROUTES map missing"))?,
+        )?;
+        for r in &old.srv6_irb_routes {
+            let (_, addr) = r.inner_dst.lpm_key();
+            let key = Key::new(
+                TunnelKey::prefix_len(r.inner_dst.prefix),
+                TunnelKey::new(r.vni, addr),
+            );
+            let _ = irb.remove(&key);
+        }
+    }
     if let Some(old_srv6) = &old.srv6 {
         // B9 trusted-SRv6-peer set (C2): drop the old peers so a peer removed from
         // the config stops being an authorized decap source on this live
@@ -1654,6 +1717,8 @@ fn apply_config(ebpf: &mut Ebpf, cfg: &RuntimeConfig, old: Option<&RuntimeConfig
         cfg.srv6.as_ref(),
         &cfg.srv6_routes,
         &cfg.srv6_local_sids,
+        &cfg.srv6_floods,
+        &cfg.srv6_irb_routes,
     )?;
 
     Ok(())
@@ -1699,7 +1764,8 @@ fn program_rate_limits(
             let slot = buckets.len() as u32 + 1;
             if slot > MAX_RULE_LIMITS {
                 warn!(
-                    "policy {}: more than {MAX_RULE_LIMITS} rate-limited rules;                      the rule on port {} stays unlimited",
+                    "policy {}: more than {MAX_RULE_LIMITS} rate-limited rules; the rule \
+                     on port {} stays unlimited",
                     policy.id, rule.key.port
                 );
                 continue;
@@ -3026,6 +3092,8 @@ fn program_srv6(
     srv6: Option<&ResolvedSrv6>,
     routes: &[ResolvedSrv6Route],
     local_sids: &[ResolvedSrv6LocalSid],
+    floods: &[ResolvedSrv6Flood],
+    irb_routes: &[ResolvedSrv6IrbRoute],
 ) -> Result<()> {
     // Resolve the host config (source MAC) before borrowing any map.
     let config = match srv6 {
@@ -3125,13 +3193,109 @@ fn program_srv6(
         }
     }
 
+    // B9 flood sets: group by VNI into one `Srv6FloodSet` per segment, the SRv6
+    // twin of the FLOOD_LIST grouping in `program_overlay`. Deferring an
+    // unresolvable egress matches every other table here — a tap that appears
+    // later is picked up on the next reconcile rather than aborting this one.
+    let mut flood_groups: Vec<(u32, Vec<Srv6Endpoint>)> = Vec::new();
+    for f in floods {
+        let ifindex = match if_nametoindex(&f.out_iface) {
+            Ok(i) => i,
+            Err(_) => {
+                log::debug!(
+                    "srv6_flood egress {} not present yet; deferring its flood entry",
+                    f.out_iface
+                );
+                continue;
+            }
+        };
+        let ep = Srv6Endpoint::new(ifindex, f.remote_sid, f.outer_dst_mac);
+        match flood_groups.iter_mut().find(|(v, _)| *v == f.vni) {
+            Some((_, eps)) => eps.push(ep),
+            None => flood_groups.push((f.vni, vec![ep])),
+        }
+    }
+
+    {
+        // Reconciled, not merely written: a VNI whose flood set the control plane
+        // withdrew must stop replicating, and a stale set keeps sending every BUM
+        // frame to a peer that no longer serves the tenant.
+        let keep: HashSet<u32> = flood_groups.iter().map(|(v, _)| *v).collect();
+        let mut flood: HashMap<_, u32, Srv6FloodSet> = HashMap::try_from(
+            ebpf.map_mut("SRV6_FLOOD_LIST")
+                .ok_or_else(|| anyhow!("SRV6_FLOOD_LIST map missing"))?,
+        )?;
+        drop_unlisted(&mut flood, &keep)?;
+        for (vni, eps) in &flood_groups {
+            flood
+                .insert(vni, Srv6FloodSet::new(eps), 0)
+                .with_context(|| format!("inserting SRv6 flood set for vni {vni}"))?;
+        }
+    }
+
+    // B9 symmetric-IRB routes, keyed exactly like the VXLAN trie: longest-prefix
+    // on `(ingress vni, inner dst)`.
+    let prepared_irb: Vec<(Key<TunnelKey>, Srv6IrbEndpoint)> = irb_routes
+        .iter()
+        .filter_map(|r| {
+            let ifindex = match if_nametoindex(&r.out_iface) {
+                Ok(i) => i,
+                Err(_) => {
+                    log::debug!(
+                        "srv6_irb_route egress {} not present yet; deferring its route",
+                        r.out_iface
+                    );
+                    return None;
+                }
+            };
+            let (_, addr) = r.inner_dst.lpm_key();
+            Some((
+                Key::new(
+                    TunnelKey::prefix_len(r.inner_dst.prefix),
+                    TunnelKey::new(r.vni, addr),
+                ),
+                Srv6IrbEndpoint::new(
+                    ifindex,
+                    r.l3_vni,
+                    r.remote_sid,
+                    r.outer_dst_mac,
+                    r.router_mac,
+                    r.gateway_mac,
+                ),
+            ))
+        })
+        .collect();
+
+    {
+        let mut irb: LpmTrie<_, TunnelKey, Srv6IrbEndpoint> = LpmTrie::try_from(
+            ebpf.map_mut("SRV6_IRB_ROUTES")
+                .ok_or_else(|| anyhow!("SRV6_IRB_ROUTES map missing"))?,
+        )?;
+        for (key, endpoint) in &prepared_irb {
+            irb.insert(key, endpoint, 0)
+                .context("inserting SRv6 IRB route entry")?;
+        }
+    }
+
     let mut tx_ports: DevMap<_> = DevMap::try_from(
         ebpf.map_mut("TX_PORTS")
             .ok_or_else(|| anyhow!("TX_PORTS map missing"))?,
     )?;
-    for (_, endpoint) in &prepared {
+    // Every table that can redirect needs its egress in the devmap, not just the
+    // unicast FDB: a flood copy and a routed frame leave through the same helper,
+    // and an ifindex missing here turns `redirect` into `XDP_ABORTED`.
+    for ifindex in prepared
+        .iter()
+        .map(|(_, e)| e.out_ifindex)
+        .chain(
+            flood_groups
+                .iter()
+                .flat_map(|(_, eps)| eps.iter().map(|e| e.out_ifindex)),
+        )
+        .chain(prepared_irb.iter().map(|(_, e)| e.out_ifindex))
+    {
         tx_ports
-            .set(endpoint.out_ifindex, endpoint.out_ifindex, None, 0)
+            .set(ifindex, ifindex, None, 0)
             .context("registering SRv6 redirect device")?;
     }
 
@@ -3348,9 +3512,20 @@ fn attach_bum_ingress(ebpf: &mut Ebpf, ifaces: &[String]) -> Result<()> {
         .program_mut("velstra_bum")
         .ok_or_else(|| anyhow!("eBPF object has no `velstra_bum` program"))?
         .try_into()?;
-    program
-        .load()
-        .context("loading TC BUM-replication program into the kernel")?;
+    // The load is attempted once per call, and an *already-loaded* program is the
+    // normal case from the second call onward: a controller-driven agent picks up
+    // new tenant taps on every reconfigure, and the program is already in the
+    // kernel by then. Aya reports that as `ProgramError::AlreadyLoaded`, which we
+    // swallow — treating it as fatal would mean only the taps present at startup
+    // ever got a classifier, the bug this routine exists to fix.
+    //
+    // Any *other* load error is a genuine failure (a verifier rejection on the
+    // first real attempt, most importantly) and is surfaced with its full context
+    // instead of being lost to a debug line.
+    match program.load() {
+        Ok(()) | Err(ProgramError::AlreadyLoaded) => {}
+        Err(e) => return Err(e).context("loading TC BUM-replication program into the kernel"),
+    }
     for iface in ifaces {
         // Idempotent: a pre-existing clsact qdisc is fine.
         let _ = qdisc_add_clsact(iface);

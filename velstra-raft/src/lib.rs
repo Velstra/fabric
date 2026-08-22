@@ -223,6 +223,7 @@ mod tests {
             encap: EncapName::Vxlan,
             udp_port: None,
             underlay_mtu: None,
+            srv6_locator: String::new(),
         }
     }
 

@@ -163,6 +163,14 @@ message HostSpec {
   Encap encap = 5;
   uint32 udp_port = 6;        // 0 = encap default
   uint32 underlay_mtu = 7;    // 0 = default (1500)
+
+  // B9: this host's SRv6 locator, as `prefix/len` (e.g. "fc00:0:1::/64"). Every
+  // service SID this host instantiates, and the outer IPv6 source it sends from,
+  // are *derived* from it — so peers agree on each other's SIDs without any of
+  // them being allocated, stored, or replicated. Required when encap is
+  // ENCAP_SRV6 and meaningless otherwise; the controller refuses the mismatch in
+  // both directions rather than picking a default.
+  string srv6_locator = 8;
 }
 
 message NetworkSpec {
@@ -543,12 +551,28 @@ message NodeConfig {
   bool fail_closed = 18;
 
   SourceValidation source_validation = 20; // uRPF for policy 0
+
+  // B9 SRv6 overlay. Mutually exclusive with `overlay` above: a host runs one
+  // wire format, and the agent's config resolve refuses both at once. The five
+  // tables mirror the VXLAN ones one-for-one — endpoint, unicast FDB, flood set,
+  // routed subnets — plus `srv6_local_sids`, which has no VXLAN counterpart
+  // because a VXLAN decap is identified by "our VTEP IP + a served VNI" while an
+  // SRv6 decap is identified by a SID this node explicitly instantiated.
+  Srv6 srv6 = 21;                            // this host's SRv6 endpoint
+  repeated Srv6Route srv6_routes = 22;       // per-MAC End.DT2U forwarding
+  repeated Srv6LocalSid srv6_local_sids = 23; // SIDs this node terminates
+  repeated Srv6Flood srv6_floods = 24;       // per-VNI End.DT2M flood set
+  repeated Srv6IrbRoute srv6_irb_routes = 25; // symmetric-IRB routed subnets
 }
 
 // Encapsulation format for the overlay.
 enum Encap {
   ENCAP_VXLAN = 0;  // UDP/4789
   ENCAP_GENEVE = 1; // UDP/6081
+  // SRv6 (RFC 8986). Selects a different wire family, not another UDP shim: a
+  // host on ENCAP_SRV6 carries an `srv6` message instead of an `overlay` one,
+  // and the two are never both present.
+  ENCAP_SRV6 = 2;
 }
 
 // This host's overlay tunnel endpoint (VTEP). Absent on non-overlay hosts.
@@ -620,6 +644,82 @@ message FloodVtep {
   string remote_vtep = 2;  // remote VTEP underlay IPv4 (outer destination)
   string via_mac = 3;      // next-hop MAC on the underlay
   string out_iface = 4;    // underlay egress interface
+}
+
+// B9: this host's SRv6 tunnel-source identity (RFC 8986). The SRv6 analogue of
+// Overlay — but the outer source is a 128-bit IPv6 address out of this node's
+// locator, and there is no UDP port or encap choice: reduced encapsulation
+// (H.Encaps.Red) puts a single service SID in the IPv6 destination and needs no
+// Segment Routing Header.
+message Srv6 {
+  string local_src = 1;      // this host's SRv6 source (outer IPv6 source)
+  string underlay_iface = 2; // egress interface (its MAC = outer source MAC)
+  string local_mac = 3;      // override outer source MAC; empty = iface's MAC
+  uint32 underlay_mtu = 4;   // 0 = default (1500)
+  // Trusted decap peers: the outer IPv6 *source* of every peer this node accepts
+  // a decap from. Empty means fail-closed, not permissive — the datapath refuses
+  // every decap rather than trusting the underlay. The remote SID we send toward
+  // is a function-bearing SID and generally is not a peer's source, so trust
+  // cannot be derived from the route tables; it is listed here on purpose.
+  repeated string peers = 5;
+}
+
+// B9 one SRv6 L2 forwarding entry: which remote End.DT2U service SID hosts a
+// given tenant destination MAC. The SRv6 analogue of MacRoute.
+message Srv6Route {
+  uint32 vni = 1;          // tenant VNI the destination MAC lives on
+  string mac = 2;          // inner destination MAC to bridge toward
+  string remote_sid = 3;   // remote End.DT2U service SID (outer IPv6 destination)
+  string via_mac = 4;      // next-hop MAC on the underlay
+  string out_iface = 5;    // underlay egress interface
+}
+
+// B9 one service SID this node instantiates and terminates. A packet whose outer
+// IPv6 destination matches `sid` is decapsulated into `vni` per `behavior`.
+message Srv6LocalSid {
+  string sid = 1;      // the instantiated SID (an address out of our locator)
+  uint32 vni = 2;      // tenant VNI this SID terminates into
+  string behavior = 3; // "end.dt2u" (unicast bridge) or "end.dt2m" (flood); empty = end.dt2u
+}
+
+// B9 one SRv6 BUM head-end replication entry: a remote End.DT2M service SID that
+// broadcast/unknown-unicast/multicast traffic on `vni` must be flooded to. The
+// SRv6 analogue of FloodVtep.
+//
+// `remote_sid` must be the peer's End.DT2M SID, never the End.DT2U one an
+// Srv6Route names: RFC 9252 binds a SID to one behaviour, so a flood copy sent to
+// a unicast SID is bridged to a single MAC on arrival instead of flooded.
+message Srv6Flood {
+  uint32 vni = 1;        // tenant VNI whose BUM traffic floods to this SID
+  string remote_sid = 2; // remote End.DT2M service SID
+  string via_mac = 3;    // next-hop MAC on the underlay
+  string out_iface = 4;  // underlay egress interface
+}
+
+// B9 one SRv6 symmetric-IRB route: a remote tenant subnet reached by routing
+// rather than bridging. The SRv6 analogue of IrbRoute, keyed the same way on the
+// ingress VNI.
+//
+// `remote_sid` is the peer's End.DT2U SID for the tenant's *L3* VNI, not an
+// End.DT4 one. RFC 9252 section 6 does specify End.DT4/DT6 for a type-5 route, and
+// this deliberately deviates: an End.DT4 payload is a bare IP packet, which has to
+// be delivered into the tenant's own L3 device to be routed in the right VRF, and
+// this host model has one shared kernel bridge. Encapsulating a rewritten Ethernet
+// frame under the L3 VNI — exactly what the VXLAN path does — keeps routed and
+// bridged traffic on one encapsulation shape and one decap path.
+//
+// The controller therefore *derives* this SID from the peer's locator instead of
+// using the End.DT4 SID a type-5 route advertises. Interop with a third-party PE
+// needs the L3 behaviours, and those need per-tenant L3 devices first.
+message Srv6IrbRoute {
+  uint32 vni = 1;         // ingress tenant segment this route applies on
+  string inner_dst = 2;   // remote tenant subnet (longest-prefix match)
+  uint32 l3_vni = 3;      // the routed VNI whose End.DT2U SID remote_sid is
+  string remote_sid = 4;  // that L3 VNI's End.DT2U service SID
+  string via_mac = 5;     // next-hop MAC on the underlay
+  string out_iface = 6;   // underlay egress interface
+  string router_mac = 7;  // egress router's IRB MAC: rewritten inner destination
+  string gateway_mac = 8; // this tenant's anycast gateway: rewritten inner source
 }
 
 // A named tenant policy (the top-level fields above are policy 0).

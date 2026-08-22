@@ -66,7 +66,7 @@ pub use overlay::{
     LocalMac, LocalMacKey, MAX_FLOOD_VTEPS, MacFdbKey, ND_NA_MSG_LEN, NaReply, NdKey,
     OVERLAY_OUTER_LEN, OverlayConfig, TunnelEndpoint, TunnelKey, VXLAN_PORT, build_encap,
     decode_vni, encap_kind, icmpv6_checksum, is_overlay_dport, overlay_src_port, plan_arp_reply,
-    plan_irb, plan_na_reply,
+    plan_irb, plan_na_reply, write_encap,
 };
 pub use packet::{
     ETHERTYPE_IPV4, ETHERTYPE_IPV6, PORT_ENFORCE_MAC, PORT_ENFORCE_V4, PORT_ENFORCE_V6, PacketMeta,
@@ -91,8 +91,9 @@ pub use reject::{
     plan_icmp_unreachable, plan_tcp_rst, tcp_flags,
 };
 pub use srv6::{
-    SRV6_L2_OUTER_LEN, Srv6Config, Srv6Encap, Srv6Endpoint, Srv6LocalSid, Srv6Sid, Srv6SidKey,
-    build_service_sid, build_srv6_encap, decode_service_sid,
+    SRV6_L2_OUTER_LEN, Srv6Config, Srv6Encap, Srv6Endpoint, Srv6FloodSet, Srv6IrbEndpoint,
+    Srv6LocalSid, Srv6Sid, Srv6SidKey, build_service_sid, build_srv6_encap, decode_service_sid,
+    plan_srv6_irb, write_srv6_encap,
 };
 pub use synproxy::{
     EPOCH_SHIFT, MSS_TABLE, SYNTH_WINDOW, SynFlow, SynProxyCfg, SynProxyKey, TcpSynth,

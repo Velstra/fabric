@@ -561,7 +561,29 @@ pub fn build_encap(
     entropy: u32,
 ) -> Encap {
     let mut h = [0u8; OVERLAY_OUTER_LEN];
+    write_encap(&mut h, cfg, ep, vni, inner_frame_len, entropy);
+    Encap {
+        headers: h,
+        out_ifindex: ep.out_ifindex,
+    }
+}
 
+/// The same header stack, written **into a caller-owned buffer** instead of
+/// returned by value. See [`crate::srv6::write_srv6_encap`] for why this shape
+/// exists: [`Encap`] is 56 bytes on the caller's frame, the XDP encapsulation
+/// path is the deepest frame in the program, and BPF caps the *combined* depth of
+/// a call chain at 512 — so those bytes are the difference between a data plane
+/// that loads and one the verifier refuses, on whichever machine happens to have
+/// the other compiler.
+#[inline]
+pub fn write_encap(
+    h: &mut [u8; OVERLAY_OUTER_LEN],
+    cfg: &OverlayConfig,
+    ep: &TunnelEndpoint,
+    vni: u32,
+    inner_frame_len: u16,
+    entropy: u32,
+) {
     // --- Outer Ethernet (0..14) ---------------------------------------------
     h[0..6].copy_from_slice(&ep.outer_dst_mac);
     h[6..12].copy_from_slice(&cfg.local_mac);
@@ -603,11 +625,6 @@ pub fn build_encap(
     }
     h[SHIM_OFFSET + 4..SHIM_OFFSET + 7].copy_from_slice(&vni_be);
     // h[SHIM_OFFSET + 7] reserved (zero)
-
-    Encap {
-        headers: h,
-        out_ifindex: ep.out_ifindex,
-    }
 }
 
 /// Read the 24-bit VNI out of an 8-byte VXLAN or Geneve shim. The VNI occupies

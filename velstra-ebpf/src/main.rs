@@ -76,15 +76,16 @@ use velstra_common::{
     PortFwd, PortalClientKey, PortalGate, PortalSeenKey, RateBucket, Rewrite, RouteEntry,
     SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6, ScopedDstPortKey, ScopedDstPortKey6, ScopedMac,
     ScopedPortKey, ScopedSrcPortKey, ScopedSrcPortKey6, ServiceKey, ServiceValue, SourceValidation,
-    Srv6Config, Srv6Endpoint, Srv6LocalSid, Srv6SidKey, SynFlow, SynProxyCfg, SynProxyKey,
-    TcpSynth, TunnelEndpoint, TunnelKey, build_encap, build_srv6_encap, check_cookie,
-    csum_replace_u32, decide, decide_egress, decode_vni, epoch_of, gate_admits_unauthenticated,
-    icmp, icmp_checksum, icmp_reply_probe, icmp_type_probe, ip_proto, ipv6_ext_len, is_ipv6_ext,
-    is_overlay_dport, lpm_key_addr, make_cookie, plan_arp_reply, plan_forward,
-    plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_server_ack, plan_server_syn,
-    plan_syn_ack, plan_tcp_rst, port_rule_action, port_rule_excluded, port_rule_limit,
-    port_rule_logs, port_rule_present, port_rule_winner, select_backend, session_hash, tcp_flags,
-    translate_to_client, translate_to_server, v6_source_is_v4_mapped,
+    Srv6Config, Srv6Endpoint, Srv6FloodSet, Srv6IrbEndpoint, Srv6LocalSid, Srv6SidKey, SynFlow,
+    SynProxyCfg, SynProxyKey, TcpSynth, TunnelEndpoint, TunnelKey, build_encap, build_srv6_encap,
+    check_cookie, csum_replace_u32, decide, decide_egress, decode_vni, epoch_of,
+    gate_admits_unauthenticated, icmp, icmp_checksum, icmp_reply_probe, icmp_type_probe, ip_proto,
+    ipv6_ext_len, is_ipv6_ext, is_overlay_dport, lpm_key_addr, make_cookie, plan_arp_reply,
+    plan_forward, plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_server_ack,
+    plan_server_syn, plan_srv6_irb, plan_syn_ack, plan_tcp_rst, port_rule_action,
+    port_rule_excluded, port_rule_limit, port_rule_logs, port_rule_present, port_rule_winner,
+    select_backend, session_hash, tcp_flags, translate_to_client, translate_to_server,
+    v6_source_is_v4_mapped, write_encap, write_srv6_encap,
 };
 
 /// Maps an ingress interface index to its policy id, so one XDP program can
@@ -579,6 +580,32 @@ static SRV6_LOCAL_SIDS: HashMap<Srv6SidKey, Srv6LocalSid> = HashMap::with_max_en
 #[map]
 static SRV6_PEERS: HashMap<[u8; 16], u8> = HashMap::with_max_entries(8192, 0);
 
+/// B9 SRv6 per-VNI **flood set**: `vni` → the [`Srv6FloodSet`] of remote
+/// `End.DT2M` service SIDs a BUM frame on that segment must be head-end
+/// replicated to. The SRv6 analogue of [`FLOOD_LIST`], consulted by the same TC
+/// ingress `velstra_bum` classifier — which of the two it reads is decided by
+/// which overlay this host has enabled, never by the frame.
+///
+/// The SIDs here are `End.DT2M`, **not** the `End.DT2U` SIDs [`SRV6_FDB`] holds:
+/// RFC 9252 binds a SID to exactly one behaviour, so sending a flood copy to a
+/// peer's unicast SID would have it bridged to one MAC instead of flooded.
+#[map]
+static SRV6_FLOOD_LIST: HashMap<u32, Srv6FloodSet> = HashMap::with_max_entries(4096, 0);
+
+/// B9 SRv6 **symmetric-IRB** routes: longest-prefix `(vni, inner dst IP)` → the
+/// remote [`Srv6IrbEndpoint`]. The SRv6 analogue of [`IRB_ROUTES`], and consulted
+/// under the same gate — only for frames addressed to the tenant's anycast
+/// gateway MAC, ahead of the bridging FDB.
+///
+/// The entry points at an `End.DT2U` SID derived from the tenant's **L3** VNI,
+/// because RFC 9136 symmetric IRB puts a rewritten *Ethernet* frame on the wire
+/// under the L3 VNI. The routed frame therefore decapsulates through exactly the
+/// same `End.DT2U` leg a bridged one does. RFC 9252 §6 would use `End.DT4`/`DT6`
+/// here; see `Srv6IrbEndpoint` for why this host model cannot terminate one yet
+/// (a bare IP payload needs a per-tenant L3 device to land in the right VRF).
+#[map]
+static SRV6_IRB_ROUTES: LpmTrie<TunnelKey, Srv6IrbEndpoint> = LpmTrie::with_max_entries(8192, 0);
+
 /// B2 per-VNI **flood set**: `vni` → the [`FloodSet`] of remote VTEPs a
 /// broadcast/unknown-unicast/multicast (BUM) frame on that segment must be
 /// head-end replicated to. Consulted by the TC ingress `velstra_bum` classifier
@@ -645,6 +672,41 @@ fn fib_scratch() -> Option<*mut bpf_fib_lookup> {
     unsafe { core::ptr::write_bytes(params, 0, 1) };
     Some(params)
 }
+
+/// This CPU's scratch buffer for an outer VXLAN/Geneve header stack.
+///
+/// The same reasoning as [`FIB_SCRATCH`], and the same 512-byte ceiling — but
+/// this one is why the data plane stopped loading at all on one machine and kept
+/// loading on another. `Encap` is 56 bytes returned by value onto the caller's
+/// frame, `Srv6Encap` 60; the encapsulation path is the deepest frame in the
+/// program, and the verifier caps the **combined** depth of a call chain, not
+/// each frame. A build whose inliner made slightly different choices therefore
+/// tipped `velstra_forward` plus its uRPF leaf past 512, and the failure landed
+/// on whoever had the other compiler.
+///
+/// Holding the header here costs one map lookup and takes those bytes off the
+/// frame permanently, whatever the compiler decides to inline.
+#[map]
+static ENCAP_SCRATCH: PerCpuArray<[u8; OVERLAY_OUTER_LEN]> = PerCpuArray::with_max_entries(1, 0);
+
+/// The SRv6 half of [`ENCAP_SCRATCH`]: 54 bytes of outer Ethernet + IPv6.
+#[map]
+static SRV6_ENCAP_SCRATCH: PerCpuArray<[u8; SRV6_L2_OUTER_LEN]> =
+    PerCpuArray::with_max_entries(1, 0);
+
+/// This CPU's copy of the fixed 40-byte IPv6 header.
+///
+/// The IPv6 path reads the header once and then hands `&hdr` to the SRv6 decap,
+/// the portal, uRPF and the firewall, so it has to outlive every packet-pointer
+/// invalidation along the way — which is why it was a copy in the first place.
+/// Keeping that copy on the frame cost forty bytes of `velstra_main`, and
+/// `velstra_main` plus its uRPF leaf is the deepest chain in the program: 392 + 120
+/// is 512 exactly, the verifier's whole budget, with nothing left for a compiler
+/// that lays out one frame differently. That is not a margin, it is a coincidence,
+/// and it is why the data plane loaded under one toolchain and was refused under
+/// another with `combined stack size of 2 calls is 528`.
+#[map]
+static V6_HDR_SCRATCH: PerCpuArray<[u8; Ipv6Hdr::LEN]> = PerCpuArray::with_max_entries(1, 0);
 
 /// Everything the tail-called [`velstra_forward`] program needs from
 /// [`try_velstra`]'s post-firewall state. A tail call replaces the running
@@ -885,12 +947,6 @@ pub fn velstra_bum(ctx: TcContext) -> i32 {
 /// copies; the original frame is left for normal local delivery.
 #[inline(always)]
 fn try_bum(ctx: &TcContext) -> Result<i32, ()> {
-    // Overlay must be active for any encapsulation to make sense.
-    let ocfg = overlay_config();
-    if !ocfg.is_enabled() {
-        return Ok(TC_ACT_OK as i32);
-    }
-
     // Ingress VNI is the tap's segment — the same `IFACE_VNI` map the XDP encap
     // path keys on. A non-tenant port (vni 0) never floods.
     let ifindex = unsafe { (*ctx.skb.skb).ifindex };
@@ -899,14 +955,38 @@ fn try_bum(ctx: &TcContext) -> Result<i32, ()> {
         return Ok(TC_ACT_OK as i32);
     }
 
-    // Classify BUM by the inner destination MAC (frame offset 0):
+    // The inner destination MAC (frame offset 0) classifies the frame; read it
+    // once for whichever overlay handles it.
+    let dst_mac = unsafe { *ptr_at_tc::<[u8; 6]>(ctx, O_ETH_DST)? };
+
+    // Which overlay this host runs decides which unicast FDB proves "already
+    // handled by XDP" and which flood set holds the targets. The two are mutually
+    // exclusive by construction (`Srv6Config` is enabled only when `OverlayConfig`
+    // is not), so this is a dispatch, not a fallthrough: reading the wrong pair
+    // would either re-flood a frame XDP already encapsulated or flood none at all.
+    let ocfg = overlay_config();
+    if ocfg.is_enabled() {
+        return bum_vxlan(ctx, &ocfg, vni, dst_mac);
+    }
+    let scfg = srv6_config();
+    if scfg.is_enabled() {
+        return bum_srv6(ctx, &scfg, vni, dst_mac);
+    }
+    // No overlay at all — nothing to encapsulate toward.
+    Ok(TC_ACT_OK as i32)
+}
+
+/// Head-end replicate a BUM frame over **VXLAN/Geneve** to every remote VTEP in
+/// its VNI's [`FLOOD_LIST`] set.
+#[inline(always)]
+fn bum_vxlan(ctx: &TcContext, ocfg: &OverlayConfig, vni: u32, dst_mac: [u8; 6]) -> Result<i32, ()> {
+    // Classify BUM by the inner destination MAC:
     //   * broadcast  (ff:ff:ff:ff:ff:ff) — has bit 0 of octet 0 set, so it is
     //     caught by the multicast test;
     //   * multicast  (octet0 & 1 == 1);
     //   * unknown-unicast — a MAC_FDB miss for this (vni, dst MAC).
     // A KNOWN unicast (MAC_FDB hit) is not BUM and was already handled by XDP
     // `try_encap`; leave it alone.
-    let dst_mac = unsafe { *ptr_at_tc::<[u8; 6]>(ctx, O_ETH_DST)? };
     let is_multicast = dst_mac[0] & 1 == 1;
     let is_bum = is_multicast || unsafe { MAC_FDB.get(&MacFdbKey::new(vni, dst_mac)) }.is_none();
     if !is_bum {
@@ -951,7 +1031,7 @@ fn try_bum(ctx: &TcContext) -> Result<i32, ()> {
         };
 
         // Build this VTEP's full outer stack (correct checksum included).
-        let encap = build_encap(&ocfg, &ep, vni, inner_len, entropy);
+        let encap = build_encap(ocfg, &ep, vni, inner_len, entropy);
 
         // Grow the headroom exactly once, on the first copy.
         if !grown {
@@ -980,6 +1060,102 @@ fn try_bum(ctx: &TcContext) -> Result<i32, ()> {
     // locally unchanged (clone_redirect did not consume it).
     if grown {
         let _ = ctx.adjust_room(-(OVERLAY_OUTER_LEN as i32), BPF_ADJ_ROOM_MAC, 0);
+    }
+
+    Ok(TC_ACT_OK as i32)
+}
+
+/// B9 head-end replicate a BUM frame over **SRv6** to every remote `End.DT2M`
+/// service SID in its VNI's [`SRV6_FLOOD_LIST`] set.
+///
+/// Structurally identical to [`bum_vxlan`] — grow the room once, re-store the
+/// outer stack per copy, `clone_redirect`, shrink back — because the constraint
+/// that shaped that design is the same one: XDP is one-packet-in/one-action-out,
+/// so replication has to happen at TC where `bpf_clone_redirect` exists. Only
+/// three things differ, and each is load-bearing:
+///
+/// * the "already handled by XDP" test reads [`SRV6_FDB`], not `MAC_FDB`;
+/// * the outer stack is [`SRV6_L2_OUTER_LEN`] bytes, not [`OVERLAY_OUTER_LEN`];
+/// * the endpoints hold `End.DT2M` SIDs, so each copy is *flooded* by the
+///   receiving host rather than bridged to one MAC.
+#[inline(always)]
+fn bum_srv6(ctx: &TcContext, scfg: &Srv6Config, vni: u32, dst_mac: [u8; 6]) -> Result<i32, ()> {
+    // Same three-way BUM classification as the VXLAN branch, but against the SRv6
+    // unicast FDB: a MAC the SRv6 FDB knows was already encapsulated by XDP
+    // `try_srv6_encap` and must not be flooded on top of that.
+    let is_multicast = dst_mac[0] & 1 == 1;
+    let is_bum = is_multicast || unsafe { SRV6_FDB.get(&MacFdbKey::new(vni, dst_mac)) }.is_none();
+    if !is_bum {
+        return Ok(TC_ACT_OK as i32);
+    }
+
+    // The flood set for this segment. A miss or an empty set ⇒ nothing to do.
+    // Hold a *reference* into the map value — the whole `Srv6FloodSet` is 452
+    // bytes, far past the 512-byte BPF stack; we index it in place and copy out
+    // only one 28-byte `Srv6Endpoint` per iteration.
+    let flood = match unsafe { SRV6_FLOOD_LIST.get(&vni) } {
+        Some(f) => f,
+        None => return Ok(TC_ACT_OK as i32),
+    };
+    let count = flood.count;
+    if count == 0 {
+        return Ok(TC_ACT_OK as i32);
+    }
+
+    // The inner frame length (whole L2 frame becomes the tunnel payload), read
+    // BEFORE any room grow. Leave for local delivery if encap would exceed the
+    // underlay MTU — mirrors the XDP encap MTU guard.
+    let inner_len = (ctx.data_end() - ctx.data()) as u16;
+    if inner_len > scfg.max_inner_len() {
+        return Ok(TC_ACT_OK as i32);
+    }
+    // Coarse flow-label entropy: a BUM frame carries no single L4 flow to hash,
+    // so we spread only by (vni, dst MAC) — the same coarseness the VXLAN branch
+    // accepts for the same reason.
+    let entropy = vni ^ ((dst_mac[4] as u32) << 8) ^ (dst_mac[5] as u32);
+
+    let mut grown = false;
+    let mut i: usize = 0;
+    while i < MAX_FLOOD_VTEPS {
+        if i as u32 >= count {
+            break;
+        }
+        // `.get` (not `[]`) keeps the verifier off any panic/bounds path.
+        let ep = match flood.endpoints.get(i) {
+            Some(e) => *e,
+            None => break,
+        };
+
+        // Build this peer's full outer stack. IPv6 has no header checksum, so
+        // unlike the VXLAN branch there is nothing to repair between copies.
+        let encap = build_srv6_encap(&scfg.local_src, &scfg.local_mac, &ep, inner_len, entropy);
+
+        // Grow the headroom exactly once, on the first copy.
+        if !grown {
+            if ctx
+                .adjust_room(SRV6_L2_OUTER_LEN as i32, BPF_ADJ_ROOM_MAC, 0)
+                .is_err()
+            {
+                // Could not make room — abandon replication, deliver locally.
+                return Ok(TC_ACT_OK as i32);
+            }
+            grown = true;
+        }
+
+        // Overwrite the outer stack for this peer, then clone+redirect the copy
+        // onto the underlay.
+        if ctx.store(0, &encap.headers, 0).is_ok() && ctx.clone_redirect(ep.out_ifindex, 0).is_ok()
+        {
+            bump(Counter::Srv6BumReplicated);
+        }
+
+        i += 1;
+    }
+
+    // Remove the outer stack we prepended so the ORIGINAL frame is delivered
+    // locally unchanged (clone_redirect did not consume it).
+    if grown {
+        let _ = ctx.adjust_room(-(SRV6_L2_OUTER_LEN as i32), BPF_ADJ_ROOM_MAC, 0);
     }
 
     Ok(TC_ACT_OK as i32)
@@ -2176,7 +2352,8 @@ fn try_velstra_forward(ctx: &XdpContext) -> Result<u32, ()> {
     // overlay wire format per host); a miss falls through unchanged.
     let scfg = srv6_config();
     if let Some(action) = try_srv6_encap(
-        ctx, &scfg, s.vni, s.src_addr, s.src_port, s.dst_port, s.proto, log,
+        ctx, &scfg, s.vni, s.src_addr, s.dst_addr, s.src_port, s.dst_port, s.proto, s.ttl,
+        s.checksum, log,
     )? {
         return Ok(action);
     }
@@ -2324,17 +2501,29 @@ fn walk_ipv6_ext(ctx: &XdpContext, first: u8) -> Ipv6Upper {
 /// whatever header happens to come first.
 #[inline(always)]
 fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
-    // The fixed 40-byte IPv6 header, copied out in one bounds-checked read. We
-    // read raw bytes rather than `Ipv6Hdr` to sidestep its `in6_addr` unions.
-    let hdr: *const [u8; Ipv6Hdr::LEN] = unsafe { ptr_at(ctx, EthHdr::LEN)? };
-    let hdr = unsafe { *hdr };
+    // The fixed 40-byte IPv6 header, copied out in one bounds-checked read — into
+    // this CPU's slot rather than onto the frame (see `V6_HDR_SCRATCH`). We read
+    // raw bytes rather than `Ipv6Hdr` to sidestep its `in6_addr` unions.
+    //
+    // A copy at all, rather than a borrow of the packet, because the readers below
+    // outlive the packet pointer: `try_srv6_decap` calls `bpf_xdp_adjust_head`.
+    let src: *const [u8; Ipv6Hdr::LEN] = unsafe { ptr_at(ctx, EthHdr::LEN)? };
+    let Some(slot) = V6_HDR_SCRATCH.get_ptr_mut(0) else {
+        return Ok(xdp_action::XDP_PASS);
+    };
+    // SAFETY: `src` is a bounds-checked pointer to 40 live packet bytes and
+    // `slot` is this CPU's own map slot; per-CPU maps are not shared.
+    unsafe { *slot = *src };
+    let hdr = unsafe { &*slot };
 
-    // B9: SRv6 decapsulation (End.DT2U). If this packet's IPv6 destination is a
+    // B9: SRv6 decapsulation (End.DT2U unicast or End.DT2M flood — both carry an
+    // inner Ethernet frame and strip identically here; the difference between
+    // them is entirely at the head end). If this packet's IPv6 destination is a
     // service SID we instantiated, strip the outer Ethernet+IPv6 and hand the
     // inner Ethernet frame to the kernel bridge (deliver by inner MAC). Runs
     // before the firewall — the SID match is the authorization (we only ever
     // instantiate our own SIDs). A miss falls through to the IPv6 firewall below.
-    if let Some(action) = try_srv6_decap(ctx, &hdr)? {
+    if let Some(action) = try_srv6_decap(ctx, hdr)? {
         return Ok(action);
     }
 
@@ -2398,7 +2587,7 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
     // Source validation, ahead of every other verdict (see the IPv4 path).
     let rpf = cfg.source_validation();
     if rpf != SourceValidation::Disabled
-        && source_is_spoofed_v6(ctx, &hdr, &meta, ifindex, rpf == SourceValidation::Strict)
+        && source_is_spoofed_v6(ctx, hdr, &meta, ifindex, rpf == SourceValidation::Strict)
     {
         bump(Counter::DroppedSpoofed);
         if cfg.has_flag(ConfigFlags::LOG) {
@@ -2411,7 +2600,7 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
     // dual-stacked guest zone would hand every unadmitted device a working IPv6
     // path around the portal, which is not a gap in the feature — it is the
     // feature not existing.
-    if cfg.has_flag(ConfigFlags::PORTAL) && !portal_admits_v6(ctx, policy_id, &hdr, &meta) {
+    if cfg.has_flag(ConfigFlags::PORTAL) && !portal_admits_v6(ctx, policy_id, hdr, &meta) {
         bump(Counter::DroppedPortal);
         if cfg.has_flag(ConfigFlags::LOG) {
             info!(ctx, "DROP6 portal proto={} dport={}", proto, dst_port);
@@ -2897,9 +3086,22 @@ fn try_srv6_decap(ctx: &XdpContext, hdr: &[u8; Ipv6Hdr::LEN]) -> Result<Option<u
         Some(l) => l.behavior,
         None => return Ok(None),
     };
-    // Only the L2 unicast behaviour is decapsulated in this fast path; End.DT2M
-    // (BUM flood) needs head-end replication at the TC layer and is not here.
-    if behavior != velstra_common::srv6::behavior::END_DT2U {
+    // Both L2 behaviours decapsulate identically *here*: the difference between
+    // End.DT2U and End.DT2M is entirely a head-end one (one copy to one SID, vs
+    // one copy to every SID in the flood set — see `try_bum`). On this, the
+    // receiving side, each arrives as one packet carrying one Ethernet frame, and
+    // the bridge does the rest. Refusing End.DT2M here — as this did before the
+    // flood set existed — silently black-holes every ARP, ND and DHCP frame in an
+    // SRv6 fabric, which is a segment that looks configured and cannot resolve.
+    // An L3 behaviour (End.DT4/DT6) is *not* accepted, and refusing it is the
+    // correct failure: its inner payload is a bare IP packet, so the fixed strip
+    // below would hand the bridge a corrupt frame. Terminating one properly needs a
+    // per-tenant L3 device this host model does not have yet, so a peer that
+    // advertises only End.DT4 is unreachable *loudly* (the frame falls through to
+    // the firewall and is dropped) rather than mis-bridged.
+    if behavior != velstra_common::srv6::behavior::END_DT2U
+        && behavior != velstra_common::srv6::behavior::END_DT2M
+    {
         return Ok(None);
     }
     // Reduced End.DT2U encap carries the inner Ethernet frame directly after the
@@ -2950,22 +3152,64 @@ fn try_srv6_encap(
     scfg: &Srv6Config,
     vni: u32,
     src_addr: [u8; 4],
+    dst_addr: [u8; 4],
     src_port: u16,
     dst_port: u16,
     proto: u8,
+    ttl: u8,
+    ip_checksum: u16,
     log: bool,
 ) -> Result<Option<u32>, ()> {
     // No SRv6 overlay configured, or the ingress port is not on a tenant segment.
     if !scfg.is_enabled() || vni == 0 {
         return Ok(None);
     }
-    // Bridge by the inner destination MAC (End.DT2U unicast). Read it now, before
-    // any `bpf_xdp_adjust_head` grows the head. A miss means local delivery or a
-    // BUM frame (End.DT2M flood, handled elsewhere) — fall through unchanged.
+    // Read the inner dst MAC now, before any `bpf_xdp_adjust_head` grows the head:
+    // both the IRB gate and the SRv6 FDB need it, and after the grow its offset
+    // moves.
     let inner_dst_mac = unsafe { *ptr_at::<[u8; 6]>(ctx, O_ETH_DST)? };
-    let ep = match unsafe { SRV6_FDB.get(&MacFdbKey::new(vni, inner_dst_mac)) } {
-        Some(ep) => *ep,
-        None => return Ok(None),
+
+    // Symmetric IRB, ahead of the bridging FDB and under the same gate the VXLAN
+    // path uses: an inner destination matching a routed prefix of this tenant
+    // **and** addressed at L2 to the tenant's anycast gateway is inter-subnet
+    // traffic. Without the gateway-MAC gate a frame between two hosts of one
+    // segment that merely matches a remote prefix would be routed, and arrive
+    // with the wrong MACs.
+    // The 44-byte `Srv6IrbEndpoint` is held as a *reference* into the map value and
+    // never copied onto this frame: `try_srv6_encap` and `try_encap` are both
+    // inlined into `try_velstra`, so their locals sum against one 512-byte budget,
+    // and a by-value copy here is what pushes it over. Only the two small
+    // aggregates actually needed downstream (`Srv6Endpoint`, `IrbRewrite`) land on
+    // the stack.
+    let irb = match SRV6_IRB_ROUTES.get(&Key::new(
+        TunnelKey::FULL_PREFIX,
+        TunnelKey::new(vni, lpm_key_addr(dst_addr)),
+    )) {
+        Some(irb) if irb.gateway_mac == inner_dst_mac => Some(irb),
+        _ => None,
+    };
+
+    // Either route (IRB) or bridge (SRv6 FDB). In the routed case the endpoint is
+    // the **L3** VNI's End.DT2U SID — RFC 9136 symmetric IRB puts a rewritten
+    // Ethernet frame on the wire under the L3 VNI, so the SRv6 twin of a VXLAN
+    // "encapsulate with the L3 VNI" is "encapsulate toward the L3 VNI's SID".
+    let (ep, rewrite): (Srv6Endpoint, Option<IrbRewrite>) = match irb {
+        Some(irb) => {
+            // Routing decrements the TTL, so a packet that cannot survive the hop
+            // is dropped here — before anything is rewritten or encapsulated.
+            let Some(rw) = plan_srv6_irb(irb, ttl, ip_checksum, proto) else {
+                bump(Counter::ForwardTtlExceeded);
+                return Ok(Some(xdp_action::XDP_DROP));
+            };
+            (irb.endpoint(), Some(rw))
+        }
+        // Bridge by the inner destination MAC (End.DT2U unicast). A miss means
+        // local delivery or a BUM frame (End.DT2M flood, replicated at the TC
+        // layer by `try_bum`) — fall through unchanged.
+        None => match unsafe { SRV6_FDB.get(&MacFdbKey::new(vni, inner_dst_mac)) } {
+            Some(ep) => (*ep, None),
+            None => return Ok(None),
+        },
     };
 
     // Entropy for the outer IPv6 flow label: hash the inner flow so the underlay
@@ -2981,7 +3225,20 @@ fn try_srv6_encap(
         return Ok(Some(xdp_action::XDP_DROP));
     }
 
-    let encap = build_srv6_encap(&scfg.local_src, &scfg.local_mac, &ep, inner_len, entropy);
+    // Per-CPU slot rather than this frame: see `SRV6_ENCAP_SCRATCH`.
+    let Some(scratch) = SRV6_ENCAP_SCRATCH.get_ptr_mut(0) else {
+        return Err(());
+    };
+    // SAFETY: this CPU's own slot; per-CPU maps are not shared.
+    write_srv6_encap(
+        unsafe { &mut *scratch },
+        &scfg.local_src,
+        &scfg.local_mac,
+        &ep,
+        inner_len,
+        entropy,
+    );
+    let out_ifindex = ep.out_ifindex;
 
     // Grow the head by exactly the outer stack length.
     // SAFETY: negative delta adds headroom; checked for failure below.
@@ -2998,23 +3255,46 @@ fn try_srv6_encap(
         return Err(());
     }
     // SAFETY: the bounds check above proves all `SRV6_L2_OUTER_LEN` bytes from
-    // `data` are within the (now larger) packet.
+    // `data` are within the (now larger) packet; `scratch` is this CPU's slot.
     unsafe {
-        *(data as *mut [u8; SRV6_L2_OUTER_LEN]) = encap.headers;
+        *(data as *mut [u8; SRV6_L2_OUTER_LEN]) = *scratch;
+    }
+
+    // Apply the routed rewrite to the *inner* frame, which the head grow just
+    // shifted `SRV6_L2_OUTER_LEN` bytes further in. Identical in shape to the
+    // VXLAN path bar the constant, and for the same reasons: the offsets stay
+    // compile-time constants (what the verifier needs to accept the writes), and
+    // doing it after the grow means a refused grow never leaves a locally-passed
+    // frame with a half-applied rewrite.
+    if let Some(rw) = rewrite {
+        const I_ETH_DST: usize = SRV6_L2_OUTER_LEN + O_ETH_DST;
+        const I_ETH_SRC: usize = SRV6_L2_OUTER_LEN + O_ETH_SRC;
+        const I_IP_TTL: usize = SRV6_L2_OUTER_LEN + O_IP_TTL;
+        const I_IP_CSUM: usize = SRV6_L2_OUTER_LEN + O_IP_CSUM;
+        // Furthest byte touched is the inner IPv4 checksum at I_IP_CSUM..+2.
+        if data + I_IP_CSUM + 2 > data_end {
+            return Err(());
+        }
+        // SAFETY: the bounds check above proves every byte written below is
+        // inside the packet; all four offsets are compile-time constants.
+        unsafe {
+            *((data + I_ETH_DST) as *mut [u8; 6]) = rw.inner_dst_mac;
+            *((data + I_ETH_SRC) as *mut [u8; 6]) = rw.inner_src_mac;
+            *((data + I_IP_TTL) as *mut u8) = rw.new_ttl;
+            *((data + I_IP_CSUM) as *mut [u8; 2]) = rw.new_checksum.to_be_bytes();
+        }
+        bump(Counter::IrbRouted);
     }
 
     bump(Counter::Srv6Encap);
     if log {
-        info!(
-            ctx,
-            "SRV6 ENCAP vni={} -> ifindex {}", vni, encap.out_ifindex
-        );
+        info!(ctx, "SRV6 ENCAP vni={} -> ifindex {}", vni, out_ifindex);
     }
     // Redirect onto the underlay; an absent devmap entry aborts (the control
     // plane mirrors every overlay egress ifindex into `TX_PORTS`).
     Ok(Some(
         TX_PORTS
-            .redirect(encap.out_ifindex, 0)
+            .redirect(out_ifindex, 0)
             .unwrap_or(xdp_action::XDP_ABORTED),
     ))
 }
@@ -3160,7 +3440,23 @@ fn try_encap(
         return Ok(Some(xdp_action::XDP_DROP));
     }
 
-    let encap = build_encap(ocfg, &ep, encap_vni, inner_len, entropy);
+    // Built into a per-CPU slot, never onto this frame: see `ENCAP_SCRATCH`.
+    // The map pointer survives the head grow below, which a packet pointer does
+    // not, so the header is composed first and copied in afterwards.
+    let Some(scratch) = ENCAP_SCRATCH.get_ptr_mut(0) else {
+        return Err(());
+    };
+    // SAFETY: `get_ptr_mut` returned this CPU's own slot; per-CPU maps are not
+    // shared, so nothing else can be writing it.
+    write_encap(
+        unsafe { &mut *scratch },
+        ocfg,
+        &ep,
+        encap_vni,
+        inner_len,
+        entropy,
+    );
+    let out_ifindex = ep.out_ifindex;
 
     // Grow the head by exactly the outer stack length.
     // SAFETY: negative delta adds headroom; checked for failure below.
@@ -3177,9 +3473,9 @@ fn try_encap(
         return Err(());
     }
     // SAFETY: the bounds check above proves all `OVERLAY_OUTER_LEN` bytes from
-    // `data` are within the (now larger) packet.
+    // `data` are within the (now larger) packet; `scratch` is this CPU's slot.
     unsafe {
-        *(data as *mut [u8; OVERLAY_OUTER_LEN]) = encap.headers;
+        *(data as *mut [u8; OVERLAY_OUTER_LEN]) = *scratch;
     }
 
     // B7: apply the routed rewrite to the *inner* frame, which the head grow just
@@ -3209,16 +3505,13 @@ fn try_encap(
 
     bump(Counter::OverlayEncap);
     if log {
-        info!(
-            ctx,
-            "ENCAP vni={} -> ifindex {}", encap_vni, encap.out_ifindex
-        );
+        info!(ctx, "ENCAP vni={} -> ifindex {}", encap_vni, out_ifindex);
     }
     // Redirect onto the underlay; an absent devmap entry aborts (the control
     // plane mirrors every overlay egress ifindex into `TX_PORTS`).
     Ok(Some(
         TX_PORTS
-            .redirect(encap.out_ifindex, 0)
+            .redirect(out_ifindex, 0)
             .unwrap_or(xdp_action::XDP_ABORTED),
     ))
 }

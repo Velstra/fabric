@@ -406,6 +406,125 @@ scenario_srv6_roundtrip() {
   kill -TERM "$pidb" 2>/dev/null || true  # stop B (the EXIT trap also reaps it)
 }
 
+# B9 — SRv6 BUM head-end replication (End.DT2M). The SRv6 analogue of the VXLAN
+# flood path, and the half that was missing for long enough to matter: without
+# it a tenant on an SRv6 segment can never ARP, never get a DHCP lease, and never
+# reach anything it has not already learned — a segment that looks configured and
+# cannot resolve.
+#
+# The frame has to be genuinely BUM to reach the replicator: XDP's `try_srv6_encap`
+# consumes any KNOWN unicast (an SRV6_FDB hit) before TC ever sees it, so this
+# programs NO srv6_route and sends to a broadcast destination. `srv6_bum_replicated`
+# firing proves the TC clone path built the outer stack and redirected a copy.
+scenario_srv6_flood() {
+  section "B9 — SRv6 BUM head-end replication (End.DT2M)"
+  ns_add s6f   # host (SRv6 source)
+  ns_add s6fc  # tenant VM
+  ns_add s6fu  # remote underlay peer
+  veth_pair s6f tap0 - s6fc tap0c 192.168.100.1/24
+  veth_pair s6f uplink0 fc00:0:1::1/64 s6fu under0 fc00:0:1::2/64
+  local umac
+  umac="$(nse s6fu cat /sys/class/net/under0/address)"
+  # The peer's End.DT2M SID — discriminator 1, distinct from the End.DT2U SID a
+  # unicast route would name. Sending a flood copy to a unicast SID would have it
+  # bridged to one MAC on arrival instead of flooded, which is why they differ.
+  cat >"$WORKDIR/srv6-flood.toml" <<-EOF
+	default_action = "pass"
+	[srv6]
+	local_src = "fc00:0:1::1"
+	underlay_iface = "uplink0"
+	underlay_mtu = 1500
+	[[interface]]
+	name = "tap0"
+	policy = 0
+	vni = 10000
+	[[srv6_flood]]
+	vni = 10000
+	remote_sid = "fc00:0:2:1:2710::"
+	via_mac = "$umac"
+	out_iface = "uplink0"
+	EOF
+  agent_start s6f -- --iface tap0 --iface uplink0 --config "$WORKDIR/srv6-flood.toml" \
+    || { bad "agent start"; return; }
+  # A broadcast frame: an ARP request for an address nothing answers. There is no
+  # SRV6_FDB entry at all here, so XDP falls through and TC is the only thing that
+  # can act on it.
+  nse s6fc arping -c3 -w2 -I tap0c 192.168.100.2 >/dev/null 2>&1 \
+    || nse s6fc ping -c2 -W1 192.168.100.2 >/dev/null 2>&1 || true
+  settle
+  assert_ge "$LAST_LOG" srv6_bum_replicated 1 \
+    "broadcast frame head-end replicated toward the End.DT2M SID"
+  agent_stop
+}
+
+# B9 — SRv6 symmetric IRB. A tenant frame addressed at L2 to its anycast gateway
+# and at L3 to a REMOTE subnet is routed, not bridged: the inner Ethernet header
+# is rewritten toward the egress router's MAC, the TTL comes down by one, and the
+# frame is encapsulated toward the peer's End.DT2U SID for the tenant's *L3* VNI.
+#
+# Two counters, and both matter. `irb_routed` alone would fire on the VXLAN path
+# too; `srv6_encap` alone would fire on a bridged frame. Together they say this
+# frame was routed AND left over SRv6, which is the thing being tested.
+#
+# The gateway-MAC gate is asserted by the second half: an identical frame sent to
+# some other MAC must NOT be routed, because bridged traffic that merely matches a
+# remote prefix would otherwise arrive with the wrong MACs.
+scenario_srv6_irb() {
+  section "B9 — SRv6 symmetric IRB (routed, not bridged)"
+  ns_add s6i   # host (SRv6 source)
+  ns_add s6ic  # tenant VM
+  ns_add s6iu  # remote underlay peer
+  veth_pair s6i tap0 - s6ic tap0c 192.168.100.1/24
+  veth_pair s6i uplink0 fc00:0:1::1/64 s6iu under0 fc00:0:1::2/64
+  local umac gw_mac router_mac
+  umac="$(nse s6iu cat /sys/class/net/under0/address)"
+  gw_mac="02:00:5e:00:00:01"      # the tenant's anycast gateway
+  router_mac="02:00:5e:00:00:bb"  # the egress router (inner dst after the rewrite)
+  cat >"$WORKDIR/srv6-irb.toml" <<-EOF
+	default_action = "pass"
+	[srv6]
+	local_src = "fc00:0:1::1"
+	underlay_iface = "uplink0"
+	underlay_mtu = 1500
+	[[interface]]
+	name = "tap0"
+	policy = 0
+	vni = 10000
+	[[srv6_irb_route]]
+	vni = 10000
+	inner_dst = "10.20.0.0/24"
+	l3_vni = 50100
+	remote_sid = "fc00:0:2:0:c3b4::"
+	via_mac = "$umac"
+	out_iface = "uplink0"
+	router_mac = "$router_mac"
+	gateway_mac = "$gw_mac"
+	EOF
+  agent_start s6i -- --iface tap0 --iface uplink0 --config "$WORKDIR/srv6-irb.toml" \
+    || { bad "agent start"; return; }
+  # Route 10.20.0.0/24 via the gateway MAC, so the VM emits a frame addressed to
+  # the gateway at L2 and to the remote subnet at L3 — which is exactly what
+  # inter-subnet traffic looks like to the datapath.
+  nse s6ic ip route replace 10.20.0.0/24 via 192.168.100.254 dev tap0c
+  nse s6ic ip neigh replace 192.168.100.254 lladdr "$gw_mac" dev tap0c
+  nse s6ic ping -c3 -W1 10.20.0.5 >/dev/null 2>&1 || true
+  settle
+  assert_ge "$LAST_LOG" irb_routed 1 "inter-subnet frame was routed by the SRv6 IRB entry"
+  assert_ge "$LAST_LOG" srv6_encap 1 "...and left over SRv6, toward the L3 VNI's SID"
+
+  # The gate: the same destination subnet, but addressed at L2 to somebody other
+  # than the gateway. That is bridged traffic and must stay bridged — routing it
+  # would deliver it with a rewritten source MAC nobody expects.
+  local before
+  before="$(counter "$LAST_LOG" irb_routed)"
+  nse s6ic ip neigh replace 192.168.100.254 lladdr 02:00:00:00:0b:99 dev tap0c
+  nse s6ic ping -c2 -W1 10.20.0.5 >/dev/null 2>&1 || true
+  settle
+  assert_unchanged "$LAST_LOG" irb_routed "$before" \
+    "a frame not addressed to the gateway MAC was left bridged"
+  agent_stop
+}
+
 # B4b — local MAC learning. A tenant frame ingressing a tenant port (`vni != 0`)
 # is learned into the `LOCAL_MACS` map on the firewall-allowed path, so the agent
 # can advertise it to a co-located Wren daemon (EVPN type-2). This asserts the
@@ -503,7 +622,7 @@ scenario_lb() {
 ALL=(
   fw_pass fw_default_drop fw_blocklist_v4 fw_icmp fw_port fw_blocklist_v6
   egress_blocklist routing lb overlay_arp overlay_nd overlay_encap overlay_mac_fdb
-  srv6_encap srv6_roundtrip local_mac_learn
+  srv6_encap srv6_roundtrip srv6_flood srv6_irb local_mac_learn
 )
 
 main() {

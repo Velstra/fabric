@@ -418,6 +418,7 @@ fn encap_name_str(e: EncapName) -> &'static str {
     match e {
         EncapName::Vxlan => "vxlan",
         EncapName::Geneve => "geneve",
+        EncapName::Srv6 => "srv6",
     }
 }
 
@@ -425,9 +426,10 @@ fn parse_encap(s: &str) -> Result<Encap, ApiError> {
     match s {
         "vxlan" => Ok(Encap::Vxlan),
         "geneve" => Ok(Encap::Geneve),
+        "srv6" => Ok(Encap::Srv6),
         other => Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            format!("unknown encap {other:?} (use vxlan or geneve)"),
+            format!("unknown encap {other:?} (use vxlan, geneve or srv6)"),
         )),
     }
 }
@@ -441,6 +443,8 @@ struct HostJson {
     encap: String,
     udp_port: u16,
     underlay_mtu: u16,
+    /// The host's SRv6 locator as `prefix/len`, or empty on a non-SRv6 host.
+    srv6_locator: String,
 }
 
 impl From<&Host> for HostJson {
@@ -453,6 +457,10 @@ impl From<&Host> for HostJson {
             encap: encap_name_str(h.encap).to_string(),
             udp_port: h.udp_port.unwrap_or(0),
             underlay_mtu: h.underlay_mtu.unwrap_or(0),
+            srv6_locator: h
+                .srv6_locator
+                .map(|(a, l)| format!("{a}/{l}"))
+                .unwrap_or_default(),
         }
     }
 }
@@ -469,6 +477,11 @@ struct CreateHostReq {
     udp_port: u32,
     #[serde(default)]
     underlay_mtu: u32,
+    /// SRv6 locator as `prefix/len`. Required when `encap` is `srv6`; the
+    /// topology refuses the mismatch either way rather than defaulting one from
+    /// the other.
+    #[serde(default)]
+    srv6_locator: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1081,6 +1094,7 @@ async fn create_host(
         encap: parse_encap(body.encap.as_deref().unwrap_or("vxlan"))? as i32,
         udp_port: body.udp_port,
         underlay_mtu: body.underlay_mtu,
+        srv6_locator: body.srv6_locator,
     };
     propose_audited(
         &state,

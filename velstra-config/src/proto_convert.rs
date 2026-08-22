@@ -12,7 +12,8 @@ use velstra_proto as proto;
 use crate::config::{
     ActionName, BackendCfg, EncapName, FileConfig, FloodVtepCfg, ForwardMode, InterfaceFile,
     IrbRouteCfg, MacRouteCfg, Nd6Cfg, NeighborCfg, OverlayCfg, PolicyFile, PortRule, ProtoName,
-    RouteCfg, RuntimeConfig, ServiceCfg, SourceValidationName, TunnelCfg,
+    RouteCfg, RuntimeConfig, ServiceCfg, SourceValidationName, Srv6Cfg, Srv6FloodCfg,
+    Srv6IrbRouteCfg, Srv6LocalSidCfg, Srv6RouteCfg, TunnelCfg,
 };
 
 fn port_rule_to_proto(r: &PortRule) -> proto::PortRule {
@@ -148,6 +149,7 @@ fn encap_to_proto(e: EncapName) -> proto::Encap {
     match e {
         EncapName::Vxlan => proto::Encap::Vxlan,
         EncapName::Geneve => proto::Encap::Geneve,
+        EncapName::Srv6 => proto::Encap::Srv6,
     }
 }
 
@@ -155,6 +157,7 @@ fn encap_from_proto(e: proto::Encap) -> EncapName {
     match e {
         proto::Encap::Vxlan => EncapName::Vxlan,
         proto::Encap::Geneve => EncapName::Geneve,
+        proto::Encap::Srv6 => EncapName::Srv6,
     }
 }
 
@@ -304,6 +307,57 @@ pub fn file_config_to_proto(cfg: &FileConfig, version: u64) -> proto::NodeConfig
                 remote_vtep: fv.remote_vtep.clone(),
                 via_mac: fv.via_mac.clone(),
                 out_iface: fv.out_iface.clone(),
+            })
+            .collect(),
+        srv6: cfg.srv6.as_ref().map(|s| proto::Srv6 {
+            local_src: s.local_src.clone(),
+            underlay_iface: s.underlay_iface.clone(),
+            local_mac: s.local_mac.clone().unwrap_or_default(),
+            underlay_mtu: u32::from(s.underlay_mtu.unwrap_or(0)),
+            peers: s.peers.clone(),
+        }),
+        srv6_routes: cfg
+            .srv6_routes
+            .iter()
+            .map(|r| proto::Srv6Route {
+                vni: r.vni,
+                mac: r.mac.clone(),
+                remote_sid: r.remote_sid.clone(),
+                via_mac: r.via_mac.clone(),
+                out_iface: r.out_iface.clone(),
+            })
+            .collect(),
+        srv6_local_sids: cfg
+            .srv6_local_sids
+            .iter()
+            .map(|ls| proto::Srv6LocalSid {
+                sid: ls.sid.clone(),
+                vni: ls.vni,
+                behavior: ls.behavior.clone().unwrap_or_default(),
+            })
+            .collect(),
+        srv6_floods: cfg
+            .srv6_floods
+            .iter()
+            .map(|f| proto::Srv6Flood {
+                vni: f.vni,
+                remote_sid: f.remote_sid.clone(),
+                via_mac: f.via_mac.clone(),
+                out_iface: f.out_iface.clone(),
+            })
+            .collect(),
+        srv6_irb_routes: cfg
+            .srv6_irb_routes
+            .iter()
+            .map(|r| proto::Srv6IrbRoute {
+                vni: r.vni,
+                inner_dst: r.inner_dst.clone(),
+                l3_vni: r.l3_vni,
+                remote_sid: r.remote_sid.clone(),
+                via_mac: r.via_mac.clone(),
+                out_iface: r.out_iface.clone(),
+                router_mac: r.router_mac.clone(),
+                gateway_mac: r.gateway_mac.clone(),
             })
             .collect(),
     }
@@ -505,12 +559,62 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
         // Conntrack sync (C9) is a file-config-only HA-appliance feature; the
         // controller never pushes it, so it converts to/from `None`.
         conntrack_sync: None,
-        // SRv6 (B9) is driven from file config (and, later, the controller's own
-        // SID feed); the current gRPC NodeConfig has no SRv6 message, so it
-        // converts to/from an empty endpoint + entries.
-        srv6: None,
-        srv6_routes: Vec::new(),
-        srv6_local_sids: Vec::new(),
+        srv6: cfg.srv6.as_ref().map(|s| Srv6Cfg {
+            local_src: s.local_src.clone(),
+            underlay_iface: s.underlay_iface.clone(),
+            local_mac: (!s.local_mac.is_empty()).then(|| s.local_mac.clone()),
+            // `0` is protobuf's absent-integer, and it is also not a legal MTU, so
+            // the two mean the same thing here: fall back to the resolve default.
+            underlay_mtu: (s.underlay_mtu != 0).then(|| s.underlay_mtu.min(u16::MAX as u32) as u16),
+            peers: s.peers.clone(),
+        }),
+        srv6_routes: cfg
+            .srv6_routes
+            .iter()
+            .map(|r| Srv6RouteCfg {
+                vni: r.vni,
+                mac: r.mac.clone(),
+                remote_sid: r.remote_sid.clone(),
+                via_mac: r.via_mac.clone(),
+                out_iface: r.out_iface.clone(),
+            })
+            .collect(),
+        srv6_local_sids: cfg
+            .srv6_local_sids
+            .iter()
+            .map(|ls| Srv6LocalSidCfg {
+                sid: ls.sid.clone(),
+                vni: ls.vni,
+                // Empty means "unset", which resolve reads as end.dt2u. Mapping it
+                // to Some("") instead would fail validation on a config nobody
+                // wrote that way.
+                behavior: (!ls.behavior.is_empty()).then(|| ls.behavior.clone()),
+            })
+            .collect(),
+        srv6_floods: cfg
+            .srv6_floods
+            .iter()
+            .map(|f| Srv6FloodCfg {
+                vni: f.vni,
+                remote_sid: f.remote_sid.clone(),
+                via_mac: f.via_mac.clone(),
+                out_iface: f.out_iface.clone(),
+            })
+            .collect(),
+        srv6_irb_routes: cfg
+            .srv6_irb_routes
+            .iter()
+            .map(|r| Srv6IrbRouteCfg {
+                vni: r.vni,
+                inner_dst: r.inner_dst.clone(),
+                l3_vni: r.l3_vni,
+                remote_sid: r.remote_sid.clone(),
+                via_mac: r.via_mac.clone(),
+                out_iface: r.out_iface.clone(),
+                router_mac: r.router_mac.clone(),
+                gateway_mac: r.gateway_mac.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -931,5 +1035,159 @@ mod every_field_survives {
         assert_eq!(*dst, before.dst, "dst");
         assert_eq!(*limit, before.limit, "limit");
         assert_eq!(*burst, before.burst, "burst");
+    }
+
+    /// Every SRv6 table survives FileConfig → proto → FileConfig.
+    ///
+    /// The assertions destructure each row with **no `..`**, so adding a field to
+    /// any of the five SRv6 messages without also carrying it across the wire is a
+    /// compile error here rather than a silently dropped value at runtime. That
+    /// guard is the whole point of the test: the SRv6 half of `NodeConfig` spent
+    /// its first release hardcoded to `None` on the way back in, so a controller
+    /// could serve an SRv6 config an agent would then quietly discard.
+    #[test]
+    fn every_srv6_table_survives_the_proto_roundtrip() {
+        let toml = r#"
+            [srv6]
+            local_src = "fc00:0:1::1"
+            underlay_iface = "eth0"
+            local_mac = "02:00:00:00:00:01"
+            underlay_mtu = 9000
+            peers = ["fc00:0:2::1", "fc00:0:3::1"]
+
+            [[srv6_route]]
+            vni = 10100
+            mac = "02:00:5e:00:00:11"
+            remote_sid = "fc00:0:2:0:2774::"
+            via_mac = "02:00:00:00:00:02"
+            out_iface = "eth0"
+
+            [[srv6_local_sid]]
+            sid = "fc00:0:1:0:2774::"
+            vni = 10100
+            behavior = "end.dt2u"
+
+            [[srv6_local_sid]]
+            sid = "fc00:0:1:1:2774::"
+            vni = 10100
+            behavior = "end.dt2m"
+
+            [[srv6_flood]]
+            vni = 10100
+            remote_sid = "fc00:0:2:1:2774::"
+            via_mac = "02:00:00:00:00:02"
+            out_iface = "eth0"
+
+            [[srv6_irb_route]]
+            vni = 10100
+            inner_dst = "10.20.0.0/24"
+            l3_vni = 50100
+            remote_sid = "fc00:0:2:0:c3b4::"
+            via_mac = "02:00:00:00:00:02"
+            out_iface = "eth0"
+            router_mac = "02:aa:bb:cc:dd:ee"
+            gateway_mac = "02:00:5e:00:00:01"
+        "#;
+        let original: FileConfig = toml::from_str(toml).unwrap();
+        let back = file_config_from_proto(&file_config_to_proto(&original, 9));
+
+        // Destructured by reference so `back` stays whole for the resolve below;
+        // the `..`-free pattern is what makes a new field a compile error.
+        let Some(Srv6Cfg {
+            local_src,
+            underlay_iface,
+            local_mac,
+            underlay_mtu,
+            peers,
+        }) = back.srv6.as_ref()
+        else {
+            panic!("the endpoint must survive the wire");
+        };
+        assert_eq!(local_src, "fc00:0:1::1");
+        assert_eq!(underlay_iface, "eth0");
+        assert_eq!(local_mac.as_deref(), Some("02:00:00:00:00:01"));
+        assert_eq!(*underlay_mtu, Some(9000));
+        assert_eq!(peers, &["fc00:0:2::1", "fc00:0:3::1"]);
+
+        assert_eq!(back.srv6_routes.len(), 1);
+        let Srv6RouteCfg {
+            vni,
+            mac,
+            remote_sid,
+            via_mac,
+            out_iface,
+        } = &back.srv6_routes[0];
+        assert_eq!((*vni, mac.as_str()), (10100, "02:00:5e:00:00:11"));
+        assert_eq!(remote_sid, "fc00:0:2:0:2774::");
+        assert_eq!(
+            (via_mac.as_str(), out_iface.as_str()),
+            ("02:00:00:00:00:02", "eth0")
+        );
+
+        // Both behaviours make the trip. `end.dt2m` matters twice over: it is the
+        // flood SID, and the datapath refused to decapsulate it at all until the
+        // flood set existed.
+        assert_eq!(back.srv6_local_sids.len(), 2);
+        let behaviors: Vec<_> = back
+            .srv6_local_sids
+            .iter()
+            .map(|ls| {
+                let Srv6LocalSidCfg { sid, vni, behavior } = ls;
+                assert_eq!(*vni, 10100);
+                assert!(sid.starts_with("fc00:0:1:"));
+                behavior.clone()
+            })
+            .collect();
+        assert_eq!(
+            behaviors,
+            [Some("end.dt2u".to_string()), Some("end.dt2m".to_string())]
+        );
+
+        assert_eq!(back.srv6_floods.len(), 1);
+        let Srv6FloodCfg {
+            vni,
+            remote_sid,
+            via_mac,
+            out_iface,
+        } = &back.srv6_floods[0];
+        assert_eq!(*vni, 10100);
+        // The flood row must carry the End.DT2M SID, distinct from the unicast one
+        // in srv6_routes above — swapping the two bridges every BUM frame to one
+        // MAC instead of flooding it.
+        assert_eq!(remote_sid, "fc00:0:2:1:2774::");
+        assert_eq!(
+            (via_mac.as_str(), out_iface.as_str()),
+            ("02:00:00:00:00:02", "eth0")
+        );
+
+        assert_eq!(back.srv6_irb_routes.len(), 1);
+        let Srv6IrbRouteCfg {
+            vni,
+            inner_dst,
+            l3_vni,
+            remote_sid,
+            via_mac,
+            out_iface,
+            router_mac,
+            gateway_mac,
+        } = &back.srv6_irb_routes[0];
+        assert_eq!((*vni, *l3_vni), (10100, 50100));
+        assert_eq!(inner_dst, "10.20.0.0/24");
+        assert_eq!(remote_sid, "fc00:0:2:0:c3b4::");
+        assert_eq!(via_mac, "02:00:00:00:00:02");
+        assert_eq!(out_iface, "eth0");
+        assert_eq!(
+            (router_mac.as_str(), gateway_mac.as_str()),
+            ("02:aa:bb:cc:dd:ee", "02:00:5e:00:00:01")
+        );
+
+        // And the whole thing still resolves — the wire form is not merely
+        // preserved, it is usable.
+        let rt = back
+            .resolve()
+            .expect("a round-tripped SRv6 config must resolve");
+        assert_eq!(rt.srv6_floods.len(), 1);
+        assert_eq!(rt.srv6_irb_routes.len(), 1);
+        assert_eq!(rt.srv6_local_sids.len(), 2);
     }
 }

@@ -279,9 +279,14 @@ enum OrchAction {
         iface: String,
         #[arg(long)]
         mac: String,
-        /// `vxlan` (default) or `geneve`.
+        /// `vxlan` (default), `geneve` or `srv6`.
         #[arg(long, default_value = "vxlan")]
         encap: String,
+        /// SRv6 locator as `prefix/len` (e.g. `fc00:0:1::/64`). Required with
+        /// `--encap srv6`, refused without it: every service SID this host
+        /// instantiates is derived from it.
+        #[arg(long)]
+        srv6_locator: Option<String>,
     },
     /// Define a network (tenant).
     AddNetwork {
@@ -974,9 +979,11 @@ fn raft_host_spec(s: HostSpec) -> velstra_raft::HostSpec {
         encap: match s.encap() {
             Encap::Geneve => EncapName::Geneve,
             Encap::Vxlan => EncapName::Vxlan,
+            Encap::Srv6 => EncapName::Srv6,
         },
         udp_port: (s.udp_port != 0).then_some(s.udp_port as u16),
         underlay_mtu: (s.underlay_mtu != 0).then_some(s.underlay_mtu as u16),
+        srv6_locator: s.srv6_locator.clone(),
     }
 }
 
@@ -2478,6 +2485,7 @@ async fn orch(args: OrchArgs) -> Result<()> {
         OrchAction::AddHost {
             id,
             vtep,
+            srv6_locator,
             iface,
             mac,
             encap,
@@ -2485,7 +2493,8 @@ async fn orch(args: OrchArgs) -> Result<()> {
             let encap = match encap.as_str() {
                 "geneve" => Encap::Geneve,
                 "vxlan" => Encap::Vxlan,
-                other => bail!("unknown encap {other:?} (use vxlan or geneve)"),
+                "srv6" => Encap::Srv6,
+                other => bail!("unknown encap {other:?} (use vxlan, geneve or srv6)"),
             };
             client
                 .add_host(HostSpec {
@@ -2496,6 +2505,7 @@ async fn orch(args: OrchArgs) -> Result<()> {
                     encap: encap as i32,
                     udp_port: 0,
                     underlay_mtu: 0,
+                    srv6_locator: srv6_locator.unwrap_or_default(),
                 })
                 .await?;
             println!("added host {id:?}");

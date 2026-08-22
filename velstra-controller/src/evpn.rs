@@ -45,8 +45,8 @@
 //! table.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    net::IpAddr,
+    collections::BTreeMap,
+    net::{IpAddr, Ipv6Addr},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -73,11 +73,24 @@ pub enum EvpnMonitorEvent {
         mac: [u8; 6],
         ip: Option<IpAddr>,
         vtep: IpAddr,
+        /// The advertising PE's `End.DT2U` service SID, when it runs an SRv6 data
+        /// plane (RFC 9252). `None` on a VXLAN peer. Carried, not dropped: it is
+        /// the *only* thing that says where to send an SRv6-encapsulated frame,
+        /// and a fabric whose hosts run SRv6 has no VTEP IPv4 to fall back on.
+        srv6_sid: Option<Ipv6Addr>,
     },
     /// A remote type-2 MAC was withdrawn.
     MacWithdraw { vni: u32, mac: [u8; 6] },
     /// A type-3 IMET BUM flood VTEP was added.
-    FloodUpdate { vni: u32, vtep: IpAddr },
+    FloodUpdate {
+        vni: u32,
+        vtep: IpAddr,
+        /// The advertising PE's `End.DT2M` (flood) service SID on an SRv6 data
+        /// plane. Distinct from the `End.DT2U` SID a [`Self::MacUpdate`] carries:
+        /// RFC 9252 binds a SID to one behaviour, so a BUM copy sent to the
+        /// unicast SID is bridged to a single MAC instead of flooded.
+        srv6_sid: Option<Ipv6Addr>,
+    },
     /// A type-3 IMET BUM flood VTEP was removed.
     FloodWithdraw { vni: u32, vtep: IpAddr },
     /// A remote tenant subnet (type-5 IP Prefix, RFC 9136) reachable by routing
@@ -90,6 +103,8 @@ pub enum EvpnMonitorEvent {
         vtep: IpAddr,
         router_mac: Option<[u8; 6]>,
         gw: Option<IpAddr>,
+        /// The advertising PE's service SID for this IP-VRF on an SRv6 data plane.
+        srv6_sid: Option<Ipv6Addr>,
     },
     /// A remote tenant subnet was withdrawn.
     PrefixWithdraw { l3_vni: u32, prefix: String },
@@ -147,14 +162,18 @@ pub fn parse_evpn_event(line: &str) -> Option<EvpnMonitorEvent> {
 
     match t[4] {
         "flood" => {
-            if t.len() != 6 {
-                return None;
-            }
+            // `<sign> evpn vni V flood VT [srv6 SID]`.
             let vtep: IpAddr = t[5].parse().ok()?;
-            match sign {
-                "+" => Some(EvpnMonitorEvent::FloodUpdate { vni, vtep }),
-                _ => Some(EvpnMonitorEvent::FloodWithdraw { vni, vtep }),
+            if sign == "-" {
+                // Withdraw names the endpoint, nothing more.
+                return (t.len() == 6).then_some(EvpnMonitorEvent::FloodWithdraw { vni, vtep });
             }
+            let srv6_sid = parse_tail_srv6(&t[6..])?;
+            Some(EvpnMonitorEvent::FloodUpdate {
+                vni,
+                vtep,
+                srv6_sid,
+            })
         }
         "mac" => {
             let mac = parse_mac(t[5])?;
@@ -162,38 +181,54 @@ pub fn parse_evpn_event(line: &str) -> Option<EvpnMonitorEvent> {
                 // Withdraw is exactly `- evpn vni <vni> mac <mac>`.
                 return (t.len() == 6).then_some(EvpnMonitorEvent::MacWithdraw { vni, mac });
             }
-            // `+` update: with or without a bound IP.
-            match t.len() {
-                8 => {
-                    // `+ evpn vni V mac M vtep VT`
-                    if t[6] != "vtep" {
-                        return None;
-                    }
-                    let vtep: IpAddr = t[7].parse().ok()?;
-                    Some(EvpnMonitorEvent::MacUpdate {
-                        vni,
-                        mac,
-                        ip: None,
-                        vtep,
-                    })
+            // `+ evpn vni V mac M [ip IP] vtep VT [srv6 SID]`.
+            //
+            // Read as keyword/value pairs, NOT by token count. Counting was the
+            // original shape and it failed the moment wren gained an SRv6 locator:
+            // `... vtep VT srv6 SID` is ten tokens, the same length as the
+            // `... ip IP vtep VT` form, so the `t[6] == "ip"` check rejected it and
+            // every type-2 route in an SRv6 fabric was silently discarded. The
+            // type-5 lines below already read their tail this way and say why; the
+            // bridging lines never got the lesson. An unknown keyword still rejects
+            // the whole line — a line we only half understand is one we would
+            // program incompletely.
+            let mut ip = None;
+            let mut vtep = None;
+            let mut srv6_sid = None;
+            let mut rest = &t[6..];
+            while let [key, value, tail @ ..] = rest {
+                match *key {
+                    "ip" => ip = Some(value.parse::<IpAddr>().ok()?),
+                    "vtep" => vtep = Some(value.parse::<IpAddr>().ok()?),
+                    "srv6" => srv6_sid = Some(value.parse::<Ipv6Addr>().ok()?),
+                    _ => return None,
                 }
-                10 => {
-                    // `+ evpn vni V mac M ip IP vtep VT`
-                    if t[6] != "ip" || t[8] != "vtep" {
-                        return None;
-                    }
-                    let ip: IpAddr = t[7].parse().ok()?;
-                    let vtep: IpAddr = t[9].parse().ok()?;
-                    Some(EvpnMonitorEvent::MacUpdate {
-                        vni,
-                        mac,
-                        ip: Some(ip),
-                        vtep,
-                    })
-                }
-                _ => None,
+                rest = tail;
             }
+            // An odd trailing token means a key without its value.
+            if !rest.is_empty() {
+                return None;
+            }
+            Some(EvpnMonitorEvent::MacUpdate {
+                vni,
+                mac,
+                ip,
+                // The endpoint is not optional: a MAC with no way to reach it is
+                // not a route.
+                vtep: vtep?,
+                srv6_sid,
+            })
         }
+        _ => None,
+    }
+}
+
+/// Read an optional trailing `srv6 <sid>` pair off a line's tail, rejecting
+/// anything else. Shared by the flood lines, whose only extension this is.
+fn parse_tail_srv6(tail: &[&str]) -> Option<Option<Ipv6Addr>> {
+    match tail {
+        [] => Some(None),
+        ["srv6", sid] => Some(Some(sid.parse().ok()?)),
         _ => None,
     }
 }
@@ -223,17 +258,17 @@ fn parse_prefix_event(sign: &str, t: &[&str]) -> Option<EvpnMonitorEvent> {
     let vtep: IpAddr = t[7].parse().ok()?;
     let mut router_mac = None;
     let mut gw = None;
+    let mut srv6_sid = None;
     let mut rest = &t[8..];
     while let [key, value, tail @ ..] = rest {
         match *key {
             "router-mac" => router_mac = Some(parse_mac(value)?),
             "gw" => gw = Some(value.parse().ok()?),
-            // The SRv6 service SID is the alternative to VXLAN encapsulation; the
-            // overlay datapath is VXLAN-only here, so it is validated and dropped
-            // rather than carried as state nothing programs.
-            "srv6" => {
-                value.parse::<std::net::Ipv6Addr>().ok()?;
-            }
+            // The SRv6 service SID is the alternative to VXLAN encapsulation. It
+            // used to be validated and thrown away, on the grounds that the
+            // datapath was VXLAN-only; it no longer is, and a discarded SID is a
+            // routed prefix an SRv6 host cannot reach.
+            "srv6" => srv6_sid = Some(value.parse::<Ipv6Addr>().ok()?),
             _ => return None,
         }
         rest = tail;
@@ -248,6 +283,7 @@ fn parse_prefix_event(sign: &str, t: &[&str]) -> Option<EvpnMonitorEvent> {
         vtep,
         router_mac,
         gw,
+        srv6_sid,
     })
 }
 
@@ -269,6 +305,10 @@ fn validated_cidr(s: &str) -> Option<String> {
 pub struct LearnedMac {
     pub vtep: IpAddr,
     pub ip: Option<IpAddr>,
+    /// The advertising PE's `End.DT2U` service SID when it runs SRv6. `None` on a
+    /// VXLAN peer, which is also how a derive decides which overlay table this
+    /// MAC belongs in.
+    pub srv6_sid: Option<Ipv6Addr>,
 }
 
 /// The controller's in-memory view of the remote EVPN state.
@@ -276,8 +316,11 @@ pub struct LearnedMac {
 pub struct EvpnLearned {
     /// `(vni, mac) -> where it lives`. `BTreeMap` for deterministic derive order.
     macs: BTreeMap<(u32, [u8; 6]), LearnedMac>,
-    /// `vni -> {flood VTEPs}` (type-3 IMET). Held for the future BUM datapath.
-    floods: BTreeMap<u32, BTreeSet<IpAddr>>,
+    /// `vni -> {flood VTEP -> its End.DT2M SID, if any}` (type-3 IMET). A map
+    /// rather than a set because an SRv6 peer's flood target is its `End.DT2M`
+    /// SID, and the VTEP address alone cannot reach it; withdrawal still keys on
+    /// the VTEP, which is what the withdraw line names.
+    floods: BTreeMap<u32, BTreeMap<IpAddr, Option<Ipv6Addr>>>,
     /// `(l3_vni, prefix) -> where to route it`. Keyed on the pair, not the prefix
     /// alone: two tenants routinely use the same RFC 1918 subnet, and collapsing
     /// them onto one key would send one tenant's traffic to the other's VTEP.
@@ -290,10 +333,12 @@ pub struct EvpnLearned {
 pub struct LearnedPrefix {
     pub vtep: IpAddr,
     /// RFC 9135 Router's MAC. `None` when the advertising PE omitted it — such a
-    /// route is held but not programmable over VXLAN, since there is no inner
-    /// destination MAC to encapsulate toward.
+    /// route is held but not programmable over either overlay, since there is no
+    /// inner destination MAC to encapsulate toward.
     pub router_mac: Option<[u8; 6]>,
     pub gw: Option<IpAddr>,
+    /// The advertising PE's service SID for this IP-VRF when it runs SRv6.
+    pub srv6_sid: Option<Ipv6Addr>,
 }
 
 impl EvpnLearned {
@@ -302,11 +347,18 @@ impl EvpnLearned {
     /// state and returns `false`.
     pub fn apply(&mut self, ev: &EvpnMonitorEvent) -> bool {
         match ev {
-            EvpnMonitorEvent::MacUpdate { vni, mac, ip, vtep } => {
+            EvpnMonitorEvent::MacUpdate {
+                vni,
+                mac,
+                ip,
+                vtep,
+                srv6_sid,
+            } => {
                 let key = (*vni, *mac);
                 let next = LearnedMac {
                     vtep: *vtep,
                     ip: *ip,
+                    srv6_sid: *srv6_sid,
                 };
                 match self.macs.get(&key) {
                     Some(cur) if *cur == next => false,
@@ -317,14 +369,28 @@ impl EvpnLearned {
                 }
             }
             EvpnMonitorEvent::MacWithdraw { vni, mac } => self.macs.remove(&(*vni, *mac)).is_some(),
-            EvpnMonitorEvent::FloodUpdate { vni, vtep } => {
-                self.floods.entry(*vni).or_default().insert(*vtep)
+            EvpnMonitorEvent::FloodUpdate {
+                vni,
+                vtep,
+                srv6_sid,
+            } => {
+                // `insert` on a map returns the *previous* value, so compare rather
+                // than trusting its return: re-learning the same endpoint with the
+                // same SID must report "unchanged" and skip a needless re-derive.
+                let set = self.floods.entry(*vni).or_default();
+                match set.get(vtep) {
+                    Some(cur) if cur == srv6_sid => false,
+                    _ => {
+                        set.insert(*vtep, *srv6_sid);
+                        true
+                    }
+                }
             }
             EvpnMonitorEvent::FloodWithdraw { vni, vtep } => {
                 let Some(set) = self.floods.get_mut(vni) else {
                     return false;
                 };
-                let removed = set.remove(vtep);
+                let removed = set.remove(vtep).is_some();
                 if set.is_empty() {
                     self.floods.remove(vni);
                 }
@@ -336,12 +402,14 @@ impl EvpnLearned {
                 vtep,
                 router_mac,
                 gw,
+                srv6_sid,
             } => {
                 let key = (*l3_vni, prefix.clone());
                 let next = LearnedPrefix {
                     vtep: *vtep,
                     router_mac: *router_mac,
                     gw: *gw,
+                    srv6_sid: *srv6_sid,
                 };
                 match self.prefixes.get(&key) {
                     Some(cur) if *cur == next => false,
@@ -364,9 +432,10 @@ impl EvpnLearned {
         self.macs.iter().map(|((vni, mac), v)| (*vni, *mac, v))
     }
 
-    /// The learned type-3 BUM flood VTEPs per VNI. Held for the future BUM
-    /// datapath (B2); not yet programmed into any map.
-    pub fn floods(&self) -> &BTreeMap<u32, BTreeSet<IpAddr>> {
+    /// The learned type-3 BUM flood endpoints per VNI, each mapped to the
+    /// advertising PE's `End.DT2M` service SID when it runs SRv6 (`None` on a
+    /// VXLAN peer).
+    pub fn floods(&self) -> &BTreeMap<u32, BTreeMap<IpAddr, Option<Ipv6Addr>>> {
         &self.floods
     }
 
@@ -424,7 +493,7 @@ async fn monitor_once(socket: &Path, shared: &Arc<Shared>) -> std::io::Result<()
                 // programmed yet (held for the BUM datapath, B2).
                 let learned = shared.evpn_learned.read().await;
                 let macs = learned.iter_macs().count();
-                let floods: usize = learned.floods().values().map(BTreeSet::len).sum();
+                let floods: usize = learned.floods().values().map(BTreeMap::len).sum();
                 info!(
                     "evpn monitor: snapshot complete ({macs} mac(s), {floods} flood vtep(s) held)"
                 );
@@ -477,6 +546,7 @@ mod tests {
                 mac: mac("aa:bb:cc:dd:ee:ff"),
                 ip: Some("192.168.5.7".parse().unwrap()),
                 vtep: "10.0.0.2".parse().unwrap(),
+                srv6_sid: None,
             }
         );
     }
@@ -491,6 +561,7 @@ mod tests {
                 mac: mac("02:00:00:00:00:11"),
                 ip: None,
                 vtep: "10.0.0.9".parse().unwrap(),
+                srv6_sid: None,
             }
         );
     }
@@ -507,6 +578,7 @@ mod tests {
                 mac: mac("aa:bb:cc:dd:ee:ff"),
                 ip: Some("2001:db8::1".parse().unwrap()),
                 vtep: "2001:db8::2".parse().unwrap(),
+                srv6_sid: None,
             }
         );
     }
@@ -530,6 +602,7 @@ mod tests {
             EvpnMonitorEvent::FloodUpdate {
                 vni: 100,
                 vtep: "10.0.0.2".parse().unwrap(),
+                srv6_sid: None,
             }
         );
         assert_eq!(
@@ -541,9 +614,95 @@ mod tests {
         );
     }
 
+    /// The bridging lines wren actually emits once an `srv6-locator` is
+    /// configured — and the regression that made an SRv6 fabric silently
+    /// unreachable.
+    ///
+    /// `... vtep VT srv6 SID` is ten tokens, exactly as many as `... ip IP vtep
+    /// VT`, so the old count-based parser matched the ten-token arm, found `t[6]`
+    /// was `vtep` rather than `ip`, and returned `None`. Every type-2 MAC route in
+    /// the fabric was dropped at the parser, with no log line and no counter: the
+    /// MAC-FDB simply never filled. The twelve-token form (ip *and* srv6) fell off
+    /// the end of the match entirely.
+    #[test]
+    fn a_mac_line_carrying_an_srv6_sid_is_not_dropped() {
+        let sid: Ipv6Addr = "fc00:0:1:0:2774::".parse().unwrap();
+
+        // Ten tokens, the shape that used to be rejected.
+        assert_eq!(
+            parse_evpn_event(
+                "+ evpn vni 10100 mac 02:00:5e:00:00:01 vtep 10.0.0.1 srv6 fc00:0:1:0:2774::"
+            )
+            .unwrap(),
+            EvpnMonitorEvent::MacUpdate {
+                vni: 10100,
+                mac: [0x02, 0x00, 0x5e, 0x00, 0x00, 0x01],
+                ip: None,
+                vtep: "10.0.0.1".parse().unwrap(),
+                srv6_sid: Some(sid),
+            }
+        );
+
+        // Twelve tokens: a bound IP *and* a SID.
+        assert_eq!(
+            parse_evpn_event(
+                "+ evpn vni 10100 mac 02:00:5e:00:00:01 ip 10.100.0.5 vtep 10.0.0.1 srv6 fc00:0:1:0:2774::"
+            )
+            .unwrap(),
+            EvpnMonitorEvent::MacUpdate {
+                vni: 10100,
+                mac: [0x02, 0x00, 0x5e, 0x00, 0x00, 0x01],
+                ip: Some("10.100.0.5".parse().unwrap()),
+                vtep: "10.0.0.1".parse().unwrap(),
+                srv6_sid: Some(sid),
+            }
+        );
+
+        // A flood line carries the peer's *End.DT2M* SID — a different SID from the
+        // unicast one above, and the only thing that can address a BUM copy.
+        assert_eq!(
+            parse_evpn_event("+ evpn vni 10100 flood 10.0.0.1 srv6 fc00:0:1:1:2774::").unwrap(),
+            EvpnMonitorEvent::FloodUpdate {
+                vni: 10100,
+                vtep: "10.0.0.1".parse().unwrap(),
+                srv6_sid: Some("fc00:0:1:1:2774::".parse().unwrap()),
+            }
+        );
+    }
+
+    /// Reading the tail as keyword/value pairs must not become "accept anything":
+    /// an unknown keyword, a keyword without its value, or an unparsable SID still
+    /// rejects the whole line. A half-understood line is one we would program
+    /// incompletely, which is worse than not programming it at all.
+    #[test]
+    fn a_loosely_read_tail_is_still_a_strict_one() {
+        for bad in [
+            // unknown keyword
+            "+ evpn vni 10100 mac 02:00:5e:00:00:01 vtep 10.0.0.1 label 17",
+            // keyword with no value
+            "+ evpn vni 10100 mac 02:00:5e:00:00:01 vtep 10.0.0.1 srv6",
+            // SID that is not an address
+            "+ evpn vni 10100 mac 02:00:5e:00:00:01 vtep 10.0.0.1 srv6 not-a-sid",
+            // an SRv6 SID where an IPv4 VTEP belongs
+            "+ evpn vni 10100 mac 02:00:5e:00:00:01 vtep fc00::1 srv6 10.0.0.1",
+            // no endpoint at all: a MAC with no way to reach it is not a route
+            "+ evpn vni 10100 mac 02:00:5e:00:00:01 srv6 fc00:0:1:0:2774::",
+            // flood lines take only the srv6 pair
+            "+ evpn vni 10100 flood 10.0.0.1 gw 10.0.0.254",
+        ] {
+            assert_eq!(
+                parse_evpn_event(bad),
+                None,
+                "should have been refused: {bad}"
+            );
+        }
+    }
+
     /// The full type-5 line, every optional field present. The Router's MAC is the
-    /// inner destination symmetric IRB encapsulates toward, so it must survive the
-    /// parse; the SRv6 SID is validated and dropped (the overlay is VXLAN here).
+    /// inner destination symmetric IRB encapsulates toward, and the SRv6 SID is
+    /// where an SRv6 host encapsulates *to*; both must survive the parse. The SID
+    /// used to be validated and thrown away here, which was defensible only while
+    /// the datapath was VXLAN-only.
     #[test]
     fn parses_prefix_update_with_full_tail() {
         let ev = parse_evpn_event(
@@ -559,6 +718,7 @@ mod tests {
                 vtep: "10.0.0.1".parse().unwrap(),
                 router_mac: Some([0x02, 0x00, 0x5e, 0x00, 0x00, 0xaa]),
                 gw: Some("10.20.0.1".parse().unwrap()),
+                srv6_sid: Some("fc00:0:1:200:c3b4::".parse().unwrap()),
             }
         );
     }
@@ -577,6 +737,7 @@ mod tests {
                 vtep: "2001:db8::9".parse().unwrap(),
                 router_mac: None,
                 gw: None,
+                srv6_sid: None,
             }
         );
         let a = parse_evpn_event(
@@ -635,6 +796,7 @@ mod tests {
                 vtep: vtep.parse().unwrap(),
                 router_mac: None,
                 gw: None,
+                srv6_sid: None,
             }));
         }
         assert_eq!(learned.iter_prefixes().count(), 2);
@@ -644,6 +806,7 @@ mod tests {
             mac: mac("aa:bb:cc:dd:ee:ff"),
             ip: None,
             vtep: "10.0.0.1".parse().unwrap(),
+            srv6_sid: None,
         }));
         assert_eq!(learned.iter_prefixes().count(), 2);
 
@@ -655,6 +818,7 @@ mod tests {
             vtep: "10.0.0.1".parse().unwrap(),
             router_mac: None,
             gw: None,
+            srv6_sid: None,
         }));
         // A withdraw removes only its own tenant's route.
         assert!(learned.apply(&EvpnMonitorEvent::PrefixWithdraw {
@@ -714,6 +878,7 @@ mod tests {
             mac: mac("aa:bb:cc:dd:ee:ff"),
             ip: Some("192.168.1.5".parse().unwrap()),
             vtep: "10.0.0.2".parse().unwrap(),
+            srv6_sid: None,
         };
         // First apply: state changes.
         assert!(learned.apply(&add));
@@ -725,6 +890,7 @@ mod tests {
             mac: mac("aa:bb:cc:dd:ee:ff"),
             ip: Some("192.168.1.5".parse().unwrap()),
             vtep: "10.0.0.3".parse().unwrap(),
+            srv6_sid: None,
         };
         assert!(learned.apply(&moved));
         assert_eq!(learned.iter_macs().count(), 1);
@@ -747,6 +913,7 @@ mod tests {
         let add = EvpnMonitorEvent::FloodUpdate {
             vni: 100,
             vtep: "10.0.0.2".parse().unwrap(),
+            srv6_sid: None,
         };
         assert!(learned.apply(&add));
         assert!(!learned.apply(&add)); // duplicate flood VTEP: no change

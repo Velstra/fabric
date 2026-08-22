@@ -58,6 +58,12 @@ pub struct HostSpec {
     pub encap: EncapName,
     pub udp_port: Option<u16>,
     pub underlay_mtu: Option<u16>,
+    /// B9 SRv6 locator as `prefix/len` (e.g. `"fc00:0:1::/64"`), empty on a host
+    /// that is not on the SRv6 wire family. `#[serde(default)]` so a log entry
+    /// written before SRv6 existed still replays — it describes a VXLAN host,
+    /// which is what it was.
+    #[serde(default)]
+    pub srv6_locator: String,
 }
 
 /// A serializable network description carried in [`TopoRequest::AddNetwork`].
@@ -352,7 +358,30 @@ fn host_from_spec(s: &HostSpec) -> Result<Host> {
         encap: s.encap,
         udp_port: s.udp_port,
         underlay_mtu: s.underlay_mtu,
+        srv6_locator: parse_srv6_locator(&s.srv6_locator)?,
     })
+}
+
+/// Parse an SRv6 locator written as `prefix/len`, or `None` for an empty string.
+///
+/// A malformed locator is an error rather than a silent `None`: `None` means "a
+/// VXLAN host", and turning a typo into that would have `add_host` reject the
+/// entry with "srv6 encapsulation but no locator" — a message pointing at the
+/// wrong field.
+fn parse_srv6_locator(text: &str) -> Result<Option<(std::net::Ipv6Addr, u8)>> {
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let (addr, len) = text
+        .split_once('/')
+        .ok_or_else(|| anyhow!("srv6 locator {text:?} must be written as prefix/len"))?;
+    let addr: std::net::Ipv6Addr = addr
+        .parse()
+        .map_err(|_| anyhow!("invalid srv6 locator prefix in {text:?}"))?;
+    let len: u8 = len
+        .parse()
+        .map_err(|_| anyhow!("invalid srv6 locator length in {text:?}"))?;
+    Ok(Some((addr, len)))
 }
 
 fn network_from_spec(s: &NetworkSpec) -> Result<Network> {
@@ -480,7 +509,7 @@ fn fip_record(f: &FloatingIp) -> FloatingIpRecord {
 pub fn apply(topo: &mut Topology, req: &TopoRequest) -> TopoResponse {
     let outcome: Result<TopoResponse> = (|| match req {
         TopoRequest::AddHost(s) => {
-            topo.add_host(host_from_spec(s)?);
+            topo.add_host(host_from_spec(s)?)?;
             Ok(TopoResponse::ok())
         }
         TopoRequest::AddNetwork(s) => {
@@ -1102,6 +1131,7 @@ mod tests {
             underlay_iface: "eth0".into(),
             underlay_mac: "02:00:00:00:00:11".into(),
             encap: EncapName::Vxlan,
+            srv6_locator: String::new(),
             udp_port: None,
             underlay_mtu: None,
         }

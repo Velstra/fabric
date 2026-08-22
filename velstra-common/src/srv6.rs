@@ -297,7 +297,34 @@ pub fn build_srv6_encap(
     entropy: u32,
 ) -> Srv6Encap {
     let mut h = [0u8; SRV6_L2_OUTER_LEN];
+    write_srv6_encap(&mut h, local_src, local_mac, ep, inner_frame_len, entropy);
+    Srv6Encap {
+        headers: h,
+        out_ifindex: ep.out_ifindex,
+    }
+}
 
+/// The same header stack, written **into a caller-owned buffer** instead of
+/// returned by value.
+///
+/// This exists for one reason and it is a hard constraint rather than a
+/// preference: [`Srv6Encap`] is 60 bytes, and returning it by value puts those
+/// 60 bytes on the caller's frame. In the XDP encapsulation path that frame is
+/// already the deepest in the program, and BPF caps the *combined* depth of a
+/// call chain at 512 bytes — so a build that inlines slightly differently turns a
+/// working data plane into one the verifier refuses to load, with the failure
+/// appearing on whichever machine has the other compiler. The datapath therefore
+/// points this at a per-CPU scratch map; [`build_srv6_encap`] stays for the TC
+/// path, where the frame has room, and for the tests.
+#[inline]
+pub fn write_srv6_encap(
+    h: &mut [u8; SRV6_L2_OUTER_LEN],
+    local_src: &Srv6Sid,
+    local_mac: &[u8; 6],
+    ep: &Srv6Endpoint,
+    inner_frame_len: u16,
+    entropy: u32,
+) {
     // --- Outer Ethernet (0..14) ---------------------------------------------
     h[0..6].copy_from_slice(&ep.outer_dst_mac);
     h[6..12].copy_from_slice(local_mac);
@@ -312,11 +339,6 @@ pub fn build_srv6_encap(
     h[21] = 64; // hop limit
     h[22..38].copy_from_slice(local_src); // source address
     h[38..54].copy_from_slice(&ep.remote_sid); // destination = service SID
-
-    Srv6Encap {
-        headers: h,
-        out_ifindex: ep.out_ifindex,
-    }
 }
 
 /// Compose a locator-derived service SID, mirroring wren's
@@ -378,6 +400,189 @@ pub const fn decode_service_sid(sid: &Srv6Sid, locator_len_bits: u8) -> Option<(
     let disc = sid[off];
     let vni = ((sid[off + 1] as u32) << 16) | ((sid[off + 2] as u32) << 8) | (sid[off + 3] as u32);
     Some((disc, vni))
+}
+
+/// B9 SRv6 per-VNI **flood set**: the remote `End.DT2M` service SIDs a
+/// broadcast/unknown-unicast/multicast frame on a tenant segment must be
+/// head-end replicated to. The SRv6 analogue of [`crate::FloodSet`], keyed in
+/// `SRV6_FLOOD_LIST` by a bare `u32` VNI.
+///
+/// Fixed-size for the same reason the VXLAN one is: the TC replication loop is
+/// bounded by the constant [`crate::MAX_FLOOD_VTEPS`] so the verifier can bound
+/// it, and `count` says how many slots are valid (the rest are zeroed).
+///
+/// Note the endpoints hold `End.DT2M` SIDs, **not** the `End.DT2U` SIDs the
+/// unicast `SRV6_FDB` holds. RFC 9252 binds a SID to exactly one behaviour, so
+/// an EVI needs both, and sending a BUM copy to a peer's unicast SID would have
+/// it bridged to a single MAC instead of flooded.
+///
+/// `#[repr(C)]`: a `u32` count (offset 0) followed by `[Srv6Endpoint; 16]` (each
+/// 28-byte, 4-aligned) — `4 + 16*28 = 452` bytes, no implicit padding.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Srv6FloodSet {
+    /// Number of valid entries in [`Self::endpoints`] (`0..=MAX_FLOOD_VTEPS`).
+    pub count: u32,
+    /// The flood endpoints. Only the first `count` are meaningful; the rest are
+    /// zeroed so the layout is deterministic.
+    pub endpoints: [Srv6Endpoint; crate::MAX_FLOOD_VTEPS],
+}
+
+impl Srv6FloodSet {
+    /// An empty flood set — nothing to replicate to.
+    pub const EMPTY: Self = Self {
+        count: 0,
+        endpoints: [Srv6Endpoint::new(0, [0; 16], [0; 6]); crate::MAX_FLOOD_VTEPS],
+    };
+
+    /// Build a flood set from a slice of endpoints. Truncates to
+    /// [`crate::MAX_FLOOD_VTEPS`] if the slice is longer, and zero-pads the
+    /// unused slots so two equal sets compare byte-for-byte.
+    pub fn new(endpoints: &[Srv6Endpoint]) -> Self {
+        let mut arr = [Srv6Endpoint::new(0, [0; 16], [0; 6]); crate::MAX_FLOOD_VTEPS];
+        let count = if endpoints.len() > crate::MAX_FLOOD_VTEPS {
+            crate::MAX_FLOOD_VTEPS
+        } else {
+            endpoints.len()
+        };
+        arr[..count].copy_from_slice(&endpoints[..count]);
+        Self {
+            count: count as u32,
+            endpoints: arr,
+        }
+    }
+}
+
+// SAFETY: `#[repr(C)]`, a `u32` followed by an array of `Pod` `Srv6Endpoint`s,
+// no implicit padding.
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for Srv6FloodSet {}
+
+/// B9 SRv6 **symmetric-IRB** route entry: the SRv6 analogue of
+/// [`crate::IrbEndpoint`], keyed in `SRV6_IRB_ROUTES` by `(vni, inner dst IP)`.
+///
+/// The wire behaviour mirrors the VXLAN IRB path: RFC 9136 symmetric IRB
+/// encapsulates a *rewritten Ethernet frame* with the tenant's **L3 VNI**, and
+/// here that becomes an `End.DT2U` SID derived from that L3 VNI. One
+/// encapsulation shape (`IPPROTO_ETHERNET`, [`SRV6_L2_OUTER_LEN`]) on the wire,
+/// one decap path in the datapath.
+///
+/// **This is not what RFC 9252 §6 specifies for a type-5 route**, which is
+/// `End.DT4`/`End.DT6` — a *bare IP* payload the egress looks up in a VRF. wren
+/// already originates those SIDs. The reason this datapath cannot consume one is
+/// concrete rather than aesthetic: an `End.DT4` decap yields a packet with no
+/// Ethernet header, which has to be delivered into the tenant's own L3 device to
+/// be routed in the right VRF — and this host model has a single shared kernel
+/// bridge (`LOCAL_VNIS`' value is a reserved per-VNI bridge ifindex that is not
+/// populated yet). Handing a bare IP packet to the ingress interface would route
+/// it in the default VRF, i.e. leak it out of its tenant.
+///
+/// So: fabric-to-fabric IRB works over these SIDs, and the controller derives the
+/// peer's L3-VNI `End.DT2U` SID from the peer's locator rather than trusting the
+/// `End.DT4` SID a type-5 route advertises. Interop with a third-party PE needs
+/// the L3 behaviours, and those need per-tenant L3 devices first.
+///
+/// `#[repr(C)]`: two `u32`s, then the 16-byte SID, then three 6-byte MACs and
+/// explicit padding — `4+4+16+6+6+6+2 = 44` bytes, 4-aligned, no implicit
+/// padding.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Srv6IrbEndpoint {
+    /// Underlay interface index to redirect the encapsulated packet out of.
+    pub out_ifindex: u32,
+    /// The tenant's **L3 VNI** — the VNI whose `End.DT2U` SID this entry points
+    /// at, replacing the ingress segment's (RFC 9136 §4.4.1).
+    pub l3_vni: u32,
+    /// Remote `End.DT2U` service SID for the tenant's L3 VNI (outer IPv6
+    /// destination).
+    pub remote_sid: Srv6Sid,
+    /// Outer destination MAC: the underlay next hop toward that SID.
+    pub outer_dst_mac: [u8; 6],
+    /// The remote PE's **Router's MAC** (RFC 9135 §4), which becomes the inner
+    /// destination MAC.
+    pub router_mac: [u8; 6],
+    /// This tenant's **anycast gateway MAC**, which becomes the inner source
+    /// MAC — and, on ingress, the L2 address that gates whether to route at all.
+    pub gateway_mac: [u8; 6],
+    /// Explicit padding, always zero.
+    pub _pad: [u8; 2],
+}
+
+impl Srv6IrbEndpoint {
+    /// Build an SRv6 IRB route entry.
+    #[inline]
+    pub const fn new(
+        out_ifindex: u32,
+        l3_vni: u32,
+        remote_sid: Srv6Sid,
+        outer_dst_mac: [u8; 6],
+        router_mac: [u8; 6],
+        gateway_mac: [u8; 6],
+    ) -> Self {
+        Self {
+            out_ifindex,
+            l3_vni,
+            remote_sid,
+            outer_dst_mac,
+            router_mac,
+            gateway_mac,
+            _pad: [0; 2],
+        }
+    }
+
+    /// The plain [`Srv6Endpoint`] this route encapsulates toward, so the routed
+    /// path can hand [`build_srv6_encap`] exactly what the bridged path does.
+    #[inline]
+    pub const fn endpoint(&self) -> Srv6Endpoint {
+        Srv6Endpoint::new(self.out_ifindex, self.remote_sid, self.outer_dst_mac)
+    }
+}
+
+// SAFETY: `#[repr(C)]`, `u32`s + byte arrays, padding explicitly zeroed.
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for Srv6IrbEndpoint {}
+
+/// Plan the inner rewrite for an SRv6 symmetric-IRB hit — the SRv6 twin of
+/// [`crate::plan_irb`], and deliberately producing the very same
+/// [`crate::IrbRewrite`]: the rewrite is a property of RFC 9135 routing, not of
+/// the encapsulation carrying it, so both paths apply identical inner edits and
+/// a change to one can never silently diverge from the other.
+///
+/// Returns `None` when the packet cannot survive another hop.
+///
+/// As with the VXLAN path, the gate on *whether* to route (inner destination MAC
+/// == the anycast gateway MAC) belongs to the caller.
+///
+/// ```
+/// use velstra_common::{plan_srv6_irb, Srv6IrbEndpoint};
+///
+/// let ep = Srv6IrbEndpoint::new(
+///     3, 50100, [0xfc, 0, 0, 0, 0, 2, 0, 0xc3, 0xb4, 0, 0, 0, 0, 0, 0, 0],
+///     [0x02, 0, 0, 0, 0, 0x02], [0x02, 0xaa, 0, 0, 0, 0x01], [0x02, 0, 0x5e, 0, 0, 0x01],
+/// );
+/// let rw = plan_srv6_irb(&ep, 64, 0xb761, 6).expect("a TTL-64 packet survives the hop");
+/// assert_eq!(rw.inner_dst_mac, [0x02, 0xaa, 0, 0, 0, 0x01]);
+/// assert_eq!(rw.inner_src_mac, [0x02, 0, 0x5e, 0, 0, 0x01]);
+/// assert_eq!(rw.new_ttl, 63);
+/// // A packet at the end of its life is dropped, not routed onto the overlay.
+/// assert!(plan_srv6_irb(&ep, 1, 0xb861, 6).is_none());
+/// ```
+#[inline]
+pub const fn plan_srv6_irb(
+    ep: &Srv6IrbEndpoint,
+    ttl: u8,
+    checksum: u16,
+    proto: u8,
+) -> Option<crate::IrbRewrite> {
+    let Some((new_ttl, new_checksum)) = crate::decrement_ttl(ttl, checksum, proto) else {
+        return None;
+    };
+    Some(crate::IrbRewrite {
+        inner_dst_mac: ep.router_mac,
+        inner_src_mac: ep.gateway_mac,
+        new_ttl,
+        new_checksum,
+    })
 }
 
 #[cfg(test)]
@@ -505,5 +710,93 @@ mod tests {
         assert_eq!(decode_service_sid(&locator, 104), None);
         // 96-bit locator is the maximum that still fits the 4-byte function.
         assert!(build_service_sid(&locator, 96, 0, 1).is_some());
+    }
+
+    #[test]
+    fn the_new_pod_layouts_have_no_padding_either() {
+        // 4 (count) + 16 * 28 (endpoints) = 452, 4-aligned like `Srv6Endpoint`.
+        assert_eq!(core::mem::size_of::<Srv6FloodSet>(), 452);
+        assert_eq!(core::mem::align_of::<Srv6FloodSet>(), 4);
+        // 4 + 4 + 16 + 6 + 6 + 6 + 2 = 44, 4-aligned.
+        assert_eq!(core::mem::size_of::<Srv6IrbEndpoint>(), 44);
+        assert_eq!(core::mem::align_of::<Srv6IrbEndpoint>(), 4);
+    }
+
+    #[test]
+    fn a_flood_set_zero_pads_so_equal_sets_compare_byte_for_byte() {
+        let a = Srv6Endpoint::new(3, [0xfc; 16], [0x02, 0, 0, 0, 0, 1]);
+        let one = Srv6FloodSet::new(&[a]);
+        assert_eq!(one.count, 1);
+        assert_eq!(one.endpoints[0], a);
+        // The unused slots are zeroed, not left uninitialised, so two sets built
+        // from the same endpoints are bitwise identical — what lets the agent
+        // skip an unchanged map write.
+        assert_eq!(one, Srv6FloodSet::new(&[a]));
+        assert_eq!(one.endpoints[1], Srv6Endpoint::new(0, [0; 16], [0; 6]));
+        assert_eq!(Srv6FloodSet::new(&[]), Srv6FloodSet::EMPTY);
+    }
+
+    #[test]
+    fn a_flood_set_truncates_rather_than_overflowing_its_fixed_array() {
+        // The datapath loop is bounded by the constant, so a longer list must be
+        // cut here — silently growing the array would not be representable.
+        let many: Vec<_> = (0..crate::MAX_FLOOD_VTEPS as u32 + 5)
+            .map(|i| Srv6Endpoint::new(i, [0; 16], [0; 6]))
+            .collect();
+        let set = Srv6FloodSet::new(&many);
+        assert_eq!(set.count as usize, crate::MAX_FLOOD_VTEPS);
+        assert_eq!(set.endpoints[crate::MAX_FLOOD_VTEPS - 1].out_ifindex, 15);
+    }
+
+    #[test]
+    fn an_irb_route_hands_the_bridged_builder_exactly_what_it_expects() {
+        // The routed path must reach `build_srv6_encap` through the same
+        // `Srv6Endpoint` shape the bridged path uses — that identity is what
+        // keeps one encap builder correct for both.
+        let sid = [0xfc, 0, 0, 0, 0, 2, 0, 0xc3, 0xb4, 0, 0, 0, 0, 0, 0, 0];
+        let via = [0x02, 0, 0, 0, 0, 0x02];
+        let irb = Srv6IrbEndpoint::new(
+            7,
+            50100,
+            sid,
+            via,
+            [0x02, 0xaa, 0, 0, 0, 1],
+            [0x02, 0, 0x5e, 0, 0, 1],
+        );
+        assert_eq!(irb.endpoint(), Srv6Endpoint::new(7, sid, via));
+    }
+
+    #[test]
+    fn the_two_irb_paths_plan_identical_inner_rewrites() {
+        // The rewrite is a property of RFC 9135 routing, not of the encap. If the
+        // VXLAN and SRv6 planners ever disagree, one of the two overlays silently
+        // routes differently from the other — assert they cannot.
+        let router_mac = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+        let gw_mac = [0x02, 0x00, 0x5e, 0x00, 0x00, 0x01];
+        let v = crate::IrbEndpoint::new(
+            7,
+            50100,
+            [10, 0, 0, 2],
+            [0x02, 0, 0, 0, 0, 2],
+            router_mac,
+            gw_mac,
+        );
+        let s = Srv6IrbEndpoint::new(
+            7,
+            50100,
+            [0xfc; 16],
+            [0x02, 0, 0, 0, 0, 2],
+            router_mac,
+            gw_mac,
+        );
+        for ttl in [2u8, 64, 255] {
+            assert_eq!(
+                crate::plan_irb(&v, ttl, 0xb761, 6),
+                plan_srv6_irb(&s, ttl, 0xb761, 6)
+            );
+        }
+        // Including the refusal at the end of a packet's life.
+        assert_eq!(crate::plan_irb(&v, 1, 0xb861, 6), None);
+        assert_eq!(plan_srv6_irb(&s, 1, 0xb861, 6), None);
     }
 }

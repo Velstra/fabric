@@ -377,11 +377,18 @@ pub enum Counter {
     /// throttled" and "the tenant is being filtered" are different
     /// conversations.
     DroppedPortRate = 43,
+    /// A copy of a BUM frame was head-end replicated over **SRv6** — encapsulated
+    /// toward a remote `End.DT2M` service SID in the ingress VNI's SRv6 flood set
+    /// and `clone_redirect`ed onto the underlay (B9). The SRv6 twin of
+    /// [`Counter::BumReplicated`], counted separately because the two never run at
+    /// once: a host has one overlay format, so which of the pair moves says which
+    /// wire format is actually carrying the fabric's broadcast traffic.
+    Srv6BumReplicated = 44,
 }
 
 impl Counter {
     /// Number of distinct counters — the `max_entries` of the `STATS` map.
-    pub const COUNT: u32 = 44;
+    pub const COUNT: u32 = 45;
 
     /// The array index of this counter.
     #[inline]
@@ -431,6 +438,7 @@ impl Counter {
             35 => Counter::DroppedSpoofed,
             42 => Counter::DroppedNotYours,
             43 => Counter::DroppedPortRate,
+            44 => Counter::Srv6BumReplicated,
             36 => Counter::SynproxyChallenged,
             37 => Counter::SynproxyAdmitted,
             38 => Counter::SynproxyRejected,
@@ -491,6 +499,7 @@ impl Counter {
             Counter::DroppedSpoofed => "dropped_spoofed",
             Counter::DroppedNotYours => "dropped_not_yours",
             Counter::DroppedPortRate => "dropped_port_rate",
+            Counter::Srv6BumReplicated => "srv6_bum_replicated",
             Counter::SynproxyChallenged => "synproxy_challenged",
             Counter::SynproxyAdmitted => "synproxy_admitted",
             Counter::SynproxyRejected => "synproxy_rejected",

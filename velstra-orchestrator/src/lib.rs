@@ -26,7 +26,7 @@
 //! [`ARP_TABLE`]: velstra_common::ArpKey
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
 };
 
@@ -34,8 +34,21 @@ use anyhow::{Result, bail};
 use velstra_common::{Cidr4, Cidr6, PolicyId, mask_v4, mask_v6};
 use velstra_config::{
     ActionName, BackendCfg, EncapName, FileConfig, InterfaceFile, NeighborCfg, OverlayCfg,
-    PolicyFile, PortRule, ProtoName, ServiceCfg, SourceValidationName, TunnelCfg,
+    PolicyFile, PortRule, ProtoName, ServiceCfg, SourceValidationName, Srv6Cfg, Srv6FloodCfg,
+    Srv6LocalSidCfg, Srv6RouteCfg, TunnelCfg,
 };
+
+/// The service-SID discriminators this fabric uses, mirroring wren's
+/// `wren-bgp/src/srv6.rs::sid_disc` so a SID derived on either side of the
+/// control plane means the same thing.
+pub mod srv6_disc {
+    /// `End.DT2U` — the unicast bridge SID for a segment.
+    pub const UNICAST: u8 = 0;
+    /// `End.DT2M` — the BUM flood SID for a segment. A distinct value is what
+    /// keeps one VNI's two behaviours on two different SIDs, as RFC 9252
+    /// requires.
+    pub const MULTICAST: u8 = 1;
+}
 
 /// A physical host that terminates tunnels (a VTEP).
 #[derive(Debug, Clone)]
@@ -56,6 +69,57 @@ pub struct Host {
     pub udp_port: Option<u16>,
     /// Underlay MTU, or `None` for the default (1500).
     pub underlay_mtu: Option<u16>,
+    /// B9: this host's SRv6 locator (prefix, prefix length in bits), required
+    /// when [`Self::encap`] is [`EncapName::Srv6`] and refused otherwise.
+    ///
+    /// Everything SRv6 needs is **derived** from it — this host's outer IPv6
+    /// source ([`Self::srv6_src`]), and the `End.DT2U`/`End.DT2M` service SID of
+    /// every `(host, vni)` pair ([`srv6_service_sid`]). Nothing is allocated and
+    /// nothing is stored per SID, so two controllers, or one controller after a
+    /// failover, compute identical SIDs from identical topology. That is the same
+    /// reasoning that made a router's `l3_vni` and gateway MAC functions of its
+    /// name rather than entries in an allocator: state a failover loses is a
+    /// running tenant whose numbers change under it.
+    pub srv6_locator: Option<(Ipv6Addr, u8)>,
+}
+
+/// The number of bits of a locator that must be byte-aligned and leave room for
+/// the 4-byte function (1 discriminator + 3 VNI bytes) a service SID appends.
+/// [`velstra_common::build_service_sid`] enforces both; this is the ceiling.
+pub const SRV6_MAX_LOCATOR_BITS: u8 = 96;
+
+/// Derive the `End.DT2U`/`End.DT2M` service SID a host instantiates for one VNI.
+///
+/// Pure and total given `(locator, len, discriminator, vni)`, and identical to
+/// what wren computes for its own EVPN origination — the two share the layout
+/// (`locator ++ disc(1) ++ vni(3)`) precisely so a SID means the same thing on
+/// the control plane that advertises it and the data plane that terminates it.
+pub fn srv6_service_sid(
+    locator: Ipv6Addr,
+    locator_len: u8,
+    discriminator: u8,
+    vni: u32,
+) -> Option<Ipv6Addr> {
+    velstra_common::build_service_sid(&locator.octets(), locator_len, discriminator, vni)
+        .map(Ipv6Addr::from)
+}
+
+impl Host {
+    /// This host's SRv6 outer IPv6 **source** — the locator with everything below
+    /// the prefix zeroed.
+    ///
+    /// It is deliberately *not* one of the instantiated service SIDs: those carry
+    /// a non-zero discriminator/VNI function, so the source can never collide with
+    /// a SID and be mistaken for one on decap. Peers authenticate each other by
+    /// this value (`SRV6_PEERS`), and because it is derived, a host added to the
+    /// fabric is trusted by every other host with no key exchange or extra field.
+    pub fn srv6_src(&self) -> Option<Ipv6Addr> {
+        let (loc, len) = self.srv6_locator?;
+        // Discriminator 0 with VNI 0 is exactly "the locator, zero-filled": the
+        // function bytes are all zero, and no real SID has VNI 0 (a VNI is
+        // non-zero by validation).
+        srv6_service_sid(loc, len, 0, 0)
+    }
 }
 
 /// Map-ownership convention between the two writers of `OVERLAY_FDB` /
@@ -539,8 +603,45 @@ impl Topology {
     }
 
     /// Register a host (VTEP). Replaces any existing host with the same id.
-    pub fn add_host(&mut self, host: Host) {
+    ///
+    /// Refuses a host whose overlay format and SRv6 locator disagree, in **both**
+    /// directions. An `srv6` host with no locator has nothing to derive its own
+    /// service SIDs or outer source from, and would come up with an SRv6 endpoint
+    /// that encapsulates nowhere; a VXLAN host carrying a locator is an operator
+    /// who thinks they enabled SRv6 and did not. Neither is a state the derive can
+    /// repair by guessing, so both are named here rather than papered over.
+    ///
+    /// The locator must also be byte-aligned and leave room for the 4-byte
+    /// function a service SID appends — the same constraint
+    /// [`velstra_common::build_service_sid`] enforces, checked once at admission
+    /// so a derive can never produce a `None` SID for a host that was accepted.
+    pub fn add_host(&mut self, host: Host) -> Result<()> {
+        match (host.encap.is_srv6(), host.srv6_locator) {
+            (true, None) => bail!(
+                "host {:?} uses srv6 encapsulation but has no srv6 locator; its service \
+                 SIDs and tunnel source are derived from one",
+                host.id
+            ),
+            (false, Some(_)) => bail!(
+                "host {:?} has an srv6 locator but uses {:?} encapsulation; set encap to \
+                 srv6 or drop the locator",
+                host.id,
+                host.encap
+            ),
+            (true, Some((loc, len))) => {
+                if len % 8 != 0 || len > SRV6_MAX_LOCATOR_BITS {
+                    bail!(
+                        "host {:?} srv6 locator {loc}/{len} must be byte-aligned and at most \
+                         {SRV6_MAX_LOCATOR_BITS} bits, to leave room for the 4-byte \
+                         service-SID function",
+                        host.id
+                    );
+                }
+            }
+            (false, None) => {}
+        }
         self.hosts.insert(host.id.clone(), host);
+        Ok(())
     }
 
     /// Define a network. Fails for a zero VNI, a VNI in the reserved EVPN range
@@ -576,7 +677,8 @@ impl Topology {
             let stranded = self.ports.iter().filter(|p| p.vni == network.vni).count();
             if stranded > 0 {
                 bail!(
-                    "network {} already holds {stranded} port(s) allocated from {}/{};                      changing its subnet to {}/{} would put them outside it",
+                    "network {} already holds {stranded} port(s) allocated from {}/{}; \
+                     changing its subnet to {}/{} would put them outside it",
                     network.vni,
                     Ipv4Addr::from(existing.subnet.octets),
                     existing.subnet.prefix,
@@ -1556,15 +1658,38 @@ impl Topology {
             .map(|p| p.vni)
             .collect();
 
+        // One overlay section, never both: the two are mutually exclusive in the
+        // config's own validation, and which one this host gets is decided here,
+        // by its declared wire family, rather than by whichever field a caller
+        // happened to fill in.
+        let is_srv6 = host.encap.is_srv6();
         let mut cfg = FileConfig {
             default_action: ActionName::Pass,
-            overlay: Some(OverlayCfg {
+            overlay: (!is_srv6).then(|| OverlayCfg {
                 local_vtep: host.vtep_ip.to_string(),
                 underlay_iface: host.underlay_iface.clone(),
                 encap: host.encap,
                 udp_port: host.udp_port,
                 local_mac: None,
                 underlay_mtu: host.underlay_mtu,
+            }),
+            srv6: is_srv6.then(|| Srv6Cfg {
+                // `add_host` refused an srv6 host without a well-formed locator, so
+                // this cannot be `None` for a host that is in the topology at all.
+                local_src: host
+                    .srv6_src()
+                    .expect("an srv6 host has a validated locator")
+                    .to_string(),
+                underlay_iface: host.underlay_iface.clone(),
+                local_mac: None,
+                underlay_mtu: host.underlay_mtu,
+                // Trusted decap peers: every *other* SRv6 host that shares at least
+                // one segment with this one. Scoped rather than fabric-wide for the
+                // same reason `VTEP_PEERS` is derived from the tunnel tables — a
+                // host that cannot legitimately send us an inner frame has no
+                // business being an authorized decap source. Filled in below, once
+                // the shared segments are known.
+                peers: Vec::new(),
             }),
             ..FileConfig::default()
         };
@@ -1694,18 +1819,127 @@ impl Topology {
                 let Some(remote) = self.hosts.get(&port.host) else {
                     continue;
                 };
-                cfg.tunnels.push(TunnelCfg {
-                    vni: port.vni,
-                    inner_dst: format!("{}/32", port.ip),
-                    remote_vtep: remote.vtep_ip.to_string(),
-                    via_mac: fmt_mac(remote.underlay_mac),
-                    out_iface: host.underlay_iface.clone(),
-                });
+                if is_srv6 {
+                    // SRv6 bridges by inner MAC only: there is no L3 (inner-IP)
+                    // FDB on that path, so a remote port becomes one MAC-keyed
+                    // entry toward the peer's `End.DT2U` SID for this segment.
+                    // The SID is *derived* from the peer's locator, not read from
+                    // anything the peer advertised — a peer that has not come up
+                    // yet, or whose BGP session is down, is still addressable the
+                    // moment it does.
+                    //
+                    // A peer with no usable locator is skipped rather than
+                    // guessed at; `add_host` makes that unreachable for a host in
+                    // the topology, and skipping keeps a corrupted snapshot from
+                    // taking down the whole re-derive.
+                    if let Some((loc, len)) = remote.srv6_locator
+                        && let Some(sid) = srv6_service_sid(loc, len, srv6_disc::UNICAST, port.vni)
+                    {
+                        cfg.srv6_routes.push(Srv6RouteCfg {
+                            vni: port.vni,
+                            mac: fmt_mac(port.mac),
+                            remote_sid: sid.to_string(),
+                            via_mac: fmt_mac(remote.underlay_mac),
+                            out_iface: host.underlay_iface.clone(),
+                        });
+                    }
+                } else {
+                    cfg.tunnels.push(TunnelCfg {
+                        vni: port.vni,
+                        inner_dst: format!("{}/32", port.ip),
+                        remote_vtep: remote.vtep_ip.to_string(),
+                        via_mac: fmt_mac(remote.underlay_mac),
+                        out_iface: host.underlay_iface.clone(),
+                    });
+                }
+                // ARP suppression is a property of the segment, not of the wire
+                // format: both overlays want a remote address answered locally
+                // rather than flooded.
                 cfg.neighbors.push(NeighborCfg {
                     vni: port.vni,
                     ip: port.ip.to_string(),
                     mac: fmt_mac(port.mac),
                 });
+            }
+        }
+
+        // B9: the SRv6 tables that are a property of the *fabric*, not of any one
+        // remote port — this host's own instantiated SIDs, the flood set of each
+        // segment, and the trusted decap peers.
+        if is_srv6 {
+            // Every segment this host serves gets both behaviours instantiated.
+            // Both, always: a segment with only the unicast SID has no way to
+            // receive a broadcast, so ARP and DHCP never arrive and the tenant
+            // looks up but cannot talk to anyone it has not already learned.
+            let (loc, len) = host
+                .srv6_locator
+                .expect("an srv6 host has a validated locator");
+            for vni in &vnis {
+                for (disc, behavior) in [
+                    (srv6_disc::UNICAST, "end.dt2u"),
+                    (srv6_disc::MULTICAST, "end.dt2m"),
+                ] {
+                    let Some(sid) = srv6_service_sid(loc, len, disc, *vni) else {
+                        continue;
+                    };
+                    cfg.srv6_local_sids.push(Srv6LocalSidCfg {
+                        sid: sid.to_string(),
+                        vni: *vni,
+                        behavior: Some(behavior.to_string()),
+                    });
+                }
+            }
+
+            // Which other hosts serve each of our segments. Derived from where the
+            // ports actually are, so a host that stops hosting a tenant drops out
+            // of that tenant's flood set on the next pass instead of keeping a
+            // copy of every broadcast it no longer has any use for.
+            let mut peers: BTreeSet<&str> = BTreeSet::new();
+            for vni in &vnis {
+                let mut sharers: Vec<&str> = self
+                    .ports
+                    .iter()
+                    .filter(|p| p.vni == *vni && p.host != host_id)
+                    .map(|p| p.host.as_str())
+                    .collect();
+                sharers.sort_unstable();
+                sharers.dedup();
+                for remote_id in sharers {
+                    let Some(remote) = self.hosts.get(remote_id) else {
+                        continue;
+                    };
+                    let Some((rloc, rlen)) = remote.srv6_locator else {
+                        // A VXLAN host on a shared segment cannot be flooded to
+                        // over SRv6 at all. Skipping is the honest outcome: the
+                        // two halves of a mixed-encap segment genuinely cannot
+                        // reach each other, and inventing a SID for it would turn
+                        // that into silently discarded traffic.
+                        continue;
+                    };
+                    let Some(sid) = srv6_service_sid(rloc, rlen, srv6_disc::MULTICAST, *vni) else {
+                        continue;
+                    };
+                    cfg.srv6_floods.push(Srv6FloodCfg {
+                        vni: *vni,
+                        remote_sid: sid.to_string(),
+                        via_mac: fmt_mac(remote.underlay_mac),
+                        out_iface: host.underlay_iface.clone(),
+                    });
+                    peers.insert(remote_id);
+                }
+            }
+
+            // Trusted decap sources. A peer's outer source is derived from its
+            // locator exactly as ours is, so both ends agree with nothing
+            // exchanged. An empty set is fail-closed by design — a single-host
+            // fabric decapsulates nothing, which is correct, because nobody is
+            // sending it anything.
+            if let Some(srv6) = cfg.srv6.as_mut() {
+                srv6.peers = peers
+                    .iter()
+                    .filter_map(|id| self.hosts.get(*id)?.srv6_src())
+                    .map(|src| src.to_string())
+                    .collect();
             }
         }
 
@@ -1844,6 +2078,11 @@ pub struct HostRec {
     pub encap: EncapName,
     pub udp_port: Option<u16>,
     pub underlay_mtu: Option<u16>,
+    /// B9 SRv6 locator as `(octets, prefix bits)`. `#[serde(default)]` so a
+    /// snapshot written before SRv6 existed still loads — it simply describes a
+    /// VXLAN host, which is what it was.
+    #[serde(default)]
+    pub srv6_locator: Option<([u8; 16], u8)>,
 }
 
 /// Serializable mirror of a [`Network`].
@@ -1975,6 +2214,7 @@ impl Topology {
                     encap: h.encap,
                     udp_port: h.udp_port,
                     underlay_mtu: h.underlay_mtu,
+                    srv6_locator: h.srv6_locator.map(|(a, l)| (a.octets(), l)),
                 })
                 .collect(),
             networks: self
@@ -2129,6 +2369,7 @@ impl Topology {
                     encap: h.encap,
                     udp_port: h.udp_port,
                     underlay_mtu: h.underlay_mtu,
+                    srv6_locator: h.srv6_locator.map(|(a, l)| (Ipv6Addr::from(a), l)),
                 },
             );
         }
@@ -2292,6 +2533,22 @@ mod tests {
             encap: EncapName::Vxlan,
             udp_port: None,
             underlay_mtu: None,
+            srv6_locator: None,
+        }
+    }
+
+    /// The same host, but on the SRv6 wire family. Its locator is derived from
+    /// `last_mac` so two fixtures never share one — a shared locator would give
+    /// two hosts identical service SIDs, which is exactly the bug the derive
+    /// tests below exist to rule out.
+    fn srv6_host(id: &str, vtep: &str, last_mac: u8) -> Host {
+        Host {
+            encap: EncapName::Srv6,
+            srv6_locator: Some((
+                format!("fc00:0:{last_mac}::").parse::<Ipv6Addr>().unwrap(),
+                64,
+            )),
+            ..host(id, vtep, last_mac)
         }
     }
 
@@ -2333,7 +2590,7 @@ mod tests {
     #[test]
     fn a_network_subnet_cannot_move_out_from_under_its_ports() {
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.10.0.1", 0x11));
+        t.add_host(host("h1", "10.10.0.1", 0x11)).unwrap();
         t.add_network(network(100, "blue", "10.0.0.0/24")).unwrap();
 
         // With no ports, the subnet may still be corrected.
@@ -2366,7 +2623,7 @@ mod tests {
     #[test]
     fn a_tap_carries_one_port_and_restating_it_is_not_a_conflict() {
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         let first = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
@@ -2412,7 +2669,7 @@ mod tests {
     #[test]
     fn remove_host_and_network_require_no_ports() {
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         let p = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
@@ -2430,7 +2687,7 @@ mod tests {
     #[test]
     fn ipam_allocates_sequentially_and_skips_taken() {
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
 
@@ -2460,7 +2717,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_and_out_of_subnet_ips() {
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         t.create_port(
@@ -2499,7 +2756,7 @@ mod tests {
     #[test]
     fn rejects_unknown_network_or_host_and_bad_vni() {
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
         assert!(t.create_port(100, "h1", "tap0", None, None, None).is_err()); // no network
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
@@ -2533,8 +2790,8 @@ mod tests {
     #[test]
     fn derives_local_interface_and_remote_tunnel_neighbor() {
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.10.0.1", 0x11));
-        t.add_host(host("h2", "10.10.0.2", 0x22));
+        t.add_host(host("h1", "10.10.0.1", 0x11)).unwrap();
+        t.add_host(host("h2", "10.10.0.2", 0x22)).unwrap();
         t.add_network(network(5000, "blue", "192.168.100.0/24"))
             .unwrap();
 
@@ -2582,9 +2839,9 @@ mod tests {
     #[test]
     fn host_without_ports_on_a_network_gets_no_tunnel_to_it() {
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.10.0.1", 0x11));
-        t.add_host(host("h2", "10.10.0.2", 0x22));
-        t.add_host(host("h3", "10.10.0.3", 0x33));
+        t.add_host(host("h1", "10.10.0.1", 0x11)).unwrap();
+        t.add_host(host("h2", "10.10.0.2", 0x22)).unwrap();
+        t.add_host(host("h3", "10.10.0.3", 0x33)).unwrap();
         t.add_network(network(5000, "blue", "192.168.100.0/24"))
             .unwrap();
         t.create_port(5000, "h1", "tapA", None, None, None).unwrap();
@@ -2603,7 +2860,7 @@ mod tests {
     #[test]
     fn snapshot_roundtrip_is_lossless() {
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.10.0.1", 0x11));
+        t.add_host(host("h1", "10.10.0.1", 0x11)).unwrap();
         t.add_network(network(5000, "blue", "192.168.100.0/24"))
             .unwrap();
         let p = t.create_port(5000, "h1", "tapA", None, None, None).unwrap();
@@ -2628,8 +2885,8 @@ mod tests {
     #[test]
     fn removing_a_port_withdraws_it_from_peer_configs() {
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.10.0.1", 0x11));
-        t.add_host(host("h2", "10.10.0.2", 0x22));
+        t.add_host(host("h1", "10.10.0.1", 0x11)).unwrap();
+        t.add_host(host("h2", "10.10.0.2", 0x22)).unwrap();
         t.add_network(network(5000, "blue", "192.168.100.0/24"))
             .unwrap();
         t.create_port(5000, "h1", "tapA", None, None, None).unwrap();
@@ -2646,9 +2903,9 @@ mod tests {
     #[test]
     fn migrating_a_port_preserves_identity_and_repoints_peers() {
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.10.0.1", 0x11));
-        t.add_host(host("h2", "10.10.0.2", 0x22));
-        t.add_host(host("h3", "10.10.0.3", 0x33));
+        t.add_host(host("h1", "10.10.0.1", 0x11)).unwrap();
+        t.add_host(host("h2", "10.10.0.2", 0x22)).unwrap();
+        t.add_host(host("h3", "10.10.0.3", 0x33)).unwrap();
         t.add_network(network(5000, "blue", "192.168.100.0/24"))
             .unwrap();
         // pa lives on h1; pc gives h3 a port on the network so it tunnels to pa.
@@ -2692,7 +2949,7 @@ mod tests {
         // overlay segment — the eBPF IFACE_POLICY vs IFACE_VNI split the model now
         // exposes.
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.10.0.1", 0x11));
+        t.add_host(host("h1", "10.10.0.1", 0x11)).unwrap();
         t.add_network(network(5000, "blue", "192.168.100.0/24"))
             .unwrap();
 
@@ -2808,7 +3065,7 @@ mod tests {
     #[test]
     fn bind_and_unbind_port_resolves_security_group_policy_id() {
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         t.add_security_group(sg("web", vec![])).unwrap();
@@ -2836,7 +3093,7 @@ mod tests {
         use velstra_config::ProtoName;
 
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.10.0.1", 0x11));
+        t.add_host(host("h1", "10.10.0.1", 0x11)).unwrap();
         t.add_network(network(5000, "blue", "192.168.100.0/24"))
             .unwrap();
         // A "web" group: default-drop, allow tcp/80, block tcp/22.
@@ -2883,7 +3140,7 @@ mod tests {
     #[test]
     fn one_group_bound_by_many_ports_emits_a_single_policy_block() {
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.10.0.1", 0x11));
+        t.add_host(host("h1", "10.10.0.1", 0x11)).unwrap();
         t.add_network(network(5000, "blue", "192.168.100.0/24"))
             .unwrap();
         t.add_security_group(sg("web", vec![])).unwrap();
@@ -2903,7 +3160,7 @@ mod tests {
     #[test]
     fn remove_security_group_is_blocked_while_a_port_binds_it() {
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         t.add_security_group(sg("web", vec![])).unwrap();
@@ -2924,7 +3181,7 @@ mod tests {
         use velstra_config::ProtoName;
 
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.10.0.1", 0x11));
+        t.add_host(host("h1", "10.10.0.1", 0x11)).unwrap();
         t.add_network(network(5000, "blue", "192.168.100.0/24"))
             .unwrap();
         let mut g = sg("web", vec![rule(ProtoName::Tcp, 443, ActionName::Pass)]);
@@ -3108,7 +3365,7 @@ mod tests {
     #[test]
     fn port_binds_dual_stack_addresses_from_v4_and_v6_subnets() {
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         let mut s4 = v4_subnet("s4", 100, "192.168.50.0/24");
@@ -3146,7 +3403,7 @@ mod tests {
     #[test]
     fn unbind_and_remove_port_release_ipam_addresses() {
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         t.add_subnet(v4_subnet("s4", 100, "192.168.50.0/24"))
@@ -3173,7 +3430,7 @@ mod tests {
     #[test]
     fn remove_subnet_blocked_while_allocated_gateway_does_not_block() {
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         let mut s = v4_subnet("s4", 100, "192.168.50.0/24");
@@ -3208,7 +3465,7 @@ mod tests {
     #[test]
     fn subnets_and_ipam_survive_a_snapshot_roundtrip() {
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         let mut s4 = v4_subnet("s4", 100, "192.168.50.0/24");
@@ -3314,7 +3571,7 @@ mod tests {
     #[test]
     fn associate_and_disassociate_validate_and_map_one_to_one() {
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         let mut ext = v4_subnet("ext", 100, "203.0.113.0/29");
@@ -3387,7 +3644,7 @@ mod tests {
     #[test]
     fn floating_ip_maps_an_ipam_bound_fixed_address() {
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         t.add_subnet(v4_subnet("tenant", 100, "192.168.50.0/24"))
@@ -3408,7 +3665,7 @@ mod tests {
     #[test]
     fn release_floating_ip_blocked_while_associated_then_frees_ipam() {
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         t.add_subnet(v4_subnet("ext", 100, "203.0.113.0/29"))
@@ -3441,7 +3698,7 @@ mod tests {
     #[test]
     fn remove_port_disassociates_its_floating_ips() {
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         t.add_subnet(v4_subnet("ext", 100, "203.0.113.0/29"))
@@ -3473,7 +3730,7 @@ mod tests {
     #[test]
     fn floating_ips_survive_a_snapshot_roundtrip() {
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         t.add_subnet(v4_subnet("ext", 100, "203.0.113.0/29"))
@@ -3530,7 +3787,7 @@ mod tests {
     /// A one-host, one-network fabric with two ports, for the LBaaS tests.
     fn lb_fixture() -> (Topology, String, String) {
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 0x11));
+        t.add_host(host("h1", "10.0.0.1", 0x11)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         let a = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
@@ -3816,7 +4073,7 @@ mod tests {
         // plane expects another has every frame dropped and looks like a network
         // that does not work.
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         let chosen = [0x02, 0xab, 0xcd, 0xef, 0x00, 0x01];
@@ -3835,7 +4092,7 @@ mod tests {
         // Two workloads answering to one address is an outage for both, and
         // neither of them says why. This is the only place that can notice.
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         let chosen = [0x02, 0xab, 0xcd, 0xef, 0x00, 0x02];
@@ -3855,7 +4112,7 @@ mod tests {
         // all; the data plane would refuse every frame from it. Refused here,
         // where there is somebody to tell.
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         let group = [0x01, 0x00, 0x5e, 0x00, 0x00, 0x01];
@@ -3874,7 +4131,7 @@ mod tests {
         // id the data plane is already using. Nothing unbinds, and there is no
         // moment where the port falls back to its network's default policy.
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         t.add_security_group(sg("web", vec![])).unwrap();
@@ -3911,7 +4168,7 @@ mod tests {
         // which is the exact hole uRPF does *not* close. Nothing else in this
         // crate asserted that the binding is emitted at all.
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         t.add_subnet(v4_subnet("ext", 100, "203.0.113.0/29"))
@@ -3985,7 +4242,7 @@ mod tests {
         // the agent never programs a token bucket — one guest can still starve
         // the whole host's NIC.
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         let p = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
@@ -4025,7 +4282,7 @@ mod tests {
         // simply unset would be read as "may send nothing" and the port would
         // stop passing traffic for no reason anybody can see.
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         let p = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
@@ -4055,7 +4312,7 @@ mod tests {
         // If this fails, every port ceiling in the fabric is quietly lifted the
         // next time the controller restarts from its snapshot.
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         let p = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
@@ -4083,8 +4340,8 @@ mod tests {
         // left unfirewalled or on the wrong tenant segment, with no error
         // anywhere. `create_port` guards this; migration must too.
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
-        t.add_host(host("h2", "10.0.0.2", 2));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
+        t.add_host(host("h2", "10.0.0.2", 2)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         let a = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
@@ -4118,7 +4375,7 @@ mod tests {
         // fabric its last good config forever, so no policy change lands
         // anywhere — a fabric-wide outage caused by one broken record.
         let mut t = Topology::new();
-        t.add_host(host("h1", "10.0.0.1", 1));
+        t.add_host(host("h1", "10.0.0.1", 1)).unwrap();
         t.add_network(network(100, "blue", "192.168.50.0/24"))
             .unwrap();
         t.create_port(100, "h1", "tap0", None, None, None).unwrap();
@@ -4146,5 +4403,223 @@ mod tests {
             !cfg.neighbors.iter().any(|n| n.ip == "192.168.50.99"),
             "a port with no host produced a neighbour entry"
         );
+    }
+
+    /// What one host floods *to* is what the other host is listening *on*.
+    ///
+    /// Both halves are derived, independently, from the two locators — so this
+    /// is not a restatement of the literals in the test below it. It is the one
+    /// assertion that fails if the head end and the tail end ever compute the
+    /// SID differently: the sender replicates happily, the receiver has no such
+    /// SID instantiated, and the copy is dropped with nothing on either side
+    /// saying why. That failure looks exactly like a working fabric until
+    /// something needs ARP.
+    #[test]
+    fn what_one_host_floods_to_is_a_sid_the_other_host_instantiates() {
+        let mut t = Topology::new();
+        t.add_host(srv6_host("h1", "10.10.0.1", 0x11)).unwrap();
+        t.add_host(srv6_host("h2", "10.10.0.2", 0x22)).unwrap();
+        t.add_network(network(100, "blue", "10.0.0.0/24")).unwrap();
+        t.create_port(100, "h1", "tap0", None, None, None).unwrap();
+        t.create_port(100, "h2", "tap0", None, None, None).unwrap();
+
+        let one = t.derive("h1").expect("h1 derives");
+        let two = t.derive("h2").expect("h2 derives");
+
+        for (from, to, who) in [(&one, &two, "h1 -> h2"), (&two, &one, "h2 -> h1")] {
+            let flood = from
+                .srv6_floods
+                .iter()
+                .find(|f| f.vni == 100)
+                .unwrap_or_else(|| panic!("{who}: nothing to flood to"));
+            let instantiated: Vec<&str> = to
+                .srv6_local_sids
+                .iter()
+                .filter(|ls| ls.vni == 100 && ls.behavior.as_deref() == Some("end.dt2m"))
+                .map(|ls| ls.sid.as_str())
+                .collect();
+            assert_eq!(
+                instantiated,
+                [flood.remote_sid.as_str()],
+                "{who}: the flood target is not a SID the far end terminates"
+            );
+
+            // And the far end trusts the sender's outer source, which is the
+            // other half of the same handshake: a SID it terminates plus a
+            // source it refuses is a copy that arrives and is dropped.
+            let src = from
+                .srv6
+                .as_ref()
+                .expect("an srv6 host has a source")
+                .local_src
+                .clone();
+            assert!(
+                to.srv6.as_ref().expect("srv6").peers.contains(&src),
+                "{who}: the receiver does not trust {src}, so every flood copy is refused"
+            );
+        }
+    }
+
+    /// An SRv6 host's derived config is a *complete* one: an endpoint, both
+    /// service SIDs for every segment it serves, a unicast entry toward each
+    /// remote workload, a flood target for each remote host on the segment, and
+    /// the peers that may decapsulate into it.
+    ///
+    /// Each of those is load-bearing on its own, and the fabric fails differently
+    /// without each one — which is why they are asserted separately rather than as
+    /// one "config is non-empty" check:
+    ///
+    /// * no `End.DT2M` local SID → this host never receives a broadcast;
+    /// * no flood entry → it never *sends* one, so ARP and DHCP die one-way;
+    /// * no peer → decap is fail-closed and nothing arrives at all;
+    /// * no unicast route → known destinations fall through to local delivery.
+    #[test]
+    fn an_srv6_host_derives_a_complete_overlay() {
+        let mut t = Topology::new();
+        t.add_host(srv6_host("h1", "10.10.0.1", 0x11)).unwrap();
+        t.add_host(srv6_host("h2", "10.10.0.2", 0x22)).unwrap();
+        t.add_network(network(100, "blue", "10.0.0.0/24")).unwrap();
+        let local = t.create_port(100, "h1", "tap0", None, None, None).unwrap();
+        let remote = t.create_port(100, "h2", "tap0", None, None, None).unwrap();
+
+        let cfg = t.derive("h1").expect("h1 derives");
+
+        // One overlay section, and it is the SRv6 one.
+        assert!(
+            cfg.overlay.is_none(),
+            "an srv6 host must not also get a VXLAN endpoint"
+        );
+        let srv6 = cfg.srv6.as_ref().expect("srv6 endpoint");
+        assert_eq!(srv6.local_src, "fc00:0:17::");
+        assert_eq!(srv6.underlay_iface, "eth0");
+
+        // h2's source, derived from h2's locator — not from anything h2 said.
+        assert_eq!(srv6.peers, ["fc00:0:34::"]);
+
+        // Both behaviours instantiated for the one segment served.
+        //
+        // The literals pin the *wire* layout, which is the point: bytes 8..12 of
+        // the SID are `disc ++ vni(3)` appended to the /64 locator, so VNI 100
+        // (0x64) with discriminator 0 lands as `…::64:0:0` and with discriminator
+        // 1 as `…:0:100:64::`. A peer computes the same bytes from the same
+        // locator; if this layout drifts, the two stop agreeing and nothing on the
+        // wire says why.
+        let mut sids: Vec<(&str, u32, &str)> = cfg
+            .srv6_local_sids
+            .iter()
+            .map(|ls| {
+                (
+                    ls.sid.as_str(),
+                    ls.vni,
+                    ls.behavior.as_deref().unwrap_or(""),
+                )
+            })
+            .collect();
+        sids.sort_unstable();
+        assert_eq!(
+            sids,
+            [
+                ("fc00:0:17:0:100:64::", 100, "end.dt2m"),
+                ("fc00:0:17::64:0:0", 100, "end.dt2u"),
+            ]
+        );
+
+        // One unicast entry, keyed by the remote workload's MAC and pointing at
+        // h2's *unicast* SID for this segment.
+        assert_eq!(cfg.srv6_routes.len(), 1);
+        let r = &cfg.srv6_routes[0];
+        assert_eq!(r.vni, 100);
+        assert_eq!(r.mac, fmt_mac(remote.mac));
+        assert_eq!(r.remote_sid, "fc00:0:34::64:0:0");
+        assert_eq!(r.via_mac, "02:00:00:00:00:22");
+
+        // One flood target, pointing at h2's *multicast* SID — a different SID
+        // from the unicast one above. Swapping the two is the failure this
+        // assertion exists to catch: BUM traffic would be bridged to one MAC.
+        assert_eq!(cfg.srv6_floods.len(), 1);
+        assert_eq!(cfg.srv6_floods[0].remote_sid, "fc00:0:34:0:100:64::");
+        assert_ne!(cfg.srv6_floods[0].remote_sid, r.remote_sid);
+
+        // No VXLAN tables leak into an SRv6 config...
+        assert!(cfg.tunnels.is_empty());
+        assert!(cfg.flood_vteps.is_empty());
+        // ...but ARP suppression does, because it belongs to the segment rather
+        // than to the wire format.
+        assert_eq!(cfg.neighbors.len(), 1);
+        assert_eq!(cfg.neighbors[0].ip, remote.ip.to_string());
+
+        // And the whole thing validates.
+        cfg.resolve().expect("a derived srv6 config must resolve");
+
+        // The local port is still an ordinary tenant tap.
+        assert!(cfg.interfaces.iter().any(|i| i.name == local.tap));
+    }
+
+    /// A host's overlay format and its locator have to agree, and disagreeing in
+    /// either direction is refused at admission rather than silently repaired.
+    ///
+    /// The asymmetric case matters most: a VXLAN host that carries a locator is an
+    /// operator who believes they turned SRv6 on. Accepting it would give them a
+    /// working VXLAN fabric and no signal at all that the thing they configured is
+    /// not the thing that is running.
+    #[test]
+    fn a_hosts_encapsulation_and_locator_must_agree() {
+        let mut t = Topology::new();
+
+        let mut no_locator = srv6_host("h1", "10.10.0.1", 0x11);
+        no_locator.srv6_locator = None;
+        let err = t.add_host(no_locator).unwrap_err().to_string();
+        assert!(err.contains("no srv6 locator"), "unexpected: {err}");
+
+        let mut stray_locator = host("h2", "10.10.0.2", 0x22);
+        stray_locator.srv6_locator = Some(("fc00:0:9::".parse().unwrap(), 64));
+        let err = t.add_host(stray_locator).unwrap_err().to_string();
+        assert!(err.contains("but uses"), "unexpected: {err}");
+
+        // A locator that is not byte-aligned, or leaves no room for the 4-byte
+        // service-SID function, cannot produce a SID at all — so it is refused
+        // here rather than yielding a host whose every derive silently skips it.
+        for bad_len in [63u8, 104, 128] {
+            let mut bad = srv6_host("h3", "10.10.0.3", 0x33);
+            bad.srv6_locator = Some(("fc00:0:9::".parse().unwrap(), bad_len));
+            let err = t.add_host(bad).unwrap_err().to_string();
+            assert!(err.contains("byte-aligned"), "len {bad_len}: {err}");
+        }
+    }
+
+    /// A segment split across a VXLAN host and an SRv6 host cannot bridge, and the
+    /// derive says so by omission rather than by inventing a SID for a host that
+    /// has none.
+    ///
+    /// This is the honest failure. The tempting alternative — fall back to the
+    /// VXLAN entry — produces a config that loads clean on both hosts and drops
+    /// every frame between them, which is the worst of the two outcomes.
+    #[test]
+    fn a_mixed_encapsulation_segment_bridges_neither_way() {
+        let mut t = Topology::new();
+        t.add_host(srv6_host("h1", "10.10.0.1", 0x11)).unwrap();
+        t.add_host(host("h2", "10.10.0.2", 0x22)).unwrap();
+        t.add_network(network(100, "blue", "10.0.0.0/24")).unwrap();
+        t.create_port(100, "h1", "tap0", None, None, None).unwrap();
+        t.create_port(100, "h2", "tap0", None, None, None).unwrap();
+
+        let from_srv6 = t.derive("h1").expect("h1 derives");
+        assert!(
+            from_srv6.srv6_routes.is_empty(),
+            "h2 has no SID to point at"
+        );
+        assert!(from_srv6.srv6_floods.is_empty());
+        assert!(
+            from_srv6.srv6.as_ref().expect("endpoint").peers.is_empty(),
+            "a VXLAN peer must not be trusted to decapsulate SRv6"
+        );
+
+        // The VXLAN side still derives its own (equally one-sided) view, and both
+        // configs are individually valid — the incompatibility is a fabric
+        // property, not a config error.
+        let from_vxlan = t.derive("h2").expect("h2 derives");
+        assert!(from_vxlan.srv6.is_none());
+        from_srv6.resolve().expect("srv6 side resolves");
+        from_vxlan.resolve().expect("vxlan side resolves");
     }
 }
