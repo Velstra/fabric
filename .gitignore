@@ -17,3 +17,9 @@ target/
 *.pem
 *.key
 *.crt
+
+# …except the committed REST-gateway TLS test fixtures: a throwaway EC test PKI
+# (CA + a localhost server cert/key), not real secrets, that the controller's
+# HTTPS integration test and the rest_tls unit tests load by path.
+!velstra-controller/tests/fixtures/*.pem
+!velstra-controller/tests/fixtures/*.key

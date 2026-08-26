@@ -28,13 +28,13 @@
 
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::Path,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use velstra_common::{parse_cidr_v4, parse_cidr_v6, parse_mac};
+use velstra_common::{parse_cidr_v4, parse_cidr_v6, parse_mac, srv6::locator_src_from_service_sid};
 use velstra_config::{
     ActionName, EncapName, FileConfig, FloodVtepCfg, IrbRouteCfg, MacRouteCfg, Nd6Cfg, NeighborCfg,
     PortRule, ProtoName, Srv6FloodCfg, Srv6IrbRouteCfg, Srv6LocalSidCfg, Srv6RouteCfg, TunnelCfg,
@@ -462,6 +462,227 @@ pub fn derive_configs(
     Ok(out)
 }
 
+/// The `End.DT2U` (unicast) service SID this fabric *would* derive for `remote`'s
+/// `vni` from its topology locator, or `None` when `remote` runs no SRv6 locator.
+///
+/// Shared by [`append_evpn_entries`] (the bring-up fallback when a peer advertised
+/// no SID) and [`srv6_divergences`] (the reference a learned SID is compared
+/// against), so the "what we would derive" answer is computed one way in both.
+fn derived_unicast_sid(remote: &Host, vni: u32) -> Option<Ipv6Addr> {
+    let (loc, len) = remote.srv6_locator?;
+    srv6_service_sid(loc, len, srv6_disc::UNICAST, vni)
+}
+
+/// The `End.DT2M` (BUM flood) service SID this fabric would derive for `remote`'s
+/// `vni`. The flood twin of [`derived_unicast_sid`] — a distinct discriminator, so
+/// one VNI's two behaviours never share a SID (RFC 9252).
+fn derived_multicast_sid(remote: &Host, vni: u32) -> Option<Ipv6Addr> {
+    let (loc, len) = remote.srv6_locator?;
+    srv6_service_sid(loc, len, srv6_disc::MULTICAST, vni)
+}
+
+/// The trusted decap source of an **external** (non-topology) SRv6 peer, recovered
+/// from the service SID it advertised over EVPN.
+///
+/// A learned VTEP that is not a configured fabric host has no topology entry to
+/// borrow a next-hop `via_mac` from, so this host cannot *encapsulate toward* it —
+/// that needs underlay next-hop resolution EVPN does not carry (a routed-underlay
+/// concern deferred with the rest of external-peer *forwarding*). But it can still
+/// **accept** that peer's frames on decap: the datapath source-auth (`SRV6_PEERS`)
+/// is keyed on the peer's zero-filled locator, which [`locator_src_from_service_sid`]
+/// recovers from the learned SID alone when the peer follows the standard
+/// locator-derived layout (the layout wren originates, so a federated wren / RFC
+/// 9252 speaker with its own locator matches). A foreign-layout SID recovers
+/// nothing and is left untrusted — its decap-auth needs the SID structure on the
+/// wire, a later interop-gated chunk. `disc` is the behaviour the SID was learned
+/// under: `UNICAST` for an RT-2 MAC, `MULTICAST` for an RT-3 flood.
+fn external_peer_decap_src(learned_sid: Ipv6Addr, disc: u8, vni: u32) -> Option<Ipv6Addr> {
+    locator_src_from_service_sid(&learned_sid.octets(), disc, vni).map(Ipv6Addr::from)
+}
+
+/// A learned L2 SRv6 SID that disagrees with what this fabric's locator math would
+/// derive for the same `(peer, vni, behaviour)`.
+///
+/// This is the operator's early warning that a peer **allocates** SIDs rather than
+/// deriving them — an external RFC 9252 PE (FRR/Cisco) that assigns SIDs from its
+/// own pool. It is *not* an error: EVPN-learned SIDs are authoritative (see
+/// [`append_evpn_entries`]), so a divergent SID is programmed as advertised. The
+/// divergence is surfaced only so a heterogeneous fleet is visible instead of
+/// silently masked by derivation — the exact failure Stage 1 of the
+/// EVPN-over-SRv6 convergence plan closes (gap G1).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Srv6Divergence {
+    /// The (L2) VNI the SID serves.
+    pub vni: u32,
+    /// `"end.dt2u"` (RT-2 unicast) or `"end.dt2m"` (RT-3 flood) — the two L2
+    /// behaviours this fabric derives and can therefore compare against.
+    pub behavior: &'static str,
+    /// The advertising peer's VTEP.
+    pub vtep: IpAddr,
+    /// The SID the peer advertised over EVPN (the one actually programmed).
+    pub learned_sid: Ipv6Addr,
+    /// The SID this fabric's locator math would have produced.
+    pub derived_sid: Ipv6Addr,
+}
+
+/// Scan learned EVPN state against the topology and return every learned L2 SRv6
+/// SID that diverges from the one this fabric would derive.
+///
+/// **Pure**: a function of `(topology, learned)` only, so it unit-tests directly
+/// and is recomputed on each re-derive with no side effects. Only the L2
+/// behaviours are compared — RT-2 `End.DT2U` and RT-3 `End.DT2M` — because those
+/// are the SIDs the fabric both derives and programs. RT-5 (`End.DT4`/`End.DT6`)
+/// is deliberately re-derived today (Stage 3 of the convergence plan owns learning
+/// it), so there is no learned-vs-derived L2 SID to compare for a type-5 route.
+///
+/// A peer that is not a known fabric host, or a known host with no SRv6 locator,
+/// yields no derived SID to compare against and is therefore never reported — it
+/// is not "divergent", it is simply outside what this fabric derives.
+pub fn srv6_divergences(topo: &Topology, evpn: &EvpnLearned) -> Vec<Srv6Divergence> {
+    let mut out = Vec::new();
+    // RT-2 End.DT2U: every learned MAC that carries a SID and lives behind a known
+    // fabric host we can derive a reference SID for.
+    for (vni, _mac, learned) in evpn.iter_macs() {
+        let (Some(learned_sid), IpAddr::V4(v4)) = (learned.srv6_sid, learned.vtep) else {
+            continue;
+        };
+        let Some(remote) = topo.hosts().find(|h| h.vtep_ip == v4) else {
+            continue;
+        };
+        if let Some(derived_sid) = derived_unicast_sid(remote, vni)
+            && derived_sid != learned_sid
+        {
+            out.push(Srv6Divergence {
+                vni,
+                behavior: "end.dt2u",
+                vtep: learned.vtep,
+                learned_sid,
+                derived_sid,
+            });
+        }
+    }
+    // RT-3 End.DT2M: the flood SID a peer advertised for a VNI.
+    for (&vni, vtep_set) in evpn.floods() {
+        for (vtep, learned_sid) in vtep_set {
+            let (Some(learned_sid), IpAddr::V4(v4)) = (*learned_sid, *vtep) else {
+                continue;
+            };
+            let Some(remote) = topo.hosts().find(|h| h.vtep_ip == v4) else {
+                continue;
+            };
+            if let Some(derived_sid) = derived_multicast_sid(remote, vni)
+                && derived_sid != learned_sid
+            {
+                out.push(Srv6Divergence {
+                    vni,
+                    behavior: "end.dt2m",
+                    vtep: *vtep,
+                    learned_sid,
+                    derived_sid,
+                });
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A learned type-5 (`End.DT4`/`End.DT6`) SRv6 SID this fabric **cannot make
+/// authoritative** because the datapath terminates only the L2 behaviours
+/// (`End.DT2U`/`End.DT2M`).
+///
+/// This is the Stage-3 counterpart of [`Srv6Divergence`], and the two are
+/// deliberately *not* the same signal. A Stage-1 divergence is "the peer allocated
+/// a different SID than we would derive for the **same** behaviour, and we programmed
+/// the peer's" — authority inverted, learned wins. An IRB gate is the opposite
+/// outcome: the peer advertised an L3 SID (a bare-IP `End.DT4`/`End.DT6` payload,
+/// RFC 9252 §6) whose behaviour class this host model has no way to terminate — it
+/// has a single shared kernel bridge, not the per-tenant L3 device an L3 decap needs
+/// (see `velstra_common::srv6::Srv6IrbEndpoint` and `try_srv6_decap`). So the learned
+/// SID is **refused as authoritative** and the L3-VNI's derived `End.DT2U` SID is
+/// programmed instead (the RFC 9136 symmetric-IRB-over-DT2U path B9 shipped), exactly
+/// as [`append_evpn_entries`] does at the type-5 fold.
+///
+/// Surfacing it is the honest half of that gate: without this, an operator pointing a
+/// third-party RFC 9252 PE at the fabric sees inter-subnet interop silently fall back
+/// to the derived SID with no indication that the advertised L3 SID was dropped on the
+/// floor. Making these SIDs authoritative (true `End.DT4`/`End.DT6` decap + L3 encap in
+/// XDP) is the remaining Stage-3 datapath work; until it lands, this is the "refuse the
+/// rest, and say so" the convergence plan's gate calls for.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Srv6IrbGatedSid {
+    /// The tenant's L3 VNI the type-5 route names.
+    pub l3_vni: u32,
+    /// The routed prefix (CIDR text, as learned off the wire).
+    pub prefix: String,
+    /// The advertising peer's VTEP.
+    pub vtep: IpAddr,
+    /// The `End.DT4`/`End.DT6` SID the peer advertised — refused as authoritative.
+    pub learned_sid: Ipv6Addr,
+    /// `"end.dt4"` (a v4 prefix) or `"end.dt6"` (a v6 prefix) — the L3 behaviour the
+    /// learned SID carries by RFC 9252 §6, inferred from the prefix family.
+    pub behavior: &'static str,
+    /// The derived L3-VNI `End.DT2U` SID actually programmed toward this peer in the
+    /// learned one's place (the symmetric-IRB-over-DT2U fallback).
+    pub programmed_sid: Ipv6Addr,
+}
+
+/// Scan learned EVPN state and return every type-5 SRv6 SID the datapath cannot yet
+/// honour — the Stage-3 gate surface (a peer advertised an `End.DT4`/`End.DT6` L3 SID
+/// this host model cannot terminate).
+///
+/// **Pure**: a function of `(topology, learned)` only, recomputed on each re-derive
+/// with no side effects, so it unit-tests directly — the same contract as
+/// [`srv6_divergences`]. It reports exactly the routes [`append_evpn_entries`] would
+/// install an SRv6 IRB entry for (a known SRv6 fabric-host peer, a v4 prefix — the
+/// datapath's IRB path is v4-only) that additionally advertised a SID: those are the
+/// ones where a learned L3 SID was present and dropped in favour of the derived DT2U
+/// SID. An external (non-topology) peer, or one that advertised no SID, yields nothing
+/// — there is no learned L3 SID being refused.
+pub fn srv6_irb_gated_sids(topo: &Topology, evpn: &EvpnLearned) -> Vec<Srv6IrbGatedSid> {
+    let mut out = Vec::new();
+    for (l3_vni, prefix, learned) in evpn.iter_prefixes() {
+        // Only a route this fabric actually processes: a hosted VRF for the L3 VNI…
+        if !topo.ip_vrfs().any(|v| v.l3_vni == l3_vni) {
+            continue;
+        }
+        // …that advertised an L3 SID (the thing being gated)…
+        let (Some(learned_sid), IpAddr::V4(v4)) = (learned.srv6_sid, learned.vtep) else {
+            continue;
+        };
+        // …behind a known SRv6 fabric host we derive the DT2U fallback for.
+        let Some(remote) = topo.hosts().find(|h| h.vtep_ip == v4) else {
+            continue;
+        };
+        let Some(programmed_sid) = derived_unicast_sid(remote, l3_vni) else {
+            continue;
+        };
+        // The IRB datapath is v4-only (a v6 prefix has no L3 map to go in), matching
+        // `append_evpn_entries`' `prefix.contains('.')` gate; label the behaviour by
+        // the family so a future v6 route reads honestly.
+        let behavior = if prefix.contains('.') {
+            "end.dt4"
+        } else {
+            "end.dt6"
+        };
+        if behavior == "end.dt6" {
+            // No v6 IRB route is programmed today, so there is no DT2U fallback in
+            // its place — nothing was gated in the "refused in favour of" sense.
+            continue;
+        }
+        out.push(Srv6IrbGatedSid {
+            l3_vni,
+            prefix: prefix.to_string(),
+            vtep: learned.vtep,
+            learned_sid,
+            behavior,
+            programmed_sid,
+        });
+    }
+    out.sort();
+    out
+}
+
 /// Fold EVPN-learned type-2 MAC/IP routes into `host`'s derived `file`, on top
 /// of (and after) the topology-derived overlay entries (roadmap B4a).
 ///
@@ -528,42 +749,69 @@ fn append_evpn_entries(file: &mut FileConfig, host: &Host, topo: &Topology, evpn
             continue;
         }
         // Borrow the remote VTEP host's underlay MAC as the next hop (mirrors
-        // the topology derive). An external VTEP we don't know is held, not
-        // programmed.
-        let Some(remote) = topo.hosts().find(|h| h.vtep_ip == vtep) else {
-            continue;
+        // the topology derive). An external VTEP we don't know cannot be
+        // encapsulated toward (no next-hop MAC) — but if it advertised a
+        // standard-layout End.DT2U SID we still trust it as a decap source, so
+        // its BUM/return traffic is accepted instead of dropped fail-closed.
+        let remote = match topo.hosts().find(|h| h.vtep_ip == vtep) {
+            Some(r) => r,
+            None => {
+                if is_srv6
+                    && let Some(sid) = learned.srv6_sid
+                    && let Some(src) = external_peer_decap_src(sid, srv6_disc::UNICAST, vni)
+                {
+                    evpn_peers.push(src.to_string());
+                }
+                continue;
+            }
         };
         // B1: every type-2 MAC (MAC-only AND MAC/IP) gets an L2 bridging entry so
         // the datapath can bridge by destination MAC, independent of the L3 FDB.
         // Which table it lands in follows *this* host's wire family, and the SRv6
         // one needs a service SID rather than a VTEP address.
         if is_srv6 {
-            // Prefer the SID the advertising PE actually put in its Prefix-SID
-            // attribute; fall back to deriving it from the peer's locator.
+            // EVPN-learned SID is authoritative (convergence plan Stage 1, gap G1).
+            // When the advertising PE put a SID in its Prefix-SID attribute we
+            // program *that* SID verbatim — even when it diverges from what our
+            // locator math would derive, because an external RFC 9252 PE allocates
+            // SIDs from its own pool and its SID is the only thing that reaches it.
+            // The divergence itself is counted and surfaced separately
+            // (`srv6_divergences`) so a heterogeneous fleet is visible, not masked.
             //
-            // The fallback is not a nicety. A learned SID is only present once the
-            // BGP session is up and the route has arrived, whereas the derivation
-            // holds from the moment the peer exists in the topology — so a fabric
-            // whose control plane is still converging still bridges. When both are
-            // available they agree, because both sides compute the same layout.
-            let sid = learned.srv6_sid.or_else(|| {
-                let (loc, len) = remote.srv6_locator?;
-                srv6_service_sid(loc, len, srv6_disc::UNICAST, vni)
-            });
-            // No SID and no locator means a VXLAN peer on a shared segment: it
-            // cannot be reached over SRv6 at all, and inventing an entry would
-            // silently discard the traffic instead of not carrying it.
-            if let Some(sid) = sid {
-                file.srv6_routes.push(Srv6RouteCfg {
-                    vni,
-                    mac: fmt_mac(mac),
-                    remote_sid: sid.to_string(),
-                    via_mac: fmt_mac(remote.underlay_mac),
-                    out_iface: host.underlay_iface.clone(),
-                });
-                if let Some(src) = remote.srv6_src() {
-                    evpn_peers.push(src.to_string());
+            // Derivation is only the bring-up fallback: a learned SID is present
+            // just once the BGP session is up and the route has arrived, whereas
+            // the derived SID holds from the moment the peer exists in the topology
+            // — so a fabric whose control plane is still converging still bridges.
+            let sid = learned
+                .srv6_sid
+                .or_else(|| derived_unicast_sid(remote, vni));
+            match sid {
+                Some(sid) => {
+                    file.srv6_routes.push(Srv6RouteCfg {
+                        vni,
+                        mac: fmt_mac(mac),
+                        remote_sid: sid.to_string(),
+                        via_mac: fmt_mac(remote.underlay_mac),
+                        out_iface: host.underlay_iface.clone(),
+                    });
+                    // The peer's outer source becomes a trusted decap source, or
+                    // its return frames hit `srv6_drop_untrusted` and are refused.
+                    if let Some(src) = remote.srv6_src() {
+                        evpn_peers.push(src.to_string());
+                    }
                 }
+                // No learned SID and no locator: a pure-VXLAN peer. An SRv6 host
+                // carries no `[overlay]` (the two are mutually exclusive per host),
+                // so it cannot bridge VXLAN to reach this peer at all — the config
+                // model has no mixed-transport host (that coexistence is a later
+                // stage). Held, not programmed; logged so a genuinely unreachable
+                // peer is visible rather than a silent blackhole.
+                None => log::warn!(
+                    "evpn: srv6 host {:?} learned mac {} on vni {vni} behind vxlan-only \
+                     peer {vtep} (no advertised or derivable SID); held, not programmed",
+                    host.id,
+                    fmt_mac(mac),
+                ),
             }
         } else {
             file.mac_routes.push(MacRouteCfg {
@@ -650,11 +898,18 @@ fn append_evpn_entries(file: &mut FileConfig, host: &Host, topo: &Topology, evpn
         // per-tenant L3 device this host model does not have. Programming the
         // advertised SID would build an encapsulation the far end refuses. So the
         // L3-VNI L2 SID is derived from the peer's locator instead.
+        //
+        // Making the learned End.DT4/DT6 SID authoritative here (the L3 half of
+        // the unified plane) is **Stage 3** of the EVPN-over-SRv6 convergence plan
+        // (gap G3): it needs DT4/DT6 decap in the XDP datapath, which does not
+        // exist yet. Stage 1 inverts authority for L2 only; leaving this derivation
+        // in place is deliberate, not an oversight. Stage 3's first slice does not
+        // change this line — it makes the refusal *visible*: every learned L3 SID
+        // dropped here is reported by [`srv6_irb_gated_sids`] and surfaced at
+        // `/v1/srv6/irb-gated`, so an operator sees the advertised End.DT4/DT6 SID
+        // was gated rather than silently ignored.
         let srv6_sid = is_srv6
-            .then(|| {
-                let (loc, len) = remote.srv6_locator?;
-                srv6_service_sid(loc, len, srv6_disc::UNICAST, l3_vni)
-            })
+            .then(|| derived_unicast_sid(remote, l3_vni))
             .flatten();
         if is_srv6 && srv6_sid.is_none() {
             // A VXLAN peer cannot route for an SRv6 host. Held, not programmed.
@@ -671,10 +926,7 @@ fn append_evpn_entries(file: &mut FileConfig, host: &Host, topo: &Topology, evpn
         // L3 VNI belongs to no local tenant port, so nothing else ever registers
         // it. The failure is one-way reachability, which reads like a routing
         // problem rather than a missing table entry.
-        if is_srv6
-            && let Some((loc, len)) = host.srv6_locator
-            && let Some(own) = srv6_service_sid(loc, len, srv6_disc::UNICAST, l3_vni)
-        {
+        if is_srv6 && let Some(own) = derived_unicast_sid(host, l3_vni) {
             let sid = own.to_string();
             if !file.srv6_local_sids.iter().any(|ls| ls.sid == sid) {
                 file.srv6_local_sids.push(Srv6LocalSidCfg {
@@ -727,19 +979,29 @@ fn append_evpn_entries(file: &mut FileConfig, host: &Host, topo: &Topology, evpn
             if *vtep == host.vtep_ip {
                 continue;
             }
-            let Some(remote) = topo.hosts().find(|h| h.vtep_ip == *vtep) else {
-                continue;
+            let remote = match topo.hosts().find(|h| h.vtep_ip == *vtep) {
+                Some(r) => r,
+                None => {
+                    // External flood peer: cannot be replicated toward (no
+                    // next-hop MAC), but a standard-layout End.DT2M SID makes it a
+                    // trusted decap source for the flood copies it sends us.
+                    if is_srv6
+                        && let Some(sid) = *learned_sid
+                        && let Some(src) = external_peer_decap_src(sid, srv6_disc::MULTICAST, vni)
+                    {
+                        evpn_peers.push(src.to_string());
+                    }
+                    continue;
+                }
             };
             if is_srv6 {
-                // The peer's **End.DT2M** SID — advertised if the IMET route
-                // carried one, derived from its locator otherwise. It is a
+                // The peer's **End.DT2M** SID. Learned is authoritative (Stage 1,
+                // gap G1): an advertised flood SID is programmed verbatim, derived
+                // from the peer's locator only as the bring-up fallback. It is a
                 // different SID from the unicast one: RFC 9252 binds a SID to one
                 // behaviour, so a flood copy sent to the unicast SID is bridged to
                 // a single MAC and every other workload on the segment misses it.
-                let sid = learned_sid.or_else(|| {
-                    let (loc, len) = remote.srv6_locator?;
-                    srv6_service_sid(loc, len, srv6_disc::MULTICAST, vni)
-                });
+                let sid = learned_sid.or_else(|| derived_multicast_sid(remote, vni));
                 if let Some(sid) = sid {
                     file.srv6_floods.push(Srv6FloodCfg {
                         vni,
@@ -1427,6 +1689,151 @@ mod tests {
         // reaching this point at all means the SRv6 tables validated.
     }
 
+    /// Stage 3 gate: a learned type-5 `End.DT4` SID is **refused** as authoritative
+    /// (the datapath terminates only L2 behaviours) — the derived L3-VNI `End.DT2U`
+    /// SID is programmed in its place — *and* the refusal is surfaced by
+    /// [`srv6_irb_gated_sids`], so it is visible rather than silently dropped.
+    #[test]
+    fn a_learned_type5_l3_sid_is_gated_not_authoritative() {
+        use crate::evpn::{EvpnLearned, EvpnMonitorEvent};
+
+        let toml = r#"
+            [[host]]
+            id = "h1"
+            vtep = "10.10.0.1"
+            underlay_iface = "eth0"
+            underlay_mac = "02:00:00:00:00:11"
+            encap = "srv6"
+            srv6_locator = "fc00:0:1::/64"
+
+            [[host]]
+            id = "h2"
+            vtep = "10.10.0.2"
+            underlay_iface = "eth0"
+            underlay_mac = "02:00:00:00:00:22"
+            encap = "srv6"
+            srv6_locator = "fc00:0:2::/64"
+
+            [[network]]
+            vni = 5000
+            name = "blue"
+            subnet = "192.168.100.0/24"
+
+            [[ip_vrf]]
+            l3_vni = 50100
+            name = "tenant-a"
+            gateway_mac = "02:00:5e:00:00:aa"
+            networks = [5000]
+        "#;
+        let topo = build(&toml::from_str::<TopologyFile>(toml).unwrap()).unwrap();
+
+        // An End.DT4 SID under a locator that is NOT h2's — an external-style
+        // allocation derivation could never produce, pinning "the learned L3 SID was
+        // gated" beyond doubt.
+        let advertised_dt4: Ipv6Addr = "fc00:dead:beef:4::c3b4".parse().unwrap();
+        let mut evpn = EvpnLearned::default();
+        evpn.apply(&EvpnMonitorEvent::PrefixUpdate {
+            l3_vni: 50100,
+            prefix: "10.20.0.0/24".into(),
+            vtep: "10.10.0.2".parse().unwrap(),
+            router_mac: Some([0x02, 0x00, 0x5e, 0x00, 0x00, 0xbb]),
+            gw: None,
+            srv6_sid: Some(advertised_dt4),
+        });
+
+        // The derived L3-VNI unicast SID this fabric programs in the learned one's
+        // place (End.DT2U under h2's own locator, discriminator 0).
+        let programmed = derived_unicast_sid(topo.hosts().find(|h| h.id == "h2").unwrap(), 50100)
+            .expect("h2 has a locator");
+        assert_ne!(
+            programmed, advertised_dt4,
+            "the fabric must not derive the DT4 SID"
+        );
+
+        let cfgs = derive_configs(&topo, Some(&evpn)).unwrap();
+        let h1 = &cfgs["h1"];
+
+        // The IRB route carries the derived DT2U SID, never the advertised DT4 one.
+        assert_eq!(h1.srv6_irb_routes.len(), 1, "{:?}", h1.srv6_irb_routes);
+        assert_eq!(h1.srv6_irb_routes[0].remote_sid, programmed.to_string());
+        assert_ne!(h1.srv6_irb_routes[0].remote_sid, advertised_dt4.to_string());
+
+        // And the gate is visible: exactly one gated learned L3 SID, naming the
+        // advertised SID that was refused and the DT2U SID programmed instead.
+        let gated = srv6_irb_gated_sids(&topo, &evpn);
+        assert_eq!(gated.len(), 1, "{gated:?}");
+        assert_eq!(gated[0].l3_vni, 50100);
+        assert_eq!(gated[0].prefix, "10.20.0.0/24");
+        assert_eq!(gated[0].behavior, "end.dt4");
+        assert_eq!(gated[0].learned_sid, advertised_dt4);
+        assert_eq!(gated[0].programmed_sid, programmed);
+    }
+
+    /// The gate reports only a genuinely refused learned L3 SID: a type-5 route that
+    /// advertised no SID (a fabric whose BGP has not converged) is derived from the
+    /// locator with nothing gated, and a route for a VRF this fabric does not host is
+    /// outside what it processes.
+    #[test]
+    fn srv6_irb_gated_reports_only_refused_learned_l3_sids() {
+        use crate::evpn::{EvpnLearned, EvpnMonitorEvent};
+
+        let toml = r#"
+            [[host]]
+            id = "h1"
+            vtep = "10.10.0.1"
+            underlay_iface = "eth0"
+            underlay_mac = "02:00:00:00:00:11"
+            encap = "srv6"
+            srv6_locator = "fc00:0:1::/64"
+
+            [[host]]
+            id = "h2"
+            vtep = "10.10.0.2"
+            underlay_iface = "eth0"
+            underlay_mac = "02:00:00:00:00:22"
+            encap = "srv6"
+            srv6_locator = "fc00:0:2::/64"
+
+            [[network]]
+            vni = 5000
+            name = "blue"
+            subnet = "192.168.100.0/24"
+
+            [[ip_vrf]]
+            l3_vni = 50100
+            name = "tenant-a"
+            gateway_mac = "02:00:5e:00:00:aa"
+            networks = [5000]
+        "#;
+        let topo = build(&toml::from_str::<TopologyFile>(toml).unwrap()).unwrap();
+
+        let mut evpn = EvpnLearned::default();
+        // A type-5 route that advertised no SID: derived, nothing refused.
+        evpn.apply(&EvpnMonitorEvent::PrefixUpdate {
+            l3_vni: 50100,
+            prefix: "10.20.0.0/24".into(),
+            vtep: "10.10.0.2".parse().unwrap(),
+            router_mac: Some([0x02, 0x00, 0x5e, 0x00, 0x00, 0xbb]),
+            gw: None,
+            srv6_sid: None,
+        });
+        // A type-5 route carrying a SID but for a VRF this fabric does not host: not
+        // a route it processes, so not gated (it is simply held elsewhere).
+        evpn.apply(&EvpnMonitorEvent::PrefixUpdate {
+            l3_vni: 60600,
+            prefix: "10.30.0.0/24".into(),
+            vtep: "10.10.0.2".parse().unwrap(),
+            router_mac: Some([0x02, 0x00, 0x5e, 0x00, 0x00, 0xcc]),
+            gw: None,
+            srv6_sid: Some("fc00:0:2:6::c3b4".parse().unwrap()),
+        });
+
+        assert!(
+            srv6_irb_gated_sids(&topo, &evpn).is_empty(),
+            "neither a no-SID route nor an unhosted-VRF route is a gated learned L3 SID"
+        );
+    }
+
     /// The two ends of an SRv6 fabric agree, with nothing exchanged between them.
     ///
     /// Every other test here checks one host's config in isolation, and a config
@@ -1530,6 +1937,301 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Stage 1 authority inversion: a learned End.DT2U SID is programmed
+    /// **verbatim**, even one this fabric's locator math could never have derived
+    /// (a foreign locator, as an external RFC 9252 PE that *allocates* SIDs would
+    /// advertise). Derivation must not mask it — and the divergence must be
+    /// reported so a heterogeneous fleet is visible, plus the peer's outer source
+    /// must land in the trusted-decap set in the exact form the datapath checks.
+    #[test]
+    fn a_learned_l2_sid_is_authoritative_over_derivation() {
+        use crate::evpn::{EvpnLearned, EvpnMonitorEvent};
+
+        let toml = r#"
+            [[host]]
+            id = "h1"
+            vtep = "10.10.0.1"
+            underlay_iface = "eth0"
+            underlay_mac = "02:00:00:00:00:11"
+            encap = "srv6"
+            srv6_locator = "fc00:0:1::/64"
+
+            [[host]]
+            id = "h2"
+            vtep = "10.10.0.2"
+            underlay_iface = "eth0"
+            underlay_mac = "02:00:00:00:00:22"
+            encap = "srv6"
+            srv6_locator = "fc00:0:2::/64"
+
+            [[network]]
+            vni = 5000
+            name = "blue"
+            subnet = "192.168.100.0/24"
+        "#;
+        let topo = build(&toml::from_str::<TopologyFile>(toml).unwrap()).unwrap();
+
+        // A SID under a locator that is NOT h2's — derivation from fc00:0:2::/64
+        // cannot produce a fc00:dead:beef:: SID, so this pins "learned, not
+        // derived" beyond doubt.
+        let allocated: Ipv6Addr = "fc00:dead:beef:0:1234::".parse().unwrap();
+        let derived = derived_unicast_sid(topo.hosts().find(|h| h.id == "h2").unwrap(), 5000)
+            .expect("h2 has a locator");
+        assert_ne!(
+            allocated, derived,
+            "test SID must be one derive cannot produce"
+        );
+
+        let mut evpn = EvpnLearned::default();
+        evpn.apply(&EvpnMonitorEvent::MacUpdate {
+            vni: 5000,
+            mac: [0x02, 0x00, 0x5e, 0x00, 0x00, 0x01],
+            ip: None,
+            vtep: "10.10.0.2".parse().unwrap(),
+            srv6_sid: Some(allocated),
+        });
+
+        let cfgs = derive_configs(&topo, Some(&evpn)).unwrap();
+        let h1 = &cfgs["h1"];
+
+        // The advertised SID is programmed verbatim — not the derived one.
+        assert_eq!(h1.srv6_routes.len(), 1, "{:?}", h1.srv6_routes);
+        assert_eq!(h1.srv6_routes[0].remote_sid, allocated.to_string());
+        assert_ne!(h1.srv6_routes[0].remote_sid, derived.to_string());
+
+        // The peer's outer source is trusted for decap, in the `srv6_src`
+        // (zero-filled locator) form `srv6_drop_untrusted` checks against.
+        let src = topo
+            .hosts()
+            .find(|h| h.id == "h2")
+            .unwrap()
+            .srv6_src()
+            .unwrap()
+            .to_string();
+        assert!(
+            h1.srv6
+                .as_ref()
+                .expect("srv6 endpoint")
+                .peers
+                .contains(&src),
+            "learned peer {src} must be a trusted decap source: {:?}",
+            h1.srv6.as_ref().map(|s| &s.peers)
+        );
+
+        // And the divergence is reported (learned ≠ derived).
+        let div = srv6_divergences(&topo, &evpn);
+        assert_eq!(div.len(), 1, "{div:?}");
+        assert_eq!(div[0].behavior, "end.dt2u");
+        assert_eq!(div[0].vni, 5000);
+        assert_eq!(div[0].learned_sid, allocated);
+        assert_eq!(div[0].derived_sid, derived);
+    }
+
+    /// External (non-topology) EVPN peer decap-auth: a federated SRv6 speaker that
+    /// is *not* a configured fabric host advertises standard-layout service SIDs.
+    /// This host cannot encapsulate toward it (no next-hop MAC in the topology), so
+    /// no `srv6_route`/`srv6_flood` is programmed — but its zero-filled locator must
+    /// still land in the trusted-decap set, recovered from the SID alone, so the
+    /// unicast return and BUM flood copies it sends us are accepted instead of
+    /// dropped fail-closed. Encapsulating *toward* it (a routed underlay's next-hop
+    /// resolution) is a separate, later chunk.
+    #[test]
+    fn an_external_peer_is_trusted_for_decap_from_its_learned_sid() {
+        use velstra_common::srv6::{build_service_sid, sid_disc};
+
+        use crate::evpn::{EvpnLearned, EvpnMonitorEvent};
+
+        let toml = r#"
+            [[host]]
+            id = "h1"
+            vtep = "10.10.0.1"
+            underlay_iface = "eth0"
+            underlay_mac = "02:00:00:00:00:11"
+            encap = "srv6"
+            srv6_locator = "fc00:0:1::/64"
+
+            [[network]]
+            vni = 5000
+            name = "blue"
+            subnet = "192.168.100.0/24"
+        "#;
+        let topo = build(&toml::from_str::<TopologyFile>(toml).unwrap()).unwrap();
+
+        // A federated speaker at a VTEP no host in the topology owns, advertising
+        // standard-layout SIDs under its own /64 locator.
+        let ext_loc = [0xfc, 0, 0, 0x99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let ext_dt2u =
+            Ipv6Addr::from(build_service_sid(&ext_loc, 64, sid_disc::UNICAST, 5000).unwrap());
+        let ext_dt2m =
+            Ipv6Addr::from(build_service_sid(&ext_loc, 64, sid_disc::MULTICAST, 5000).unwrap());
+        let ext_src = Ipv6Addr::from(build_service_sid(&ext_loc, 64, 0, 0).unwrap());
+
+        let mut evpn = EvpnLearned::default();
+        evpn.apply(&EvpnMonitorEvent::MacUpdate {
+            vni: 5000,
+            mac: [0x02, 0x00, 0x5e, 0x00, 0x00, 0x09],
+            ip: None,
+            vtep: "10.10.0.9".parse().unwrap(),
+            srv6_sid: Some(ext_dt2u),
+        });
+        evpn.apply(&EvpnMonitorEvent::FloodUpdate {
+            vni: 5000,
+            vtep: "10.10.0.9".parse().unwrap(),
+            srv6_sid: Some(ext_dt2m),
+        });
+
+        let cfgs = derive_configs(&topo, Some(&evpn)).unwrap();
+        let h1 = &cfgs["h1"];
+
+        // Nothing is programmed toward the external peer: no forward unicast route
+        // and no flood target (we have no next-hop MAC for it).
+        assert!(
+            h1.srv6_routes
+                .iter()
+                .all(|r| r.remote_sid != ext_dt2u.to_string()),
+            "no forward route to an external peer: {:?}",
+            h1.srv6_routes
+        );
+        assert!(
+            h1.srv6_floods
+                .iter()
+                .all(|f| f.remote_sid != ext_dt2m.to_string()),
+            "no flood target toward an external peer: {:?}",
+            h1.srv6_floods
+        );
+
+        // But both of its SIDs recover the same zero-filled-locator source, which
+        // is trusted for decap so its unicast return and BUM flood copies land.
+        let peers = &h1.srv6.as_ref().expect("srv6 endpoint").peers;
+        assert!(
+            peers.contains(&ext_src.to_string()),
+            "external peer source {ext_src} must be trusted for decap: {peers:?}"
+        );
+
+        // It is not a divergence: divergence compares against a *derivable*
+        // reference, and an external peer is not a known host, so nothing to
+        // compare — it is outside what this fabric derives, not disagreeing with it.
+        assert!(
+            srv6_divergences(&topo, &evpn).is_empty(),
+            "an external (non-topology) peer yields no divergence"
+        );
+    }
+
+    /// The transport is chosen per peer by what EVPN advertised. A peer that is a
+    /// VXLAN-only host (no SRv6 locator) advertises no SID and cannot be reached
+    /// over SRv6 by an SRv6 host — which carries no `[overlay]` and so cannot
+    /// bridge VXLAN either. Such an entry is *held, not programmed*: it must not
+    /// land in the SRv6 tables (there is no SID for it) and must not silently
+    /// invent one. The full VXLAN-on-an-SRv6-host coexistence is a later stage.
+    #[test]
+    fn a_vxlan_only_peer_is_held_on_an_srv6_host_not_given_a_derived_sid() {
+        use crate::evpn::{EvpnLearned, EvpnMonitorEvent};
+
+        let toml = r#"
+            [[host]]
+            id = "h1"
+            vtep = "10.10.0.1"
+            underlay_iface = "eth0"
+            underlay_mac = "02:00:00:00:00:11"
+            encap = "srv6"
+            srv6_locator = "fc00:0:1::/64"
+
+            [[host]]
+            id = "h2"
+            vtep = "10.10.0.2"
+            underlay_iface = "eth0"
+            underlay_mac = "02:00:00:00:00:22"
+
+            [[network]]
+            vni = 5000
+            name = "blue"
+            subnet = "192.168.100.0/24"
+        "#;
+        let topo = build(&toml::from_str::<TopologyFile>(toml).unwrap()).unwrap();
+
+        let mut evpn = EvpnLearned::default();
+        // h2 is a VXLAN host (no locator) and advertised no SID.
+        evpn.apply(&EvpnMonitorEvent::MacUpdate {
+            vni: 5000,
+            mac: [0x02, 0x00, 0x5e, 0x00, 0x00, 0x02],
+            ip: None,
+            vtep: "10.10.0.2".parse().unwrap(),
+            srv6_sid: None,
+        });
+
+        let cfgs = derive_configs(&topo, Some(&evpn)).unwrap();
+        let h1 = &cfgs["h1"];
+
+        // No SRv6 route (no SID to reach it) and no VXLAN mac_route (an SRv6 host
+        // has no overlay). Held, not programmed — and no divergence (nothing to
+        // compare: the peer runs no SRv6).
+        assert!(h1.srv6_routes.is_empty(), "{:?}", h1.srv6_routes);
+        assert!(h1.mac_routes.is_empty(), "{:?}", h1.mac_routes);
+        assert!(srv6_divergences(&topo, &evpn).is_empty());
+    }
+
+    /// A learned SID that *matches* derivation is not a divergence, and a flood
+    /// (End.DT2M) SID diverges independently of the unicast one. Pins that the
+    /// gauge counts real heterogeneity, not every learned SID.
+    #[test]
+    fn srv6_divergences_reports_only_genuine_mismatches() {
+        use crate::evpn::{EvpnLearned, EvpnMonitorEvent};
+
+        let toml = r#"
+            [[host]]
+            id = "h1"
+            vtep = "10.10.0.1"
+            underlay_iface = "eth0"
+            underlay_mac = "02:00:00:00:00:11"
+            encap = "srv6"
+            srv6_locator = "fc00:0:1::/64"
+
+            [[host]]
+            id = "h2"
+            vtep = "10.10.0.2"
+            underlay_iface = "eth0"
+            underlay_mac = "02:00:00:00:00:22"
+            encap = "srv6"
+            srv6_locator = "fc00:0:2::/64"
+
+            [[network]]
+            vni = 5000
+            name = "blue"
+            subnet = "192.168.100.0/24"
+        "#;
+        let topo = build(&toml::from_str::<TopologyFile>(toml).unwrap()).unwrap();
+        let h2 = topo.hosts().find(|h| h.id == "h2").unwrap();
+
+        // A MAC advertising exactly the derived SID: no divergence.
+        let matching = derived_unicast_sid(h2, 5000).unwrap();
+        let mut evpn = EvpnLearned::default();
+        evpn.apply(&EvpnMonitorEvent::MacUpdate {
+            vni: 5000,
+            mac: [0x02, 0x00, 0x5e, 0x00, 0x00, 0x03],
+            ip: None,
+            vtep: "10.10.0.2".parse().unwrap(),
+            srv6_sid: Some(matching),
+        });
+        assert!(
+            srv6_divergences(&topo, &evpn).is_empty(),
+            "a SID equal to the derived one is not a divergence"
+        );
+
+        // A flood advertising a foreign End.DT2M SID: exactly one divergence,
+        // tagged as the flood behaviour.
+        let foreign_flood: Ipv6Addr = "fc00:aaaa:bbbb:1:5678::".parse().unwrap();
+        evpn.apply(&EvpnMonitorEvent::FloodUpdate {
+            vni: 5000,
+            vtep: "10.10.0.2".parse().unwrap(),
+            srv6_sid: Some(foreign_flood),
+        });
+        let div = srv6_divergences(&topo, &evpn);
+        assert_eq!(div.len(), 1, "{div:?}");
+        assert_eq!(div[0].behavior, "end.dt2m");
+        assert_eq!(div[0].learned_sid, foreign_flood);
+        assert_eq!(div[0].derived_sid, derived_multicast_sid(h2, 5000).unwrap());
     }
 
     #[test]

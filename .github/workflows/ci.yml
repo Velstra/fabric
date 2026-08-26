@@ -112,6 +112,50 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  # Root/KVM lane: the eBPF verifier acceptance (tests/e2e/loadcheck.sh). GitHub's
+  # ubuntu-latest runners now grant passwordless sudo and a real kernel, so the
+  # ~2-second "does the datapath load at all" check — the acceptance for the whole
+  # stack-discipline rework — can gate every PR instead of only running on a
+  # developer box. It loads the real XDP program into the runner's OWN kernel
+  # (root, not a nested guest), so it needs no /dev/kvm.
+  #
+  # The heavier full datapath suite (tests/e2e/run.sh, netns/veth topologies) stays
+  # the nightly `datapath` job below on purpose: its per-runner kernel-load
+  # behaviour is still unproven, and a kernel-loading suite is the wrong thing to
+  # put between a maintainer and a merge. This loadcheck is precisely the probe
+  # that will tell us whether promoting the rest is safe — the first green run here
+  # is evidence the hosted kernel accepts these programs at all.
+  loadcheck:
+    name: ebpf verifier load-check (root)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          # `rust-src` cross-compiles std for the BPF target (via the app's
+          # build.rs); no clippy needed here, the host lanes cover that.
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc and iproute2
+        # protoc: velstra-proto's build. iproute2: loadcheck.sh's `ip link`.
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler iproute2
+      - name: Install bpf-linker
+        run: cargo install bpf-linker --locked
+      - name: Say what kernel this is
+        # The verifier's verdict depends on it, so a failure that does not name the
+        # kernel is a failure nobody can act on (same rationale as `datapath`).
+        run: |
+          uname -a
+          grep -E "^BPF|BPF_SYSCALL|^CONFIG_XDP" /boot/config-"$(uname -r)" 2>/dev/null || true
+      - name: Build the agent (release, embeds the eBPF object via build.rs)
+        run: cargo build --release --locked -p velstra
+      - name: Load-check (root) — the verifier must accept the datapath
+        # `-E` keeps the invoking env (PATH, CARGO_*); the script finds the tree
+        # from its own path, so it needs no VELSTRA_ROOT here.
+        run: sudo -E ./tests/e2e/loadcheck.sh
+
   # Build the three container images from the binaries the `build` job produced
   # and push them to GHCR. Runs only on a push to the default branch or a version
   # tag — never on pull requests (which can't access the registry token anyway).

@@ -25,7 +25,7 @@
 #![allow(clippy::result_large_err)]
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -221,6 +221,15 @@ struct ServeArgs {
     /// reconcile against `GET /v1/audit` if completeness matters.
     #[arg(long = "webhook", requires = "rest_listen")]
     webhooks: Vec<String>,
+
+    /// Serve the REST gateway over plaintext HTTP even when `--tls-cert`/
+    /// `--tls-key` are configured — the dev / loopback escape hatch. By default
+    /// the gateway inherits the agent channel's certs and serves **HTTPS**
+    /// whenever they are present (and requires a client cert when `--client-ca`
+    /// is set, transport-level mTLS); this flag opts back out, mirroring the
+    /// tls=false decision on the gRPC side.
+    #[arg(long, requires = "rest_listen")]
+    rest_plaintext: bool,
 }
 
 /// Client TLS options for the admin/orchestrator CLIs (use an `https://`
@@ -566,8 +575,46 @@ struct Shared {
     /// time series, and a controller that grew a history in memory would be a
     /// controller that eventually stops.
     stats: RwLock<BTreeMap<String, (u64, Vec<ProtoCounter>)>>,
+    /// EVPN-learned SRv6 SIDs that diverge from what this fabric's locator math
+    /// would derive — the early warning that a peer *allocates* SIDs rather than
+    /// deriving them (an external RFC 9252 PE). Recomputed on every re-derive, so
+    /// `current` is a gauge of the fleet's present heterogeneity; `seen` only
+    /// grows, giving a monotonic `total` and a once-per-divergence log. A sample,
+    /// never replicated, never persisted — the same contract as [`Self::stats`].
+    srv6_divergence: RwLock<Srv6DivergenceState>,
+    /// EVPN-learned type-5 `End.DT4`/`End.DT6` SIDs the datapath cannot terminate,
+    /// refused as authoritative in favour of the derived L3-VNI `End.DT2U` SID
+    /// (Stage 3 of the EVPN-over-SRv6 convergence plan, gap G3). Same sample-not-state
+    /// contract as [`Self::srv6_divergence`]: `current` is the live gate, `seen` grows
+    /// for a monotonic `total` and a once-per-SID log.
+    srv6_irb_gated: RwLock<Srv6IrbGatedState>,
     generation: AtomicU64,
     notify: watch::Sender<u64>,
+}
+
+/// Controller-side view of SRv6 SID divergence (Stage 1 of the EVPN-over-SRv6
+/// convergence plan, gap G1). See [`Shared::srv6_divergence`].
+#[derive(Default)]
+struct Srv6DivergenceState {
+    /// Every distinct divergence ever observed. Backs the monotonic `total` and
+    /// deduplicates the log so an external PE's allocation is announced once, not
+    /// on every re-derive.
+    seen: BTreeSet<topology::Srv6Divergence>,
+    /// The most recent re-derive's snapshot — the divergences live *now*.
+    current: Vec<topology::Srv6Divergence>,
+}
+
+/// Controller-side view of the Stage-3 IRB gate (EVPN-over-SRv6 convergence plan,
+/// gap G3): learned type-5 `End.DT4`/`End.DT6` SIDs the datapath cannot yet terminate.
+/// See [`Shared::srv6_irb_gated`].
+#[derive(Default)]
+struct Srv6IrbGatedState {
+    /// Every distinct gated SID ever observed. Backs the monotonic `total` and
+    /// deduplicates the log so a third-party PE's L3 SID is announced once, not on
+    /// every re-derive.
+    seen: BTreeSet<topology::Srv6IrbGatedSid>,
+    /// The most recent re-derive's snapshot — the gated SIDs live *now*.
+    current: Vec<topology::Srv6IrbGatedSid>,
 }
 
 impl Shared {
@@ -580,6 +627,8 @@ impl Shared {
             raft,
             evpn_learned: RwLock::new(EvpnLearned::default()),
             stats: RwLock::new(BTreeMap::new()),
+            srv6_divergence: RwLock::new(Srv6DivergenceState::default()),
+            srv6_irb_gated: RwLock::new(Srv6IrbGatedState::default()),
             generation: AtomicU64::new(0),
             notify: watch::channel(0).0,
         }
@@ -659,26 +708,82 @@ async fn re_derive(shared: &Shared) -> Result<()> {
     // Fold in any EVPN-learned routes (empty/None-equivalent when the feature is
     // off, so the derived output is unchanged in that case).
     let evpn = shared.evpn_learned.read().await;
-    let derived = if let Some(raft) = &shared.raft {
+    // Alongside the derive, recompute which learned SIDs diverge from what this
+    // fabric would derive. Same `(topology, learned)` inputs, computed under the
+    // same read of each, so the gauge can never describe a topology the served
+    // configs were not derived from.
+    let (derived, divergences, irb_gated) = if let Some(raft) = &shared.raft {
         // Cluster mode: derive from the replicated, committed topology.
         let topo = raft.topology().await;
-        topology::derive_configs(&topo, Some(&evpn))?
+        (
+            topology::derive_configs(&topo, Some(&evpn))?,
+            topology::srv6_divergences(&topo, &evpn),
+            topology::srv6_irb_gated_sids(&topo, &evpn),
+        )
     } else {
         let topo = shared.topology.read().await;
         let derived = topology::derive_configs(&topo, Some(&evpn))?;
+        let divergences = topology::srv6_divergences(&topo, &evpn);
+        let irb_gated = topology::srv6_irb_gated_sids(&topo, &evpn);
         // Single-controller mode: persist the mutated model atomically.
         if let Some(path) = &shared.topology_path {
             topology::save_model(&topo, path).context("persisting topology")?;
         }
-        derived
+        (derived, divergences, irb_gated)
     };
     drop(evpn);
+    update_srv6_divergence(shared, divergences).await;
+    update_srv6_irb_gated(shared, irb_gated).await;
     let mut state = shared.state.write().await;
     if state.derived != derived {
         state.derived = derived;
         shared.recompute(&mut state);
     }
     Ok(())
+}
+
+/// Fold a fresh divergence snapshot into `Shared`, announcing any newly-seen
+/// divergence exactly once.
+///
+/// `current` always reflects the latest re-derive (a gauge). `seen` only grows,
+/// so the `total` an operator alerts on is monotonic and the warning fires once
+/// per distinct `(vni, behaviour, peer, learned, derived)` — an external PE that
+/// allocates a SID should page someone the first time, not on every reconcile.
+async fn update_srv6_divergence(shared: &Shared, divergences: Vec<topology::Srv6Divergence>) {
+    let mut st = shared.srv6_divergence.write().await;
+    for d in &divergences {
+        if st.seen.insert(d.clone()) {
+            warn!(
+                "srv6 sid divergence: vni {} {} peer {} advertised {} but this fabric \
+                 derives {} — a peer is allocating SIDs rather than deriving them; the \
+                 advertised SID is programmed as-is",
+                d.vni, d.behavior, d.vtep, d.learned_sid, d.derived_sid
+            );
+        }
+    }
+    st.current = divergences;
+}
+
+/// Fold a fresh IRB-gate snapshot into `Shared`, announcing any newly-seen gated
+/// learned L3 SID exactly once.
+///
+/// Mirrors [`update_srv6_divergence`]: `current` is a gauge of the fleet's present
+/// L3-interop state, `seen` only grows so `total` is monotonic, and the warning fires
+/// once per distinct gated SID — a third-party PE advertising an End.DT4/DT6 route the
+/// datapath cannot terminate should page someone the first time, not every reconcile.
+async fn update_srv6_irb_gated(shared: &Shared, gated: Vec<topology::Srv6IrbGatedSid>) {
+    let mut st = shared.srv6_irb_gated.write().await;
+    for g in &gated {
+        if st.seen.insert(g.clone()) {
+            warn!(
+                "srv6 irb gate: vni {} prefix {} peer {} advertised {} ({}) but this fabric's \
+                 datapath terminates only End.DT2U/DT2M — the L3 SID is refused and the derived \
+                 L3-VNI End.DT2U SID {} is programmed instead (Stage 3 DT4/DT6 decap pending)",
+                g.l3_vni, g.prefix, g.vtep, g.learned_sid, g.behavior, g.programmed_sid
+            );
+        }
+    }
+    st.current = gated;
 }
 
 /// Two configs are equal apart from their `version` stamp.
@@ -2118,6 +2223,95 @@ fn parse_rest_tokens(specs: &[String]) -> Result<HashMap<String, String>> {
     Ok(map)
 }
 
+/// Build the REST gateway's rustls `ServerConfig` from the same PEM material as
+/// the gRPC channel (`--tls-cert`/`--tls-key`). When `client_ca` is set, clients
+/// must present a certificate signed by it — transport-level mTLS, so only
+/// fabric-CA peers can open the connection. The ring crypto provider is selected
+/// explicitly (not via a process-wide default), matching the tonic stack so the
+/// two TLS servers in this process never fight over a global provider.
+fn load_rest_server_config(
+    cert: &Path,
+    key: &Path,
+    client_ca: Option<&Path>,
+) -> Result<rustls::ServerConfig> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    let cert_bytes = std::fs::read(cert).with_context(|| format!("reading {}", cert.display()))?;
+    let key_bytes = std::fs::read(key).with_context(|| format!("reading {}", key.display()))?;
+
+    let cert_chain: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut cert_bytes.as_slice())
+            .collect::<Result<_, _>>()
+            .with_context(|| format!("parsing certificates in {}", cert.display()))?;
+    if cert_chain.is_empty() {
+        bail!("no certificates found in {}", cert.display());
+    }
+    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_bytes.as_slice())
+        .with_context(|| format!("parsing private key in {}", key.display()))?
+        .ok_or_else(|| anyhow!("no private key found in {}", key.display()))?;
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ServerConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .context("rustls protocol versions")?;
+
+    let config = if let Some(ca) = client_ca {
+        let ca_bytes = std::fs::read(ca).with_context(|| format!("reading {}", ca.display()))?;
+        let mut roots = rustls::RootCertStore::empty();
+        for c in rustls_pemfile::certs(&mut ca_bytes.as_slice()) {
+            let c = c.with_context(|| format!("parsing CA in {}", ca.display()))?;
+            roots
+                .add(c)
+                .with_context(|| format!("adding CA from {}", ca.display()))?;
+        }
+        let verifier =
+            rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
+                .build()
+                .context("building client-certificate verifier")?;
+        builder
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(cert_chain, key)
+    } else {
+        builder
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key)
+    }
+    .context("building REST server TLS config")?;
+
+    Ok(config)
+}
+
+/// The REST gateway's TLS decision, factored out of [`ServeArgs`] so it is unit
+/// testable: HTTPS reusing the agent-channel certs whenever both are set and
+/// `plaintext` is false; `None` (plaintext) otherwise — no certs, only one of the
+/// pair, or the explicit `--rest-plaintext` opt-out.
+fn rest_tls_decision(
+    tls_cert: Option<&Path>,
+    tls_key: Option<&Path>,
+    client_ca: Option<&Path>,
+    plaintext: bool,
+) -> Result<Option<Arc<rustls::ServerConfig>>> {
+    if plaintext {
+        return Ok(None);
+    }
+    let (Some(cert), Some(key)) = (tls_cert, tls_key) else {
+        return Ok(None);
+    };
+    Ok(Some(Arc::new(load_rest_server_config(
+        cert, key, client_ca,
+    )?)))
+}
+
+/// The REST gateway's TLS config from the serve args (see [`rest_tls_decision`]).
+fn rest_tls(args: &ServeArgs) -> Result<Option<Arc<rustls::ServerConfig>>> {
+    rest_tls_decision(
+        args.tls_cert.as_deref(),
+        args.tls_key.as_deref(),
+        args.client_ca.as_deref(),
+        args.rest_plaintext,
+    )
+}
+
 async fn serve(args: ServeArgs) -> Result<()> {
     if args.config_dir.is_none() && args.topology.is_none() && args.node_id.is_none() {
         bail!("provide --config-dir, --topology, or --node-id (cluster mode)");
@@ -2356,17 +2550,43 @@ async fn serve(args: ServeArgs) -> Result<()> {
             audit,
         });
         let app = rest::router(rest_state);
-        tokio::spawn(async move {
-            match tokio::net::TcpListener::bind(rest_addr).await {
-                Ok(listener) => {
-                    info!("REST gateway listening on {rest_addr}");
-                    if let Err(e) = axum::serve(listener, app).await {
+        // HTTPS whenever the agent-channel certs are present (unless
+        // --rest-plaintext); plaintext otherwise. Built before the spawn so a bad
+        // cert fails startup loudly rather than in a detached task.
+        match rest_tls(&args)? {
+            Some(tls) => {
+                let mtls = args.client_ca.is_some();
+                let tls_cfg = axum_server::tls_rustls::RustlsConfig::from_config(tls);
+                tokio::spawn(async move {
+                    info!(
+                        "REST gateway listening on {rest_addr} (https{})",
+                        if mtls { ", client certs required" } else { "" }
+                    );
+                    if let Err(e) = axum_server::bind_rustls(rest_addr, tls_cfg)
+                        .serve(app.into_make_service())
+                        .await
+                    {
                         warn!("REST gateway stopped: {e}");
                     }
-                }
-                Err(e) => warn!("REST gateway bind {rest_addr} failed: {e}"),
+                });
             }
-        });
+            None => {
+                warn!(
+                    "REST gateway on {rest_addr} is PLAINTEXT http (no --tls-cert, or --rest-plaintext) — front it with TLS termination or supply certs"
+                );
+                tokio::spawn(async move {
+                    match tokio::net::TcpListener::bind(rest_addr).await {
+                        Ok(listener) => {
+                            info!("REST gateway listening on {rest_addr} (http)");
+                            if let Err(e) = axum::serve(listener, app).await {
+                                warn!("REST gateway stopped: {e}");
+                            }
+                        }
+                        Err(e) => warn!("REST gateway bind {rest_addr} failed: {e}"),
+                    }
+                });
+            }
+        }
     }
 
     // Agent-facing server (optionally with TLS/mTLS).
@@ -2963,4 +3183,87 @@ fn parse_cli_rule(spec: &str, action: Action) -> Result<PortRule> {
         limit: 0,
         burst: 0,
     })
+}
+
+#[cfg(test)]
+mod rest_tls_tests {
+    use super::*;
+
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
+    }
+
+    #[test]
+    fn builds_server_only_tls_from_certs() {
+        // A server cert + key with no client CA builds a valid server-auth config.
+        load_rest_server_config(&fixture("server.pem"), &fixture("server.key"), None)
+            .expect("server-only TLS config builds");
+    }
+
+    #[test]
+    fn builds_mtls_config_when_a_client_ca_is_given() {
+        // With a client CA the config additionally requires and verifies client
+        // certs (transport-level mTLS). Building it proves the CA parsed into a
+        // verifier and the identity loaded.
+        load_rest_server_config(
+            &fixture("server.pem"),
+            &fixture("server.key"),
+            Some(&fixture("ca.pem")),
+        )
+        .expect("mTLS config builds with a client CA");
+    }
+
+    #[test]
+    fn a_keyless_key_file_is_refused() {
+        // The cert file has no private key; the builder must error, not serve a
+        // config with no usable identity.
+        let err = load_rest_server_config(&fixture("server.pem"), &fixture("server.pem"), None)
+            .expect_err("a keyless key file must be refused");
+        assert!(
+            err.chain().any(|c| c.to_string().contains("private key")),
+            "the error names the missing private key: {err:#}"
+        );
+    }
+
+    #[test]
+    fn decision_is_https_when_both_certs_present() {
+        let cfg = rest_tls_decision(
+            Some(&fixture("server.pem")),
+            Some(&fixture("server.key")),
+            None,
+            false,
+        )
+        .expect("decision builds");
+        assert!(cfg.is_some(), "certs present ⇒ HTTPS");
+    }
+
+    #[test]
+    fn decision_plaintext_flag_wins_over_certs() {
+        // The explicit dev/loopback opt-out disables TLS even with certs present.
+        let cfg = rest_tls_decision(
+            Some(&fixture("server.pem")),
+            Some(&fixture("server.key")),
+            Some(&fixture("ca.pem")),
+            true,
+        )
+        .expect("decision builds");
+        assert!(cfg.is_none(), "--rest-plaintext overrides configured certs");
+    }
+
+    #[test]
+    fn decision_is_plaintext_without_certs() {
+        let cfg = rest_tls_decision(None, None, None, false).expect("decision builds");
+        assert!(cfg.is_none(), "no certs ⇒ plaintext");
+    }
+
+    #[test]
+    fn decision_needs_both_cert_and_key() {
+        // A cert without its key is not enough to serve TLS — plaintext, not a
+        // half-configured server that fails at handshake time.
+        let cfg = rest_tls_decision(Some(&fixture("server.pem")), None, None, false)
+            .expect("decision builds");
+        assert!(cfg.is_none(), "cert without key ⇒ plaintext");
+    }
 }

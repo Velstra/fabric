@@ -4,6 +4,21 @@
 
 ### Added
 
+- **A learned type-5 `End.DT4`/`End.DT6` SID is now refused *visibly*, not
+  silently.** The datapath terminates only the L2 SRv6 behaviours
+  (`End.DT2U`/`End.DT2M`); an RFC 9252 §6 type-5 route advertises an L3 SID whose
+  payload is a bare IP packet, which this single-shared-bridge host model has no way
+  to route into the right tenant VRF. The controller therefore keeps deriving the
+  L3-VNI `End.DT2U` SID for symmetric IRB (the path B9 shipped) and now surfaces the
+  refused L3 SID: `srv6_irb_gated_sids` reports each learned `End.DT4`/`End.DT6` SID
+  the datapath cannot honour and which derived DT2U SID was programmed in its place,
+  exposed at `GET /v1/srv6/irb-gated` (monotonic `total` + live `current`, the
+  sample-not-state contract the SID-divergence surface already uses) and logged once
+  per SID. This is the honest half of the Stage-3 gate (EVPN-over-SRv6 convergence
+  plan, gap G3): standing up L3 interop with a third-party PE no longer falls back to
+  the derived SID with no indication the advertised one was dropped. True
+  `End.DT4`/`End.DT6` decap + L3 encap in XDP — which needs a per-tenant L3
+  delivery path this host model does not yet have — remains the named follow-up.
 - **SRv6 is a complete overlay, not a unicast-only one.** `End.DT2M` frames are
   decapsulated (they were refused outright, so every ARP, ND and DHCP frame on an
   SRv6 segment died), BUM traffic is head-end replicated over SRv6 at the TC layer
@@ -26,6 +41,20 @@
 - `--encap srv6 --srv6-locator <prefix/len>` on `velstra-controller orch
   add-host`, `"encap": "srv6"` + `"srv6_locator"` over REST, and a new
   `srv6_bum_replicated` counter.
+- **An external (non-topology) EVPN peer is trusted for decap from its learned
+  SID alone.** A federated SRv6 speaker that is not a configured fabric host has
+  no topology entry to borrow a next-hop MAC from, so this fabric still cannot
+  *encapsulate toward* it — but it can now **accept** its frames: the new
+  `locator_src_from_service_sid` recovers the peer's zero-filled locator (the
+  `SRV6_PEERS` decap-auth key) from a learned `End.DT2U`/`End.DT2M` SID *without*
+  its locator length, by locating the standard `disc ++ vni` function window. It
+  is conservative — a foreign-layout SID (a PE allocating from its own pool with a
+  different structure) recovers nothing and stays untrusted rather than guessed
+  at, so the source-auth boundary is no looser than the topology-derived path.
+  Until now such a peer's BUM and return traffic was dropped fail-closed. This is
+  the decap half of external-peer support; encapsulating toward one still needs
+  underlay next-hop resolution EVPN does not carry, and a truly foreign-layout
+  peer needs the SID structure on the `monitor evpn` wire — both later chunks.
 
 ### Fixed
 

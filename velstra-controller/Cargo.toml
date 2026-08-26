@@ -33,6 +33,16 @@ tokio-stream = { workspace = true, features = ["sync"] }
 axum = { version = "0.7", default-features = true }
 serde_json = { workspace = true }
 
+# Native TLS for the REST northbound gateway. Reuses the rustls/ring stack the
+# tonic gRPC server already pulls in (no aws-lc-rs, no cmake in the closure):
+# axum-server's `tls-rustls-no-provider` lets us hand it a `ServerConfig` we build
+# with the ring provider ourselves. rustls-pemfile parses the same PEM files the
+# gRPC channel uses; rustls builds the server identity + optional client-CA
+# verifier (transport-level mTLS when --client-ca is set).
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+
 # HTTP client for webhook delivery (D1) and the REST integration tests. rustls
 # rather than native TLS: the tonic stack already brings rustls, so an https
 # webhook endpoint costs no second TLS implementation.

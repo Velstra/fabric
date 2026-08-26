@@ -3,7 +3,10 @@
 # Answers in two seconds what the e2e suite answers in a minute, and it is the
 # question that was actually failing.
 set -uo pipefail
-R=~/01_repositories/velstra/fabric
+# Repo root: derived from this script's location (tests/e2e/ -> ../..) so it runs
+# from a CI checkout or any clone, not just a developer's home. Override with
+# VELSTRA_ROOT=... if the tree lives somewhere the derivation can't reach.
+R="${VELSTRA_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 cat > "$W/min.toml" <<'TOML'
 default_action = "pass"

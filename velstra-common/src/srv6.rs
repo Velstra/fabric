@@ -402,6 +402,63 @@ pub const fn decode_service_sid(sid: &Srv6Sid, locator_len_bits: u8) -> Option<(
     Some((disc, vni))
 }
 
+/// Recover the SRv6 outer **source** address (the locator with its function
+/// region zeroed — what a host advertises as its `srv6_src` and what decap
+/// source-auth trusts) from *only* a learned service SID plus the
+/// `(discriminator, vni)` it was learned under — **without** knowing the peer's
+/// locator length.
+///
+/// The controller learns a peer's service SID off the EVPN `monitor evpn` wire,
+/// but that line carries the SID address, not the SID-Structure Sub-Sub-TLV, so
+/// for a peer that is not a configured fabric host (an external / federated
+/// speaker) the controller never learns the peer's locator length — and
+/// [`decode_service_sid`] needs it. Yet the datapath's decap source-auth
+/// (`SRV6_PEERS`) is keyed on the peer's zero-filled locator: without recovering
+/// it, that peer's frames are dropped fail-closed and its BUM/return traffic
+/// silently black-holes.
+///
+/// This is the length-free inverse of [`build_service_sid`]: the 4-byte function
+/// `[disc, vni_hi, vni_mid, vni_lo]` sits at the byte-aligned locator boundary
+/// with everything below it zero, so the boundary is found by locating that exact
+/// window with an all-zero tail. It is deliberately **conservative** — it returns
+/// `Some` only when the window matches at exactly one byte-aligned offset. A SID
+/// that does not follow this layout (a foreign PE allocating from its own pool
+/// with a different structure), or whose function pattern is ambiguous, yields
+/// `None` and is *not* trusted rather than guessed at. The recovered source is
+/// therefore exactly the SID this fabric's own math would produce for the same
+/// `(locator, disc, vni)`, so trusting it is no weaker than trusting a
+/// topology-derived peer — a foreign-layout speaker needs the SID structure on
+/// the wire (a later, interop-gated chunk) before it can be trusted.
+#[inline]
+pub fn locator_src_from_service_sid(sid: &Srv6Sid, discriminator: u8, vni: u32) -> Option<Srv6Sid> {
+    let func = [
+        discriminator,
+        (vni >> 16) as u8,
+        (vni >> 8) as u8,
+        vni as u8,
+    ];
+    // A real locator is 8..=96 bits (1..=12 bytes); offset 0 (a zero-length
+    // locator, no prefix at all) is never one, so the search starts at 1.
+    let mut found: Option<usize> = None;
+    let mut off = 1usize;
+    while off <= 12 {
+        if sid[off..off + 4] == func && sid[off + 4..].iter().all(|&b| b == 0) {
+            if found.is_some() {
+                // A second byte-aligned offset also matches: ambiguous, refuse.
+                return None;
+            }
+            found = Some(off);
+        }
+        off += 1;
+    }
+    let off = found?;
+    let mut src = *sid;
+    for b in src.iter_mut().skip(off) {
+        *b = 0;
+    }
+    Some(src)
+}
+
 /// B9 SRv6 per-VNI **flood set**: the remote `End.DT2M` service SIDs a
 /// broadcast/unknown-unicast/multicast frame on a tenant segment must be
 /// head-end replicated to. The SRv6 analogue of [`crate::FloodSet`], keyed in
@@ -696,6 +753,57 @@ mod tests {
         assert_eq!(
             decode_service_sid(&m, 48),
             Some((sid_disc::MULTICAST, 10000))
+        );
+    }
+
+    #[test]
+    fn locator_src_recovers_from_a_service_sid_without_its_length() {
+        // The common /64 case: disc at byte 8, VNI at 9..12, tail zero. The
+        // recovered source is the locator zero-filled — exactly what
+        // `build_service_sid(loc, len, 0, 0)` produces — found with no length.
+        let locator = [0xfc, 0, 0, 7, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        let want = build_service_sid(&locator, 64, 0, 0).unwrap();
+        for (disc, vni) in [(sid_disc::UNICAST, 10100u32), (sid_disc::MULTICAST, 10100)] {
+            let sid = build_service_sid(&locator, 64, disc, vni).unwrap();
+            assert_eq!(
+                locator_src_from_service_sid(&sid, disc, vni),
+                Some(want),
+                "recover the zero-filled locator from a {disc}-disc /64 SID"
+            );
+        }
+        // A /48 locator (function at byte 6) round-trips the same way.
+        let loc48 = [0xfc, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let sid48 = build_service_sid(&loc48, 48, sid_disc::UNICAST, 42).unwrap();
+        assert_eq!(
+            locator_src_from_service_sid(&sid48, sid_disc::UNICAST, 42),
+            Some(build_service_sid(&loc48, 48, 0, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn locator_src_refuses_a_foreign_or_mismatched_sid() {
+        // A SID whose function bytes do not appear at any byte boundary with a
+        // zero tail (a PE allocating from its own pool) is not trusted.
+        let foreign = [
+            0xfc, 0, 0, 0, 0xaa, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44, 0, 0, 0, 0,
+        ];
+        assert_eq!(
+            locator_src_from_service_sid(&foreign, sid_disc::UNICAST, 9999),
+            None
+        );
+        // The right SID but the wrong (disc, vni) — asking for a behaviour/VNI the
+        // SID was not built for — also yields nothing.
+        let locator = [0xfc, 0, 0, 7, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        let sid = build_service_sid(&locator, 64, sid_disc::UNICAST, 10100).unwrap();
+        assert_eq!(
+            locator_src_from_service_sid(&sid, sid_disc::MULTICAST, 10100),
+            None,
+            "a unicast SID is not trusted as a multicast source"
+        );
+        assert_eq!(
+            locator_src_from_service_sid(&sid, sid_disc::UNICAST, 10101),
+            None,
+            "wrong VNI does not match"
         );
     }
 

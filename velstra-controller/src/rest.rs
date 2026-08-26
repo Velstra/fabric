@@ -18,17 +18,28 @@
 //! are additive; unknown request fields are ignored by serde). A breaking change
 //! ships under a new `/v2` prefix rather than mutating `/v1`.
 //!
-//! ## AuthN/Z (bearer-token stand-in)
+//! ## Transport (TLS)
 //!
-//! Wiring full client-certificate mTLS into the HTTP server is out of scope for
-//! D1, so authentication uses a **bearer token that stands in for the mTLS
-//! Common Name**: a `--rest-token CN=TOKEN` maps a token to the identity `CN`,
-//! and the *same* [`Authz`](crate::authz::Authz) policy that guards the gRPC
-//! channel is applied — admin CNs may perform any write, a node CN may only
-//! mutate its own host, reads are open. With no `--rest-token` configured the
-//! gateway is open (single-operator / localhost default), mirroring the gRPC
-//! admin channel with no `--client-ca`. Front the gateway with TLS termination
-//! (or add mTLS later) for transport confidentiality.
+//! The gateway reuses the agent channel's `--tls-cert`/`--tls-key`: when they are
+//! present it serves **HTTPS** (built with the same rustls/ring stack as the gRPC
+//! server, so no second TLS implementation), and when `--client-ca` is set it
+//! additionally **requires a client certificate** signed by that CA — only
+//! fabric-CA peers can open the connection (transport-level mTLS). `--rest-plaintext`
+//! is the explicit dev/loopback opt-out. With no certs configured the gateway is
+//! plaintext (front it with TLS termination). See `serve()` in [`crate`].
+//!
+//! ## AuthN/Z (bearer-token identity)
+//!
+//! Authorization identity comes from a **bearer token that stands in for the mTLS
+//! Common Name**: a `--rest-token CN=TOKEN` maps a token to the identity `CN`, and
+//! the *same* [`Authz`](crate::authz::Authz) policy that guards the gRPC channel is
+//! applied — admin CNs may perform any write, a node CN may only mutate its own
+//! host, reads are open. With no `--rest-token` configured the gateway is open
+//! (single-operator / localhost default), mirroring the gRPC admin channel with no
+//! `--client-ca`. Binding the *verified client-certificate CN* directly to the
+//! `Authz` identity (so the token can be dropped when mTLS is on) is the remaining
+//! follow-up; the transport already verifies the cert, only the identity plumbing
+//! into the handler is still token-based.
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -265,6 +276,8 @@ pub fn router(state: Arc<RestState>) -> Router {
         .route("/v1/audit", get(list_audit))
         .route("/v1/stats", get(list_stats))
         .route("/v1/stats/:node_id", get(get_stats))
+        .route("/v1/srv6/divergence", get(srv6_divergence))
+        .route("/v1/srv6/irb-gated", get(srv6_irb_gated))
         .route("/v1/events", get(events))
         .route("/v1/hosts", get(list_hosts).post(create_host))
         .route("/v1/hosts/:id", get(get_host).delete(delete_host))
@@ -1047,6 +1060,102 @@ async fn get_stats(
         // that does not exist, and this route can only answer the second — so
         // it says which question it is answering.
         .ok_or_else(|| ApiError::not_found(format!("no node {node_id:?} has reported statistics")))
+}
+
+// ---------------------------------------------------------------------------
+// SRv6 SID divergence (EVPN-over-SRv6 convergence plan, Stage 1 / gap G1)
+// ---------------------------------------------------------------------------
+
+/// The controller's SRv6 SID-divergence surface: how many EVPN-learned L2 SIDs
+/// currently disagree with what this fabric would derive, and which ones.
+///
+/// A **sample**, not state — recomputed on every re-derive. `total` is monotonic
+/// (distinct divergences ever seen, the number to alert on); `current` is the live
+/// set. A non-empty result is not an error: a learned SID is authoritative and is
+/// programmed as advertised, so this is the operator's window onto a heterogeneous
+/// fleet (an external PE allocating SIDs) rather than a fault.
+#[derive(Debug, Serialize)]
+pub struct Srv6DivergenceJson {
+    pub total: u64,
+    pub current: Vec<Srv6DivergenceEntryJson>,
+}
+
+/// One diverging learned SID.
+#[derive(Debug, Serialize)]
+pub struct Srv6DivergenceEntryJson {
+    pub vni: u32,
+    pub behavior: String,
+    pub vtep: String,
+    pub learned_sid: String,
+    pub derived_sid: String,
+}
+
+async fn srv6_divergence(State(state): State<Arc<RestState>>) -> Json<Srv6DivergenceJson> {
+    let st = state.shared.srv6_divergence.read().await;
+    Json(Srv6DivergenceJson {
+        total: st.seen.len() as u64,
+        current: st
+            .current
+            .iter()
+            .map(|d| Srv6DivergenceEntryJson {
+                vni: d.vni,
+                behavior: d.behavior.to_string(),
+                vtep: d.vtep.to_string(),
+                learned_sid: d.learned_sid.to_string(),
+                derived_sid: d.derived_sid.to_string(),
+            })
+            .collect(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// SRv6 IRB gate (EVPN-over-SRv6 convergence plan, Stage 3 / gap G3)
+// ---------------------------------------------------------------------------
+
+/// The controller's SRv6 IRB-gate surface: EVPN-learned type-5 `End.DT4`/`End.DT6`
+/// SIDs the datapath cannot yet terminate, and which derived `End.DT2U` SID was
+/// programmed in each one's place.
+///
+/// A **sample**, not state — recomputed on every re-derive. `total` is monotonic
+/// (distinct gated SIDs ever seen, the number to alert on when standing up L3 interop
+/// with a third-party RFC 9252 PE); `current` is the live gate. A non-empty result is
+/// not an error: symmetric IRB still works over the derived DT2U SID, but the peer's
+/// advertised L3 SID was refused because true DT4/DT6 termination is not yet in the XDP
+/// datapath.
+#[derive(Debug, Serialize)]
+pub struct Srv6IrbGatedJson {
+    pub total: u64,
+    pub current: Vec<Srv6IrbGatedEntryJson>,
+}
+
+/// One gated learned L3 SID.
+#[derive(Debug, Serialize)]
+pub struct Srv6IrbGatedEntryJson {
+    pub l3_vni: u32,
+    pub prefix: String,
+    pub vtep: String,
+    pub behavior: String,
+    pub learned_sid: String,
+    pub programmed_sid: String,
+}
+
+async fn srv6_irb_gated(State(state): State<Arc<RestState>>) -> Json<Srv6IrbGatedJson> {
+    let st = state.shared.srv6_irb_gated.read().await;
+    Json(Srv6IrbGatedJson {
+        total: st.seen.len() as u64,
+        current: st
+            .current
+            .iter()
+            .map(|g| Srv6IrbGatedEntryJson {
+                l3_vni: g.l3_vni,
+                prefix: g.prefix.clone(),
+                vtep: g.vtep.to_string(),
+                behavior: g.behavior.to_string(),
+                learned_sid: g.learned_sid.to_string(),
+                programmed_sid: g.programmed_sid.to_string(),
+            })
+            .collect(),
+    })
 }
 
 // ---------------------------------------------------------------------------

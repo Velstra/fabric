@@ -19,6 +19,23 @@ data plane).
 > multi-host tenants (Phase 4). A **gRPC controller** distributes config to a
 > fleet of nodes with live updates, and a Kubernetes CNI plugin (`velstra-cni`)
 > brings the same data plane to pods.
+>
+> **On top of that, in tree:** an HA **controller cluster** (Raft over openraft),
+> a declarative **orchestrator** (hosts/networks/ports → derived per-host config
+> with IPAM and automatic tunnel/ARP derivation), an **EVPN↔fabric bridge**, a
+> **REST/JSON northbound** served over the same rustls/ring stack as the gRPC
+> agent channel (HTTPS with optional client-certificate mTLS, per-CN bearer
+> tokens, `--rest-plaintext` for dev/loopback), and **EVPN-over-SRv6**: an SRv6
+> (RFC 8986) data plane in eBPF/XDP — End.DT2U L2 encap/decap with decap
+> source-authentication, plus End.DT2M head-end BUM replication and IRB — driven
+> by BGP-EVPN. The SRv6 work is **Stage 1** of a staged convergence plan
+> (`EVPN-SRV6-CONVERGENCE-PLAN.md` in the workspace root): EVPN-learned SIDs are
+> treated as authoritative and a divergence metric is exposed at
+> `GET /v1/srv6/divergence`. It post-dates the last tagged release
+> (`CHANGELOG.md` `[Unreleased]`) and is the least hardware-verified surface —
+> the eBPF verifier-acceptance `loadcheck` job and the netns `datapath` e2e are
+> CI bring-up (the loadcheck runs the XDP program in the runner's own kernel as
+> root and needs no `/dev/kvm`), not yet a proof at scale on real NICs.
 
 ## Why?
 
@@ -550,7 +567,10 @@ For a guided manual walkthrough of all three phases (incl. routing & LB), follow
   live-updates per-node config across a fleet (file + runtime admin overrides),
   secured with **mTLS**; agents report stats back.
 * **REST/JSON northbound.** A versioned REST/JSON gateway on the controller
-  exposes the fabric API over HTTP alongside gRPC.
+  exposes the fabric API over HTTP(S) alongside gRPC. It reuses the agent
+  channel's `--tls-cert`/`--tls-key` to serve **HTTPS** (and requires a client
+  cert when `--client-ca` is set), with `--rest-plaintext` as the dev/loopback
+  opt-out; caller identity is a per-CN bearer token.
 * **Kubernetes CNI.** `velstra-cni` implements the CNI protocol with pod
   veth/netns setup (see [`docs/TESTING.md`](docs/TESTING.md) §7) in two modes:
   **standalone** (host-local IPAM) and **controller-integrated**, where ADD
