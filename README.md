@@ -28,10 +28,13 @@ data plane).
 > tokens, `--rest-plaintext` for dev/loopback), and **EVPN-over-SRv6**: an SRv6
 > (RFC 8986) data plane in eBPF/XDP — End.DT2U L2 encap/decap with decap
 > source-authentication, plus End.DT2M head-end BUM replication and IRB — driven
-> by BGP-EVPN. The SRv6 work is **Stage 1** of a staged convergence plan
-> (`EVPN-SRV6-CONVERGENCE-PLAN.md` in the workspace root): EVPN-learned SIDs are
-> treated as authoritative and a divergence metric is exposed at
-> `GET /v1/srv6/divergence`. It post-dates the last tagged release
+> by BGP-EVPN. The SRv6 work is staged: Stage 1 (EVPN-learned SIDs are
+> authoritative, with the divergence metric at `GET /v1/srv6/divergence`) and
+> the honest half of Stage 3 (a learned L3 `End.DT4`/`End.DT6` SID is refused
+> visibly at `GET /v1/srv6/irb-gated` rather than silently rewritten) are in;
+> true L3 decap and encap wait for a per-tenant L3 device. The stages and their
+> gaps are written up in `CHANGELOG.md` (`[Unreleased]`, G1 and G3) — the plan
+> document the earlier text pointed at is not in this repository. It post-dates the last tagged release
 > (`CHANGELOG.md` `[Unreleased]`) and is the least hardware-verified surface —
 > the eBPF verifier-acceptance `loadcheck` job and the netns `datapath` e2e are
 > CI bring-up (the loadcheck runs the XDP program in the runner's own kernel as
@@ -366,8 +369,13 @@ controller-pushed `[[neighbor]]` IP→MAC entries) and bounces the reply with
 that would exceed `underlay_mtu - 36` (counter `overlay_too_big`) instead of
 emitting one the underlay silently black-holes, so size tenant MTUs to ≤ 1464
 (at the default 1500 underlay) or enable jumbo frames. IPv6 Neighbor-Discovery
-suppression mirrors ARP suppression for IPv6 tenants; the overlay applies no
-MSS-clamp or PMTU handling.
+suppression mirrors ARP suppression for IPv6 tenants. The agent derives an MSS
+ceiling per egress interface from the underlay MTU and the encapsulation
+overhead (`derived_overlay_mss`) and programs it into `MSS_CLAMP`
+(`program_mss_clamp`), so a departing SYN cannot advertise a segment the
+encapsulated path cannot carry; a box with no tunnels gets no entries and pays
+nothing. PMTU discovery proper — generating ICMP too-big for an oversized
+non-SYN packet — is not done; the MTU guard above drops instead.
 
 On egress from a tenant tap, a longest-prefix hit in the `OVERLAY_FDB` trie on
 `(vni, inner dst)` **encapsulates** (prepend a 50-byte outer
