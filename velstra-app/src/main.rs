@@ -21,6 +21,7 @@ mod ipfix;
 mod mapping;
 mod portal;
 mod query;
+mod routes;
 mod wren;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -191,6 +192,20 @@ struct RunArgs {
     /// `0` accepts anything, for an operator who means it.
     #[arg(long, default_value_t = 8)]
     flowspec_min_prefix: u8,
+
+    /// Follow Wren's forwarding table (`monitor routes`) into the ROUTES trie,
+    /// FPM-style: each learned route's next hop is resolved to a MAC and
+    /// programmed; a withdrawn route is removed. Needs `--wren-socket`.
+    #[arg(long)]
+    wren_routes: bool,
+
+    /// The policy id learned routes are programmed under.
+    #[arg(long, default_value_t = 0)]
+    wren_routes_policy: u32,
+
+    /// The kernel routing table (VRF) to follow; 254 is `main`.
+    #[arg(long, default_value_t = 254)]
+    wren_routes_table: u32,
 }
 
 #[derive(Debug, Args)]
@@ -418,6 +433,29 @@ async fn run(args: RunArgs) -> Result<()> {
             // Said out loud rather than ignored: an operator who asked for
             // enforcement and got silence would believe it was happening.
             None => warn!("--flowspec needs --wren-socket; nothing is being enforced"),
+        }
+    }
+
+    // Wren's forwarding table into ROUTES. Same socket again, its own opt-in
+    // for the same reason as FlowSpec: letting a routing daemon decide where
+    // this box forwards is a decision, not a side effect of having it around.
+    if args.wren_routes {
+        match args.wren_socket.clone() {
+            Some(socket) => {
+                info!(
+                    "wren routes: following table {} from {} into policy {}",
+                    args.wren_routes_table,
+                    socket.display(),
+                    args.wren_routes_policy
+                );
+                tokio::spawn(routes::follow(
+                    socket,
+                    firewall.clone(),
+                    args.wren_routes_policy,
+                    args.wren_routes_table,
+                ));
+            }
+            None => warn!("--wren-routes needs --wren-socket; nothing is being followed"),
         }
     }
 

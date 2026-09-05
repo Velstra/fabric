@@ -95,6 +95,9 @@ pub struct Firewall {
     /// replaced. Both paths rebuild the merge from these two, so whichever
     /// arrives last, the answer is the same.
     base: RuntimeConfig,
+    /// Routes learned from Wren (`routes::follow`), merged under the static
+    /// ones at every reprogram. Empty when nothing subscribes.
+    dynamic_routes: Vec<velstra_config::ResolvedRoute>,
     /// The rules a BGP peer has asked this box to enforce (roadmap A3), already
     /// translated. Empty unless the FlowSpec task is running.
     flowspec: Vec<velstra_config::ResolvedRule>,
@@ -284,6 +287,7 @@ impl Firewall {
             applied: cfg.clone(),
             base: cfg.clone(),
             flowspec: Vec::new(),
+            dynamic_routes: Vec::new(),
             flowspec_refused: Vec::new(),
             auto_attached: HashSet::new(),
             config_attached: HashSet::new(),
@@ -567,6 +571,21 @@ impl Firewall {
 
     /// What the FlowSpec feed has come to: the rules in force and, beside them,
     /// what arrived and is not being enforced.
+    /// Replace the routes learned from Wren and put the merged set in force.
+    /// `Ok(true)` when something changed; the same set again is a no-op, so a
+    /// feed that repeats itself costs nothing in the maps.
+    pub fn set_dynamic_routes(
+        &mut self,
+        routes: Vec<velstra_config::ResolvedRoute>,
+    ) -> Result<bool> {
+        if self.dynamic_routes == routes {
+            return Ok(false);
+        }
+        self.dynamic_routes = routes;
+        self.reprogram()?;
+        Ok(true)
+    }
+
     pub fn flowspec_state(&self) -> (&[velstra_config::ResolvedRule], &[(String, String)]) {
         (&self.flowspec, &self.flowspec_refused)
     }
@@ -621,11 +640,22 @@ impl Firewall {
     /// config, so a withdrawn advertised rule is taken out as surely as a
     /// deleted configured one.
     fn reprogram(&mut self) -> Result<()> {
-        let merged = if self.flowspec.is_empty() {
+        let mut merged = if self.flowspec.is_empty() {
             self.base.clone()
         } else {
             crate::flowspec::merge_into(&self.base, &self.flowspec)
         };
+        // Learned routes under the static ones: a destination the operator
+        // wrote a route for keeps that route, whatever Wren says about it.
+        for learned in &self.dynamic_routes {
+            let taken = merged
+                .routes
+                .iter()
+                .any(|r| r.policy == learned.policy && r.dest == learned.dest);
+            if !taken {
+                merged.routes.push(learned.clone());
+            }
+        }
         apply_config(&mut self.ebpf, &merged, Some(&self.applied))?;
         // After the maps, not before: a classifier attached to a tap whose flood
         // set has not been written yet would replicate to an empty set, which is
