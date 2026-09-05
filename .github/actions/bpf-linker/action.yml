@@ -1,0 +1,49 @@
+name: Install bpf-linker
+description: >
+  Install bpf-linker against the same LLVM the nightly rustc uses.
+
+  bpf-linker links the BPF object rustc emits, so the two have to agree on
+  LLVM. Until 0.11.0 it borrowed rustc's own copy through
+  aya-rustc-llvm-proxy and nothing had to be installed; 0.11.0 dropped that
+  and links a system LLVM instead, and Ubuntu ships none new enough — so
+  `cargo install bpf-linker` began failing with "could not find llvm-config".
+
+  A mismatch is worse than a missing one, because it does not fail here: it
+  fails at the end of the build with "failure linking module", which reads
+  like a broken eBPF program rather than a wrong toolchain. So the version is
+  read off the rustc that will do the compiling — `rustup run nightly`, which
+  is what aya-build invokes — and exactly that one is installed.
+
+runs:
+  using: composite
+  steps:
+    - name: Install the LLVM that rustc itself uses
+      shell: bash
+      run: |
+        set -euo pipefail
+        llvm=$(rustup run nightly rustc --version --verbose \
+                 | awk -F'[ .]' '/^LLVM version:/ { print $3 }')
+        if [ -z "$llvm" ]; then
+          echo "::error::could not read the LLVM version out of rustc; bpf-linker cannot be matched to it."
+          exit 1
+        fi
+        echo "the nightly rustc uses LLVM $llvm; bpf-linker will link the same one."
+        . /etc/os-release
+        curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+          | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+        echo "deb http://apt.llvm.org/${VERSION_CODENAME}/ llvm-toolchain-${VERSION_CODENAME}-${llvm} main" \
+          | sudo tee "/etc/apt/sources.list.d/llvm-${llvm}.list" > /dev/null
+        sudo apt-get update
+        sudo apt-get install -y "llvm-${llvm}-dev" "libpolly-${llvm}-dev"
+        echo "/usr/lib/llvm-${llvm}/bin" >> "$GITHUB_PATH"
+        echo "BPF_LINKER_LLVM=${llvm}" >> "$GITHUB_ENV"
+
+    - name: Install bpf-linker
+      shell: bash
+      # Named rather than left to the default feature: the default tracks
+      # whatever LLVM bpf-linker was released against, which is not necessarily
+      # the one this rustc emits.
+      run: |
+        cargo install bpf-linker --locked \
+          --no-default-features --features "llvm-${BPF_LINKER_LLVM}"
+        bpf-linker --version

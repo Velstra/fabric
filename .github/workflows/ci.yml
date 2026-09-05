@@ -74,8 +74,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Install bpf-linker
-        run: cargo install bpf-linker --locked
+      - uses: ./.github/actions/bpf-linker
       - name: clippy (control plane)
         # The eBPF crate is only ever built for the bpf target via the app's
         # build script, so it is intentionally excluded from host clippy
@@ -141,8 +140,7 @@ jobs:
       - name: Install protoc and iproute2
         # protoc: velstra-proto's build. iproute2: loadcheck.sh's `ip link`.
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler iproute2
-      - name: Install bpf-linker
-        run: cargo install bpf-linker --locked
+      - uses: ./.github/actions/bpf-linker
       - name: Say what kernel this is
         # The verifier's verdict depends on it, so a failure that does not name the
         # kernel is a failure nobody can act on (same rationale as `datapath`).
@@ -229,8 +227,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc and iproute2
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler iproute2 ethtool iputils-arping
-      - name: Install bpf-linker
-        run: cargo install bpf-linker --locked
+      - uses: ./.github/actions/bpf-linker
       - name: Say what kernel this is
         # The verifier's answer depends on it, so a failure report that does not
         # name the kernel is a failure report nobody can act on.

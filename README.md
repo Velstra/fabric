@@ -93,6 +93,21 @@ cargo install bpf-linker                                # the eBPF linker
 # macOS only: `brew bundle` (uses the Brewfile) for an LLVM that supports BPF.
 ```
 
+**bpf-linker and rustc must agree on LLVM.** Up to 0.10.x the linker borrowed
+rustc's own copy and there was nothing to install; 0.11.0 links a *system*
+LLVM instead, so it needs the same major version the nightly rustc emits:
+
+```shell
+rustup run nightly rustc --version --verbose | grep '^LLVM version:'
+# Debian/Ubuntu, for the number that prints (apt.llvm.org has the new ones):
+sudo apt-get install -y llvm-<N>-dev libpolly-<N>-dev
+cargo install bpf-linker --locked --no-default-features --features llvm-<N>
+```
+
+Getting this wrong does not fail at install time. It fails at the end of a
+build with `failure linking module`, which reads like a broken eBPF program
+and is not one. CI does the same thing in `.github/actions/bpf-linker`.
+
 ### Build, test, validate
 
 ```shell
