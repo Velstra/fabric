@@ -23,5 +23,20 @@ fn main() -> anyhow::Result<()> {
             .as_str(),
         ..Default::default()
     };
-    aya_build::build_ebpf([ebpf_package], Toolchain::default())
+    // Which nightly compiles the data plane.
+    //
+    // `nightly` by default, so a workstation keeps working with whatever it
+    // has. It is settable because the toolchain's LLVM is not a detail here:
+    // bpf-linker has to be built against the same major version, and a
+    // too-new one can emit a register the kernel verifier refuses outright
+    // (`R11 is invalid`). When that happens the only way out is to name a
+    // toolchain that does not.
+    let pinned = std::env::var("VELSTRA_EBPF_TOOLCHAIN").unwrap_or_default();
+    let toolchain = if pinned.is_empty() {
+        Toolchain::default()
+    } else {
+        Toolchain::Custom(&pinned)
+    };
+    println!("cargo:rerun-if-env-changed=VELSTRA_EBPF_TOOLCHAIN");
+    aya_build::build_ebpf([ebpf_package], toolchain)
 }

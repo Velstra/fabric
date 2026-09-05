@@ -24,6 +24,17 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Which nightly compiles the data plane, and therefore which LLVM bpf-linker
+  # is built against.
+  #
+  # Pinned, and not out of caution: rustc's rolling nightly is on LLVM 23,
+  # whose BPF backend emits `r11` — a register the instruction set does not
+  # have — and the kernel refuses the load outright with "R11 is invalid".
+  # Measured on the same tree: twelve `r11` references in the object built with
+  # LLVM 23, none in the one built with LLVM 22. Velstra/fabric#8 tracks
+  # getting rid of this; when it is gone, delete the variable and the two
+  # steps that read it.
+  VELSTRA_EBPF_TOOLCHAIN: nightly-2026-06-19
 
 jobs:
   # Fast lane: the std-testable crates (logic, config, gRPC). No eBPF toolchain,
