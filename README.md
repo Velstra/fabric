@@ -174,6 +174,12 @@ trie (`BLOCKLIST6`), ICMPv6 is covered by `drop_icmp`, and `[[port_rule]]` /
 is a `/128`). Switching/routing and load balancing remain IPv4-only for now, so
 allowed IPv6 traffic is passed to the kernel stack.
 
+> **Routed IPv6 is kernel-delegated on purpose.** The IPv6 path does the
+> firewall, neighbour-discovery suppression, NPTv6 and SRv6 work in XDP and then
+> hands an allowed packet to the kernel: `ROUTES` and the load balancer's VIPs
+> are IPv4, so there is no IPv6 FIB or VIP6 in the data path yet (issue #1).
+> Fine for a host firewall; a tenant gateway routing IPv6 takes the slow path.
+
 ### Stateful firewall
 
 Set `stateful = true` on a policy to track TCP/UDP connections and allow
