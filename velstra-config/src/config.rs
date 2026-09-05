@@ -996,7 +996,7 @@ pub struct ResolvedService {
 /// A resolved forwarding rule. The egress interface is kept as a name here and
 /// turned into an ifindex (plus, if needed, its MAC) at load time by the control
 /// plane, since that requires touching the OS.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedRoute {
     /// Owning policy (tenant); `0` is the default routing table (C3).
     pub policy: PolicyId,

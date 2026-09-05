@@ -4,6 +4,17 @@
 
 ### Added
 
+- **Wren's forwarding table into `ROUTES`, FPM-style.** `--wren-routes` (with
+  `--wren-socket`) subscribes the agent to Wren's `monitor routes` feed and
+  programs what it hears: each learned route's next hop is resolved to a MAC
+  through the kernel's ARP table (an unresolved gateway is nudged and retried
+  on the next pass), written under `--wren-routes-policy`, and removed on
+  withdrawal; `--wren-routes-table` picks the VRF. A static route wins over a
+  learned one for the same destination, on-link routes stay the kernel's,
+  IPv6 prefixes are skipped and said so, and a Wren restart leaves the trie in
+  force until the feed is back. Best-effort like the EVPN advertiser: nothing
+  here can kill the agent.
+
 - **A learned type-5 `End.DT4`/`End.DT6` SID is now refused *visibly*, not
   silently.** The datapath terminates only the L2 SRv6 behaviours
   (`End.DT2U`/`End.DT2M`); an RFC 9252 §6 type-5 route advertises an L3 SID whose

@@ -261,6 +261,27 @@ the IPv4 header checksum is repaired incrementally (RFC 1624).
 > mode; native driver mode additionally requires the **egress** NIC's driver to
 > support `ndo_xdp_xmit`. veth pairs and most modern NICs do.
 
+#### Routes from Wren (FPM-style)
+
+Static `[[route]]` blocks are one source of the `ROUTES` trie; a routing daemon
+is the other. With `--wren-socket <path> --wren-routes` the agent subscribes to
+Wren's `monitor routes` feed — the snapshot, then `+`/`-` lines as the RIB
+moves, the same job FRR's zebra hands an external forwarder through the FPM —
+and programs what it hears: each learned route's next hop is resolved to a MAC
+through the kernel's ARP table and written as `(policy, prefix) → (egress,
+MACs)`; a withdrawn route is removed. `--wren-routes-policy` (default `0`) says
+which policy the routes belong to, `--wren-routes-table` (default `254`, the
+main table) which VRF is followed.
+
+What it deliberately does not do: a static route wins over a learned one for
+the same destination; a route with a device and no gateway is on-link and is
+left to the kernel (every host behind it has its own MAC); an unresolved
+gateway is nudged and tried again on the next pass rather than programmed with
+no destination address; IPv6 prefixes are skipped, because the trie is IPv4.
+Wren restarting does not empty the trie — the routes in force stay until the
+feed is back and says otherwise. Wren stays free of eBPF and the agent free of
+BGP: Wren is the brain, this is the data path.
+
 ### Load balancing & NAT (Phase 3)
 
 A `[[service]]` turns Velstra into a stateless **L4 load balancer**: traffic to
