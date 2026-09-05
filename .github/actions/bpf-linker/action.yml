@@ -21,13 +21,15 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        llvm=$(rustup run nightly rustc --version --verbose \
+        toolchain="${VELSTRA_EBPF_TOOLCHAIN:-nightly}"
+        rustup toolchain install "$toolchain" --profile minimal --component rust-src
+        llvm=$(rustup run "$toolchain" rustc --version --verbose \
                  | awk -F'[ .]' '/^LLVM version:/ { print $3 }')
         if [ -z "$llvm" ]; then
           echo "::error::could not read the LLVM version out of rustc; bpf-linker cannot be matched to it."
           exit 1
         fi
-        echo "the nightly rustc uses LLVM $llvm; bpf-linker will link the same one."
+        echo "$toolchain uses LLVM $llvm; bpf-linker will link the same one."
         . /etc/os-release
         curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
           | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
