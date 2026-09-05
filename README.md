@@ -101,6 +101,9 @@ LLVM instead, so it needs the same major version the nightly rustc emits:
 rustup run nightly rustc --version --verbose | grep '^LLVM version:'
 # Debian/Ubuntu, for the number that prints (apt.llvm.org has the new ones):
 sudo apt-get install -y llvm-<N>-dev libpolly-<N>-dev
+# The package installs `llvm-config` under /usr/lib/llvm-<N>/bin and leaves the
+# unversioned name alone, so without this llvm-sys finds an older one or none.
+export PATH=/usr/lib/llvm-<N>/bin:$PATH
 cargo install bpf-linker --locked --no-default-features --features llvm-<N>
 ```
 
