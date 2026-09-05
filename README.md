@@ -32,10 +32,11 @@ data plane).
 > authoritative, with the divergence metric at `GET /v1/srv6/divergence`) and
 > the honest half of Stage 3 (a learned L3 `End.DT4`/`End.DT6` SID is refused
 > visibly at `GET /v1/srv6/irb-gated` rather than silently rewritten) are in;
-> true L3 decap and encap wait for a per-tenant L3 device. The stages and their
-> gaps are written up in `CHANGELOG.md` (`[Unreleased]`, G1 and G3) — the plan
-> document the earlier text pointed at is not in this repository. It post-dates the last tagged release
-> (`CHANGELOG.md` `[Unreleased]`) and is the least hardware-verified surface —
+> true L3 decap and encap wait for a per-tenant L3 device. What each stage
+> covers and what it does not is written up under `[Unreleased]` in
+> `CHANGELOG.md`; the convergence-plan document earlier text pointed at is not
+> in this repository. The SRv6 work post-dates the last tagged release and is
+> the least hardware-verified surface here —
 > the eBPF verifier-acceptance `loadcheck` job and the netns `datapath` e2e are
 > CI bring-up (the loadcheck runs the XDP program in the runner's own kernel as
 > root and needs no `/dev/kvm`), not yet a proof at scale on real NICs.
