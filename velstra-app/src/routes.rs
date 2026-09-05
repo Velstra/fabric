@@ -205,99 +205,103 @@ impl Store {
         self.routes.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.routes.is_empty()
-    }
-
     pub fn iter(&self) -> impl Iterator<Item = (&Cidr4, &Learned)> {
         self.routes.values().map(|(p, l)| (p, l))
     }
 }
 
-/// Where a next hop's MAC comes from. A trait so the resolution can be tested
-/// without a kernel; the real one reads the ARP table.
-pub trait Neighbours {
-    /// The MAC and the device a complete ARP entry names for `ip`.
-    fn lookup(&self, ip: Ipv4Addr) -> Option<([u8; 6], String)>;
-    /// Make the kernel resolve `ip`, for the next pass.
-    fn nudge(&self, ip: Ipv4Addr);
-}
+/// What the kernel has resolved: address → its MAC and the link it is on.
+///
+/// Taken as a snapshot rather than queried per route. `/proc/net/arp` is a file
+/// read, and one per route inside the loop that also reads the feed would put a
+/// blocking read on the async path once per route per pass.
+pub type ArpTable = BTreeMap<Ipv4Addr, ([u8; 6], String)>;
 
 /// The kernel's ARP table, as `/proc/net/arp` prints it.
 pub struct ProcArp;
 
 impl ProcArp {
-    pub fn parse(text: &str, ip: Ipv4Addr) -> Option<([u8; 6], String)> {
-        // "IP address  HW type  Flags  HW address  Mask  Device"; 0x2 is complete.
-        text.lines().skip(1).find_map(|line| {
-            let f: Vec<&str> = line.split_whitespace().collect();
-            if f.len() < 6 || f[0].parse::<Ipv4Addr>().ok()? != ip {
-                return None;
-            }
-            let flags = u32::from_str_radix(f[2].trim_start_matches("0x"), 16).ok()?;
-            if flags & 0x2 == 0 {
-                return None;
-            }
-            let mac = velstra_common::parse_mac(f[3]).ok()?;
-            Some((mac, f[5].to_string()))
-        })
+    /// Read and parse the whole table. Blocking; call it off the runtime.
+    pub fn read() -> ArpTable {
+        std::fs::read_to_string("/proc/net/arp")
+            .map(|text| Self::parse(&text))
+            .unwrap_or_default()
+    }
+
+    /// "IP address  HW type  Flags  HW address  Mask  Device"; flag 0x2 is a
+    /// complete entry, and an incomplete one names no MAC worth writing.
+    pub fn parse(text: &str) -> ArpTable {
+        text.lines()
+            .skip(1)
+            .filter_map(|line| {
+                let f: Vec<&str> = line.split_whitespace().collect();
+                if f.len() < 6 {
+                    return None;
+                }
+                let ip: Ipv4Addr = f[0].parse().ok()?;
+                let flags = u32::from_str_radix(f[2].trim_start_matches("0x"), 16).ok()?;
+                if flags & 0x2 == 0 {
+                    return None;
+                }
+                let mac = velstra_common::parse_mac(f[3]).ok()?;
+                Some((ip, (mac, f[5].to_string())))
+            })
+            .collect()
     }
 }
 
-impl Neighbours for ProcArp {
-    fn lookup(&self, ip: Ipv4Addr) -> Option<([u8; 6], String)> {
-        let text = std::fs::read_to_string("/proc/net/arp").ok()?;
-        Self::parse(&text, ip)
+/// Ask the kernel to resolve `ip`, so the next pass finds it. A zero-length
+/// datagram to the discard port: nothing answers, and the kernel has to resolve
+/// the address before it can send. Best effort.
+pub fn nudge(ip: Ipv4Addr) {
+    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        let _ = socket.send_to(&[], (ip, 9));
     }
+}
 
-    fn nudge(&self, ip: Ipv4Addr) {
-        // A zero-length datagram to the discard port: nothing answers, and the
-        // kernel has to resolve the address to send it. Best effort.
-        if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
-            let _ = socket.send_to(&[], (ip, 9));
-        }
-    }
+/// What one pass made of what Wren said: the routes that can be programmed, the
+/// ones that cannot and why, and the gateways worth asking the kernel about.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Resolved {
+    pub routes: Vec<ResolvedRoute>,
+    pub waiting: Vec<(Cidr4, String)>,
+    pub unresolved: Vec<Ipv4Addr>,
 }
 
 /// Turn what Wren said into what the trie takes. The second list is the
 /// routes that could not be programmed this pass and why — logged once each
 /// time the set changes, not every pass, because "still unresolved" is not
 /// news.
-pub fn resolve(
-    store: &Store,
-    neighbours: &dyn Neighbours,
-    policy: PolicyId,
-) -> (Vec<ResolvedRoute>, Vec<(Cidr4, String)>) {
-    let mut routes = Vec::new();
-    let mut waiting = Vec::new();
+pub fn resolve(store: &Store, arp: &ArpTable, policy: PolicyId) -> Resolved {
+    let mut out = Resolved::default();
     for (prefix, learned) in store.iter() {
         let Some(gateway) = learned.gateway else {
-            waiting.push((
+            out.waiting.push((
                 *prefix,
                 "on-link, no gateway: every host behind it has its own MAC, left to the kernel"
                     .into(),
             ));
             continue;
         };
-        match neighbours.lookup(gateway) {
-            Some((mac, dev)) => routes.push(ResolvedRoute {
+        match arp.get(&gateway) {
+            Some((mac, dev)) => out.routes.push(ResolvedRoute {
                 policy,
                 dest: *prefix,
-                out_iface: learned.dev.clone().unwrap_or(dev),
+                out_iface: learned.dev.clone().unwrap_or_else(|| dev.clone()),
                 src_mac: None,
-                dst_mac: mac,
+                dst_mac: *mac,
                 flags: RouteEntry::DECREMENT_TTL,
             }),
             None => {
-                neighbours.nudge(gateway);
-                waiting.push((
+                out.unresolved.push(gateway);
+                out.waiting.push((
                     *prefix,
                     format!("gateway {gateway} is not in the ARP table yet"),
                 ));
             }
         }
     }
-    (routes, waiting)
+    out
 }
 
 const BACKOFF_FLOOR: Duration = Duration::from_millis(500);
@@ -345,7 +349,6 @@ async fn subscribe(
     let mut store = Store::new(table);
     let mut lines = BufReader::new(stream).lines();
     let mut settled = false;
-    let mut dirty = false;
     let mut last_waiting: Vec<(Cidr4, String)> = Vec::new();
     let mut tick = tokio::time::interval(RERESOLVE);
     tick.tick().await; // the first tick is immediate; the feed's snapshot comes first
@@ -358,22 +361,30 @@ async fn subscribe(
                     continue;
                 }
                 if !line.starts_with(['+', '-', '%']) {
-                    warn!("wren refused the routes subscription: {line}");
-                    return Ok(());
+                    // An error, not a clean close: the caller's Ok arm resets
+                    // the backoff and reconnects at once, which against a wren
+                    // that keeps refusing is a retry every half second for ever.
+                    return Err(std::io::Error::other(format!(
+                        "wren refused the routes subscription: {line}"
+                    )));
                 }
                 match parse_line(&line) {
                     Ok(Line::EndOfDump) => {
+                        // Always, even for an empty snapshot with nothing
+                        // dirty. A reconnect after wren lost its last route
+                        // sends exactly that, and skipping it would leave the
+                        // routes from the previous connection programmed for
+                        // ever — the trie would be a memory of a table that no
+                        // longer exists.
                         settled = true;
-                        if std::mem::take(&mut dirty) || !store.is_empty() {
-                            push(firewall, &store, policy, &mut last_waiting).await;
-                        }
+                        push(firewall, &store, policy, &mut last_waiting).await;
                     }
                     Ok(parsed) => {
-                        let changed = store.apply(parsed);
-                        if changed && settled {
+                        // Before the snapshot ends, nothing is programmed:
+                        // end-of-dump pushes whatever the store holds by then,
+                        // so a half-read snapshot never reaches the trie.
+                        if store.apply(parsed) && settled {
                             push(firewall, &store, policy, &mut last_waiting).await;
-                        } else {
-                            dirty |= changed;
                         }
                     }
                     Err(why) => warn!("wren routes: {why}"),
@@ -395,7 +406,19 @@ async fn push(
     policy: PolicyId,
     last_waiting: &mut Vec<(Cidr4, String)>,
 ) {
-    let (routes, waiting) = resolve(store, &ProcArp, policy);
+    // Reading /proc and sending a datagram are both blocking, and this runs on
+    // the task that is also reading the feed. Off the runtime with both.
+    let arp = tokio::task::spawn_blocking(ProcArp::read)
+        .await
+        .unwrap_or_default();
+    let Resolved {
+        routes,
+        waiting,
+        unresolved,
+    } = resolve(store, &arp, policy);
+    if !unresolved.is_empty() {
+        let _ = tokio::task::spawn_blocking(move || unresolved.into_iter().for_each(nudge)).await;
+    }
     if waiting != *last_waiting {
         for (prefix, why) in &waiting {
             info!("wren route {prefix} not programmed: {why}");
@@ -502,27 +525,20 @@ mod tests {
             prefix: cidr("10.20.0.0/24"),
             table: 254
         }));
-        assert!(store.is_empty());
+        assert_eq!(store.len(), 0);
         assert!(!store.apply(Line::EndOfDump));
         assert!(!store.apply(Line::Skipped("v6".into())));
     }
 
-    struct FakeArp(
-        BTreeMap<Ipv4Addr, ([u8; 6], String)>,
-        std::cell::RefCell<Vec<Ipv4Addr>>,
-    );
-
-    impl Neighbours for FakeArp {
-        fn lookup(&self, ip: Ipv4Addr) -> Option<([u8; 6], String)> {
-            self.0.get(&ip).cloned()
-        }
-        fn nudge(&self, ip: Ipv4Addr) {
-            self.1.borrow_mut().push(ip);
-        }
+    fn arp(entries: &[(&str, [u8; 6], &str)]) -> ArpTable {
+        entries
+            .iter()
+            .map(|(ip, mac, dev)| (ip.parse().unwrap(), (*mac, dev.to_string())))
+            .collect()
     }
 
     #[test]
-    fn a_resolved_gateway_becomes_a_route_and_an_unresolved_one_is_nudged_and_waits() {
+    fn a_resolved_gateway_becomes_a_route_and_an_unresolved_one_waits_to_be_asked_about() {
         let mut store = Store::new(254);
         for (p, gw, dev) in [
             ("10.20.0.0/24", Some("10.0.0.2"), None),
@@ -537,20 +553,15 @@ mod tests {
                 dev: dev.map(str::to_string),
             });
         }
-        let arp = FakeArp(
-            BTreeMap::from([
-                (
-                    "10.0.0.2".parse().unwrap(),
-                    ([1, 2, 3, 4, 5, 6], "eth1".into()),
-                ),
-                (
-                    "10.0.0.3".parse().unwrap(),
-                    ([1, 2, 3, 4, 5, 7], "eth1".into()),
-                ),
-            ]),
-            Default::default(),
-        );
-        let (routes, waiting) = resolve(&store, &arp, 3);
+        let table = arp(&[
+            ("10.0.0.2", [1, 2, 3, 4, 5, 6], "eth1"),
+            ("10.0.0.3", [1, 2, 3, 4, 5, 7], "eth1"),
+        ]);
+        let Resolved {
+            routes,
+            waiting,
+            unresolved,
+        } = resolve(&store, &table, 3);
         assert_eq!(routes.len(), 2);
         assert_eq!(routes[0].dest, cidr("10.20.0.0/24"));
         assert_eq!(
@@ -567,10 +578,9 @@ mod tests {
         assert_eq!(waiting.len(), 2, "{waiting:?}");
         assert!(waiting[0].1.contains("not in the ARP table"));
         assert!(waiting[1].1.contains("on-link"));
-        assert_eq!(
-            *arp.1.borrow(),
-            vec!["10.0.0.4".parse::<Ipv4Addr>().unwrap()]
-        );
+        // The gateway nobody has resolved is the one to ask the kernel about,
+        // and the on-link route is not — there is no single next hop to ask for.
+        assert_eq!(unresolved, vec!["10.0.0.4".parse::<Ipv4Addr>().unwrap()]);
     }
 
     #[test]
@@ -578,15 +588,15 @@ mod tests {
         let text = "IP address       HW type     Flags       HW address            Mask     Device\n\
                     10.8.0.2         0x1         0x2         52:54:00:12:34:56     *        eth1\n\
                     10.8.0.3         0x1         0x0         00:00:00:00:00:00     *        eth1\n";
+        let table = ProcArp::parse(text);
         assert_eq!(
-            ProcArp::parse(text, "10.8.0.2".parse().unwrap()),
-            Some(([0x52, 0x54, 0, 0x12, 0x34, 0x56], "eth1".into()))
+            table.get(&"10.8.0.2".parse().unwrap()),
+            Some(&([0x52, 0x54, 0, 0x12, 0x34, 0x56], "eth1".to_string()))
         );
-        assert_eq!(
-            ProcArp::parse(text, "10.8.0.3".parse().unwrap()),
-            None,
-            "incomplete"
+        assert!(
+            !table.contains_key(&"10.8.0.3".parse().unwrap()),
+            "an incomplete entry names no MAC and must not be read as one"
         );
-        assert_eq!(ProcArp::parse(text, "10.8.0.4".parse().unwrap()), None);
+        assert_eq!(table.len(), 1, "only the complete entry: {table:?}");
     }
 }
