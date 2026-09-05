@@ -34,7 +34,12 @@ env:
   # LLVM 23, none in the one built with LLVM 22. Velstra/fabric#8 tracks
   # getting rid of this; when it is gone, delete the variable and the two
   # steps that read it.
-  VELSTRA_EBPF_TOOLCHAIN: nightly-2026-06-19
+  #
+  # As late as an LLVM-22 nightly goes: rustc moved to 23 somewhere between
+  # 2026-07-20 (still 22) and 2026-08-15 (23), and 2026-08-01 is on the right
+  # side of it. Measured on this tree, that toolchain builds the data plane
+  # with no `r11` in the object at all.
+  VELSTRA_EBPF_TOOLCHAIN: nightly-2026-08-01
 
 jobs:
   # Fast lane: the std-testable crates (logic, config, gRPC). No eBPF toolchain,
