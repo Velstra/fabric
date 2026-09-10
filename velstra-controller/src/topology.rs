@@ -96,6 +96,11 @@ struct LoadBalancerFile {
     /// Pool members, each naming a port declared in this file.
     #[serde(default, rename = "member", skip_serializing_if = "Vec::is_empty")]
     members: Vec<LbMemberFile>,
+    /// Send every connection from one client address to the same backend.
+    /// Omitted is the even spread, which is what a service wants unless it
+    /// keeps something per client between connections.
+    #[serde(default, skip_serializing_if = "is_false")]
+    client_affinity: bool,
 }
 
 /// One `[[load_balancer.member]]` entry. A member names its port the way the
@@ -109,10 +114,18 @@ struct LbMemberFile {
     /// Backend port, or omitted to keep the client's original destination port.
     #[serde(default, skip_serializing_if = "is_zero_port")]
     port: u16,
+    /// Take no new connections here and let the ones it has finish — how a
+    /// machine is taken out of service without cutting anybody off.
+    #[serde(default, skip_serializing_if = "is_false")]
+    draining: bool,
 }
 
 fn is_zero_port(p: &u16) -> bool {
     *p == 0
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// A load balancer with no `proto` is TCP. Deliberately local rather than a
@@ -245,6 +258,7 @@ fn build_load_balancer(topo: &Topology, lb: &LoadBalancerFile) -> Result<LoadBal
         members.push(LbMember {
             port_id: port.id.clone(),
             port: m.port,
+            draining: m.draining,
         });
     }
     Ok(LoadBalancer {
@@ -257,6 +271,7 @@ fn build_load_balancer(topo: &Topology, lb: &LoadBalancerFile) -> Result<LoadBal
         port: lb.port,
         proto: lb.proto,
         members,
+        client_affinity: lb.client_affinity,
     })
 }
 
@@ -1164,9 +1179,11 @@ fn to_file(topo: &Topology) -> TopologyFile {
                         host: port.host.clone(),
                         tap: port.tap.clone(),
                         port: m.port,
+                        draining: m.draining,
                     })
                 })
                 .collect(),
+            client_affinity: lb.client_affinity,
         })
         .collect();
     load_balancers.sort_by(|a, b| a.id.cmp(&b.id));

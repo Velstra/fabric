@@ -473,6 +473,13 @@ pub struct LbMember {
     pub port_id: String,
     /// Backend L4 port, or `0` to keep the client's original destination port.
     pub port: u16,
+    /// Take no new connections here and let the ones it has finish.
+    ///
+    /// The state a machine is in while it is being taken out of service.
+    /// Without it, taking one out means removing it, and every connection it
+    /// was serving is cut mid-request; with it, the operator waits instead of
+    /// apologising.
+    pub draining: bool,
 }
 
 /// A load-balanced virtual service (roadmap D2, "LBaaS"): a VIP fronting a pool
@@ -499,6 +506,12 @@ pub struct LoadBalancer {
     /// datapath counts the miss as `lb_no_backend` and passes the packet on),
     /// not an error.
     pub members: Vec<LbMember>,
+    /// Send every connection from one client address to the same backend.
+    ///
+    /// Off by default, which is the even spread. On for a service that keeps
+    /// something per client between connections — a session in memory, an
+    /// upload assembled in pieces, a cache only warm where it was filled.
+    pub client_affinity: bool,
 }
 
 /// The whole virtual fabric: networks, hosts, and the ports binding them.
@@ -1969,6 +1982,7 @@ impl Topology {
                     Some(BackendCfg {
                         ip: port.ip.to_string(),
                         port: (m.port != 0).then_some(m.port),
+                        draining: m.draining,
                     })
                 })
                 .collect();
@@ -1988,6 +2002,7 @@ impl Topology {
                     port: lb.port,
                     proto: lb.proto,
                     backends: backends.clone(),
+                    client_affinity: lb.client_affinity,
                     // A fabric service's members are validated to live on the
                     // VIP's own network, so the backend's reply comes back under
                     // the same policy and the flow stays tenant-scoped — which is
@@ -2059,6 +2074,11 @@ pub struct LoadBalancerRec {
     pub port: u16,
     pub proto: ProtoName,
     pub members: Vec<LbMemberRec>,
+    /// `#[serde(default)]` for the same reason the field above it carries one:
+    /// a snapshot written before affinity existed restores as the spread it
+    /// was running, not as something nobody chose.
+    #[serde(default)]
+    pub client_affinity: bool,
 }
 
 /// Serializable mirror of an [`LbMember`].
@@ -2066,6 +2086,10 @@ pub struct LoadBalancerRec {
 pub struct LbMemberRec {
     pub port_id: String,
     pub port: u16,
+    /// `#[serde(default)]`: a snapshot written before draining existed restores
+    /// with every member live, which is what it was.
+    #[serde(default)]
+    pub draining: bool,
 }
 
 /// Serializable mirror of a [`Host`].
@@ -2347,8 +2371,10 @@ impl Topology {
                         .map(|m| LbMemberRec {
                             port_id: m.port_id.clone(),
                             port: m.port,
+                            draining: m.draining,
                         })
                         .collect(),
+                    client_affinity: lb.client_affinity,
                 })
                 .collect(),
         }
@@ -2509,8 +2535,10 @@ impl Topology {
                         .map(|m| LbMember {
                             port_id: m.port_id.clone(),
                             port: m.port,
+                            draining: m.draining,
                         })
                         .collect(),
+                    client_affinity: lb.client_affinity,
                 },
             );
         }
@@ -3803,6 +3831,7 @@ mod tests {
             port: 80,
             proto: ProtoName::Tcp,
             members,
+            client_affinity: false,
         }
     }
 
@@ -3814,6 +3843,7 @@ mod tests {
         let member = |id: &str| LbMember {
             port_id: id.into(),
             port: 8080,
+            draining: false,
         };
 
         t.add_load_balancer(lb("web", "192.168.50.200", vec![member(&a)]))
@@ -3883,6 +3913,7 @@ mod tests {
             vec![LbMember {
                 port_id: a.clone(),
                 port: 8080,
+                draining: false,
             }],
         ))
         .unwrap();

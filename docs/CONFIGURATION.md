@@ -218,6 +218,20 @@ velstra-controller orch add-load-balancer --id web-vip --vni 5000 \
     --vip 192.168.100.200 --port 80 --member port-5000-192.168.100.10:8080
 ```
 
+A member takes `:draining` to stop it receiving *new* connections while the
+ones it has finish — how a machine is taken out of service without cutting
+anybody off. `--client-affinity` sends every connection from one client address
+to the same backend, for a service that keeps something per client between
+connections; it spreads worse by design, and a client behind a large NAT counts
+as one client.
+
+```shell
+velstra-controller orch add-load-balancer --id web-vip --vni 5000 \
+    --vip 192.168.100.200 --port 80 --client-affinity \
+    --member port-5000-192.168.100.10:8080 \
+    --member port-5000-192.168.100.11:8080:draining
+```
+
 ### REST
 
 Started only when `--rest-listen <addr>` is given (there is no default port).

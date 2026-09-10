@@ -113,6 +113,13 @@ pub struct LoadBalancerSpec {
     pub port: u16,
     pub proto: ProtoName,
     pub members: Vec<LbMemberSpec>,
+    /// Send every connection from one client address to the same backend.
+    ///
+    /// `#[serde(default)]` because this is replicated state: a log entry
+    /// written by a member that predates the field has to apply on one that
+    /// does not, and the answer for such an entry is the spread it was running.
+    #[serde(default)]
+    pub client_affinity: bool,
 }
 
 /// One member of a [`LoadBalancerSpec`]'s pool: a fabric port plus its L4 port.
@@ -121,6 +128,12 @@ pub struct LbMemberSpec {
     pub port_id: String,
     /// Backend port, or `0` to keep the client's original destination port.
     pub port: u16,
+    /// Take no new connections and let the ones it has finish.
+    ///
+    /// `#[serde(default)]` for the reason above it: an older member's log entry
+    /// applies here as a live backend, which is what it was.
+    #[serde(default)]
+    pub draining: bool,
 }
 
 /// A serializable subnet description carried in [`TopoRequest::AddSubnet`] (D2).
@@ -431,8 +444,10 @@ fn lb_from_spec(s: &LoadBalancerSpec) -> Result<LoadBalancer> {
             .map(|m| LbMember {
                 port_id: m.port_id.clone(),
                 port: m.port,
+                draining: m.draining,
             })
             .collect(),
+        client_affinity: s.client_affinity,
     })
 }
 

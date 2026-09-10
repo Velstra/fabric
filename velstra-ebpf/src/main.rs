@@ -3649,7 +3649,12 @@ fn try_load_balance(
         return Ok(None);
     }
 
-    let hash = session_hash(src_addr, src_port, proto);
+    // The port is dropped from the hash for a service that binds a client to a
+    // backend, so its second connection lands where the first did. `hash_port`
+    // is the one place that decides, because a data plane with the choice at
+    // each call site is one that gets it right on three paths and wrong on the
+    // fourth.
+    let hash = session_hash(src_addr, service.hash_port(src_port), proto);
     let index = service.backend_start + select_backend(hash, service.backend_count);
     let Some(backend) = BACKENDS.get(index).copied() else {
         return Ok(None);
