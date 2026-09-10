@@ -1673,10 +1673,10 @@ async fn create_load_balancer(
             .map(|m| ProtoLbMember {
                 port_id: m.port_id,
                 port: m.port as u32,
-                draining: m.draining,
+                draining: Some(m.draining),
             })
             .collect(),
-        client_affinity: body.client_affinity,
+        client_affinity: Some(body.client_affinity),
     };
     propose_audited(
         &state,

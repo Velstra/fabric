@@ -298,7 +298,13 @@ message LbMember {
   uint32 port = 2;
   // Take no new connections and let the ones it has finish. See
   // `Backend.draining`.
-  bool draining = 3;
+  //
+  // `optional` for presence, and it matters on the way *back*: a controller
+  // older than this field answers a list with nothing here, which is not the
+  // same fact as `false`. A client that read absence as "not draining" would
+  // see a difference from what it asked for and reprogram the service —
+  // dropping every connection through it — on every pass, forever.
+  optional bool draining = 3;
 }
 
 // A load-balanced virtual service (D2 LBaaS).
@@ -314,8 +320,9 @@ message LoadBalancerSpec {
   // The backend pool. May be empty — a drained pool is a legitimate state.
   repeated LbMember members = 6;
   // Send every connection from one client address to the same backend. See
-  // `Service.client_affinity`.
-  bool client_affinity = 7;
+  // `Service.client_affinity`. `optional` for presence — see
+  // `LbMember.draining`.
+  optional bool client_affinity = 7;
 }
 
 message RemoveLoadBalancerRequest {

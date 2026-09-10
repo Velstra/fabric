@@ -1247,10 +1247,12 @@ pub(crate) fn raft_load_balancer_spec(s: LoadBalancerSpec) -> velstra_raft::Load
             .map(|m| velstra_raft::LbMemberSpec {
                 port_id: m.port_id,
                 port: m.port as u16,
-                draining: m.draining,
+                // Absent is the default a client that never heard of draining
+                // means: take new connections.
+                draining: m.draining.unwrap_or(false),
             })
             .collect(),
-        client_affinity: s.client_affinity,
+        client_affinity: s.client_affinity.unwrap_or(false),
     }
 }
 
@@ -1269,10 +1271,10 @@ fn lb_to_spec(lb: &velstra_orchestrator::LoadBalancer) -> LoadBalancerSpec {
             .map(|m| LbMember {
                 port_id: m.port_id.clone(),
                 port: m.port as u32,
-                draining: m.draining,
+                draining: Some(m.draining),
             })
             .collect(),
-        client_affinity: lb.client_affinity,
+        client_affinity: Some(lb.client_affinity),
     }
 }
 
@@ -2964,7 +2966,7 @@ async fn orch(args: OrchArgs) -> Result<()> {
                 members.push(LbMember {
                     port_id: port_id.to_string(),
                     port: backend as u32,
-                    draining,
+                    draining: Some(draining),
                 });
             }
             client
@@ -2975,7 +2977,7 @@ async fn orch(args: OrchArgs) -> Result<()> {
                     port: port as u32,
                     proto: proto as i32,
                     members,
-                    client_affinity,
+                    client_affinity: Some(client_affinity),
                 })
                 .await?;
             println!("added load balancer {id:?} ({vip}:{port})");
