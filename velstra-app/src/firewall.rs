@@ -2185,7 +2185,13 @@ fn program_services(
     for service in services {
         let start = flat.len() as u32;
         flat.extend_from_slice(&service.backends);
-        let count = service.backends.len() as u32;
+        // Only the live prefix is offered to new flows. A draining member is
+        // still *in* the array — it costs one slot and keeps the window
+        // contiguous — and simply sits past the end of it, so nothing new is
+        // sent there. Its established flows are untouched: they are answered
+        // from conntrack, which holds the backend's address rather than its
+        // place in the pool.
+        let count = service.live as u32;
         entries.push((
             service.key,
             if service.router_nat {
@@ -2199,8 +2205,9 @@ fn program_services(
                     pool_reply_policy(&service.backends, interfaces)
                 };
                 ServiceValue::new_router_nat(start, count, reply)
+                    .with_client_affinity(service.client_affinity)
             } else {
-                ServiceValue::new(start, count)
+                ServiceValue::new(start, count).with_client_affinity(service.client_affinity)
             },
         ));
     }

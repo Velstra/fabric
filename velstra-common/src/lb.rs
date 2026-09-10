@@ -79,6 +79,25 @@ pub mod service_flags {
     /// back under the same policy — there the per-policy scoping is what keeps two
     /// tenants' identical 5-tuples apart, and must not be given up.
     pub const ROUTER_NAT: u32 = 1 << 0;
+
+    /// Send every connection from one **client address** to the same backend,
+    /// rather than spreading each connection on its own.
+    ///
+    /// Without it a service spreads by the whole source identity — address,
+    /// port and protocol — so one client opening four connections reaches four
+    /// backends. That is the right default: it is the even one, and a backend
+    /// that dies takes a quarter of that client's work rather than all of it.
+    ///
+    /// It is the wrong answer for a service that keeps something per client
+    /// between connections — a session in memory, an upload assembled in
+    /// pieces, a cache that is only warm on the machine that filled it. There
+    /// the second connection has to land where the first did, and this is what
+    /// says so.
+    ///
+    /// The cost is stated rather than hidden: one client is one backend, so a
+    /// pool fronting few, busy clients spreads worse, and a client behind a
+    /// large NAT arrives as one address and is treated as one client.
+    pub const CLIENT_AFFINITY: u32 = 1 << 1;
 }
 
 /// Value for `SERVICES`: a contiguous window `[start, start+count)` into the
@@ -130,10 +149,46 @@ impl ServiceValue {
         }
     }
 
+    /// The same service, with client affinity on or off.
+    ///
+    /// A builder rather than a third constructor: affinity is orthogonal to how
+    /// a service's flows are tracked, and a constructor per combination is how
+    /// two independent choices become four functions.
+    #[inline]
+    pub const fn with_client_affinity(mut self, on: bool) -> Self {
+        if on {
+            self.flags |= service_flags::CLIENT_AFFINITY;
+        } else {
+            self.flags &= !service_flags::CLIENT_AFFINITY;
+        }
+        self
+    }
+
     /// Whether this service's flows live in the router-NAT namespace.
     #[inline]
     pub const fn is_router_nat(&self) -> bool {
         self.flags & service_flags::ROUTER_NAT != 0
+    }
+
+    /// Whether every connection from one client address goes to one backend.
+    #[inline]
+    pub const fn has_client_affinity(&self) -> bool {
+        self.flags & service_flags::CLIENT_AFFINITY != 0
+    }
+
+    /// The source port to hash for this service: the real one, or zero when
+    /// the service binds a client to a backend.
+    ///
+    /// Here rather than at the call site because it is the whole of what the
+    /// flag *does*, and a data plane that had to remember to ask would one day
+    /// forget on one of its paths.
+    #[inline]
+    pub const fn hash_port(&self, src_port: u16) -> u16 {
+        if self.has_client_affinity() {
+            0
+        } else {
+            src_port
+        }
     }
 }
 
@@ -169,6 +224,12 @@ unsafe impl aya::Pod for Backend {}
 
 /// Hash a flow's *source* identity to a 32-bit value (FNV-1a). Deterministic, so
 /// every packet of a flow selects the same backend.
+///
+/// Pass `src_port = 0` for a service with [`service_flags::CLIENT_AFFINITY`]:
+/// the hash then depends on the address alone, so every connection from one
+/// client lands on the same backend. Done by zeroing the port rather than by a
+/// second hash function so that both modes are the same arithmetic, and a
+/// service that changes mode moves its clients exactly once.
 #[inline]
 pub const fn session_hash(src_ip: [u8; 4], src_port: u16, proto: u8) -> u32 {
     let bytes = [
@@ -949,5 +1010,68 @@ mod tests {
         // PortFwd: target ip + match_dst + snat_ip (3×4) + reply policy + port +
         // pad = 20 bytes.
         assert_eq!(core::mem::size_of::<PortFwd>(), 20);
+    }
+    /// Two connections from one client reach two backends by default — that is
+    /// the even spread, and it is what a service wants unless it keeps
+    /// something per client between them.
+    #[test]
+    fn without_affinity_one_client_spreads_across_the_pool() {
+        let client = [10, 0, 0, 7];
+        let mut seen = std::collections::BTreeSet::new();
+        for port in 40000u16..40040 {
+            seen.insert(select_backend(session_hash(client, port, 6), 4));
+        }
+        assert!(
+            seen.len() > 1,
+            "one client never left one backend: {seen:?}"
+        );
+    }
+
+    /// With affinity, every connection from one client lands on one backend —
+    /// and two different clients still spread.
+    #[test]
+    fn with_affinity_one_client_is_one_backend() {
+        let service = ServiceValue::new(0, 4).with_client_affinity(true);
+        assert!(service.has_client_affinity());
+
+        let client = [10, 0, 0, 7];
+        let chosen: std::collections::BTreeSet<u32> = (40000u16..40040)
+            .map(|port| select_backend(session_hash(client, service.hash_port(port), 6), 4))
+            .collect();
+        assert_eq!(chosen.len(), 1, "a client was spread across {chosen:?}");
+
+        // Not one backend for everybody: a hash that ignored the address as
+        // well would pass the assertion above and be useless.
+        let others: std::collections::BTreeSet<u32> = (1u8..40)
+            .map(|host| select_backend(session_hash([10, 0, 0, host], 0, 6), 4))
+            .collect();
+        assert!(
+            others.len() > 1,
+            "every client landed on one backend: {others:?}"
+        );
+    }
+
+    /// The flag is off unless it is asked for, and can be taken off again —
+    /// a service that stops needing affinity must be able to stop having it.
+    #[test]
+    fn affinity_is_off_by_default_and_can_be_turned_off_again() {
+        let plain = ServiceValue::new(0, 2);
+        assert!(!plain.has_client_affinity());
+        assert_eq!(plain.hash_port(1234), 1234);
+
+        let on = plain.with_client_affinity(true);
+        assert_eq!(on.hash_port(1234), 0);
+        assert!(!on.with_client_affinity(false).has_client_affinity());
+    }
+
+    /// Affinity is orthogonal to how flows are tracked: turning it on must not
+    /// disturb the router-NAT bit, which decides which conntrack namespace a
+    /// service lives in.
+    #[test]
+    fn affinity_leaves_the_tracking_namespace_alone() {
+        let router = ServiceValue::new_router_nat(0, 2, 9).with_client_affinity(true);
+        assert!(router.is_router_nat());
+        assert!(router.has_client_affinity());
+        assert_eq!(router.reply_policy, 9);
     }
 }

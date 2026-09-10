@@ -418,9 +418,20 @@ enum OrchAction {
         /// `tcp` (default) or `udp`.
         #[arg(long, default_value = "tcp")]
         proto: String,
-        /// A pool member as `port-id` or `port-id:backend-port`, repeatable.
+        /// A pool member as `port-id`, `port-id:backend-port`, or either with
+        /// `:draining` appended — take no new connections there and let the
+        /// ones it has finish. Repeatable.
         #[arg(long = "member")]
         member: Vec<String>,
+        /// Send every connection from one client address to the same backend.
+        ///
+        /// Off by default, which is the even spread: one client's four
+        /// connections reach four backends. Turn it on for a service that
+        /// keeps something per client between connections. The cost is that
+        /// one client is one backend, so a pool fronting few busy clients
+        /// spreads worse.
+        #[arg(long)]
+        client_affinity: bool,
     },
     /// Remove a load-balanced service by id.
     RemoveLoadBalancer {
@@ -1236,8 +1247,10 @@ pub(crate) fn raft_load_balancer_spec(s: LoadBalancerSpec) -> velstra_raft::Load
             .map(|m| velstra_raft::LbMemberSpec {
                 port_id: m.port_id,
                 port: m.port as u16,
+                draining: m.draining,
             })
             .collect(),
+        client_affinity: s.client_affinity,
     }
 }
 
@@ -1256,8 +1269,10 @@ fn lb_to_spec(lb: &velstra_orchestrator::LoadBalancer) -> LoadBalancerSpec {
             .map(|m| LbMember {
                 port_id: m.port_id.clone(),
                 port: m.port as u32,
+                draining: m.draining,
             })
             .collect(),
+        client_affinity: lb.client_affinity,
     }
 }
 
@@ -2921,6 +2936,7 @@ async fn orch(args: OrchArgs) -> Result<()> {
             port,
             proto,
             member,
+            client_affinity,
         } => {
             let proto = match proto.as_str() {
                 "tcp" => Proto::Tcp,
@@ -2929,19 +2945,26 @@ async fn orch(args: OrchArgs) -> Result<()> {
             };
             let mut members = Vec::with_capacity(member.len());
             for m in &member {
-                // `port-id:backend-port`, or a bare port id to keep the client's
-                // original destination port.
+                // `port-id[:backend-port][:draining]`, or a bare port id to
+                // keep the client's original destination port. The suffix is a
+                // word rather than a flag because it belongs to *one* member,
+                // and a flag would have to say which.
+                let (m, draining) = match m.strip_suffix(":draining") {
+                    Some(rest) => (rest, true),
+                    None => (m.as_str(), false),
+                };
                 let (port_id, backend) = match m.split_once(':') {
                     Some((p, b)) => (
                         p,
                         b.parse::<u16>()
                             .map_err(|_| anyhow!("bad backend port in member {m:?}"))?,
                     ),
-                    None => (m.as_str(), 0),
+                    None => (m, 0),
                 };
                 members.push(LbMember {
                     port_id: port_id.to_string(),
                     port: backend as u32,
+                    draining,
                 });
             }
             client
@@ -2952,6 +2975,7 @@ async fn orch(args: OrchArgs) -> Result<()> {
                     port: port as u32,
                     proto: proto as i32,
                     members,
+                    client_affinity,
                 })
                 .await?;
             println!("added load balancer {id:?} ({vip}:{port})");

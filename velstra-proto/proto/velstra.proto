@@ -296,6 +296,9 @@ message LbMember {
   string port_id = 1;
   // Backend port, or 0 to keep the client's original destination port.
   uint32 port = 2;
+  // Take no new connections and let the ones it has finish. See
+  // `Backend.draining`.
+  bool draining = 3;
 }
 
 // A load-balanced virtual service (D2 LBaaS).
@@ -310,6 +313,9 @@ message LoadBalancerSpec {
   Proto proto = 5;
   // The backend pool. May be empty — a drained pool is a legitimate state.
   repeated LbMember members = 6;
+  // Send every connection from one client address to the same backend. See
+  // `Service.client_affinity`.
+  bool client_affinity = 7;
 }
 
 message RemoveLoadBalancerRequest {
@@ -837,11 +843,24 @@ message Service {
   // which only the config layer can know. Clears that reply through a
   // deny-by-default internal zone. Meaningful only with router_nat; 0 = not derived.
   uint32 reply_policy = 7;
+  // Send every connection from one client address to the same backend, rather
+  // than spreading each connection on its own. For a service that keeps
+  // something per client between connections — a session in memory, an upload
+  // in pieces, a cache only warm where it was filled. The cost: one client is
+  // one backend, so a pool fronting few busy clients spreads worse, and a
+  // client behind a large NAT is one address and so one client.
+  bool client_affinity = 8;
 }
 
 message Backend {
   string ip = 1;
   uint32 port = 2; // 0 = keep the client's original destination port
+  // Take no new connections here and let the ones it has finish — the state a
+  // backend is in while it is being taken out of service. It is left out of
+  // the window new flows are chosen from; an established flow is answered from
+  // conntrack, which holds the backend's address rather than its place in the
+  // pool, so it keeps arriving until the client is done.
+  bool draining = 3;
 }
 
 // A node's statistics snapshot.

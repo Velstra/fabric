@@ -310,6 +310,42 @@ backends = [
 ]
 ```
 
+**Taking a backend out.** Mark a member `draining = true` and it stops
+receiving *new* connections while the ones it has finish:
+
+```toml
+backends = [
+  { ip = "10.0.0.7", port = 8080 },
+  { ip = "10.0.0.8", port = 8080, draining = true },  # finishing up
+]
+```
+
+New flows are chosen from the live members only; an established flow is
+answered from conntrack, which holds the backend's address rather than its
+place in the pool, so it keeps arriving until the client is done. Without this,
+taking a machine out means removing it, and every connection it was serving is
+cut mid-request. A pool where *every* member is draining is a state, not an
+error: the service answers nothing new while it finishes.
+
+**Keeping a client on one backend.** By default one client's four connections
+reach four backends — the even spread, and the right answer unless the service
+keeps something per client *between* connections (a session in memory, an
+upload assembled in pieces, a cache only warm where it was filled). For those,
+`client_affinity = true`:
+
+```toml
+[[service]]
+vip = "10.0.0.100"
+port = 80
+proto = "tcp"
+client_affinity = true
+```
+
+The hash then depends on the client's address alone. The cost is worth saying
+plainly: one client is one backend, so a pool fronting few busy clients spreads
+worse, and a client behind a large NAT arrives as one address and is treated as
+one client.
+
 Each new flow's *source* is hashed to a backend ([FNV-1a]) and recorded in a
 `CONNTRACK` LRU map. The destination IP/port are DNAT-rewritten and the IPv4
 **and** TCP/UDP checksums (incl. the pseudo-header) are repaired incrementally

@@ -230,11 +230,13 @@ pub fn file_config_to_proto(cfg: &FileConfig, version: u64) -> proto::NodeConfig
                     .map(|b| proto::Backend {
                         ip: b.ip.clone(),
                         port: u32::from(b.port.unwrap_or(0)),
+                        draining: b.draining,
                     })
                     .collect(),
                 policy: s.policy,
                 router_nat: s.router_nat,
                 reply_policy: s.reply_policy,
+                client_affinity: s.client_affinity,
             })
             .collect(),
         overlay: cfg.overlay.as_ref().map(|o| proto::Overlay {
@@ -456,10 +458,12 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
                         } else {
                             Some(b.port as u16)
                         },
+                        draining: b.draining,
                     })
                     .collect(),
                 router_nat: s.router_nat,
                 reply_policy: s.reply_policy,
+                client_affinity: s.client_affinity,
             })
             .collect(),
         // Port-forwards and the SYN proxy are file-config-only (appliance)
@@ -880,10 +884,12 @@ mod tests {
                 backends: vec![proto::Backend {
                     ip: "10.0.1.9".into(),
                     port: 0,
+                    draining: false,
                 }],
                 policy: 0,
                 router_nat: false,
                 reply_policy: 0,
+                client_affinity: false,
             }],
             ..Default::default()
         };

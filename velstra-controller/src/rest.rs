@@ -710,6 +710,8 @@ struct LoadBalancerJson {
     port: u16,
     proto: String,
     members: Vec<LbMemberJson>,
+    /// Every connection from one client address goes to the same backend.
+    client_affinity: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -718,6 +720,9 @@ struct LbMemberJson {
     /// Backend port, or 0 to keep the client's original destination port.
     #[serde(default)]
     port: u16,
+    /// Take no new connections here; let the ones it has finish.
+    #[serde(default)]
+    draining: bool,
 }
 
 impl From<&LoadBalancer> for LoadBalancerJson {
@@ -734,8 +739,10 @@ impl From<&LoadBalancer> for LoadBalancerJson {
                 .map(|m| LbMemberJson {
                     port_id: m.port_id.clone(),
                     port: m.port,
+                    draining: m.draining,
                 })
                 .collect(),
+            client_affinity: lb.client_affinity,
         }
     }
 }
@@ -750,6 +757,10 @@ struct CreateLoadBalancerReq {
     proto: String,
     #[serde(default)]
     members: Vec<LbMemberJson>,
+    /// Send every connection from one client address to the same backend.
+    /// Default off, which is the even spread.
+    #[serde(default)]
+    client_affinity: bool,
 }
 
 fn default_lb_proto() -> String {
@@ -1662,8 +1673,10 @@ async fn create_load_balancer(
             .map(|m| ProtoLbMember {
                 port_id: m.port_id,
                 port: m.port as u32,
+                draining: m.draining,
             })
             .collect(),
+        client_affinity: body.client_affinity,
     };
     propose_audited(
         &state,

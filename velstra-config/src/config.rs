@@ -294,6 +294,19 @@ pub struct BackendCfg {
     /// Backend port, or omitted to keep the packet's original destination port.
     #[serde(default)]
     pub port: Option<u16>,
+    /// Take no *new* connections here, and let the ones it has finish.
+    ///
+    /// The state a backend is in while it is being taken out of service. It
+    /// is left out of the window new flows are chosen from, and nothing else
+    /// changes: an established flow is answered from conntrack, which holds
+    /// the backend's address rather than its place in the pool, so it keeps
+    /// arriving until the client is done.
+    ///
+    /// Without this, taking a machine out means removing it — and every
+    /// connection it was serving is cut mid-request. With it, the operator
+    /// waits instead of apologising.
+    #[serde(default)]
+    pub draining: bool,
 }
 
 /// A Phase 3 load-balancer service: a virtual endpoint fronting a backend pool.
@@ -313,6 +326,19 @@ pub struct ServiceCfg {
     pub proto: ProtoName,
     /// The pool of backends to spread connections across.
     pub backends: Vec<BackendCfg>,
+    /// Send every connection from one client address to the same backend.
+    ///
+    /// Off by default, which is the even spread: one client's four connections
+    /// reach four backends, and a backend that dies takes a quarter of that
+    /// client's work rather than all of it. Turn it on for a service that
+    /// keeps something per client between connections — a session in memory,
+    /// an upload assembled in pieces, a cache only warm where it was filled.
+    ///
+    /// The cost is real and worth saying: one client is one backend, so a pool
+    /// fronting few busy clients spreads worse, and a client behind a large
+    /// NAT arrives as one address and is treated as one client.
+    #[serde(default)]
+    pub client_affinity: bool,
     /// Track this service's flows in the policy-independent (router-NAT)
     /// namespace instead of the ingress policy's.
     ///
@@ -984,13 +1010,18 @@ pub struct ResolvedConntrackSync {
 pub struct ResolvedService {
     /// The `(VIP, port, proto)` lookup key.
     pub key: ServiceKey,
-    /// The backend pool (at least one entry).
+    /// The backend pool, live members first (at least one entry).
     pub backends: Vec<Backend>,
+    /// How many of `backends` are live — the prefix new flows are chosen from.
+    /// The rest are draining: they keep what they have and take nothing new.
+    pub live: usize,
     /// Track flows in the policy-independent namespace, for a pool reached from
     /// another zone than the VIP. See [`ServiceCfg::router_nat`].
     pub router_nat: bool,
     /// Policy a backend's reply arrives under; `0` ⇒ not derived.
     pub reply_policy: PolicyId,
+    /// Bind a client address to one backend. See [`ServiceCfg::client_affinity`].
+    pub client_affinity: bool,
 }
 
 /// A resolved forwarding rule. The egress interface is kept as a name here and
@@ -1948,19 +1979,40 @@ impl FileConfig {
             if service.backends.is_empty() {
                 bail!("service {}:{} has no backends", service.vip, service.port);
             }
+            // Live members first, draining ones after them. The data plane
+            // chooses from a window that starts at the front, so ordering is
+            // the whole of what draining does: a draining backend is simply
+            // outside the window new flows are picked from. Its established
+            // flows are unaffected — conntrack holds the backend's address,
+            // not its place in the pool.
             let mut backends = Vec::with_capacity(service.backends.len());
+            let mut draining = Vec::new();
             for backend in &service.backends {
                 let ip: Ipv4Addr = backend
                     .ip
                     .parse()
                     .map_err(|_| anyhow::anyhow!("invalid backend ip {:?}", backend.ip))?;
-                backends.push(Backend::new(ip.octets(), backend.port.unwrap_or(0)));
+                let resolved = Backend::new(ip.octets(), backend.port.unwrap_or(0));
+                if backend.draining {
+                    draining.push(resolved);
+                } else {
+                    backends.push(resolved);
+                }
             }
+            // Every member draining is a legitimate state and not an error: it
+            // is what a pool looks like halfway through being moved, and the
+            // service answering nothing new while it finishes is exactly what
+            // was asked for. `backend_count == 0` is already the data plane's
+            // "no backend" path.
+            let live = backends.len();
+            backends.extend(draining);
             services.push(ResolvedService {
                 key: ServiceKey::new(service.policy, vip.octets(), service.port, proto),
                 backends,
+                live,
                 router_nat: service.router_nat,
                 reply_policy: service.reply_policy,
+                client_affinity: service.client_affinity,
             });
         }
 
@@ -3616,6 +3668,94 @@ mod tests {
         assert_eq!(svc.backends.len(), 2);
         assert_eq!(svc.backends[0].port, 8080);
         assert_eq!(svc.backends[1].port, 0); // omitted -> keep original
+    }
+
+    /// A draining member keeps its place in the pool and loses its place in
+    /// the *window*: the data plane picks new flows from the live prefix, so
+    /// nothing new is sent there while conntrack keeps what it has arriving.
+    #[test]
+    fn a_draining_backend_leaves_the_window_new_flows_are_picked_from() {
+        let toml = r#"
+            [[service]]
+            vip = "10.0.0.100"
+            port = 80
+            proto = "tcp"
+            backends = [
+                { ip = "10.0.0.7" },
+                { ip = "10.0.0.8", draining = true },
+                { ip = "10.0.0.9" },
+            ]
+        "#;
+        let cfg = toml::from_str::<FileConfig>(toml)
+            .unwrap()
+            .resolve()
+            .unwrap();
+        let svc = &cfg.services[0];
+        // All three are still there — the draining one is not thrown away.
+        assert_eq!(svc.backends.len(), 3);
+        // Two are live, and they are the two at the front.
+        assert_eq!(svc.live, 2);
+        assert_eq!(svc.backends[0].ip, [10, 0, 0, 7]);
+        assert_eq!(svc.backends[1].ip, [10, 0, 0, 9]);
+        // The draining one sits past the window.
+        assert_eq!(svc.backends[2].ip, [10, 0, 0, 8]);
+    }
+
+    /// Every member draining is a state, not an error: it is what a pool looks
+    /// like halfway through being moved. The service then answers nothing new,
+    /// which is exactly what was asked for.
+    #[test]
+    fn a_pool_that_is_entirely_draining_is_accepted_and_serves_nothing_new() {
+        let toml = r#"
+            [[service]]
+            vip = "10.0.0.100"
+            port = 80
+            proto = "tcp"
+            backends = [{ ip = "10.0.0.7", draining = true }]
+        "#;
+        let cfg = toml::from_str::<FileConfig>(toml)
+            .unwrap()
+            .resolve()
+            .unwrap();
+        assert_eq!(cfg.services[0].live, 0);
+        assert_eq!(cfg.services[0].backends.len(), 1);
+    }
+
+    /// A pool with nobody draining is every member live, in the order written.
+    #[test]
+    fn a_pool_with_nobody_draining_keeps_its_order() {
+        let toml = r#"
+            [[service]]
+            vip = "10.0.0.100"
+            port = 80
+            proto = "tcp"
+            backends = [{ ip = "10.0.0.7" }, { ip = "10.0.0.8" }]
+        "#;
+        let cfg = toml::from_str::<FileConfig>(toml)
+            .unwrap()
+            .resolve()
+            .unwrap();
+        let svc = &cfg.services[0];
+        assert_eq!(svc.live, 2);
+        assert_eq!(svc.backends[0].ip, [10, 0, 0, 7]);
+        assert!(!svc.client_affinity);
+    }
+
+    #[test]
+    fn a_service_can_ask_that_a_client_stays_on_one_backend() {
+        let toml = r#"
+            [[service]]
+            vip = "10.0.0.100"
+            port = 80
+            proto = "tcp"
+            client_affinity = true
+            backends = [{ ip = "10.0.0.7" }]
+        "#;
+        let cfg = toml::from_str::<FileConfig>(toml)
+            .unwrap()
+            .resolve()
+            .unwrap();
+        assert!(cfg.services[0].client_affinity);
     }
 
     #[test]

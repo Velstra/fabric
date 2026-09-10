@@ -165,10 +165,12 @@ async fn controller_serves_and_updates_config() {
             backends: vec![velstra_proto::Backend {
                 ip: "10.9.9.9".into(),
                 port: 8443,
+                draining: false,
             }],
             policy: 0,
             router_nat: false,
             reply_policy: 0,
+            client_affinity: false,
         }],
         ..Default::default()
     };
