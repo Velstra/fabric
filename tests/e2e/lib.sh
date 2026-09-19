@@ -88,7 +88,9 @@ agent_start() {
   shift
   [ "$1" = "--" ] && shift
   local log="$WORKDIR/agent-${ns}-$RANDOM.log"
-  nse "$ns" "$BIN" run --xdp-mode skb --stats-interval 1 "$@" >"$log" 2>&1 &
+  # Launch the executable directly: a background shell function leaves its
+  # child alive when cleanup kills the function's subshell PID.
+  ip netns exec "$ns" "$BIN" run --xdp-mode "${VELSTRA_E2E_XDP_MODE:-skb}" --stats-interval 1 "$@" >"$log" 2>&1 &
   local pid=$!
   _AGENTS+=("$pid")
   LAST_LOG="$log"

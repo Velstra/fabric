@@ -47,7 +47,7 @@ orch() { nse h1 "$CTL" orch --endpoint "$ADMIN" "$@"; }
 
 controller_start() {
   local log="$WORKDIR/controller.log" i
-  nse h1 "$CTL" serve --node-id 1 --bootstrap \
+  ip netns exec h1 "$CTL" serve --node-id 1 --bootstrap \
     --listen "$CTL_ADDR:50051" --admin-listen "$CTL_ADDR:50052" \
     --raft-listen "$CTL_ADDR:50053" >"$log" 2>&1 &
   _AGENTS+=("$!")
@@ -87,6 +87,7 @@ main() {
   require_root
   require_bin
   require_ctl
+  have python3 || { echo "python3 is required to inspect the received frame" >&2; exit 1; }
 
   section "B9 — SRv6 driven by the controller, end to end"
 
@@ -102,10 +103,12 @@ main() {
 
   controller_start || { bad "controller start"; return; }
 
+  # Native XDP is required on these veth peers: generic XDP deliberately
+  # skips TC-redirected skbs, unlike packets received from a physical NIC.
   # Each agent registers ITSELF, the way a cloud node agent does: the wire
   # family follows the locator, and the underlay MAC is read from the interface
   # rather than repeated by hand.
-  agent_start h2 -- --iface under0 --node-id n2 \
+  VELSTRA_E2E_XDP_MODE=driver agent_start h2 -- --iface under0 --node-id n2 \
     --underlay-iface under0 --vtep-ip 10.99.0.2 \
     --encap srv6 --srv6-locator "$LOC2" \
     --controller "$CONTROL" --orchestrator "$ADMIN" \
@@ -153,11 +156,17 @@ main() {
   settle 3
 
   section "  unicast — the derived End.DT2U SID"
-  # The workload addresses the remote port's MAC at L2 without ARPing for it, so
-  # the SRv6 FDB is the only thing that can resolve the destination. That entry
-  # was written by the controller, from n2's locator.
-  nse vm ip neigh replace 192.168.100.11 lladdr "$remote_mac" dev tap0c
+  # Start with an empty neighbor cache, as a newly booted tenant does. The
+  # agent must answer ARP from the controller's neighbor table even though
+  # SRv6 disables the UDP overlay configuration. A static neighbor here hid
+  # that regression while the encapsulation-only assertions kept passing.
+  nse vm ip neigh flush dev tap0c
   nse vm ping -c3 -W1 192.168.100.11 >/dev/null 2>&1 || true
+  if nse vm ip neigh show 192.168.100.11 dev tap0c | grep -q "lladdr $remote_mac"; then
+    ok "SRv6 resolves the remote tenant's MAC without a static neighbor"
+  else
+    bad "SRv6 failed to answer the tenant's ARP request"
+  fi
   settle 3
   assert_ge "$log1" srv6_encap 1 "n1 encapsulated toward the derived SID"
   assert_ge "$log2" srv6_decap 1 "n2 decapsulated it — the two ends agree"
@@ -168,7 +177,35 @@ main() {
   # derived, and n2 instantiates it because it serves the segment.
   local decap_before
   decap_before="$(counter "$log2" srv6_decap)"
+  # Inspect the decapsulated frame, not only the counter. Inserting room
+  # after Ethernet and then overwriting that header used to produce zeroed
+  # inner MACs, even when the outer tunnel packet looked valid.
+  nse h2 python3 - >"$WORKDIR/received-arp.log" 2>&1 <<'PYARP' &
+import socket, time
+sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
+sock.bind(("under0", 0))
+sock.settimeout(8)
+end = time.monotonic() + 8
+while time.monotonic() < end:
+    frame = sock.recv(65535)
+    if len(frame) >= 42 and frame[38:42] == socket.inet_aton("192.168.100.99"):
+        assert frame[:6] == bytes.fromhex("ffffffffffff")
+        assert frame[12:14] == bytes.fromhex("0806")
+        assert frame[20:22] == bytes.fromhex("0001")
+        assert frame[28:32] == socket.inet_aton("192.168.100.10")
+        print("complete tenant ARP frame received")
+        raise SystemExit(0)
+raise SystemExit("tenant ARP frame was not received")
+PYARP
+  local capture_pid=$!
+  settle 1
   nse vm ping -c3 -W1 192.168.100.99 >/dev/null 2>&1 || true
+  if wait "$capture_pid"; then
+    ok "broadcast preserves the complete inner Ethernet and ARP frame"
+  else
+    bad "broadcast corrupted or lost the tenant frame"
+    cat "$WORKDIR/received-arp.log"
+  fi
   settle 4
   assert_ge "$log1" srv6_bum_replicated 1 "n1 head-end replicated the broadcast"
   assert_ge "$log2" srv6_decap "$((decap_before + 1))" \
