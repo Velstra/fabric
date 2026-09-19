@@ -50,11 +50,11 @@
 use aya_ebpf::{
     bindings::{
         BPF_F_PSEUDO_HDR, BPF_FIB_LKUP_RET_FWD_DISABLED, BPF_FIB_LKUP_RET_NO_NEIGH,
-        BPF_FIB_LKUP_RET_SUCCESS, TC_ACT_OK, TC_ACT_SHOT, bpf_adj_room_mode::BPF_ADJ_ROOM_MAC,
-        bpf_fib_lookup, xdp_action,
+        BPF_FIB_LKUP_RET_SUCCESS, TC_ACT_OK, TC_ACT_SHOT, bpf_fib_lookup, xdp_action,
     },
     helpers::{
-        bpf_fib_lookup as fib_lookup, bpf_ktime_get_ns, bpf_xdp_adjust_head, bpf_xdp_adjust_tail,
+        bpf_fib_lookup as fib_lookup, bpf_ktime_get_ns, bpf_skb_change_tail, bpf_skb_load_bytes,
+        bpf_skb_store_bytes, bpf_xdp_adjust_head, bpf_xdp_adjust_tail,
     },
     macros::{classifier, map, xdp},
     maps::{Array, DevMap, HashMap, LpmTrie, LruHashMap, PerCpuArray, ProgramArray, lpm_trie::Key},
@@ -626,6 +626,24 @@ static FLOOD_LIST: HashMap<u32, FloodSet> = HashMap::with_max_entries(4096, 0);
 #[map]
 static LOCAL_MACS: LruHashMap<LocalMacKey, LocalMac> = LruHashMap::with_max_entries(8192, 0);
 
+/// Controller-bound destinations must work before a guest emits its first
+/// packet, including immediately after an agent restart. Keep them separate
+/// from learned entries so aging and EVPN learning cannot remove a binding.
+#[map]
+static LOCAL_PORTS: HashMap<LocalMacKey, u32> = HashMap::with_max_entries(8192, 0);
+
+#[inline(always)]
+fn local_destination(vni: u32, mac: [u8; 6]) -> u32 {
+    let key = LocalMacKey::new(vni, mac);
+    unsafe {
+        LOCAL_PORTS
+            .get(&key)
+            .copied()
+            .or_else(|| LOCAL_MACS.get(&key).map(|local| local.ifindex))
+            .unwrap_or(0)
+    }
+}
+
 /// Phase 4 **trusted VTEP set** (C2): the outer source IPv4 (network order) of
 /// every remote peer VTEP this host tunnels with. A UDP datagram on the tunnel
 /// port is only decapsulated when its outer source is in this set **and** its
@@ -897,43 +915,61 @@ pub fn velstra_egress(ctx: TcContext) -> i32 {
 // delivered locally. (`velstra_egress` is the wrong seam — it is TC *egress*,
 // the delivery-*to*-the-VM direction, and it filters, it does not replicate.)
 //
-// REPLICATION APPROACH (grow-once + full re-store per clone):
-//
-//   1. Grow skb headroom **once** with `adjust_room(+OVERLAY_OUTER_LEN,
-//      BPF_ADJ_ROOM_MAC, 0)` on the first copy.
-//   2. For each flood VTEP, `build_encap` (the same pure builder XDP uses)
-//      produces the full 50-byte outer stack **with that VTEP's already-correct
-//      IPv4 checksum**, so we simply `store()` the whole header at offset 0 —
-//      no per-field `l3_csum_replace` patching is needed (simpler and clearer
-//      than diffing the dst IP/MAC between iterations, and the checksum is never
-//      wrong).
-//   3. `clone_redirect(ep.out_ifindex, 0)` sends that copy; the ORIGINAL skb is
-//      untouched by the clone.
-//   4. After the loop, `adjust_room(-OVERLAY_OUTER_LEN, …)` removes the outer
-//      stack again so the original continues to local delivery unmodified.
-//
-// The loop bound is the CONSTANT `MAX_FLOOD_VTEPS` with an early `break` at
-// `flood.count`, so the verifier can bound it; `flood.vteps.get(i)` avoids any
-// panic/bounds-check path.
-//
-// !!! LOAD-VERIFICATION CAVEAT (B2 TODO(load-iterate)) !!!
-// This datapath is COMPILE-verified only; it has NOT been kernel-load / verifier
-// validated in this environment (that needs root + a live tap/underlay). The
-// user will iterate it under load. Specifically unverified:
-//   * exact `BPF_ADJ_ROOM_MAC` byte-insertion semantics (does the +room open at
-//     offset 0 for a fresh outer L2, and does the store land where intended?);
-//   * whether the verifier accepts `store` after `adjust_room` without a
-//     `pull_data`/re-check of `data`..`data_end`;
-//   * `clone_redirect` interaction with the subsequent room-shrink on the
-//     original;
-//   * outer UDP entropy (kept coarse below — a BUM frame carries no L4 flow).
-// If the verifier rejects a step, that step is where to iterate; the control
-// plane (FLOOD_LIST, VTEP_PEERS, TX_PORTS, attach) is already complete.
+// Replication saves the complete inner frame in per-CPU memory, grows the skb
+// at its tail, and writes each outer header plus the saved inner frame. After
+// cloning, the original bytes and length are restored for local delivery.
+// `adjust_room(MAC)` is unsuitable here: it refuses ARP and inserts room AFTER
+// the original Ethernet header, which a store at offset zero then destroys.
+// Only BUM traffic takes this copy path; known unicast remains on XDP.
+
+/// Full Ethernet frame, including jumbo frames up to 16 KiB. Per-CPU
+/// values must stay below the kernel allocator's 32 KiB ceiling. Known
+/// unicast does not use this buffer.
+#[map]
+static BUM_FRAME: PerCpuArray<[u8; 16384]> = PerCpuArray::with_max_entries(1, 0);
+
+#[inline(always)]
+fn save_bum_frame(ctx: &TcContext, len: u32) -> Result<*mut [u8; 16384], ()> {
+    if len < EthHdr::LEN as u32 || len > 16384 {
+        return Err(());
+    }
+    let frame = BUM_FRAME.get_ptr_mut(0).ok_or(())?;
+    // SAFETY: frame is this CPU's map value; len is bounded by its capacity.
+    if unsafe { bpf_skb_load_bytes(ctx.skb.skb.cast(), 0, frame.cast(), len) } != 0 {
+        return Err(());
+    }
+    Ok(frame)
+}
+
+#[inline(always)]
+fn grow_bum_frame(ctx: &TcContext, frame: *mut [u8; 16384], len: u32, outer: u32) -> bool {
+    // change_tail supports non-IP Ethernet frames, including ARP. The saved
+    // bytes include the inner Ethernet header and any padding.
+    if unsafe { bpf_skb_change_tail(ctx.skb.skb, len + outer, 0) } != 0 {
+        return false;
+    }
+    if unsafe { bpf_skb_store_bytes(ctx.skb.skb.cast(), outer, frame.cast(), len, 0) } != 0 {
+        return false;
+    }
+    true
+}
+
+#[inline(always)]
+fn restore_bum_frame(ctx: &TcContext, frame: *mut [u8; 16384], len: u32) -> i32 {
+    // Never release a partially restored tunnel packet into the tenant bridge.
+    if unsafe { bpf_skb_store_bytes(ctx.skb.skb.cast(), 0, frame.cast(), len, 0) } != 0
+        || unsafe { bpf_skb_change_tail(ctx.skb.skb, len, 0) } != 0
+    {
+        return TC_ACT_SHOT as i32;
+    }
+    TC_ACT_OK as i32
+}
 
 /// TC **ingress** entry point for B2 BUM head-end replication. Attached on
 /// tenant taps (`clsact` ingress). Delegates to [`try_bum`]; any parse/helper
 /// failure fails open (`TC_ACT_OK`) so a BUM frame is never black-holed here —
-/// worst case it just isn't replicated.
+/// worst case it just isn't replicated. A failed restoration drops the packet
+/// rather than leaking a partially rewritten frame into the local segment.
 #[classifier]
 pub fn velstra_bum(ctx: TcContext) -> i32 {
     match try_bum(&ctx) {
@@ -944,8 +980,8 @@ pub fn velstra_bum(ctx: TcContext) -> i32 {
 
 /// Head-end replicate a tenant BUM frame to every remote VTEP in its VNI's
 /// flood set. See the module-level block above for the design and the
-/// load-verification caveat. Always returns `TC_ACT_OK` — the clones are extra
-/// copies; the original frame is left for normal local delivery.
+/// replication notes. Clones are extra copies; the original frame is restored
+/// for local delivery, or dropped if that restoration fails.
 #[inline(always)]
 fn try_bum(ctx: &TcContext) -> Result<i32, ()> {
     // Ingress VNI is the tap's segment — the same `IFACE_VNI` map the XDP encap
@@ -1010,7 +1046,11 @@ fn bum_vxlan(ctx: &TcContext, ocfg: &OverlayConfig, vni: u32, dst_mac: [u8; 6]) 
     // The inner frame length (whole L2 frame becomes the tunnel payload), read
     // BEFORE any room grow. Drop-silently (leave for local delivery) if encap
     // would exceed the underlay MTU — mirrors the XDP encap MTU guard.
-    let inner_len = (ctx.data_end() - ctx.data()) as u16;
+    let frame_len = ctx.len();
+    if frame_len > 16384 {
+        return Ok(TC_ACT_OK as i32);
+    }
+    let inner_len = frame_len as u16;
     if inner_len > ocfg.max_inner_len() {
         return Ok(TC_ACT_OK as i32);
     }
@@ -1019,6 +1059,7 @@ fn bum_vxlan(ctx: &TcContext, ocfg: &OverlayConfig, vni: u32, dst_mac: [u8; 6]) 
     // ECMP distribution matters for flood traffic.
     let entropy = vni ^ ((dst_mac[4] as u32) << 8) ^ (dst_mac[5] as u32);
 
+    let frame = save_bum_frame(ctx, frame_len)?;
     let mut grown = false;
     let mut i: usize = 0;
     while i < MAX_FLOOD_VTEPS {
@@ -1034,14 +1075,10 @@ fn bum_vxlan(ctx: &TcContext, ocfg: &OverlayConfig, vni: u32, dst_mac: [u8; 6]) 
         // Build this VTEP's full outer stack (correct checksum included).
         let encap = build_encap(ocfg, &ep, vni, inner_len, entropy);
 
-        // Grow the headroom exactly once, on the first copy.
+        // Make room exactly once, on the first copy.
         if !grown {
-            if ctx
-                .adjust_room(OVERLAY_OUTER_LEN as i32, BPF_ADJ_ROOM_MAC, 0)
-                .is_err()
-            {
-                // Could not make room — abandon replication, deliver locally.
-                return Ok(TC_ACT_OK as i32);
+            if !grow_bum_frame(ctx, frame, frame_len, OVERLAY_OUTER_LEN as u32) {
+                return Ok(restore_bum_frame(ctx, frame, frame_len));
             }
             grown = true;
         }
@@ -1057,10 +1094,9 @@ fn bum_vxlan(ctx: &TcContext, ocfg: &OverlayConfig, vni: u32, dst_mac: [u8; 6]) 
         i += 1;
     }
 
-    // Remove the outer stack we prepended so the ORIGINAL frame is delivered
-    // locally unchanged (clone_redirect did not consume it).
+    // Restore the original bytes and length for local delivery.
     if grown {
-        let _ = ctx.adjust_room(-(OVERLAY_OUTER_LEN as i32), BPF_ADJ_ROOM_MAC, 0);
+        return Ok(restore_bum_frame(ctx, frame, frame_len));
     }
 
     Ok(TC_ACT_OK as i32)
@@ -1106,7 +1142,11 @@ fn bum_srv6(ctx: &TcContext, scfg: &Srv6Config, vni: u32, dst_mac: [u8; 6]) -> R
     // The inner frame length (whole L2 frame becomes the tunnel payload), read
     // BEFORE any room grow. Leave for local delivery if encap would exceed the
     // underlay MTU — mirrors the XDP encap MTU guard.
-    let inner_len = (ctx.data_end() - ctx.data()) as u16;
+    let frame_len = ctx.len();
+    if frame_len > 16384 {
+        return Ok(TC_ACT_OK as i32);
+    }
+    let inner_len = frame_len as u16;
     if inner_len > scfg.max_inner_len() {
         return Ok(TC_ACT_OK as i32);
     }
@@ -1115,6 +1155,7 @@ fn bum_srv6(ctx: &TcContext, scfg: &Srv6Config, vni: u32, dst_mac: [u8; 6]) -> R
     // accepts for the same reason.
     let entropy = vni ^ ((dst_mac[4] as u32) << 8) ^ (dst_mac[5] as u32);
 
+    let frame = save_bum_frame(ctx, frame_len)?;
     let mut grown = false;
     let mut i: usize = 0;
     while i < MAX_FLOOD_VTEPS {
@@ -1131,14 +1172,10 @@ fn bum_srv6(ctx: &TcContext, scfg: &Srv6Config, vni: u32, dst_mac: [u8; 6]) -> R
         // unlike the VXLAN branch there is nothing to repair between copies.
         let encap = build_srv6_encap(&scfg.local_src, &scfg.local_mac, &ep, inner_len, entropy);
 
-        // Grow the headroom exactly once, on the first copy.
+        // Make room exactly once, on the first copy.
         if !grown {
-            if ctx
-                .adjust_room(SRV6_L2_OUTER_LEN as i32, BPF_ADJ_ROOM_MAC, 0)
-                .is_err()
-            {
-                // Could not make room — abandon replication, deliver locally.
-                return Ok(TC_ACT_OK as i32);
+            if !grow_bum_frame(ctx, frame, frame_len, SRV6_L2_OUTER_LEN as u32) {
+                return Ok(restore_bum_frame(ctx, frame, frame_len));
             }
             grown = true;
         }
@@ -1153,10 +1190,9 @@ fn bum_srv6(ctx: &TcContext, scfg: &Srv6Config, vni: u32, dst_mac: [u8; 6]) -> R
         i += 1;
     }
 
-    // Remove the outer stack we prepended so the ORIGINAL frame is delivered
-    // locally unchanged (clone_redirect did not consume it).
+    // Restore the original bytes and length for local delivery.
     if grown {
-        let _ = ctx.adjust_room(-(SRV6_L2_OUTER_LEN as i32), BPF_ADJ_ROOM_MAC, 0);
+        return Ok(restore_bum_frame(ctx, frame, frame_len));
     }
 
     Ok(TC_ACT_OK as i32)
@@ -1866,6 +1902,7 @@ fn port_rate_ok(ctx: &XdpContext) -> bool {
     bucket.take_n(now, frame_len)
 }
 
+#[inline(always)]
 fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     let frame_len = (ctx.data_end() - ctx.data()) as u64;
     bump(Counter::RxPackets);
@@ -2781,7 +2818,9 @@ fn source_is_spoofed(ctx: &XdpContext, meta: &PacketMeta, ifindex: u32, strict: 
 /// `proto`/port fields — its address fields are zero there and unused here. A
 /// BPF function may take at most five arguments, which is exactly what is left
 /// once the header and the context are passed.
-#[inline(never)]
+// Inline the IPv6 check to avoid carrying a second address-heavy frame
+// underneath the main datapath on kernels with a 512-byte combined limit.
+#[inline(always)]
 fn source_is_spoofed_v6(
     ctx: &XdpContext,
     hdr: &[u8; Ipv6Hdr::LEN],
@@ -2883,7 +2922,11 @@ fn fib_says_spoofed(
 /// passed through untouched, preserving normal ARP as a fallback.
 #[inline(always)]
 fn try_arp(ctx: &XdpContext) -> Result<u32, ()> {
-    if !overlay_config().is_enabled() {
+    // The neighbor tables serve both wire formats. SRv6 disables the UDP
+    // overlay configuration, but still needs local ARP/ND answers.
+    if !OVERLAY_CONFIG.get(0).is_some_and(|c| c.is_enabled())
+        && !SRV6_CONFIG.get(0).is_some_and(|c| c.is_enabled())
+    {
         return Ok(xdp_action::XDP_PASS);
     }
     let ifindex = ctx.ingress_ifindex() as u32;
@@ -2951,7 +2994,11 @@ fn try_arp(ctx: &XdpContext) -> Result<u32, ()> {
 /// verifier-simple. A shorter NS (no SLLA option) is passed through untouched.
 #[inline(always)]
 fn try_nd(ctx: &XdpContext) -> Result<Option<u32>, ()> {
-    if !overlay_config().is_enabled() {
+    // The neighbor tables serve both wire formats. SRv6 disables the UDP
+    // overlay configuration, but still needs local ARP/ND answers.
+    if !OVERLAY_CONFIG.get(0).is_some_and(|c| c.is_enabled())
+        && !SRV6_CONFIG.get(0).is_some_and(|c| c.is_enabled())
+    {
         return Ok(None);
     }
     let ifindex = ctx.ingress_ifindex() as u32;
@@ -3133,8 +3180,7 @@ fn try_srv6_decap(ctx: &XdpContext, hdr: &[u8; Ipv6Hdr::LEN]) -> Result<Option<u
     let local_ifindex = unsafe {
         ptr_at::<[u8; 6]>(ctx, SRV6_L2_OUTER_LEN + O_ETH_DST)
             .ok()
-            .and_then(|mac| LOCAL_MACS.get(&LocalMacKey::new(vni, *mac)))
-            .map(|local| local.ifindex)
+            .map(|mac| local_destination(vni, *mac))
             .unwrap_or(0)
     };
     // Strip outer Ethernet (14) + IPv6 (40) = SRV6_L2_OUTER_LEN. The inner frame
@@ -3357,8 +3403,7 @@ fn try_decap(ctx: &XdpContext, ihl_bytes: usize) -> Result<u32, ()> {
     let local_ifindex = unsafe {
         ptr_at::<[u8; 6]>(ctx, delta as usize + O_ETH_DST)
             .ok()
-            .and_then(|mac| LOCAL_MACS.get(&LocalMacKey::new(vni, *mac)))
-            .map(|local| local.ifindex)
+            .map(|mac| local_destination(vni, *mac))
             .unwrap_or(0)
     };
     // SAFETY: `ctx.ctx` is the live `xdp_md`; a positive delta only shrinks the

@@ -2547,6 +2547,30 @@ where
 /// policy is still worth installing, and a port that does not exist cannot be
 /// spoofed from.
 fn program_port_bindings(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Result<()> {
+    // Program known local destinations independently of traffic learning. An
+    // idle guest must remain reachable after this agent replaces its maps.
+    let local: Vec<_> = interfaces
+        .iter()
+        .filter_map(|interface| {
+            let mac = interface.binding.as_ref()?.mac?;
+            if interface.vni == 0 {
+                return None;
+            }
+            let index = if_nametoindex(&interface.name).ok()?;
+            Some((LocalMacKey::new(interface.vni, mac), index))
+        })
+        .collect();
+    {
+        let mut ports: HashMap<_, LocalMacKey, u32> = HashMap::try_from(
+            ebpf.map_mut("LOCAL_PORTS")
+                .ok_or_else(|| anyhow!("LOCAL_PORTS map missing"))?,
+        )?;
+        drop_unlisted(&mut ports, &local.iter().map(|(key, _)| *key).collect())?;
+        for (key, index) in local {
+            ports.insert(key, index, 0)?;
+        }
+    }
+
     let bound: Vec<(u32, &PortIdentity)> = interfaces
         .iter()
         .filter_map(|i| {
