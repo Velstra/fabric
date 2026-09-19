@@ -467,6 +467,26 @@ impl Firewall {
                     .insert(ifindex, vni, 0)
                     .with_context(|| format!("assigning {iface} to vni {vni}"))?;
             }
+            if vni != 0 {
+                let mut local_vnis: HashMap<_, u32, u32> = HashMap::try_from(
+                    self.ebpf
+                        .map_mut("LOCAL_VNIS")
+                        .ok_or_else(|| anyhow!("LOCAL_VNIS map missing"))?,
+                )?;
+                local_vnis
+                    .insert(vni, 0, 0)
+                    .with_context(|| format!("registering local vni {vni}"))?;
+            }
+            {
+                let mut tx_ports: DevMap<_> = DevMap::try_from(
+                    self.ebpf
+                        .map_mut("TX_PORTS")
+                        .ok_or_else(|| anyhow!("TX_PORTS map missing"))?,
+                )?;
+                tx_ports
+                    .set(ifindex, ifindex, None, 0)
+                    .with_context(|| format!("registering local redirect device {iface}"))?;
+            }
         }
         let program: &mut Xdp = self
             .ebpf
@@ -2129,6 +2149,18 @@ fn program_interfaces(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Resu
             iface_vni
                 .insert(ifindex, vni, 0)
                 .with_context(|| format!("assigning ifindex {ifindex} to vni {vni}"))?;
+        }
+    }
+
+    {
+        let mut tx_ports: DevMap<_> = DevMap::try_from(
+            ebpf.map_mut("TX_PORTS")
+                .ok_or_else(|| anyhow!("TX_PORTS map missing"))?,
+        )?;
+        for (ifindex, _, _) in &prepared {
+            tx_ports
+                .set(*ifindex, *ifindex, None, 0)
+                .with_context(|| format!("registering local redirect device {ifindex}"))?;
         }
     }
 
@@ -4009,8 +4041,8 @@ mod every_map_is_reconciled {
         ),
         (
             "TX_PORTS",
-            "a DevMap of redirect targets keyed by ifindex, reachable only from a route the \
-             datapath resolved out of a map that is reconciled",
+            "a DevMap of redirect targets keyed by ifindex, reachable only from a route or local \
+             MAC that the datapath resolved out of a reconciled or kernel-aged map",
         ),
     ];
 

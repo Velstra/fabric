@@ -105,8 +105,9 @@ static IFACE_VNI: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
 /// inbound tunnel frame is only admitted when its inner VNI is present here, so a
 /// (trusted-or-spoofed) peer VTEP cannot inject an inner frame under an arbitrary
 /// VNI into whatever local segment its inner MAC happens to match. The value is a
-/// reserved per-VNI bridge ifindex for a future dedicated-bridge demux (`0` today
-/// ⇒ hand the decapsulated frame to the kernel bridge as before).
+/// reserved per-VNI bridge ifindex for a future dedicated-bridge demux. Known
+/// unicast is delivered directly to a learned local tap; the value remains `0`
+/// today and unknown/BUM traffic falls back to the kernel network stack.
 #[map]
 static LOCAL_VNIS: HashMap<u32, u32> = HashMap::with_max_entries(4096, 0);
 
@@ -3051,13 +3052,13 @@ fn srv6_config() -> Srv6Config {
 
 /// B9 SRv6 **decapsulation** (`End.DT2U`): if the outer IPv6 destination of an
 /// arriving packet is a service SID this node instantiated, strip the outer
-/// Ethernet + IPv6 stack and `XDP_PASS` the inner Ethernet frame to the kernel
-/// bridge (which delivers it by inner MAC).
+/// Ethernet + IPv6 stack and redirect known unicast directly to its local tap.
+/// Unknown/BUM traffic falls back to the kernel network stack.
 ///
 /// Returns `Ok(Some(action))` when it took over the packet, or `Ok(None)` to
 /// fall through (SRv6 disabled / not one of our SIDs / a non-`End.DT2U` SID / a
 /// tenant ingress port).
-#[inline(always)]
+#[inline(never)]
 fn try_srv6_decap(ctx: &XdpContext, hdr: &[u8; Ipv6Hdr::LEN]) -> Result<Option<u32>, ()> {
     // Cheap gate first, reading the enabled flag *through* the map pointer so the
     // 28-byte `Srv6Config` is never copied onto this (already deep) stack frame.
@@ -3082,8 +3083,8 @@ fn try_srv6_decap(ctx: &XdpContext, hdr: &[u8; Ipv6Hdr::LEN]) -> Result<Option<u
     // SAFETY: `hdr` is a live 40-byte array; bytes 24..40 are in bounds, and the
     // byte-array key has alignment 1 so the reinterpret is always well-aligned.
     let key = unsafe { &*(hdr.as_ptr().add(24) as *const Srv6SidKey) };
-    let behavior = match unsafe { SRV6_LOCAL_SIDS.get(key) } {
-        Some(l) => l.behavior,
+    let (vni, behavior) = match unsafe { SRV6_LOCAL_SIDS.get(key) } {
+        Some(l) => (l.vni, l.behavior),
         None => return Ok(None),
     };
     // Both L2 behaviours decapsulate identically *here*: the difference between
@@ -3126,6 +3127,16 @@ fn try_srv6_decap(ctx: &XdpContext, hdr: &[u8; Ipv6Hdr::LEN]) -> Result<Option<u
         bump(Counter::Srv6DropUntrusted);
         return Ok(Some(xdp_action::XDP_DROP));
     }
+    // Copy the learned destination ifindex out before adjust_head invalidates
+    // both packet and map pointers. A miss retains the kernel-stack fallback for
+    // BUM traffic and bridge-based installations.
+    let local_ifindex = unsafe {
+        ptr_at::<[u8; 6]>(ctx, SRV6_L2_OUTER_LEN + O_ETH_DST)
+            .ok()
+            .and_then(|mac| LOCAL_MACS.get(&LocalMacKey::new(vni, *mac)))
+            .map(|local| local.ifindex)
+            .unwrap_or(0)
+    };
     // Strip outer Ethernet (14) + IPv6 (40) = SRV6_L2_OUTER_LEN. The inner frame
     // is an Ethernet frame, left for the kernel bridge to deliver by inner MAC.
     // SAFETY: `ctx.ctx` is the live `xdp_md`; a positive delta only shrinks the
@@ -3135,6 +3146,13 @@ fn try_srv6_decap(ctx: &XdpContext, hdr: &[u8; Ipv6Hdr::LEN]) -> Result<Option<u
         return Ok(Some(xdp_action::XDP_PASS));
     }
     bump(Counter::Srv6Decap);
+    if local_ifindex != 0 {
+        return Ok(Some(
+            TX_PORTS
+                .redirect(local_ifindex, 0)
+                .unwrap_or(xdp_action::XDP_ABORTED),
+        ));
+    }
     Ok(Some(xdp_action::XDP_PASS))
 }
 
@@ -3316,7 +3334,7 @@ fn try_srv6_encap(
 /// front of the packet. We remove exactly the outer stack — `eth + ihl + udp +
 /// shim` — which for our own (option-less) encapsulation equals
 /// [`OVERLAY_OUTER_LEN`].
-#[inline(always)]
+#[inline(never)]
 fn try_decap(ctx: &XdpContext, ihl_bytes: usize) -> Result<u32, ()> {
     // The VXLAN/Geneve shim follows eth + IPv4(ihl) + UDP(8); its VNI is bytes 4..7
     // (`decode_vni`). Read it through a bounds-checked pointer before any header is
@@ -3332,6 +3350,17 @@ fn try_decap(ctx: &XdpContext, ihl_bytes: usize) -> Result<u32, ()> {
     }
 
     let delta = (EthHdr::LEN + ihl_bytes + 8 + 8) as i32;
+    // Resolve a learned local destination before adjust_head invalidates packet
+    // and map pointers. This lets a bridge-free host redirect the inner frame
+    // straight to its tenant tap. A miss falls back to XDP_PASS for BUM and for
+    // installations that intentionally use a kernel bridge.
+    let local_ifindex = unsafe {
+        ptr_at::<[u8; 6]>(ctx, delta as usize + O_ETH_DST)
+            .ok()
+            .and_then(|mac| LOCAL_MACS.get(&LocalMacKey::new(vni, *mac)))
+            .map(|local| local.ifindex)
+            .unwrap_or(0)
+    };
     // SAFETY: `ctx.ctx` is the live `xdp_md`; a positive delta only shrinks the
     // packet. A non-zero return means the kernel refused — pass the frame as-is.
     if unsafe { bpf_xdp_adjust_head(ctx.ctx, delta) } != 0 {
@@ -3339,6 +3368,11 @@ fn try_decap(ctx: &XdpContext, ihl_bytes: usize) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_PASS);
     }
     bump(Counter::OverlayDecap);
+    if local_ifindex != 0 {
+        return Ok(TX_PORTS
+            .redirect(local_ifindex, 0)
+            .unwrap_or(xdp_action::XDP_ABORTED));
+    }
     Ok(xdp_action::XDP_PASS)
 }
 
