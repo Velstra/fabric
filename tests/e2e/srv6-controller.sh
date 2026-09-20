@@ -243,6 +243,76 @@ PYARP
     fi
   fi
 
+  section "  colocated workloads — no bridge and no tunnel"
+  ns_add localvm
+  veth_pair h1 taplocal - localvm eth0 -
+  nse localvm ip addr add 192.168.100.12/24 dev eth0
+  local local_port
+  local_port=$(orch create-port --network "$VNI" --host n1 --tap taplocal \
+    --ip 192.168.100.12 --mac "$(nse localvm cat /sys/class/net/eth0/address)" | awk '{print $3}')
+  [ -n "$local_port" ] || { bad "create colocated port"; return; }
+  settle 3
+  nse vm ip neigh flush dev tap0c
+  if nse vm ping -c3 -W2 192.168.100.12 >/dev/null 2>&1; then
+    ok "colocated tenant guests resolve ARP and exchange IPv4 without a bridge"
+  else
+    bad "colocated tenant guests cannot exchange IPv4"
+  fi
+  if nse localvm ping -c3 -W2 192.168.100.10 >/dev/null 2>&1; then
+    ok "colocated delivery works in both directions"
+  else
+    bad "colocated reverse path failed"
+  fi
+
+  orch add-security-group --name local-deny --default-action drop --drop-icmp true >/dev/null
+  orch bind-port --port "$local_port" --group local-deny >/dev/null
+  settle 3
+  nse localvm python3 - <<'PY_PACKET' >"$WORKDIR/local-deny.txt" &
+import socket, time
+sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
+sock.bind(("eth0", 0))
+sock.settimeout(0.25)
+until = time.monotonic() + 4
+while time.monotonic() < until:
+    try:
+        frame = sock.recv(65535)
+    except socket.timeout:
+        continue
+    if len(frame) > 34 and frame[12:14] == b'\x08\x00' and frame[23] == 1:
+        offset = 14 + (frame[14] & 15) * 4
+        if len(frame) > offset and frame[offset] == 8:
+            print("leaked echo request")
+            raise SystemExit(1)
+print("blocked before guest delivery")
+PY_PACKET
+  local deny_capture=$!
+  sleep 0.2
+  nse vm ping -c2 -W1 192.168.100.12 >/dev/null 2>&1 || true
+  if wait "$deny_capture"; then
+    ok "colocated traffic is blocked before reaching a denied destination"
+  else
+    bad "colocated forwarding bypassed the destination policy"
+  fi
+
+  section "  migration — stale learned MACs must not keep delivery local"
+  orch bind-port --port "$local_port" --clear >/dev/null
+  local moved_mac
+  moved_mac=$(nse localvm cat /sys/class/net/eth0/address)
+  # Recreate the guest link as a hypervisor does; moving the veth itself
+  # would carry the old host's attached BPF programs into the new namespace.
+  nse h1 ip link del taplocal
+  veth_pair h2 taplocal - localvm eth0 -
+  nse localvm ip link set eth0 address "$moved_mac"
+  nse localvm ip addr add 192.168.100.12/24 dev eth0
+  orch migrate-port --id "$local_port" --host n2 --tap taplocal >/dev/null
+  settle 3
+  local encap_before_move
+  encap_before_move=$(counter "$log1" srv6_encap)
+  nse vm ping -c3 -W1 192.168.100.12 >/dev/null 2>&1 || true
+  settle 2
+  assert_ge "$log1" srv6_encap "$((encap_before_move + 1))" \
+    "a formerly local destination uses its remote route after migration"
+
   section "  nothing fell back to VXLAN"
   # The failure this rules out is the quiet one: a fabric that looks configured
   # because the VXLAN path picked up the traffic instead.

@@ -644,6 +644,84 @@ fn local_destination(vni: u32, mac: [u8; 6]) -> u32 {
     }
 }
 
+/// Deliver an allowed tenant frame to another local port on the same VNI.
+/// Remote FDB entries must not win over a controller-bound local destination
+/// after a workload moves onto this host.
+#[inline(always)]
+fn try_local_delivery(ctx: &XdpContext, s: &ForwardScratch) -> Result<Option<u32>, ()> {
+    let vni = s.vni;
+    if vni == 0 {
+        return Ok(None);
+    }
+    let mac = unsafe { *ptr_at::<[u8; 6]>(ctx, O_ETH_DST)? };
+    // Learned MACs can outlive a migration. Only a current controller binding
+    // may take precedence over a remote forwarding entry.
+    let target = unsafe { LOCAL_PORTS.get(&LocalMacKey::new(vni, mac)) }
+        .copied()
+        .unwrap_or(0);
+    if target == 0 || target == ctx.ingress_ifindex() as u32 {
+        return Ok(None);
+    }
+    // Native XDP redirect bypasses the destination's TC egress hook. Apply
+    // that hook's policy here before a frame can reach the guest.
+    let policy_id = unsafe { IFACE_POLICY.get(&target) }.copied().unwrap_or(0);
+    let cfg = unsafe { CONFIG.get(&policy_id) }
+        .copied()
+        .unwrap_or(GlobalConfig::DEFAULT);
+    let blocklisted = BLOCKLIST
+        .get(Key::new(
+            ScopedAddr::FULL_PREFIX,
+            ScopedAddr::new(policy_id, lpm_key_addr(s.dst_addr)),
+        ))
+        .is_some();
+    let icmp_type = s.icmp_type;
+    let rule = rule_winner_v4(
+        policy_id,
+        s.proto,
+        icmp_type,
+        s.dst_port,
+        target,
+        lpm_key_addr(s.src_addr),
+        lpm_key_addr(s.dst_addr),
+        PORT_RULE_IN_ONLY | PORT_RULE_V6_ONLY,
+    );
+    let rule_action = if port_rule_present(rule) {
+        Some(port_rule_action(rule))
+    } else {
+        None
+    };
+    let ipv4 = unsafe { &*ptr_at::<Ipv4Hdr>(ctx, EthHdr::LEN)? };
+    let meta = PacketMeta::new(
+        s.src_addr,
+        s.dst_addr,
+        s.proto,
+        s.src_port,
+        s.dst_port,
+        ipv4.tot_len(),
+    );
+    if decide_egress(&meta, &cfg, blocklisted, rule_action).action != Action::Pass {
+        bump(Counter::EgressDropped);
+        return Ok(Some(xdp_action::XDP_DROP));
+    }
+    if cfg.has_flag(ConfigFlags::STATEFUL)
+        && (s.proto == ip_proto::TCP || s.proto == ip_proto::UDP || s.proto == ip_proto::ICMP)
+        && s.ihl_bytes as usize == Ipv4Hdr::LEN
+    {
+        let (fs, fd, rs, rd) = if s.proto == ip_proto::ICMP {
+            (0, icmp_type as u16, 0, icmp_reply_probe(icmp_type) as u16)
+        } else {
+            (s.src_port, s.dst_port, s.dst_port, s.src_port)
+        };
+        let fkey = FlowKey::new(policy_id, s.src_addr, s.dst_addr, fs, fd, s.proto);
+        let rkey = FlowKey::new(policy_id, s.dst_addr, s.src_addr, rs, rd, s.proto);
+        let _ = FW_FLOWS.insert(&fkey, &1u8, 0);
+        let _ = FW_FLOWS.insert(&rkey, &1u8, 0);
+    }
+    Ok(Some(
+        TX_PORTS.redirect(target, 0).unwrap_or(xdp_action::XDP_DROP),
+    ))
+}
+
 /// Phase 4 **trusted VTEP set** (C2): the outer source IPv4 (network order) of
 /// every remote peer VTEP this host tunnels with. A UDP datagram on the tunnel
 /// port is only decapsulated when its outer source is in this set **and** its
@@ -762,6 +840,7 @@ struct ForwardScratch {
     /// with [`Counter::from_u32`] for the fall-through `bump`, so the exact
     /// counter `try_velstra` would have bumped is preserved.
     fw_counter: u32,
+    icmp_type: u8,
     proto: u8,
     ttl: u8,
     /// A `bool` as `u8` (a plain `bool` across the scratch copy is avoided).
@@ -2315,6 +2394,7 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
         policy_id,
         vni,
         fw_counter: fw_counter.index(),
+        icmp_type,
         proto,
         ttl,
         has_port_forward: has_port_forward as u8,
@@ -2380,6 +2460,10 @@ fn try_velstra_forward(ctx: &XdpContext) -> Result<u32, ()> {
     if let Some(action) = try_synproxy(
         ctx, ihl_bytes, s.src_addr, s.dst_addr, s.src_port, s.dst_port, s.proto,
     )? {
+        return Ok(action);
+    }
+
+    if let Some(action) = try_local_delivery(ctx, &s)? {
         return Ok(action);
     }
 
