@@ -1772,6 +1772,17 @@ impl Topology {
         // Ports: local → interface; remote on a hosted VNI → tunnel + neighbour.
         for port in &self.ports {
             if port.host == host_id {
+                // Bridge-free hosts also need neighbor suppression for peers
+                // on the same host. No remote tunnel exists for those ports.
+                if self.ports.iter().any(|other| {
+                    other.host == host_id && other.vni == port.vni && other.tap != port.tap
+                }) {
+                    cfg.neighbors.push(NeighborCfg {
+                        vni: port.vni,
+                        ip: port.ip.to_string(),
+                        mac: fmt_mac(port.mac),
+                    });
+                }
                 cfg.interfaces.push(InterfaceFile {
                     mss: None,
                     // B13: the port's own send ceiling, carried straight
@@ -2813,6 +2824,21 @@ mod tests {
             t.add_network(network(EVPN_RESERVED_VNI_BASE - 1, "ok", "10.3.0.0/24"))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn colocated_ports_get_neighbors_without_remote_tunnels() {
+        let mut t = Topology::new();
+        t.add_host(host("h1", "10.10.0.1", 0x11)).unwrap();
+        t.add_network(network(5000, "blue", "192.168.100.0/24"))
+            .unwrap();
+        let a = t.create_port(5000, "h1", "tapA", None, None, None).unwrap();
+        let b = t.create_port(5000, "h1", "tapB", None, None, None).unwrap();
+        let cfg = t.derive("h1").unwrap();
+        assert!(cfg.neighbors.iter().any(|n| n.ip == a.ip.to_string()));
+        assert!(cfg.neighbors.iter().any(|n| n.ip == b.ip.to_string()));
+        assert!(cfg.tunnels.is_empty());
+        assert!(cfg.srv6_routes.is_empty());
     }
 
     #[test]
