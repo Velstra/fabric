@@ -28,8 +28,8 @@ fn main() -> anyhow::Result<()> {
     // Keep the default aligned with CI's verified LLVM 22 toolchain. Rolling
     // nightly currently emits r11 in this program, which the kernel rejects.
     // An explicit override still supports controlled compiler upgrades.
-    let pinned = std::env::var("VELSTRA_EBPF_TOOLCHAIN")
-        .unwrap_or_else(|_| "nightly-2026-08-01".to_owned());
+    let pinned =
+        std::env::var("VELSTRA_EBPF_TOOLCHAIN").unwrap_or_else(|_| "nightly-2026-08-01".to_owned());
     let toolchain = Toolchain::Custom(&pinned);
     println!("cargo:rerun-if-env-changed=VELSTRA_EBPF_TOOLCHAIN");
     aya_build::build_ebpf([ebpf_package], toolchain)
