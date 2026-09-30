@@ -2014,6 +2014,35 @@ impl Topology {
             .collect();
         lbs.sort_by(|a, b| a.id.cmp(&b.id)); // deterministic output
         for lb in lbs {
+            // The service is looked up only after a guest has resolved its VIP
+            // to a MAC. No port owns that address, so without a neighbor entry
+            // the guest never sends the TCP/UDP packet to the datapath at all.
+            // Use the router's anycast MAC on routed segments; a plain segment
+            // gets a stable, locally administered MAC scoped by its VNI.
+            let service_mac = self.ip_vrf_of_network(lb.vni).map_or_else(
+                || {
+                    [
+                        0x02,
+                        0x56,
+                        0x00,
+                        (lb.vni >> 16) as u8,
+                        (lb.vni >> 8) as u8,
+                        lb.vni as u8,
+                    ]
+                },
+                |vrf| vrf.gateway_mac,
+            );
+            if !cfg
+                .neighbors
+                .iter()
+                .any(|n| n.vni == lb.vni && n.ip == lb.vip.to_string())
+            {
+                cfg.neighbors.push(NeighborCfg {
+                    vni: lb.vni,
+                    ip: lb.vip.to_string(),
+                    mac: fmt_mac(service_mac),
+                });
+            }
             let backends: Vec<BackendCfg> = lb
                 .members
                 .iter()
@@ -3987,6 +4016,11 @@ mod tests {
         let mut policies: Vec<u32> = cfg.services.iter().map(|s| s.policy).collect();
         policies.sort_unstable();
         assert_eq!(policies, vec![100, sg_pid]);
+        assert!(
+            cfg.neighbors.iter().any(|n| {
+                n.vni == 100 && n.ip == "192.168.50.200" && n.mac == "02:56:00:00:00:64"
+            })
+        );
         // Same pool under both scopings, resolved to the member port's address.
         let port_a_ip = t.ports().iter().find(|p| p.id == a).unwrap().ip.to_string();
         for svc in &cfg.services {
@@ -3995,6 +4029,13 @@ mod tests {
             assert_eq!(svc.backends[0].ip, port_a_ip);
             assert_eq!(svc.backends[0].port, Some(8080));
         }
+
+        t.add_ip_vrf(vrf(50100, "tenant-a", vec![100])).unwrap();
+        assert!(
+            t.derive("h1").unwrap().neighbors.iter().any(|n| {
+                n.vni == 100 && n.ip == "192.168.50.200" && n.mac == "02:00:5e:00:00:aa"
+            })
+        );
 
         // Removing a member's port drains it from the pool instead of leaving a
         // member the derive silently skips.
@@ -4009,6 +4050,13 @@ mod tests {
         );
         assert!(t.remove_load_balancer("web").unwrap());
         assert!(!t.remove_load_balancer("web").unwrap());
+        assert!(
+            !t.derive("h1")
+                .unwrap()
+                .neighbors
+                .iter()
+                .any(|n| n.ip == "192.168.50.200")
+        );
     }
 
     /// Declaring an IP-VRF again is how a reconciler works.
