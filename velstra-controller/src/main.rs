@@ -2641,13 +2641,24 @@ async fn serve(args: ServeArgs) -> Result<()> {
         builder = builder.tls_config(tls).context("configuring TLS")?;
     }
     info!("agent API listening on {addr}");
-    builder
+    let (stopping_tx, stopping_rx) = tokio::sync::oneshot::channel();
+    let server = builder
         .add_service(VelstraControlServer::new(ControlSvc {
             shared,
             authz: control_authz,
         }))
-        .serve_with_shutdown(addr, shutdown_signal())
-        .await?;
+        .serve_with_shutdown(addr, async move {
+            shutdown_signal().await;
+            let _ = stopping_tx.send(());
+        });
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result?,
+        _ = async {
+            let _ = stopping_rx.await;
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        } => warn!("agent streams did not close within 10 seconds; ending controller shutdown"),
+    }
     info!("shutting down");
     Ok(())
 }
