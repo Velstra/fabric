@@ -33,7 +33,7 @@ use std::{
 use anyhow::{Result, bail};
 use velstra_common::{Cidr4, Cidr6, PolicyId, mask_v4, mask_v6};
 use velstra_config::{
-    ActionName, BackendCfg, EncapName, FileConfig, InterfaceFile, NeighborCfg, OverlayCfg,
+    ActionName, BackendCfg, EncapName, FileConfig, InterfaceFile, Nd6Cfg, NeighborCfg, OverlayCfg,
     PolicyFile, PortRule, ProtoName, ServiceCfg, SourceValidationName, Srv6Cfg, Srv6FloodCfg,
     Srv6LocalSidCfg, Srv6RouteCfg, TunnelCfg,
 };
@@ -1738,6 +1738,35 @@ impl Topology {
                 // tenant network has no guests to hold at a gate.
                 portal: None,
             });
+        }
+
+        // A routed segment's first hop is an anycast address. Without this
+        // neighbor entry the guest repeatedly ARPs for its DHCP gateway while
+        // every host silently floods the request; no IRB frame can ever reach
+        // the routing path because it never obtains the gateway MAC.
+        for vni in &vnis {
+            let Some(vrf) = self.ip_vrf_of_network(*vni) else {
+                continue;
+            };
+            let mut gateways: Vec<IpAddr> = self
+                .network_subnets(*vni)
+                .filter_map(|subnet| subnet.gateway)
+                .collect();
+            gateways.sort_unstable();
+            for gateway in gateways {
+                match gateway {
+                    IpAddr::V4(_) => cfg.neighbors.push(NeighborCfg {
+                        vni: *vni,
+                        ip: gateway.to_string(),
+                        mac: fmt_mac(vrf.gateway_mac),
+                    }),
+                    IpAddr::V6(_) => cfg.nd_neighbors.push(Nd6Cfg {
+                        vni: *vni,
+                        ip: gateway.to_string(),
+                        mac: fmt_mac(vrf.gateway_mac),
+                    }),
+                }
+            }
         }
 
         // Security groups (B5): every group a *local* port binds (its
@@ -4035,6 +4064,34 @@ mod tests {
             gateway_mac: [0x02, 0x00, 0x5e, 0x00, 0x00, 0xaa],
             networks,
         }
+    }
+
+    #[test]
+    fn routed_guests_can_resolve_their_anycast_first_hop() {
+        let mut t = topo_with_segments();
+        t.add_host(host("h1", "10.10.0.1", 0x11)).unwrap();
+        let mut routed = v4_subnet("routed", 10100, "10.100.0.0/24");
+        routed.gateway = Some(ip("10.100.0.1"));
+        t.add_subnet(routed).unwrap();
+        let mut plain = v4_subnet("plain", 10300, "10.30.0.0/24");
+        plain.gateway = Some(ip("10.30.0.1"));
+        t.add_subnet(plain).unwrap();
+        t.create_port(10100, "h1", "tapR", None, None, None)
+            .unwrap();
+        t.create_port(10300, "h1", "tapP", None, None, None)
+            .unwrap();
+        let before = t.derive("h1").unwrap();
+        assert!(!before.neighbors.iter().any(|n| n.ip == "10.100.0.1"));
+
+        t.add_ip_vrf(vrf(50100, "tenant-a", vec![10100, 10200]))
+            .unwrap();
+        let cfg = t.derive("h1").unwrap();
+        assert!(
+            cfg.neighbors.iter().any(|n| {
+                n.vni == 10100 && n.ip == "10.100.0.1" && n.mac == "02:00:5e:00:00:aa"
+            })
+        );
+        assert!(!cfg.neighbors.iter().any(|n| n.ip == "10.30.0.1"));
     }
 
     /// A topology with the three tenant segments the IP-VRF tests route over —
