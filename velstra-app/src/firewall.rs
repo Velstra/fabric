@@ -110,14 +110,17 @@ pub struct Firewall {
     /// because the attach is now re-tried on every reprogram — a tap that appears
     /// after startup has to be picked up — and attaching twice would put two
     /// classifiers on one ingress, replicating every broadcast frame twice.
-    bum_attached: HashSet<String>,
+    bum_attached: BTreeMap<String, u32>,
+    /// TC egress classifiers installed for current interfaces. Controller-driven
+    /// tenant taps appear after startup, so their firewall hook is reconciled.
+    egress_attached: BTreeMap<String, u32>,
     /// Interfaces attached dynamically by auto-attach, tracked separately so they
     /// can be dropped again when the interface disappears (a VM tap going away).
     auto_attached: HashSet<String>,
     /// Interfaces attached because the **config** named them (e.g. pod veths the
     /// controller declared). Tracked separately from auto-attach so each is
     /// forgotten when its netdev disappears.
-    config_attached: HashSet<String>,
+    config_attached: BTreeMap<String, u32>,
     /// The `CONNTRACK` handle once it has been moved out of [`Self::ebpf`],
     /// **shared** rather than given away: both the C9 sync task and the flow
     /// query path read it. Keeping it here is what stops enabling HA from taking
@@ -242,6 +245,22 @@ impl Firewall {
             main.fd()?.try_clone()?
         };
         {
+            let delivery: &mut Xdp = ebpf
+                .program_mut("velstra_guest_delivery")
+                .ok_or_else(|| anyhow!("eBPF object has no `velstra_guest_delivery` program"))?
+                .try_into()?;
+            delivery
+                .load()
+                .context("loading XDP guest delivery program into the kernel")?;
+        }
+        let delivery_fd = {
+            let delivery: &Xdp = ebpf
+                .program("velstra_guest_delivery")
+                .ok_or_else(|| anyhow!("eBPF object has no `velstra_guest_delivery` program"))?
+                .try_into()?;
+            delivery.fd()?.try_clone()?
+        };
+        {
             let mut prog_array = ProgramArray::try_from(
                 ebpf.map_mut("VELSTRA_PROGS")
                     .ok_or_else(|| anyhow!("VELSTRA_PROGS map missing"))?,
@@ -254,6 +273,9 @@ impl Firewall {
             prog_array
                 .set(1, &main_fd, 0)
                 .context("registering velstra_main in VELSTRA_PROGS")?;
+            prog_array
+                .set(2, &delivery_fd, 0)
+                .context("registering guest delivery in VELSTRA_PROGS")?;
         }
 
         let program: &mut Xdp = ebpf
@@ -281,6 +303,16 @@ impl Firewall {
             attach_egress(&mut ebpf, &egress_ifaces)?;
         }
 
+        let config_attached = cfg
+            .interfaces
+            .iter()
+            .filter(|i| attached.iter().any(|(name, _)| name == &i.name))
+            .filter_map(|i| {
+                if_nametoindex(&i.name)
+                    .ok()
+                    .map(|index| (i.name.clone(), index))
+            })
+            .collect();
         let mut fw = Self {
             ebpf,
             attached,
@@ -290,8 +322,12 @@ impl Firewall {
             dynamic_routes: Vec::new(),
             flowspec_refused: Vec::new(),
             auto_attached: HashSet::new(),
-            config_attached: HashSet::new(),
-            bum_attached: HashSet::new(),
+            config_attached,
+            bum_attached: BTreeMap::new(),
+            egress_attached: egress_ifaces
+                .into_iter()
+                .filter_map(|name| if_nametoindex(&name).ok().map(|index| (name, index)))
+                .collect(),
             conntrack: None,
             runtime_blocks: BTreeMap::new(),
             portal_sessions: BTreeMap::new(),
@@ -333,21 +369,57 @@ impl Firewall {
         // and it never gets a classifier again — `bum_replicated`/`srv6_bum_replicated`
         // stall until the agent restarts. Mirrors how `reconcile_auto_attach` and
         // `reconcile_config_interfaces` prune their attach sets.
-        self.bum_attached.retain(|n| if_nametoindex(n).is_ok());
-        let wanted: Vec<String> = cfg
+        self.bum_attached
+            .retain(|name, index| if_nametoindex(name).ok() == Some(*index));
+        let wanted: Vec<(String, u32)> = cfg
             .interfaces
             .iter()
-            .filter(|i| i.vni != 0 && !self.bum_attached.contains(&i.name))
-            .filter(|i| if_nametoindex(&i.name).is_ok())
-            .map(|i| i.name.clone())
+            .filter(|i| i.vni != 0 && !self.bum_attached.contains_key(&i.name))
+            .filter_map(|i| {
+                if_nametoindex(&i.name)
+                    .ok()
+                    .map(|index| (i.name.clone(), index))
+            })
             .collect();
         if wanted.is_empty() {
             return;
         }
-        match attach_bum_ingress(&mut self.ebpf, &wanted) {
+        match attach_bum_ingress(
+            &mut self.ebpf,
+            &wanted
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>(),
+        ) {
             Ok(()) => self.bum_attached.extend(wanted),
             Err(e) => warn!("BUM replication attach failed: {e:#}"),
         }
+    }
+
+    /// A newly declared tenant tap needs the egress classifier before its
+    /// policy is programmed. Otherwise ingress allowances and default-deny
+    /// rules exist in maps but no hook ever evaluates packets bound for it.
+    fn sync_egress_attachments(&mut self, cfg: &RuntimeConfig) -> Result<()> {
+        // A tap can disappear and return under the same name between two
+        // config updates. Its old classifier vanished with the old ifindex.
+        self.egress_attached
+            .retain(|name, index| if_nametoindex(name).ok() == Some(*index));
+        let wanted: Vec<(String, u32)> = egress_interfaces(cfg, &[], false)
+            .into_iter()
+            .filter(|name| !self.egress_attached.contains_key(name))
+            .filter_map(|name| if_nametoindex(&name).ok().map(|index| (name, index)))
+            .collect();
+        if !wanted.is_empty() {
+            attach_egress(
+                &mut self.ebpf,
+                &wanted
+                    .iter()
+                    .map(|(name, _)| name.clone())
+                    .collect::<Vec<_>>(),
+            )?;
+            self.egress_attached.extend(wanted);
+        }
+        Ok(())
     }
 
     /// Attach the (already-loaded) program to one more interface and assign it a
@@ -509,6 +581,24 @@ impl Firewall {
     pub fn reconcile_config_interfaces(&mut self, present: &[String], mode: AttachMode) {
         let present_set: HashSet<&str> = present.iter().map(String::as_str).collect();
 
+        // A guest can recreate a TAP under the same name between two polls.
+        // Its old XDP and TC links vanished with the old ifindex, even though
+        // a name-only inventory would still claim the interface is attached.
+        let stale: Vec<String> = self
+            .config_attached
+            .iter()
+            .filter(|(name, index)| {
+                !present_set.contains(name.as_str()) || if_nametoindex(name).ok() != Some(**index)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        let mut changed = !stale.is_empty();
+        for name in stale {
+            self.config_attached.remove(&name);
+            self.attached.retain(|(attached, _)| attached != &name);
+            log::info!("config interface {name} disappeared or changed ifindex");
+        }
+
         // Attach config interfaces that are present but not yet attached.
         let todo: Vec<(String, PolicyId, u32)> = self
             .applied
@@ -521,7 +611,10 @@ impl Firewall {
         for (name, policy, vni) in todo {
             match self.attach_config_iface(&name, mode, policy, vni) {
                 Ok(chosen) => {
-                    self.config_attached.insert(name.clone());
+                    if let Ok(index) = if_nametoindex(&name) {
+                        self.config_attached.insert(name.clone(), index);
+                    }
+                    changed = true;
                     log::info!(
                         "attached config interface {name} -> policy {policy} vni {vni} ({chosen:?})"
                     );
@@ -530,17 +623,13 @@ impl Firewall {
             }
         }
 
-        // Forget config interfaces whose netdev has gone (link auto-detached).
-        let gone: Vec<String> = self
-            .config_attached
-            .iter()
-            .filter(|n| !present_set.contains(n.as_str()))
-            .cloned()
-            .collect();
-        for name in gone {
-            self.config_attached.remove(&name);
-            self.attached.retain(|(n, _)| n != &name);
-            log::info!("detached config interface {name} (interface gone)");
+        if changed {
+            // Refresh every ifindex-keyed map, including the guest firewall
+            // and BUM hooks. A controller need not resend an unchanged config
+            // just because Linux gave a recreated TAP a new interface ID.
+            if let Err(error) = self.reprogram() {
+                warn!("reprogramming recreated interfaces failed: {error:#}");
+            }
         }
     }
 
@@ -676,6 +765,7 @@ impl Firewall {
                 merged.routes.push(learned.clone());
             }
         }
+        self.sync_egress_attachments(&merged)?;
         apply_config(&mut self.ebpf, &merged, Some(&self.applied))?;
         // After the maps, not before: a classifier attached to a tap whose flood
         // set has not been written yet would replicate to an empty set, which is
@@ -3516,6 +3606,9 @@ fn read_iface_mac(iface: &str) -> Result<[u8; 6]> {
 /// * a policy carrying a rule scoped to the way **out** — otherwise the rule
 ///   loads, matches nothing and says nothing, and the operator who wrote
 ///   `direction out` gets silence;
+/// * a policy with **egress default drop**. On a guest tap this hook sees
+///   packets entering the guest, so omitting it makes a cloud security group
+///   look active while every inbound packet passes;
 /// * a **stateful** policy that does not pass by default. The ingress hook
 ///   records a flow when it admits one, so a reply to something that *arrived*
 ///   is covered — but a connection the box itself starts never crosses that hook
@@ -3559,7 +3652,11 @@ fn egress_interfaces(cfg: &RuntimeConfig, ifaces: &[String], egress: bool) -> Ve
         .map(|p| p.id)
         .collect();
     for i in &cfg.interfaces {
-        if out_scoped.contains(&i.policy) || needs_reply_state.contains(&i.policy) {
+        let drops_egress = cfg
+            .policies
+            .iter()
+            .any(|p| p.id == i.policy && p.global.has_flag(ConfigFlags::EGRESS_DEFAULT_DROP));
+        if out_scoped.contains(&i.policy) || needs_reply_state.contains(&i.policy) || drops_egress {
             push(&i.name, &mut out);
         }
     }
@@ -3577,9 +3674,10 @@ fn attach_egress(ebpf: &mut Ebpf, ifaces: &[String]) -> Result<()> {
         .program_mut("velstra_egress")
         .ok_or_else(|| anyhow!("eBPF object has no `velstra_egress` program"))?
         .try_into()?;
-    program
-        .load()
-        .context("loading TC egress program into the kernel")?;
+    match program.load() {
+        Ok(()) | Err(ProgramError::AlreadyLoaded) => {}
+        Err(e) => return Err(e).context("loading TC egress program into the kernel"),
+    }
     for iface in ifaces {
         // Idempotent: a pre-existing clsact qdisc is fine.
         let _ = qdisc_add_clsact(iface);
@@ -3792,6 +3890,15 @@ mod tests {
         let mut cfg = RuntimeConfig::passthrough();
         cfg.policies = vec![policy(1, Action::Drop, true)];
         cfg.interfaces = vec![iface("eth0", 1)];
+        assert_eq!(egress_interfaces(&cfg, &[], false), ["eth0"]);
+
+        // Cloud port policies pass traffic leaving the guest at XDP but
+        // default-deny traffic entering it at TC egress. An empty group still
+        // needs this hook or its promised ingress isolation disappears.
+        cfg.policies = vec![PolicyConfig {
+            global: GlobalConfig::new(Action::Pass, ConfigFlags::EGRESS_DEFAULT_DROP),
+            ..policy(1, Action::Pass, false)
+        }];
         assert_eq!(egress_interfaces(&cfg, &[], false), ["eth0"]);
 
         // Deny by default but NOT stateful: nothing is tracked, so there is
