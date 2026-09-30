@@ -80,6 +80,13 @@ impl Authz {
         }
         self.is_admin(caller)
     }
+
+    /// A node or administrator may discover whether this endpoint is the
+    /// leader. The answer grants no mutation rights, but an anonymous client
+    /// must not be able to probe an mTLS-only admin channel.
+    pub fn allow_leader_probe(&self, caller: &Caller) -> bool {
+        !self.enforced || matches!(caller, Caller::Cert(_))
+    }
 }
 
 /// Extract the caller identity from a request's peer TLS certificates: the
@@ -154,5 +161,13 @@ mod tests {
         let a = policy();
         assert!(!a.allow_host(&Caller::Anonymous, "web-1"));
         assert!(!a.allow_admin(&Caller::Anonymous));
+    }
+
+    #[test]
+    fn leader_probe_is_available_to_nodes_but_not_anonymous_callers() {
+        let a = policy();
+        assert!(a.allow_leader_probe(&admin()));
+        assert!(a.allow_leader_probe(&node("web-1")));
+        assert!(!a.allow_leader_probe(&Caller::Anonymous));
     }
 }

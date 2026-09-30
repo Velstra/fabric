@@ -77,15 +77,15 @@ use velstra_common::{
     SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6, ScopedDstPortKey, ScopedDstPortKey6, ScopedMac,
     ScopedPortKey, ScopedSrcPortKey, ScopedSrcPortKey6, ServiceKey, ServiceValue, SourceValidation,
     Srv6Config, Srv6Endpoint, Srv6FloodSet, Srv6IrbEndpoint, Srv6LocalSid, Srv6SidKey, SynFlow,
-    SynProxyCfg, SynProxyKey, TcpSynth, TunnelEndpoint, TunnelKey, build_encap, build_srv6_encap,
-    check_cookie, csum_replace_u32, decide, decide_egress, decode_vni, epoch_of,
-    gate_admits_unauthenticated, icmp, icmp_checksum, icmp_reply_probe, icmp_type_probe, ip_proto,
-    ipv6_ext_len, is_ipv6_ext, is_overlay_dport, lpm_key_addr, make_cookie, plan_arp_reply,
-    plan_forward, plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_server_ack,
-    plan_server_syn, plan_srv6_irb, plan_syn_ack, plan_tcp_rst, port_rule_action,
-    port_rule_excluded, port_rule_limit, port_rule_logs, port_rule_present, port_rule_winner,
-    select_backend, session_hash, tcp_flags, translate_to_client, translate_to_server,
-    v6_source_is_v4_mapped, write_encap, write_srv6_encap,
+    SynProxyCfg, SynProxyKey, TcpSynth, TunnelEndpoint, TunnelKey, admit_established_egress_reply,
+    build_encap, build_srv6_encap, check_cookie, csum_replace_u32, decide, decide_egress,
+    decode_vni, epoch_of, gate_admits_unauthenticated, icmp, icmp_checksum, icmp_reply_probe,
+    icmp_type_probe, ip_proto, ipv6_ext_len, is_ipv6_ext, is_overlay_dport, lpm_key_addr,
+    make_cookie, plan_arp_reply, plan_forward, plan_icmp_unreachable, plan_irb, plan_na_reply,
+    plan_nat, plan_server_ack, plan_server_syn, plan_srv6_irb, plan_syn_ack, plan_tcp_rst,
+    port_rule_action, port_rule_excluded, port_rule_limit, port_rule_logs, port_rule_present,
+    port_rule_winner, select_backend, session_hash, tcp_flags, translate_to_client,
+    translate_to_server, v6_source_is_v4_mapped, write_encap, write_srv6_encap,
 };
 
 /// Maps an ingress interface index to its policy id, so one XDP program can
@@ -1343,6 +1343,20 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
     let eth: *const EthHdr = unsafe { ptr_at_tc(ctx, 0)? };
     let ethertype = u16::from_be(unsafe { (*eth).ether_type });
     if ethertype != ETHERTYPE_IPV4 {
+        // The IPv6 TC egress filter does not yet implement per-port rules.
+        // A tenant tap asking for default-deny guest ingress must never pass
+        // IPv6 unfiltered merely because this hook only parses IPv4 today.
+        if ethertype == ETHERTYPE_IPV6 {
+            let ifindex = unsafe { (*ctx.skb.skb).ifindex };
+            let policy_id = unsafe { IFACE_POLICY.get(&ifindex) }.copied().unwrap_or(0);
+            let cfg = unsafe { CONFIG.get(&policy_id) }
+                .copied()
+                .unwrap_or(GlobalConfig::DEFAULT);
+            if cfg.has_flag(ConfigFlags::EGRESS_DEFAULT_DROP) {
+                bump(Counter::EgressDropped);
+                return Ok(TC_ACT_SHOT as i32);
+            }
+        }
         // NPTv6 (RFC 6296) source translation happens on the way out: an internal
         // IPv6 source leaving a boundary interface is rewritten to the external
         // prefix. Other v6 traffic (and non-IP) passes untouched.
@@ -1445,10 +1459,30 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
         ipv4.tot_len(),
     );
     let verdict = decide_egress(&meta, &cfg, blocklisted, rule_action);
+    // On a tenant tap, TC egress is traffic *entering the guest*. Its
+    // default-deny posture must admit the reply to a flow the guest started at
+    // XDP ingress. That hook records both directions in FW_FLOWS. Only the
+    // *default* drop can be bypassed: an explicit deny, blocklist or ICMP
+    // prohibition must still revoke a flow that was previously established.
+    let established_for_guest = if cfg.has_flag(ConfigFlags::EGRESS_DEFAULT_DROP)
+        && cfg.has_flag(ConfigFlags::STATEFUL)
+        && (proto == ip_proto::TCP || proto == ip_proto::UDP || proto == ip_proto::ICMP)
+        && ihl_bytes == Ipv4Hdr::LEN
+    {
+        let (key_sport, key_dport) = if proto == ip_proto::ICMP {
+            (0, icmp_type as u16)
+        } else {
+            (src_port, dst_port)
+        };
+        let key = FlowKey::new(policy_id, src_addr, dst_addr, key_sport, key_dport, proto);
+        unsafe { FW_FLOWS.get(&key) }.is_some()
+    } else {
+        false
+    };
 
     // On egress we can't bounce a RST back the way the XDP ingress path does, so
     // an active reject degrades to a silent drop here.
-    if verdict.action != Action::Pass {
+    if !admit_established_egress_reply(verdict, established_for_guest) {
         bump(Counter::EgressDropped);
         // The policy-wide log flag, or this rule's own per-rule log bit.
         let want_log = cfg.has_flag(ConfigFlags::LOG) || port_rule_logs(rule);

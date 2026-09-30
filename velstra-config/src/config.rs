@@ -696,6 +696,8 @@ pub struct PolicyFile {
     #[serde(default)]
     pub default_action: ActionName,
     #[serde(default)]
+    pub egress_default_drop: bool,
+    #[serde(default)]
     pub drop_icmp: bool,
     #[serde(default)]
     pub log: bool,
@@ -1577,6 +1579,7 @@ fn resolve_conntrack_sync(cfg: &ConntrackSyncCfg) -> Result<ResolvedConntrackSyn
 fn resolve_firewall(
     id: PolicyId,
     default_action: ActionName,
+    egress_default_drop: bool,
     drop_icmp: bool,
     log: bool,
     stateful: bool,
@@ -1594,6 +1597,9 @@ fn resolve_firewall(
     }
     if stateful {
         flags |= ConfigFlags::STATEFUL;
+    }
+    if egress_default_drop {
+        flags |= ConfigFlags::EGRESS_DEFAULT_DROP;
     }
     let portal = resolve_portal(id, portal)?;
     if portal.is_some() {
@@ -1822,6 +1828,7 @@ impl FileConfig {
         let mut policies = vec![resolve_firewall(
             0,
             self.default_action,
+            false,
             self.drop_icmp,
             self.log,
             self.stateful,
@@ -1840,6 +1847,7 @@ impl FileConfig {
             policies.push(resolve_firewall(
                 policy.id,
                 policy.default_action,
+                policy.egress_default_drop,
                 policy.drop_icmp,
                 policy.log,
                 policy.stateful,

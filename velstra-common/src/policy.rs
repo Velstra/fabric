@@ -623,9 +623,21 @@ pub fn decide_egress(
             if is_icmp && cfg.has_flag(ConfigFlags::DROP_ICMP) {
                 return Verdict::new(Action::Drop, Counter::DroppedIcmp);
             }
-            Verdict::new(Action::Pass, Counter::PassedDefault)
+            if cfg.has_flag(ConfigFlags::EGRESS_DEFAULT_DROP) {
+                Verdict::new(Action::Drop, Counter::DroppedDefault)
+            } else {
+                Verdict::new(Action::Pass, Counter::PassedDefault)
+            }
         }
     }
+}
+
+/// Whether a guest-bound packet may leave TC egress after the policy verdict.
+/// A flow started by the guest overrides only the absence of an ingress rule;
+/// it never overrides an explicit deny or a protocol-wide prohibition.
+#[inline]
+pub fn admit_established_egress_reply(verdict: Verdict, established: bool) -> bool {
+    verdict.action == Action::Pass || (established && verdict.counter == Counter::DroppedDefault)
 }
 
 #[cfg(test)]
@@ -651,6 +663,17 @@ mod tests {
             decide_egress(&meta, &deny, false, None).action,
             Action::Pass
         );
+        // A tenant tap explicitly chooses the opposite default for traffic
+        // entering its guest. Its XDP side can independently remain open.
+        let tenant_tap = GlobalConfig::new(
+            Action::Pass,
+            ConfigFlags::STATEFUL | ConfigFlags::EGRESS_DEFAULT_DROP,
+        );
+        assert_eq!(decide(&meta, &tenant_tap, false, None).action, Action::Pass);
+        assert_eq!(
+            decide_egress(&meta, &tenant_tap, false, None).action,
+            Action::Drop
+        );
 
         // What the operator did say still holds, in both directions.
         assert_eq!(
@@ -669,6 +692,40 @@ mod tests {
             decide_egress(&ping, &no_icmp, false, None).action,
             Action::Drop
         );
+    }
+
+    #[test]
+    fn an_established_guest_reply_only_overrides_default_drop() {
+        let tcp = PacketMeta::new([10, 0, 0, 1], [10, 0, 0, 2], ip_proto::TCP, 443, 51000, 60);
+        let cfg = GlobalConfig::new(
+            Action::Pass,
+            ConfigFlags::STATEFUL | ConfigFlags::EGRESS_DEFAULT_DROP,
+        );
+        assert!(!admit_established_egress_reply(
+            decide_egress(&tcp, &cfg, false, None),
+            false
+        ));
+        assert!(admit_established_egress_reply(
+            decide_egress(&tcp, &cfg, false, None),
+            true
+        ));
+        assert!(!admit_established_egress_reply(
+            decide_egress(&tcp, &cfg, false, Some(Action::Drop)),
+            true
+        ));
+        assert!(!admit_established_egress_reply(
+            decide_egress(&tcp, &cfg, true, None),
+            true
+        ));
+        let icmp = PacketMeta::new([10, 0, 0, 1], [10, 0, 0, 2], ip_proto::ICMP, 0, 0, 60);
+        let no_icmp = GlobalConfig::new(
+            Action::Pass,
+            ConfigFlags::STATEFUL | ConfigFlags::EGRESS_DEFAULT_DROP | ConfigFlags::DROP_ICMP,
+        );
+        assert!(!admit_established_egress_reply(
+            decide_egress(&icmp, &no_icmp, false, None),
+            true
+        ));
     }
 
     fn pkt(proto: u8, dst_port: u16) -> PacketMeta {

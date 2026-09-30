@@ -376,6 +376,8 @@ pub struct SecurityGroup {
     pub name: String,
     /// Verdict for traffic matching no rule.
     pub default_action: ActionName,
+    /// Deny unmatched packets entering a guest through the tap's TC egress.
+    pub egress_default_drop: bool,
     /// Drop all ICMP under this group.
     pub drop_icmp: bool,
     /// Track connections and allow established flows (stateful firewall).
@@ -1722,6 +1724,7 @@ impl Topology {
                 id: *vni,
                 name: Some(net.name.clone()),
                 default_action: net.default_action,
+                egress_default_drop: false,
                 drop_icmp: net.drop_icmp,
                 log: false,
                 stateful: false,
@@ -1758,6 +1761,7 @@ impl Topology {
                     id: pid,
                     name: Some(sg.name.clone()),
                     default_action: sg.default_action,
+                    egress_default_drop: sg.egress_default_drop,
                     drop_icmp: sg.drop_icmp,
                     log: false,
                     stateful: sg.stateful,
@@ -2138,6 +2142,8 @@ pub struct NetworkRec {
 pub struct SecurityGroupRec {
     pub name: String,
     pub default_action: ActionName,
+    #[serde(default)]
+    pub egress_default_drop: bool,
     pub drop_icmp: bool,
     pub stateful: bool,
     pub blocklist: Vec<String>,
@@ -2284,6 +2290,7 @@ impl Topology {
                 .map(|g| SecurityGroupRec {
                     name: g.name.clone(),
                     default_action: g.default_action,
+                    egress_default_drop: g.egress_default_drop,
                     drop_icmp: g.drop_icmp,
                     stateful: g.stateful,
                     blocklist: g.blocklist.clone(),
@@ -2443,6 +2450,7 @@ impl Topology {
                 SecurityGroup {
                     name: g.name.clone(),
                     default_action: g.default_action,
+                    egress_default_drop: g.egress_default_drop,
                     drop_icmp: g.drop_icmp,
                     stateful: g.stateful,
                     blocklist: g.blocklist.clone(),
@@ -3062,6 +3070,7 @@ mod tests {
         SecurityGroup {
             name: name.to_string(),
             default_action: ActionName::Drop,
+            egress_default_drop: false,
             drop_icmp: false,
             stateful: true,
             blocklist: Vec::new(),
@@ -3924,6 +3933,7 @@ mod tests {
         t.add_security_group(SecurityGroup {
             name: "web".into(),
             default_action: ActionName::Pass,
+            egress_default_drop: false,
             drop_icmp: false,
             stateful: true,
             blocklist: Vec::new(),

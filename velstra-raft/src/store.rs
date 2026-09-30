@@ -83,6 +83,8 @@ pub struct NetworkSpec {
 pub struct SecurityGroupSpec {
     pub name: String,
     pub default_action: ActionName,
+    #[serde(default)]
+    pub egress_default_drop: bool,
     pub drop_icmp: bool,
     pub stateful: bool,
     pub blocklist: Vec<String>,
@@ -411,6 +413,7 @@ fn sg_from_spec(s: &SecurityGroupSpec) -> SecurityGroup {
     SecurityGroup {
         name: s.name.clone(),
         default_action: s.default_action,
+        egress_default_drop: s.egress_default_drop,
         drop_icmp: s.drop_icmp,
         stateful: s.stateful,
         blocklist: s.blocklist.clone(),
@@ -1429,6 +1432,7 @@ mod tests {
                 &TopoRequest::AddSecurityGroup(SecurityGroupSpec {
                     name: "web".into(),
                     default_action: ActionName::Drop,
+                    egress_default_drop: false,
                     drop_icmp: false,
                     stateful: true,
                     blocklist: vec![],
@@ -1460,6 +1464,7 @@ mod tests {
                 &TopoRequest::AddSecurityGroup(SecurityGroupSpec {
                     name: "web".into(),
                     default_action: ActionName::Drop,
+                    egress_default_drop: false,
                     drop_icmp: false,
                     stateful: false,
                     blocklist: vec![],

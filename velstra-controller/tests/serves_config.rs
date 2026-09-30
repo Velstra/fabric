@@ -9,8 +9,9 @@ use std::{
 };
 
 use velstra_proto::{
-    ListNodesRequest, NodeConfig, NodeRequest, Proto, Service, SetConfigRequest,
+    LeaderRequest, ListNodesRequest, NodeConfig, NodeRequest, Proto, Service, SetConfigRequest,
     velstra_admin_client::VelstraAdminClient, velstra_control_client::VelstraControlClient,
+    velstra_orchestrator_client::VelstraOrchestratorClient,
 };
 
 /// Kills the spawned controller when the test ends (even on panic).
@@ -81,6 +82,16 @@ async fn controller_serves_and_updates_config() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let mut client = client.expect("controller never came up");
+
+    let mut orchestrator = VelstraOrchestratorClient::connect(admin_endpoint.clone())
+        .await
+        .expect("orchestrator channel");
+    let leader = orchestrator
+        .get_leader(LeaderRequest {})
+        .await
+        .expect("GetLeader")
+        .into_inner();
+    assert!(leader.leader, "a standalone controller accepts writes");
 
     // GetConfig returns the node's served policy.
     let cfg = client

@@ -72,6 +72,9 @@ message GetStatsResponse {
 // runtime and let the controller derive + push each host's config (Track C).
 // Reached over the same privileged admin channel.
 service VelstraOrchestrator {
+  // Read-only leader discovery for clients configured with multiple controller
+  // endpoints. A follower may serve reads, but must not receive mutations.
+  rpc GetLeader(LeaderRequest) returns (LeaderResponse);
   // Register (or replace) a host (VTEP).
   rpc AddHost(HostSpec) returns (Ack);
   // Define a network (tenant). Fails on a duplicate or invalid VNI.
@@ -153,6 +156,14 @@ service VelstraOrchestrator {
   rpc ReleaseFloatingIp(ReleaseFloatingIpRequest) returns (Ack);
   // List all floating IPs in the fabric.
   rpc ListFloatingIps(ListFloatingIpsRequest) returns (ListFloatingIpsResponse);
+}
+
+message LeaderRequest {}
+
+message LeaderResponse {
+  bool leader = 1;
+  uint64 node_id = 2;
+  uint64 leader_id = 3;
 }
 
 message HostSpec {
@@ -259,6 +270,9 @@ message SecurityGroupSpec {
   bool stateful = 4;
   repeated string blocklist = 5;
   repeated PortRule rules = 6;
+  // Tenant taps may allow outbound guest traffic (XDP ingress) while denying
+  // unsolicited traffic entering the guest (TC egress).
+  bool egress_default_drop = 7;
 }
 
 message RemoveSecurityGroupRequest {
@@ -345,6 +359,7 @@ message SecurityGroupInfo {
   bool stateful = 5;
   repeated string blocklist = 6;
   repeated PortRule rules = 7;
+  bool egress_default_drop = 8;
 }
 
 message ListSecurityGroupsResponse {
@@ -746,6 +761,7 @@ message Policy {
   repeated PortRule port_rules = 7;
   bool stateful = 8;
   SourceValidation source_validation = 9;
+  bool egress_default_drop = 10;
 }
 
 // Maps an interface to a policy id and (optionally) an overlay segment (VNI).
