@@ -111,6 +111,9 @@ pub struct Firewall {
     /// after startup has to be picked up — and attaching twice would put two
     /// classifiers on one ingress, replicating every broadcast frame twice.
     bum_attached: HashSet<String>,
+    /// TC egress classifiers installed for current interfaces. Controller-driven
+    /// tenant taps appear after startup, so their firewall hook is reconciled.
+    egress_attached: HashSet<String>,
     /// Interfaces attached dynamically by auto-attach, tracked separately so they
     /// can be dropped again when the interface disappears (a VM tap going away).
     auto_attached: HashSet<String>,
@@ -242,6 +245,22 @@ impl Firewall {
             main.fd()?.try_clone()?
         };
         {
+            let delivery: &mut Xdp = ebpf
+                .program_mut("velstra_guest_delivery")
+                .ok_or_else(|| anyhow!("eBPF object has no `velstra_guest_delivery` program"))?
+                .try_into()?;
+            delivery
+                .load()
+                .context("loading XDP guest delivery program into the kernel")?;
+        }
+        let delivery_fd = {
+            let delivery: &Xdp = ebpf
+                .program("velstra_guest_delivery")
+                .ok_or_else(|| anyhow!("eBPF object has no `velstra_guest_delivery` program"))?
+                .try_into()?;
+            delivery.fd()?.try_clone()?
+        };
+        {
             let mut prog_array = ProgramArray::try_from(
                 ebpf.map_mut("VELSTRA_PROGS")
                     .ok_or_else(|| anyhow!("VELSTRA_PROGS map missing"))?,
@@ -254,6 +273,9 @@ impl Firewall {
             prog_array
                 .set(1, &main_fd, 0)
                 .context("registering velstra_main in VELSTRA_PROGS")?;
+            prog_array
+                .set(2, &delivery_fd, 0)
+                .context("registering guest delivery in VELSTRA_PROGS")?;
         }
 
         let program: &mut Xdp = ebpf
@@ -292,6 +314,7 @@ impl Firewall {
             auto_attached: HashSet::new(),
             config_attached: HashSet::new(),
             bum_attached: HashSet::new(),
+            egress_attached: egress_ifaces.into_iter().collect(),
             conntrack: None,
             runtime_blocks: BTreeMap::new(),
             portal_sessions: BTreeMap::new(),
@@ -348,6 +371,22 @@ impl Firewall {
             Ok(()) => self.bum_attached.extend(wanted),
             Err(e) => warn!("BUM replication attach failed: {e:#}"),
         }
+    }
+
+    /// A newly declared tenant tap needs the egress classifier before its
+    /// policy is programmed. Otherwise ingress allowances and default-deny
+    /// rules exist in maps but no hook ever evaluates packets bound for it.
+    fn sync_egress_attachments(&mut self, cfg: &RuntimeConfig) -> Result<()> {
+        self.egress_attached.retain(|n| if_nametoindex(n).is_ok());
+        let wanted: Vec<String> = egress_interfaces(cfg, &[], false)
+            .into_iter()
+            .filter(|n| !self.egress_attached.contains(n) && if_nametoindex(n).is_ok())
+            .collect();
+        if !wanted.is_empty() {
+            attach_egress(&mut self.ebpf, &wanted)?;
+            self.egress_attached.extend(wanted);
+        }
+        Ok(())
     }
 
     /// Attach the (already-loaded) program to one more interface and assign it a
@@ -676,6 +715,7 @@ impl Firewall {
                 merged.routes.push(learned.clone());
             }
         }
+        self.sync_egress_attachments(&merged)?;
         apply_config(&mut self.ebpf, &merged, Some(&self.applied))?;
         // After the maps, not before: a classifier attached to a tap whose flood
         // set has not been written yet would replicate to an empty set, which is
@@ -3516,6 +3556,9 @@ fn read_iface_mac(iface: &str) -> Result<[u8; 6]> {
 /// * a policy carrying a rule scoped to the way **out** — otherwise the rule
 ///   loads, matches nothing and says nothing, and the operator who wrote
 ///   `direction out` gets silence;
+/// * a policy with **egress default drop**. On a guest tap this hook sees
+///   packets entering the guest, so omitting it makes a cloud security group
+///   look active while every inbound packet passes;
 /// * a **stateful** policy that does not pass by default. The ingress hook
 ///   records a flow when it admits one, so a reply to something that *arrived*
 ///   is covered — but a connection the box itself starts never crosses that hook
@@ -3559,7 +3602,11 @@ fn egress_interfaces(cfg: &RuntimeConfig, ifaces: &[String], egress: bool) -> Ve
         .map(|p| p.id)
         .collect();
     for i in &cfg.interfaces {
-        if out_scoped.contains(&i.policy) || needs_reply_state.contains(&i.policy) {
+        let drops_egress = cfg
+            .policies
+            .iter()
+            .any(|p| p.id == i.policy && p.global.has_flag(ConfigFlags::EGRESS_DEFAULT_DROP));
+        if out_scoped.contains(&i.policy) || needs_reply_state.contains(&i.policy) || drops_egress {
             push(&i.name, &mut out);
         }
     }
@@ -3577,9 +3624,10 @@ fn attach_egress(ebpf: &mut Ebpf, ifaces: &[String]) -> Result<()> {
         .program_mut("velstra_egress")
         .ok_or_else(|| anyhow!("eBPF object has no `velstra_egress` program"))?
         .try_into()?;
-    program
-        .load()
-        .context("loading TC egress program into the kernel")?;
+    match program.load() {
+        Ok(()) | Err(ProgramError::AlreadyLoaded) => {}
+        Err(e) => return Err(e).context("loading TC egress program into the kernel"),
+    }
     for iface in ifaces {
         // Idempotent: a pre-existing clsact qdisc is fine.
         let _ = qdisc_add_clsact(iface);
@@ -3792,6 +3840,15 @@ mod tests {
         let mut cfg = RuntimeConfig::passthrough();
         cfg.policies = vec![policy(1, Action::Drop, true)];
         cfg.interfaces = vec![iface("eth0", 1)];
+        assert_eq!(egress_interfaces(&cfg, &[], false), ["eth0"]);
+
+        // Cloud port policies pass traffic leaving the guest at XDP but
+        // default-deny traffic entering it at TC egress. An empty group still
+        // needs this hook or its promised ingress isolation disappears.
+        cfg.policies = vec![PolicyConfig {
+            global: GlobalConfig::new(Action::Pass, ConfigFlags::EGRESS_DEFAULT_DROP),
+            ..policy(1, Action::Pass, false)
+        }];
         assert_eq!(egress_interfaces(&cfg, &[], false), ["eth0"]);
 
         // Deny by default but NOT stateful: nothing is tracked, so there is

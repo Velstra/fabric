@@ -644,6 +644,98 @@ fn local_destination(vni: u32, mac: [u8; 6]) -> u32 {
     }
 }
 
+/// XDP devmap delivery does not traverse the destination tap's TC egress
+/// classifier. Apply its guest-ingress policy after overlay decapsulation and
+/// before redirecting the inner frame into that tap.
+#[inline(always)]
+fn admit_decapped_guest(ctx: &XdpContext, target: u32) -> Result<bool, ()> {
+    let policy_id = unsafe { IFACE_POLICY.get(&target) }.copied().unwrap_or(0);
+    let cfg = unsafe { CONFIG.get(&policy_id) }
+        .copied()
+        .unwrap_or(GlobalConfig::DEFAULT);
+    let eth = unsafe { &*ptr_at::<EthHdr>(ctx, 0)? };
+    let ethertype = u16::from_be(eth.ether_type);
+    if ethertype == ETHERTYPE_IPV6 {
+        // The IPv6 rule trie is not available on this path yet. A group that
+        // asks for default-deny must fail closed rather than admit IPv6 around
+        // the IPv4-only policy evaluator.
+        return Ok(!cfg.has_flag(ConfigFlags::EGRESS_DEFAULT_DROP));
+    }
+    if ethertype != ETHERTYPE_IPV4 {
+        return Ok(true); // ARP and other link control remain usable.
+    }
+    let ip = unsafe { &*ptr_at::<Ipv4Hdr>(ctx, EthHdr::LEN)? };
+    let ihl = ip.ihl() as usize;
+    if ip.version() != 4 || ihl < Ipv4Hdr::LEN {
+        return Ok(!cfg.has_flag(ConfigFlags::EGRESS_DEFAULT_DROP));
+    }
+    let (src, dst, proto, total_len) = (ip.src_addr, ip.dst_addr, ip.proto, ip.tot_len());
+    let (mut src_port, mut dst_port, mut icmp_type) = (0u16, 0u16, 0u8);
+    if ip.frag_offset() == 0 && (proto == ip_proto::TCP || proto == ip_proto::UDP) {
+        if let Ok(p) = unsafe { ptr_at::<[u8; 4]>(ctx, EthHdr::LEN + ihl) } {
+            let p = unsafe { *p };
+            src_port = u16::from_be_bytes([p[0], p[1]]);
+            dst_port = u16::from_be_bytes([p[2], p[3]]);
+        }
+    } else if ip.frag_offset() == 0 && proto == ip_proto::ICMP {
+        if let Ok(p) = unsafe { ptr_at::<[u8; 4]>(ctx, EthHdr::LEN + ihl) } {
+            icmp_type = icmp_type_probe(unsafe { *p }[0]);
+        }
+    }
+    let blocklisted = BLOCKLIST
+        .get(Key::new(
+            ScopedAddr::FULL_PREFIX,
+            ScopedAddr::new(policy_id, lpm_key_addr(dst)),
+        ))
+        .is_some();
+    let rule = rule_winner_v4(
+        policy_id,
+        proto,
+        icmp_type,
+        dst_port,
+        target,
+        lpm_key_addr(src),
+        lpm_key_addr(dst),
+        PORT_RULE_IN_ONLY | PORT_RULE_V6_ONLY,
+    );
+    let action = if port_rule_present(rule) {
+        Some(port_rule_action(rule))
+    } else {
+        None
+    };
+    let verdict = decide_egress(
+        &PacketMeta::new(src, dst, proto, src_port, dst_port, total_len),
+        &cfg,
+        blocklisted,
+        action,
+    );
+    let established = if cfg.has_flag(ConfigFlags::EGRESS_DEFAULT_DROP)
+        && cfg.has_flag(ConfigFlags::STATEFUL)
+        && (proto == ip_proto::TCP || proto == ip_proto::UDP || proto == ip_proto::ICMP)
+        && ihl == Ipv4Hdr::LEN
+    {
+        let (sport, dport) = if proto == ip_proto::ICMP {
+            (0, icmp_type as u16)
+        } else {
+            (src_port, dst_port)
+        };
+        let key = FlowKey::new(policy_id, src, dst, sport, dport, proto);
+        unsafe { FW_FLOWS.get(&key) }.is_some()
+    } else {
+        false
+    };
+    if !admit_established_egress_reply(verdict, established) {
+        bump(Counter::EgressDropped);
+        return Ok(false);
+    }
+    if verdict.action == Action::Pass {
+        bump(verdict.counter);
+    } else {
+        bump(Counter::EstablishedAllowed);
+    }
+    Ok(true)
+}
+
 /// Deliver an allowed tenant frame to another local port on the same VNI.
 /// Remote FDB entries must not win over a controller-bound local destination
 /// after a workload moves onto this host.
@@ -856,6 +948,11 @@ struct ForwardScratch {
 #[map]
 static SCRATCH: PerCpuArray<ForwardScratch> = PerCpuArray::with_max_entries(1, 0);
 
+/// Destination tap selected by an overlay decapsulator. The guest policy runs
+/// in a tail-called program with a fresh verifier stack.
+#[map]
+static GUEST_DELIVERY_TARGET: PerCpuArray<u32> = PerCpuArray::with_max_entries(1, 0);
+
 /// Per-port send ceiling (roadmap B13), keyed by ingress ifindex.
 ///
 /// A **byte** bucket: `rate` and `burst` are bytes per second and bytes, and a
@@ -872,13 +969,27 @@ static PORT_LIMITS: HashMap<u32, RateBucket> = HashMap::with_max_entries(4096, 0
 /// Tail-call jump table. Slot [`PROG_FORWARD`] holds [`velstra_forward`]; the
 /// control plane populates it at load time (see `firewall.rs`).
 #[map]
-static VELSTRA_PROGS: ProgramArray = ProgramArray::with_max_entries(2, 0);
+static VELSTRA_PROGS: ProgramArray = ProgramArray::with_max_entries(3, 0);
 
 /// Index of [`velstra_forward`] in [`VELSTRA_PROGS`].
 const PROG_FORWARD: u32 = 0;
 
 /// Index of [`velstra_main`] in [`VELSTRA_PROGS`].
 const PROG_MAIN: u32 = 1;
+
+const PROG_GUEST_DELIVERY: u32 = 2;
+const NEED_GUEST_DELIVERY: u32 = u32::MAX - 1;
+
+#[xdp]
+pub fn velstra_guest_delivery(ctx: XdpContext) -> u32 {
+    let Some(target) = GUEST_DELIVERY_TARGET.get(0).copied() else {
+        return xdp_action::XDP_DROP;
+    };
+    if target == 0 || !matches!(admit_decapped_guest(&ctx, target), Ok(true)) {
+        return xdp_action::XDP_DROP;
+    }
+    TX_PORTS.redirect(target, 0).unwrap_or(xdp_action::XDP_DROP)
+}
 
 /// XDP entry point: port security, then the datapath.
 ///
@@ -931,6 +1042,10 @@ pub fn velstra(ctx: XdpContext) -> u32 {
 #[xdp]
 pub fn velstra_main(ctx: XdpContext) -> u32 {
     match try_velstra(&ctx) {
+        Ok(NEED_GUEST_DELIVERY) => {
+            unsafe { VELSTRA_PROGS.tail_call(&ctx, PROG_GUEST_DELIVERY) };
+            xdp_action::XDP_DROP
+        }
         Ok(action) => action,
         // A `ptr_at` bounds failure lands here. Count it, then either let the
         // packet through — a firewall should not black-hole traffic because of its
@@ -3311,11 +3426,11 @@ fn try_srv6_decap(ctx: &XdpContext, hdr: &[u8; Ipv6Hdr::LEN]) -> Result<Option<u
     }
     bump(Counter::Srv6Decap);
     if local_ifindex != 0 {
-        return Ok(Some(
-            TX_PORTS
-                .redirect(local_ifindex, 0)
-                .unwrap_or(xdp_action::XDP_ABORTED),
-        ));
+        if let Some(target) = GUEST_DELIVERY_TARGET.get_ptr_mut(0) {
+            unsafe { *target = local_ifindex };
+            return Ok(Some(NEED_GUEST_DELIVERY));
+        }
+        return Ok(Some(xdp_action::XDP_DROP));
     }
     Ok(Some(xdp_action::XDP_PASS))
 }
@@ -3532,9 +3647,11 @@ fn try_decap(ctx: &XdpContext, ihl_bytes: usize) -> Result<u32, ()> {
     }
     bump(Counter::OverlayDecap);
     if local_ifindex != 0 {
-        return Ok(TX_PORTS
-            .redirect(local_ifindex, 0)
-            .unwrap_or(xdp_action::XDP_ABORTED));
+        if let Some(target) = GUEST_DELIVERY_TARGET.get_ptr_mut(0) {
+            unsafe { *target = local_ifindex };
+            return Ok(NEED_GUEST_DELIVERY);
+        }
+        return Ok(xdp_action::XDP_DROP);
     }
     Ok(xdp_action::XDP_PASS)
 }
