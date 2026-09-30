@@ -110,17 +110,17 @@ pub struct Firewall {
     /// because the attach is now re-tried on every reprogram — a tap that appears
     /// after startup has to be picked up — and attaching twice would put two
     /// classifiers on one ingress, replicating every broadcast frame twice.
-    bum_attached: HashSet<String>,
+    bum_attached: BTreeMap<String, u32>,
     /// TC egress classifiers installed for current interfaces. Controller-driven
     /// tenant taps appear after startup, so their firewall hook is reconciled.
-    egress_attached: HashSet<String>,
+    egress_attached: BTreeMap<String, u32>,
     /// Interfaces attached dynamically by auto-attach, tracked separately so they
     /// can be dropped again when the interface disappears (a VM tap going away).
     auto_attached: HashSet<String>,
     /// Interfaces attached because the **config** named them (e.g. pod veths the
     /// controller declared). Tracked separately from auto-attach so each is
     /// forgotten when its netdev disappears.
-    config_attached: HashSet<String>,
+    config_attached: BTreeMap<String, u32>,
     /// The `CONNTRACK` handle once it has been moved out of [`Self::ebpf`],
     /// **shared** rather than given away: both the C9 sync task and the flow
     /// query path read it. Keeping it here is what stops enabling HA from taking
@@ -303,6 +303,16 @@ impl Firewall {
             attach_egress(&mut ebpf, &egress_ifaces)?;
         }
 
+        let config_attached = cfg
+            .interfaces
+            .iter()
+            .filter(|i| attached.iter().any(|(name, _)| name == &i.name))
+            .filter_map(|i| {
+                if_nametoindex(&i.name)
+                    .ok()
+                    .map(|index| (i.name.clone(), index))
+            })
+            .collect();
         let mut fw = Self {
             ebpf,
             attached,
@@ -312,9 +322,12 @@ impl Firewall {
             dynamic_routes: Vec::new(),
             flowspec_refused: Vec::new(),
             auto_attached: HashSet::new(),
-            config_attached: HashSet::new(),
-            bum_attached: HashSet::new(),
-            egress_attached: egress_ifaces.into_iter().collect(),
+            config_attached,
+            bum_attached: BTreeMap::new(),
+            egress_attached: egress_ifaces
+                .into_iter()
+                .filter_map(|name| if_nametoindex(&name).ok().map(|index| (name, index)))
+                .collect(),
             conntrack: None,
             runtime_blocks: BTreeMap::new(),
             portal_sessions: BTreeMap::new(),
@@ -356,18 +369,28 @@ impl Firewall {
         // and it never gets a classifier again — `bum_replicated`/`srv6_bum_replicated`
         // stall until the agent restarts. Mirrors how `reconcile_auto_attach` and
         // `reconcile_config_interfaces` prune their attach sets.
-        self.bum_attached.retain(|n| if_nametoindex(n).is_ok());
-        let wanted: Vec<String> = cfg
+        self.bum_attached
+            .retain(|name, index| if_nametoindex(name).ok() == Some(*index));
+        let wanted: Vec<(String, u32)> = cfg
             .interfaces
             .iter()
-            .filter(|i| i.vni != 0 && !self.bum_attached.contains(&i.name))
-            .filter(|i| if_nametoindex(&i.name).is_ok())
-            .map(|i| i.name.clone())
+            .filter(|i| i.vni != 0 && !self.bum_attached.contains_key(&i.name))
+            .filter_map(|i| {
+                if_nametoindex(&i.name)
+                    .ok()
+                    .map(|index| (i.name.clone(), index))
+            })
             .collect();
         if wanted.is_empty() {
             return;
         }
-        match attach_bum_ingress(&mut self.ebpf, &wanted) {
+        match attach_bum_ingress(
+            &mut self.ebpf,
+            &wanted
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>(),
+        ) {
             Ok(()) => self.bum_attached.extend(wanted),
             Err(e) => warn!("BUM replication attach failed: {e:#}"),
         }
@@ -377,13 +400,23 @@ impl Firewall {
     /// policy is programmed. Otherwise ingress allowances and default-deny
     /// rules exist in maps but no hook ever evaluates packets bound for it.
     fn sync_egress_attachments(&mut self, cfg: &RuntimeConfig) -> Result<()> {
-        self.egress_attached.retain(|n| if_nametoindex(n).is_ok());
-        let wanted: Vec<String> = egress_interfaces(cfg, &[], false)
+        // A tap can disappear and return under the same name between two
+        // config updates. Its old classifier vanished with the old ifindex.
+        self.egress_attached
+            .retain(|name, index| if_nametoindex(name).ok() == Some(*index));
+        let wanted: Vec<(String, u32)> = egress_interfaces(cfg, &[], false)
             .into_iter()
-            .filter(|n| !self.egress_attached.contains(n) && if_nametoindex(n).is_ok())
+            .filter(|name| !self.egress_attached.contains_key(name))
+            .filter_map(|name| if_nametoindex(&name).ok().map(|index| (name, index)))
             .collect();
         if !wanted.is_empty() {
-            attach_egress(&mut self.ebpf, &wanted)?;
+            attach_egress(
+                &mut self.ebpf,
+                &wanted
+                    .iter()
+                    .map(|(name, _)| name.clone())
+                    .collect::<Vec<_>>(),
+            )?;
             self.egress_attached.extend(wanted);
         }
         Ok(())
@@ -548,6 +581,24 @@ impl Firewall {
     pub fn reconcile_config_interfaces(&mut self, present: &[String], mode: AttachMode) {
         let present_set: HashSet<&str> = present.iter().map(String::as_str).collect();
 
+        // A guest can recreate a TAP under the same name between two polls.
+        // Its old XDP and TC links vanished with the old ifindex, even though
+        // a name-only inventory would still claim the interface is attached.
+        let stale: Vec<String> = self
+            .config_attached
+            .iter()
+            .filter(|(name, index)| {
+                !present_set.contains(name.as_str()) || if_nametoindex(name).ok() != Some(**index)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        let mut changed = !stale.is_empty();
+        for name in stale {
+            self.config_attached.remove(&name);
+            self.attached.retain(|(attached, _)| attached != &name);
+            log::info!("config interface {name} disappeared or changed ifindex");
+        }
+
         // Attach config interfaces that are present but not yet attached.
         let todo: Vec<(String, PolicyId, u32)> = self
             .applied
@@ -560,7 +611,10 @@ impl Firewall {
         for (name, policy, vni) in todo {
             match self.attach_config_iface(&name, mode, policy, vni) {
                 Ok(chosen) => {
-                    self.config_attached.insert(name.clone());
+                    if let Ok(index) = if_nametoindex(&name) {
+                        self.config_attached.insert(name.clone(), index);
+                    }
+                    changed = true;
                     log::info!(
                         "attached config interface {name} -> policy {policy} vni {vni} ({chosen:?})"
                     );
@@ -569,17 +623,13 @@ impl Firewall {
             }
         }
 
-        // Forget config interfaces whose netdev has gone (link auto-detached).
-        let gone: Vec<String> = self
-            .config_attached
-            .iter()
-            .filter(|n| !present_set.contains(n.as_str()))
-            .cloned()
-            .collect();
-        for name in gone {
-            self.config_attached.remove(&name);
-            self.attached.retain(|(n, _)| n != &name);
-            log::info!("detached config interface {name} (interface gone)");
+        if changed {
+            // Refresh every ifindex-keyed map, including the guest firewall
+            // and BUM hooks. A controller need not resend an unchanged config
+            // just because Linux gave a recreated TAP a new interface ID.
+            if let Err(error) = self.reprogram() {
+                warn!("reprogramming recreated interfaces failed: {error:#}");
+            }
         }
     }
 
