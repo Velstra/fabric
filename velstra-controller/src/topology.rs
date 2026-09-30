@@ -212,6 +212,8 @@ struct SecurityGroupFile {
     #[serde(default)]
     default_action: ActionName,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    egress_default_drop: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     drop_icmp: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     stateful: bool,
@@ -339,6 +341,7 @@ fn build(tf: &TopologyFile) -> Result<Topology> {
         topo.add_security_group(SecurityGroup {
             name: g.name.clone(),
             default_action: g.default_action,
+            egress_default_drop: g.egress_default_drop,
             drop_icmp: g.drop_icmp,
             stateful: g.stateful,
             blocklist: g.blocklist.clone(),
@@ -1107,6 +1110,7 @@ fn to_file(topo: &Topology) -> TopologyFile {
         .map(|g| SecurityGroupFile {
             name: g.name.clone(),
             default_action: g.default_action,
+            egress_default_drop: g.egress_default_drop,
             drop_icmp: g.drop_icmp,
             stateful: g.stateful,
             blocklist: g.blocklist.clone(),

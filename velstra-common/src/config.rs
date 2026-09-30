@@ -42,6 +42,9 @@ impl ConfigFlags {
     /// without a portal — which is every policy on most appliances — pays
     /// nothing for the feature existing.
     pub const PORTAL: u32 = 1 << 5;
+    /// Deny traffic leaving an interface when no rule matches. Used by tenant
+    /// taps, where interface egress is traffic entering the guest.
+    pub const EGRESS_DEFAULT_DROP: u32 = 1 << 6;
 
     /// Mask of all defined flags; used to reject unknown bits.
     pub const ALL: u32 = Self::DROP_ICMP
@@ -49,7 +52,8 @@ impl ConfigFlags {
         | Self::STATEFUL
         | Self::RPF_LOOSE
         | Self::RPF_STRICT
-        | Self::PORTAL;
+        | Self::PORTAL
+        | Self::EGRESS_DEFAULT_DROP;
 }
 
 /// Global firewall configuration shared kernel <-> user space.

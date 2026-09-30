@@ -92,7 +92,7 @@ and the test suite run identical logic and can never drift apart. See
 
 ```shell
 rustup toolchain install stable
-rustup toolchain install nightly --component rust-src   # required to build eBPF
+rustup toolchain install nightly-2026-08-01 --component rust-src
 cargo install bpf-linker                                # the eBPF linker
 # macOS only: `brew bundle` (uses the Brewfile) for an LLVM that supports BPF.
 ```
@@ -102,7 +102,7 @@ rustc's own copy and there was nothing to install; 0.11.0 links a *system*
 LLVM instead, so it needs the same major version the nightly rustc emits:
 
 ```shell
-rustup run nightly rustc --version --verbose | grep '^LLVM version:'
+rustup run nightly-2026-08-01 rustc --version --verbose | grep '^LLVM version:'
 # Debian/Ubuntu, for the number that prints (apt.llvm.org has the new ones):
 sudo apt-get install -y llvm-<N>-dev libpolly-<N>-dev
 # The package installs `llvm-config` under /usr/lib/llvm-<N>/bin and leaves the
@@ -114,6 +114,9 @@ cargo install bpf-linker --locked --no-default-features --features llvm-<N>
 Getting this wrong does not fail at install time. It fails at the end of a
 build with `failure linking module`, which reads like a broken eBPF program
 and is not one. CI does the same thing in `.github/actions/bpf-linker`.
+The build defaults to the same verified toolchain as CI because newer rolling
+nightlies can emit an invalid eBPF register. Set `VELSTRA_EBPF_TOOLCHAIN`
+only when validating another compiler and kernel combination.
 
 ### Build, test, validate
 

@@ -181,6 +181,7 @@ pub fn file_config_to_proto(cfg: &FileConfig, version: u64) -> proto::NodeConfig
                 id: p.id,
                 name: p.name.clone().unwrap_or_default(),
                 default_action: action_to_proto(p.default_action) as i32,
+                egress_default_drop: p.egress_default_drop,
                 drop_icmp: p.drop_icmp,
                 log: p.log,
                 stateful: p.stateful,
@@ -393,6 +394,7 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
                     Some(p.name.clone())
                 },
                 default_action: action_from_proto(p.default_action()),
+                egress_default_drop: p.egress_default_drop,
                 drop_icmp: p.drop_icmp,
                 log: p.log,
                 stateful: p.stateful,

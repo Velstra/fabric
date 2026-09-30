@@ -54,15 +54,16 @@ use velstra_proto::{
     AssociateFloatingIpRequest, BindPortSecurityGroupRequest, BindPortSubnetRequest,
     Counter as ProtoCounter, CreatePortRequest, DisassociateFloatingIpRequest, Encap,
     FloatingIpInfo, GetStatsRequest, GetStatsResponse, HostSpec, IpVrfSpec, LbMember,
-    LimitPortRequest, ListFloatingIpsRequest, ListFloatingIpsResponse, ListIpVrfsRequest,
-    ListIpVrfsResponse, ListLoadBalancersRequest, ListLoadBalancersResponse, ListNodesRequest,
-    ListNodesResponse, ListPortsRequest, ListPortsResponse, ListSecurityGroupsRequest,
-    ListSecurityGroupsResponse, ListSubnetsRequest, ListSubnetsResponse, LoadBalancerSpec,
-    MigratePortRequest, NetworkSpec, NodeConfig, NodeRequest, NodeStats, NodeSummary, PortAddrInfo,
-    PortInfo, PortRule, Proto, ReleaseAddressRequest, ReleaseFloatingIpRequest, RemoveHostRequest,
-    RemoveIpVrfRequest, RemoveLoadBalancerRequest, RemoveNetworkRequest, RemovePortRequest,
-    RemoveSecurityGroupRequest, RemoveSubnetRequest, SecurityGroupInfo, SecurityGroupSpec,
-    SetConfigRequest, StatsReport, SubnetInfo, SubnetSpec, UnbindPortAddressRequest,
+    LeaderRequest, LeaderResponse, LimitPortRequest, ListFloatingIpsRequest,
+    ListFloatingIpsResponse, ListIpVrfsRequest, ListIpVrfsResponse, ListLoadBalancersRequest,
+    ListLoadBalancersResponse, ListNodesRequest, ListNodesResponse, ListPortsRequest,
+    ListPortsResponse, ListSecurityGroupsRequest, ListSecurityGroupsResponse, ListSubnetsRequest,
+    ListSubnetsResponse, LoadBalancerSpec, MigratePortRequest, NetworkSpec, NodeConfig,
+    NodeRequest, NodeStats, NodeSummary, PortAddrInfo, PortInfo, PortRule, Proto,
+    ReleaseAddressRequest, ReleaseFloatingIpRequest, RemoveHostRequest, RemoveIpVrfRequest,
+    RemoveLoadBalancerRequest, RemoveNetworkRequest, RemovePortRequest, RemoveSecurityGroupRequest,
+    RemoveSubnetRequest, SecurityGroupInfo, SecurityGroupSpec, SetConfigRequest, StatsReport,
+    SubnetInfo, SubnetSpec, UnbindPortAddressRequest,
     velstra_admin_client::VelstraAdminClient,
     velstra_admin_server::{VelstraAdmin, VelstraAdminServer},
     velstra_control_server::{VelstraControl, VelstraControlServer},
@@ -1205,6 +1206,7 @@ fn raft_security_group_spec(s: SecurityGroupSpec) -> velstra_raft::SecurityGroup
     velstra_raft::SecurityGroupSpec {
         name: s.name.clone(),
         default_action: action_from_proto(s.default_action()),
+        egress_default_drop: s.egress_default_drop,
         drop_icmp: s.drop_icmp,
         stateful: s.stateful,
         blocklist: s.blocklist.clone(),
@@ -1283,6 +1285,7 @@ fn sg_to_info(g: &velstra_orchestrator::SecurityGroup) -> SecurityGroupInfo {
         name: g.name.clone(),
         policy_id: g.policy_id(),
         default_action: action_to_proto(g.default_action) as i32,
+        egress_default_drop: g.egress_default_drop,
         drop_icmp: g.drop_icmp,
         stateful: g.stateful,
         blocklist: g.blocklist.clone(),
@@ -1414,6 +1417,28 @@ fn port_to_info(p: &velstra_orchestrator::Port) -> PortInfo {
 
 #[tonic::async_trait]
 impl VelstraOrchestrator for OrchestratorSvc {
+    async fn get_leader(
+        &self,
+        request: Request<LeaderRequest>,
+    ) -> Result<Response<LeaderResponse>, Status> {
+        if !self.authz.allow_leader_probe(&caller_of(&request)) {
+            return Err(deny("discover the leader"));
+        }
+        let response = match &self.shared.raft {
+            Some(raft) => LeaderResponse {
+                leader: raft.is_leader(),
+                node_id: raft.id,
+                leader_id: raft.current_leader().unwrap_or_default(),
+            },
+            None => LeaderResponse {
+                leader: true,
+                node_id: 0,
+                leader_id: 0,
+            },
+        };
+        Ok(Response::new(response))
+    }
+
     async fn add_host(&self, request: Request<HostSpec>) -> Result<Response<Ack>, Status> {
         let caller = caller_of(&request);
         let spec = request.into_inner();
@@ -2843,6 +2868,7 @@ async fn orch(args: OrchArgs) -> Result<()> {
                 .add_security_group(SecurityGroupSpec {
                     name: name.clone(),
                     default_action: default_action as i32,
+                    egress_default_drop: false,
                     drop_icmp,
                     stateful,
                     blocklist: block,

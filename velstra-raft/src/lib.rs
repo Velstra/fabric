@@ -330,6 +330,7 @@ mod tests {
                 .propose(TopoRequest::AddSecurityGroup(SecurityGroupSpec {
                     name: "web".into(),
                     default_action: ActionName::Drop,
+                    egress_default_drop: false,
                     drop_icmp: false,
                     stateful: true,
                     blocklist: vec![],

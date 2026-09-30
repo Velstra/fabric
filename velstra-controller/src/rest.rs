@@ -640,6 +640,7 @@ struct SecurityGroupJson {
     name: String,
     policy_id: u32,
     default_action: String,
+    egress_default_drop: bool,
     drop_icmp: bool,
     stateful: bool,
     blocklist: Vec<String>,
@@ -652,6 +653,7 @@ impl From<&SecurityGroup> for SecurityGroupJson {
             name: g.name.clone(),
             policy_id: g.policy_id(),
             default_action: action_name_str(g.default_action).to_string(),
+            egress_default_drop: g.egress_default_drop,
             drop_icmp: g.drop_icmp,
             stateful: g.stateful,
             blocklist: g.blocklist.clone(),
@@ -812,6 +814,8 @@ struct CreateSecurityGroupReq {
     name: String,
     #[serde(default)]
     default_action: Option<String>,
+    #[serde(default)]
+    egress_default_drop: bool,
     #[serde(default)]
     drop_icmp: bool,
     #[serde(default)]
@@ -1552,6 +1556,7 @@ async fn create_security_group(
     let spec = ProtoSgSpec {
         name: body.name,
         default_action,
+        egress_default_drop: body.egress_default_drop,
         drop_icmp: body.drop_icmp,
         stateful: body.stateful,
         blocklist: body.blocklist,
