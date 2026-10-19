@@ -1,7 +1,7 @@
 //! gRPC client: fetch this node's config from the controller, watch for live
 //! updates, and report statistics back — optionally over (m)TLS.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use tonic::{
@@ -146,13 +146,59 @@ impl Reporter {
                 value: *value,
             })
             .collect();
-        self.client
-            .report_stats(StatsReport {
+        // A controller may remain connected while its packet path or handler
+        // is unavailable. Optional telemetry must not hold the main service
+        // loop forever, including when SIGTERM is waiting to be handled.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            self.client.report_stats(StatsReport {
                 node_id: self.node_id.clone(),
                 counters,
-            })
-            .await
-            .context("ReportStats RPC")?;
+            }),
+        )
+        .await
+        .context("ReportStats RPC timed out")?
+        .context("ReportStats RPC")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unresponsive_controller_cannot_hold_statistics_reporting_forever() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // A real connected socket which never answers the HTTP/2 preface.
+        // This also covers a request waiting for the transport to become ready.
+        let (accepted, mut connection_seen) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (connection, _) = listener.accept().await.unwrap();
+            accepted.send(()).unwrap();
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            drop(connection);
+        });
+        let mut reporter = Reporter {
+            client: VelstraControlClient::new(
+                Endpoint::from_shared(format!("http://{address}"))
+                    .unwrap()
+                    .connect_lazy(),
+            ),
+            node_id: "deadline-test".into(),
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(8),
+            reporter.report(&Stats { rows: Vec::new() }),
+        )
+        .await
+        .expect("the RPC exceeded its application deadline");
+        assert!(format!("{:#}", result.unwrap_err()).contains("ReportStats RPC timed out"));
+        connection_seen
+            .try_recv()
+            .expect("the RPC never connected to the peer");
+        assert!(!server.is_finished(), "the peer closed instead of stalling");
+        server.abort();
     }
 }

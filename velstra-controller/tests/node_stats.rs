@@ -9,6 +9,8 @@
 //! This test reports as a node would and then asks, over the two surfaces a
 //! reader has: the admin gRPC API and the REST gateway.
 
+mod support;
+
 use std::{
     process::{Child, Command},
     time::Duration,
@@ -36,9 +38,7 @@ async fn a_nodes_counters_can_be_asked_for_after_it_reports_them() {
     let topology = dir.join("topology.toml");
     std::fs::write(&topology, "").unwrap();
 
-    // Its own band, clear of the other integration tests in this crate.
-    let base = 32000 + (pid % 6000) as u16;
-    let (agent_port, admin_port, rest_port) = (base, base + 1, base + 2);
+    let [agent_port, admin_port, rest_port] = support::free_ports();
     let rest = format!("http://127.0.0.1:{rest_port}");
 
     let _controller = Controller(

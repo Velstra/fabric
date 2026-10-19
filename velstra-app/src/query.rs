@@ -11,6 +11,7 @@
 //! socket the co-located Wren daemon exposes:
 //!
 //! ```text
+//! status            → readiness and the last configuration error
 //! stats             → the per-CPU counter table, summed
 //! flows [limit]     → the live NAT flow table (0 = all; default 100)
 //! top [limit]       → hosts ranked by the traffic volume attributed to them
@@ -103,7 +104,9 @@ pub async fn serve(path: PathBuf, firewall: Arc<Mutex<Firewall>>) {
             }
             Err(e) => {
                 warn!("query socket accept failed: {e}");
-                return;
+                // Keep the listener alive across transient descriptor/resource
+                // exhaustion, without spinning on an immediately-ready error.
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
         }
     }
@@ -132,6 +135,10 @@ async fn respond(line: &str, firewall: &Arc<Mutex<Firewall>>) -> String {
     let args: Vec<&str> = tokens.collect();
     let limit = parse_limit(args.first().copied());
     match verb {
+        "status" => match firewall.lock().await.configuration_status() {
+            Ok(status) => status,
+            Err(error) => format!("error: reading configuration state: {error:#}\n"),
+        },
         "stats" => {
             let fw = firewall.lock().await;
             match fw.read_stats() {
@@ -290,7 +297,7 @@ async fn respond(line: &str, firewall: &Arc<Mutex<Firewall>>) -> String {
             .to_string(),
         other => {
             format!(
-                "error: unknown query {other:?}; try: stats | flows | top | cgnat | \
+                "error: unknown query {other:?}; try: status | stats | flows | top | cgnat | \
                  blocks | block | unblock\n"
             )
         }

@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 description = "Configuration model for the Velstra SDN: parse/validate TOML policy + overlay config and resolve it into the data plane's map representation."
 repository.workspace = true
-homepage.workspace = true
 keywords = ["sdn", "ebpf", "networking", "config", "velstra"]
 categories = ["network-programming", "config"]
 readme = "README.md"

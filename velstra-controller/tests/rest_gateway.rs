@@ -7,6 +7,8 @@
 //! subscriber on the SSE event stream sees one arrive, and that a configured
 //! webhook endpoint is POSTed the same record. No root, no eBPF.
 
+mod support;
+
 use std::{
     process::{Child, Command},
     time::Duration,
@@ -51,11 +53,7 @@ async fn rest_gateway_crud_authz_and_audit() {
     let topology = dir.join("topology.toml");
     std::fs::write(&topology, "").unwrap();
 
-    // Spread the three listen ports well apart from the other integration test.
-    let base = 40000 + (pid % 8000) as u16;
-    let agent_port = base;
-    let admin_port = base + 1;
-    let rest_port = base + 2;
+    let [agent_port, admin_port, rest_port] = support::free_ports();
     let rest = format!("http://127.0.0.1:{rest_port}");
 
     // Bind the webhook sink first so the controller can be pointed at it.

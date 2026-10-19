@@ -30,7 +30,6 @@ license = "AGPL-3.0-or-later"
 edition = "2024"
 rust-version = "1.85"
 repository = "https://github.com/Velstra/fabric"
-homepage = "https://github.com/Velstra/fabric"
 
 [workspace.dependencies]
 aya = { git = "https://github.com/aya-rs/aya", default-features = false }
