@@ -184,6 +184,9 @@ Learned Wren routes keep their desired snapshot after a failed apply and retry
 without waiting for a duplicate advertisement. A failed neighbor-table read
 keeps active routes in place; it is not interpreted as an empty table. A complete
 withdrawal needs no neighbor lookup.
+Resolved next hops are re-observed every five seconds, so a changed gateway MAC
+converges even when Wren has no new route to advertise. Identical resolved routes
+do not rewrite the packet maps.
 
 This update barrier requires Linux `MEMBARRIER_CMD_GLOBAL` support, as provided
 by the appliance's Linux 6.12 kernel; `nohz_full` must be disabled. The agent

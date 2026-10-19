@@ -307,7 +307,7 @@ pub fn resolve(store: &Store, arp: &ArpTable, policy: PolicyId) -> Resolved {
 
 const BACKOFF_FLOOR: Duration = Duration::from_millis(500);
 const BACKOFF_CEIL: Duration = Duration::from_secs(10);
-/// Retry unresolved next hops and failed applications while the feed is idle.
+/// Refresh next hops and retry failed applications while the feed is idle.
 const RERESOLVE: Duration = Duration::from_secs(5);
 
 /// Follow Wren's forwarding table for as long as the agent runs.
@@ -393,10 +393,12 @@ async fn subscribe(
                 }
             }
             _ = tick.tick() => {
-                // A resolved next hop can still fail at map programming or
-                // host preparation. Retry that desired snapshot even when Wren
-                // sends no duplicate event and no neighbor is unresolved.
-                if settled && (apply_pending || !last_waiting.is_empty()) {
+                // The kernel can learn a new gateway MAC without changing the
+                // RIB. Re-observe resolved neighbors too; otherwise a gateway
+                // replacement leaves XDP sending to the old MAC indefinitely.
+                // Identical resolved routes do not rewrite the live maps.
+                // Pending withdrawals still retry when the store is empty.
+                if settled && (apply_pending || store.len() != 0) {
                     apply_pending = push(firewall, &store, policy, &mut last_waiting).await;
                 }
             }
