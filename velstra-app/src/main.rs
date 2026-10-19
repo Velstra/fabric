@@ -319,7 +319,7 @@ async fn run(args: RunArgs) -> Result<()> {
     for (iface, mode) in &firewall.lock().await.attached {
         info!("attached to {iface} in {mode:?} mode");
     }
-    println!("Velstra is live. Press Ctrl-C to detach.");
+    info!("Velstra is live. Press Ctrl-C to detach.");
 
     // Read-only diagnostics socket (C23): the agent owns the maps, so it is the
     // only process that can answer what the data plane is currently doing.
@@ -530,9 +530,13 @@ async fn run(args: RunArgs) -> Result<()> {
 
     serve(&firewall, args.stats_interval, reporter).await?;
 
-    println!("\nFinal statistics:");
-    print!("{}", firewall.lock().await.read_stats()?.render());
-    println!("Detaching XDP program and exiting.");
+    match firewall.lock().await.read_stats() {
+        Ok(stats) => {
+            write_statistics("Final", &stats);
+        }
+        Err(error) => warn!("could not read final statistics: {error:#}"),
+    }
+    info!("Detaching XDP program and exiting.");
     Ok(())
 }
 
@@ -569,7 +573,6 @@ async fn watch_updates(
         let mut stream = match controller_client::watch_any(&endpoints, &node_id, &tls).await {
             Ok((stream, endpoint)) => {
                 info!("watching config from {endpoint}");
-                backoff = BACKOFF_FLOOR;
                 stream
             }
             Err(e) => {
@@ -597,20 +600,32 @@ async fn watch_updates(
                     if !fresh_connection && node_config.version == last_version {
                         continue; // same config re-sent on this stream; nothing to do
                     }
-                    fresh_connection = false;
-                    last_version = node_config.version;
                     match velstra_config::runtime_from_proto(&node_config) {
                         Ok(cfg) => {
                             let mut fw = firewall.lock().await;
                             match fw.reconfigure(&cfg) {
                                 Ok(()) => {
                                     drop(fw);
+                                    fresh_connection = false;
+                                    last_version = node_config.version;
+                                    backoff = BACKOFF_FLOOR;
                                     log_policy(
                                         &format!("applied controller update v{last_version}"),
                                         &cfg,
                                     );
                                 }
-                                Err(e) => error!("failed to apply controller update: {e:#}"),
+                                Err(e) => {
+                                    drop(fw);
+                                    error!(
+                                        "failed to apply controller update: {e:#}; retrying in {}s",
+                                        backoff.as_secs_f32()
+                                    );
+                                    tokio::time::sleep(backoff).await;
+                                    backoff = (backoff * 2).min(BACKOFF_CEIL);
+                                    // Reconnect for the latest desired state, even if
+                                    // its version has not changed since this failure.
+                                    break;
+                                }
                             }
                         }
                         Err(e) => warn!("controller sent an invalid config: {e:#}"),
@@ -760,24 +775,59 @@ async fn serve(
         return Ok(());
     }
 
+    // Keep one signal subscription alive while optional telemetry is in
+    // flight. Recreating it after each tick loses SIGTERM received inside an
+    // awaited RPC, leaving systemd to force-kill the agent later.
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
     let mut ticker = tokio::time::interval(Duration::from_secs(interval));
     // The first tick fires immediately; skip it so we don't print all-zeros.
     ticker.tick().await;
     loop {
         tokio::select! {
-            result = shutdown_signal() => {
+            biased;
+            result = &mut shutdown => {
                 result?;
                 return Ok(());
             }
             _ = ticker.tick() => {
-                let stats = firewall.lock().await.read_stats()?;
-                println!("\nLive statistics:");
-                print!("{}", stats.render());
-                if let Some(reporter) = reporter.as_mut()
-                    && let Err(e) = reporter.report(&stats).await {
-                    warn!("could not report stats to controller: {e}");
+                let stats = match firewall.lock().await.read_stats() {
+                    Ok(stats) => stats,
+                    Err(error) => {
+                        // Telemetry is optional. An observation failure must
+                        // not stop the agent and detach a working firewall.
+                        warn!("could not read datapath statistics; keeping firewall active: {error:#}");
+                        continue;
+                    }
+                };
+                write_statistics("Live", &stats);
+                if let Some(reporter) = reporter.as_mut() {
+                    tokio::select! {
+                        biased;
+                        result = &mut shutdown => {
+                            result?;
+                            return Ok(());
+                        }
+                        result = reporter.report(&stats) => {
+                            if let Err(error) = result {
+                                warn!("could not report stats to controller: {error}");
+                            }
+                        }
+                    }
                 }
             }
         }
+    }
+}
+
+/// Statistics output must not unwind the firewall if its log consumer closes.
+fn write_statistics(title: &str, stats: &firewall::Stats) {
+    use std::io::Write;
+    if let Err(error) = write!(
+        std::io::stdout().lock(),
+        "\n{title} statistics:\n{}",
+        stats.render()
+    ) {
+        warn!("could not write datapath statistics: {error}");
     }
 }

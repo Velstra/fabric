@@ -5,6 +5,8 @@
 //! the same port is refused. This is the proof the northbound wire is no longer
 //! plaintext when certs are configured. No root, no eBPF.
 
+mod support;
+
 use std::{
     process::{Child, Command},
     time::Duration,
@@ -35,12 +37,7 @@ async fn rest_gateway_serves_https() {
     let topology = dir.join("topology.toml");
     std::fs::write(&topology, "").unwrap();
 
-    // A port band distinct from the plaintext gateway test so the two can run in
-    // parallel without colliding.
-    let base = 41000 + (pid % 8000) as u16;
-    let agent_port = base;
-    let admin_port = base + 1;
-    let rest_port = base + 2;
+    let [agent_port, admin_port, rest_port] = support::free_ports();
     // The server cert's SANs cover `localhost` and 127.0.0.1, so dial by name.
     let rest = format!("https://localhost:{rest_port}");
 

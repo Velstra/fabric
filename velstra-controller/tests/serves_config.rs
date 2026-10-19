@@ -3,6 +3,8 @@
 //! the generated client, and check it serves the right config — including a live
 //! update when the file changes.
 
+mod support;
+
 use std::{
     process::{Child, Command},
     time::Duration,
@@ -30,8 +32,7 @@ async fn controller_serves_and_updates_config() {
     let dir = std::env::temp_dir().join(format!("velstra-ctl-test-{pid}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let port = 49152 + (pid % 8000) as u16;
-    let admin_port = port + 1;
+    let [port, admin_port] = support::free_ports();
     let endpoint = format!("http://127.0.0.1:{port}");
     let admin_endpoint = format!("http://127.0.0.1:{admin_port}");
 

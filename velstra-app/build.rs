@@ -1,5 +1,8 @@
 use anyhow::{Context as _, anyhow};
 use aya_build::Toolchain;
+// Keep Cargo's dependency edge to the eBPF library: changes in its transitive
+// dependencies must rebuild the embedded binary as well as the host agent.
+use velstra_ebpf as _;
 
 fn main() -> anyhow::Result<()> {
     let cargo_metadata::Metadata { packages, .. } = cargo_metadata::MetadataCommand::new()

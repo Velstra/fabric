@@ -46,6 +46,7 @@ use std::{
     time::Duration,
 };
 
+use anyhow::Context as _;
 use log::{debug, info, warn};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -222,10 +223,10 @@ pub struct ProcArp;
 
 impl ProcArp {
     /// Read and parse the whole table. Blocking; call it off the runtime.
-    pub fn read() -> ArpTable {
-        std::fs::read_to_string("/proc/net/arp")
-            .map(|text| Self::parse(&text))
-            .unwrap_or_default()
+    pub fn read() -> std::io::Result<ArpTable> {
+        // An unavailable observation is not an empty neighbor table: treating
+        // EMFILE or an I/O failure as emptiness would withdraw working routes.
+        std::fs::read_to_string("/proc/net/arp").map(|text| Self::parse(&text))
     }
 
     /// "IP address  HW type  Flags  HW address  Mask  Device"; flag 0x2 is a
@@ -306,7 +307,7 @@ pub fn resolve(store: &Store, arp: &ArpTable, policy: PolicyId) -> Resolved {
 
 const BACKOFF_FLOOR: Duration = Duration::from_millis(500);
 const BACKOFF_CEIL: Duration = Duration::from_secs(10);
-/// How often unresolved next hops are tried again while nothing else moves.
+/// Retry unresolved next hops and failed applications while the feed is idle.
 const RERESOLVE: Duration = Duration::from_secs(5);
 
 /// Follow Wren's forwarding table for as long as the agent runs.
@@ -349,6 +350,7 @@ async fn subscribe(
     let mut store = Store::new(table);
     let mut lines = BufReader::new(stream).lines();
     let mut settled = false;
+    let mut apply_pending = false;
     let mut last_waiting: Vec<(Cidr4, String)> = Vec::new();
     let mut tick = tokio::time::interval(RERESOLVE);
     tick.tick().await; // the first tick is immediate; the feed's snapshot comes first
@@ -377,63 +379,81 @@ async fn subscribe(
                         // ever — the trie would be a memory of a table that no
                         // longer exists.
                         settled = true;
-                        push(firewall, &store, policy, &mut last_waiting).await;
+                        apply_pending = push(firewall, &store, policy, &mut last_waiting).await;
                     }
                     Ok(parsed) => {
                         // Before the snapshot ends, nothing is programmed:
                         // end-of-dump pushes whatever the store holds by then,
                         // so a half-read snapshot never reaches the trie.
                         if store.apply(parsed) && settled {
-                            push(firewall, &store, policy, &mut last_waiting).await;
+                            apply_pending = push(firewall, &store, policy, &mut last_waiting).await;
                         }
                     }
                     Err(why) => warn!("wren routes: {why}"),
                 }
             }
             _ = tick.tick() => {
-                // Nothing moved in Wren; a gateway may have been resolved since.
-                if settled && !last_waiting.is_empty() {
-                    push(firewall, &store, policy, &mut last_waiting).await;
+                // A resolved next hop can still fail at map programming or
+                // host preparation. Retry that desired snapshot even when Wren
+                // sends no duplicate event and no neighbor is unresolved.
+                if settled && (apply_pending || !last_waiting.is_empty()) {
+                    apply_pending = push(firewall, &store, policy, &mut last_waiting).await;
                 }
             }
         }
     }
 }
 
+/// Return whether applying the latest desired snapshot still needs a retry.
 async fn push(
     firewall: &Arc<Mutex<Firewall>>,
     store: &Store,
     policy: PolicyId,
     last_waiting: &mut Vec<(Cidr4, String)>,
-) {
-    // Reading /proc and sending a datagram are both blocking, and this runs on
-    // the task that is also reading the feed. Off the runtime with both.
-    let arp = tokio::task::spawn_blocking(ProcArp::read)
-        .await
-        .unwrap_or_default();
-    let Resolved {
-        routes,
-        waiting,
-        unresolved,
-    } = resolve(store, &arp, policy);
-    if !unresolved.is_empty() {
-        let _ = tokio::task::spawn_blocking(move || unresolved.into_iter().for_each(nudge)).await;
-    }
-    if waiting != *last_waiting {
-        for (prefix, why) in &waiting {
-            info!("wren route {prefix} not programmed: {why}");
+) -> bool {
+    let result: anyhow::Result<()> = async {
+        // With no learned routes, withdrawal needs no neighbor observation.
+        // Otherwise keep active routes when the snapshot itself is unavailable.
+        let arp = if store.len() == 0 {
+            ArpTable::new()
+        } else {
+            tokio::task::spawn_blocking(ProcArp::read)
+                .await
+                .context("waiting for kernel ARP reader")?
+                .context("reading kernel ARP table")?
+        };
+        let Resolved {
+            routes,
+            waiting,
+            unresolved,
+        } = resolve(store, &arp, policy);
+        if !unresolved.is_empty() {
+            let _ =
+                tokio::task::spawn_blocking(move || unresolved.into_iter().for_each(nudge)).await;
         }
-        *last_waiting = waiting;
+        if waiting != *last_waiting {
+            for (prefix, why) in &waiting {
+                info!("wren route {prefix} not programmed: {why}");
+            }
+            *last_waiting = waiting;
+        }
+        let programmed = routes.len();
+        if firewall.lock().await.set_dynamic_routes(routes)? {
+            info!(
+                "wren routes: {programmed} programmed, {} waiting, {} known",
+                last_waiting.len(),
+                store.len()
+            );
+        }
+        Ok(())
     }
-    let programmed = routes.len();
-    match firewall.lock().await.set_dynamic_routes(routes) {
-        Ok(true) => info!(
-            "wren routes: {programmed} programmed, {} waiting, {} known",
-            last_waiting.len(),
-            store.len()
-        ),
-        Ok(false) => {}
-        Err(e) => warn!("wren routes could not be programmed ({e:#}); keeping the previous set"),
+    .await;
+    match result {
+        Ok(()) => false,
+        Err(error) => {
+            warn!("wren routes could not be programmed ({error:#}); keeping the previous set");
+            true
+        }
     }
 }
 

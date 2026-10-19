@@ -10,6 +10,13 @@ use crate::{
     packet::{PacketMeta, ip_proto},
 };
 
+/// Shared `APPLY_STATE` map values. Unknown values are never ready.
+pub const CONFIG_READY: u32 = 0;
+/// A configuration transaction is draining readers or changing maps.
+pub const CONFIG_UPDATING: u32 = 1;
+/// Recovery failed; traffic stays blocked until reconciliation succeeds.
+pub const CONFIG_FAILED: u32 = 2;
+
 /// The verdict applied to a packet.
 ///
 /// The numeric representation is part of the on-the-wire map ABI: it is what

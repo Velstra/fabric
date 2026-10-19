@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 description = "Embedded Raft (over openraft) for the Velstra controllers: the replicated state machine is the fabric topology, so controllers stay consistent with no external datastore."
 repository.workspace = true
-homepage.workspace = true
 keywords = ["raft", "consensus", "sdn", "openraft", "velstra"]
 categories = ["network-programming", "concurrency"]
 readme = "README.md"

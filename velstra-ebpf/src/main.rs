@@ -115,6 +115,20 @@ static LOCAL_VNIS: HashMap<u32, u32> = HashMap::with_max_entries(4096, 0);
 #[map]
 static CONFIG: HashMap<PolicyId, GlobalConfig> = HashMap::with_max_entries(1024, 0);
 
+/// Traffic is admitted only after a complete configuration is installed.
+/// The agent closes this gate and drains old readers before modifying maps.
+#[map]
+static APPLY_STATE: Array<u32> = Array::with_max_entries(1, 0);
+
+#[inline(always)]
+fn configuration_ready() -> bool {
+    APPLY_STATE.get(0).is_some_and(|state| {
+        // SAFETY: the map owns this aligned u32 for the program's lifetime.
+        // Volatile prevents caching a state userspace changes concurrently.
+        (unsafe { core::ptr::read_volatile(state) }) == velstra_common::CONFIG_READY
+    })
+}
+
 /// Host-wide fail-closed switch: a single-slot flag (`0` / absent = fail **open**,
 /// non-zero = fail **closed**). It governs only what happens when the data plane
 /// cannot parse a packet at all — a `ptr_at` bounds failure — which is decided
@@ -1007,6 +1021,10 @@ pub fn velstra_guest_delivery(ctx: XdpContext) -> u32 {
 /// the firewall, before ARP.
 #[xdp]
 pub fn velstra(ctx: XdpContext) -> u32 {
+    if !configuration_ready() {
+        bump(Counter::DroppedDefault);
+        return xdp_action::XDP_DROP;
+    }
     if !port_identity_ok(&ctx) {
         bump(Counter::DroppedNotYours);
         return xdp_action::XDP_DROP;
@@ -1072,6 +1090,10 @@ pub fn velstra_main(ctx: XdpContext) -> u32 {
 /// trade the XDP hook above makes, counted the same way.
 #[classifier]
 pub fn velstra_egress(ctx: TcContext) -> i32 {
+    if !configuration_ready() {
+        bump(Counter::DroppedDefault);
+        return TC_ACT_SHOT as i32;
+    }
     match try_egress(&ctx) {
         Ok(action) => action,
         Err(()) => {
@@ -1166,6 +1188,10 @@ fn restore_bum_frame(ctx: &TcContext, frame: *mut [u8; 16384], len: u32) -> i32 
 /// rather than leaking a partially rewritten frame into the local segment.
 #[classifier]
 pub fn velstra_bum(ctx: TcContext) -> i32 {
+    if !configuration_ready() {
+        bump(Counter::DroppedDefault);
+        return TC_ACT_SHOT as i32;
+    }
     match try_bum(&ctx) {
         Ok(action) => action,
         Err(()) => TC_ACT_OK as i32,
