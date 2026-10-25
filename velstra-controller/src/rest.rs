@@ -1538,6 +1538,7 @@ async fn create_security_group(
     let mut rules = Vec::with_capacity(body.rules.len());
     for r in &body.rules {
         rules.push(PortRule {
+            name: String::new(),
             proto: parse_proto(&r.proto)? as i32,
             port: r.port as u32,
             action: parse_action(&r.action)? as i32,

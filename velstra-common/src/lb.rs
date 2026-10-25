@@ -340,6 +340,28 @@ pub fn plan_nat(
     }
 }
 
+/// Echo NAT changes an IPv4 address and an ICMP identifier. ICMPv4 has no
+/// pseudo-header: the address delta belongs only in the IPv4 checksum. Unlike
+/// a TCP/UDP port sentinel, identifier zero is a real value to restore.
+#[inline(always)]
+pub fn plan_icmp_echo_nat(
+    old_ip: [u8; 4],
+    new_ip: [u8; 4],
+    old_id: u16,
+    new_id: u16,
+    ip_checksum: u16,
+    icmp_checksum: u16,
+) -> Nat {
+    Nat {
+        new_ip,
+        new_port: new_id,
+        new_ip_checksum: replace_addr(ip_checksum, old_ip, new_ip),
+        new_l4_checksum: csum_replace_u16(icmp_checksum, old_id, new_id),
+        rewrite_port: old_id != new_id,
+        rewrite_l4_checksum: true,
+    }
+}
+
 /// Convenience wrapper over [`plan_nat`] for the DNAT-to-backend case.
 #[inline]
 pub fn plan_dnat(
@@ -461,9 +483,30 @@ pub struct FlowState {
     /// (L2 header included) — that is the number an operator compares against a
     /// link's capacity.
     pub bytes: u64,
+    /// Local monotonic activity time. Never replicate as an absolute clock.
+    pub last_seen_ns: u64,
+    pub age_ns: u64,
 }
 
 impl FlowState {
+    #[inline(always)]
+    pub fn expired(&self, proto: u8, now: u64, timeouts: crate::ConntrackTimeouts) -> bool {
+        crate::FirewallState {
+            last_seen_ns: self.last_seen_ns,
+            age_ns: self.age_ns,
+            phase: crate::FirewallState::ESTABLISHED,
+            reply: 0,
+        }
+        .expired(proto, now, timeouts)
+    }
+
+    pub fn idle_ns(&self, now: u64) -> u64 {
+        if now < self.last_seen_ns {
+            return u64::MAX;
+        }
+        (now - self.last_seen_ns).saturating_add(self.age_ns)
+    }
+
     /// This entry rewrites the packet's **source** (SNAT a reply) rather than
     /// its destination (DNAT a request).
     pub const REVERSE: u16 = 1 << 0;
@@ -493,6 +536,8 @@ impl FlowState {
             _pad: 0,
             packets: 0,
             bytes: 0,
+            last_seen_ns: 0,
+            age_ns: 0,
         }
     }
 
@@ -508,6 +553,8 @@ impl FlowState {
             _pad: 0,
             packets: 0,
             bytes: 0,
+            last_seen_ns: 0,
+            age_ns: 0,
         }
     }
 
@@ -529,6 +576,8 @@ impl FlowState {
             _pad: 0,
             packets: 0,
             bytes: 0,
+            last_seen_ns: 0,
+            age_ns: 0,
         }
     }
 
@@ -550,6 +599,8 @@ impl FlowState {
             _pad: 0,
             packets: 0,
             bytes: 0,
+            last_seen_ns: 0,
+            age_ns: 0,
         }
     }
 
@@ -567,6 +618,8 @@ impl FlowState {
             _pad: 0,
             packets: 0,
             bytes: 0,
+            last_seen_ns: 0,
+            age_ns: 0,
         }
     }
 
@@ -1001,7 +1054,7 @@ mod tests {
         // asserted because it is the conntrack map's value: it is multiplied by
         // 65536 entries, and the conntrack-sync codec is written against the
         // layout by hand.
-        assert_eq!(core::mem::size_of::<FlowState>(), 32);
+        assert_eq!(core::mem::size_of::<FlowState>(), 48);
         // The counters must sit *after* the NAT fields and the alignment must not
         // have inserted padding among them, or the wire format's 16-byte record
         // would no longer be the NAT prefix it claims to be.
@@ -1073,5 +1126,57 @@ mod tests {
         assert!(router.is_router_nat());
         assert!(router.has_client_affinity());
         assert_eq!(router.reply_policy, 9);
+    }
+}
+
+#[cfg(test)]
+mod icmp_nat_tests {
+    use super::*;
+    use crate::ipv4_checksum;
+
+    fn echo_checksum(bytes: &[u8]) -> u16 {
+        let mut sum: u32 = bytes
+            .chunks_exact(2)
+            .map(|p| u16::from_be_bytes([p[0], p[1]]) as u32)
+            .sum();
+        while sum > 0xffff {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    #[test]
+    fn echo_translation_and_reverse_restore_checksums_including_identifier_zero() {
+        for original in [0u16, 1, 65535] {
+            let mut ip = [0u8; 20];
+            ip[0] = 0x45;
+            ip[2..4].copy_from_slice(&32u16.to_be_bytes());
+            ip[8] = 64;
+            ip[9] = 1;
+            let private = [10, 1, 1, 2];
+            let public = [203, 0, 113, 10];
+            ip[12..16].copy_from_slice(&private);
+            ip[16..20].copy_from_slice(&[192, 0, 2, 2]);
+            let ip_sum = ipv4_checksum(&ip);
+            let mut echo = [8, 0, 0, 0, 0, 0, 0, 1, 11, 22, 33, 44];
+            echo[4..6].copy_from_slice(&original.to_be_bytes());
+            let echo_sum = echo_checksum(&echo);
+            let translated = plan_icmp_echo_nat(private, public, original, 40000, ip_sum, echo_sum);
+            ip[12..16].copy_from_slice(&public);
+            echo[4..6].copy_from_slice(&40000u16.to_be_bytes());
+            assert_eq!(translated.new_ip_checksum, ipv4_checksum(&ip));
+            assert_eq!(translated.new_l4_checksum, echo_checksum(&echo));
+            let restored = plan_icmp_echo_nat(
+                public,
+                private,
+                40000,
+                original,
+                translated.new_ip_checksum,
+                translated.new_l4_checksum,
+            );
+            assert_eq!(restored.new_port, original);
+            assert_eq!(restored.new_ip_checksum, ip_sum);
+            assert_eq!(restored.new_l4_checksum, echo_sum);
+        }
     }
 }

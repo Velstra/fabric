@@ -328,6 +328,7 @@ pub fn translate(spec: &str, actions: &[String], floor: u8) -> Result<Enforced, 
     let rules = ports
         .into_iter()
         .map(|port| ResolvedRule {
+            name: String::new(),
             key: PortKey::new(proto, port),
             icmp_type: 0,
             in_interface: String::new(),
@@ -753,6 +754,7 @@ mod tests {
     fn an_advertised_discard_overrides_a_configured_pass() {
         let mut cfg = one_policy();
         let permit = ResolvedRule {
+            name: String::new(),
             key: PortKey::new(6, 22),
             icmp_type: 0,
             in_interface: String::new(),
@@ -790,6 +792,7 @@ mod tests {
         // only says "discard" is not an instruction to change it.
         let mut cfg = one_policy();
         cfg.policies[0].port_rules.push(ResolvedRule {
+            name: String::new(),
             key: PortKey::new(6, 22),
             icmp_type: 0,
             in_interface: String::new(),

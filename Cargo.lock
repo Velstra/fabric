@@ -2921,12 +2921,13 @@ dependencies = [
  "env_logger",
  "libc",
  "log",
+ "object",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "tonic",
  "velstra-common",
  "velstra-config",
- "velstra-ebpf",
  "velstra-proto",
 ]
 

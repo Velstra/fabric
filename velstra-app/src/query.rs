@@ -79,7 +79,7 @@ pub async fn expire_blocks_loop(firewall: Arc<Mutex<Firewall>>) {
 /// A stale socket file from a previous run is removed first: the agent is
 /// restarted far more often than the path changes, and refusing to start because
 /// yesterday's socket file is still there would be a self-inflicted outage.
-pub async fn serve(path: PathBuf, firewall: Arc<Mutex<Firewall>>) {
+pub async fn serve(path: PathBuf, firewall: Arc<Mutex<Firewall>>, config: Option<PathBuf>) {
     if path.exists() {
         let _ = std::fs::remove_file(&path);
     }
@@ -99,7 +99,8 @@ pub async fn serve(path: PathBuf, firewall: Arc<Mutex<Firewall>>) {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let fw = firewall.clone();
-                tokio::spawn(async move { handle(stream, fw).await });
+                let source = config.clone();
+                tokio::spawn(async move { handle(stream, fw, source).await });
             }
             Err(e) => {
                 warn!("query socket accept failed: {e}");
@@ -111,18 +112,22 @@ pub async fn serve(path: PathBuf, firewall: Arc<Mutex<Firewall>>) {
 
 /// Answer one request. Errors are reported to the caller as text rather than
 /// logged and dropped — someone is waiting on this socket for an answer.
-async fn handle(stream: UnixStream, firewall: Arc<Mutex<Firewall>>) {
+async fn handle(stream: UnixStream, firewall: Arc<Mutex<Firewall>>, config: Option<PathBuf>) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     if reader.read_line(&mut line).await.is_err() {
         return;
     }
-    let reply = respond(line.trim(), &firewall).await;
+    let reply = respond(line.trim(), &firewall, config.as_deref()).await;
     let _ = reader.get_mut().write_all(reply.as_bytes()).await;
 }
 
 /// Dispatch one command to its rendering.
-async fn respond(line: &str, firewall: &Arc<Mutex<Firewall>>) -> String {
+async fn respond(
+    line: &str,
+    firewall: &Arc<Mutex<Firewall>>,
+    config: Option<&std::path::Path>,
+) -> String {
     let mut tokens = line.split_whitespace();
     let verb = tokens.next().unwrap_or("");
     // Collected rather than consumed one at a time: reading the limit off the
@@ -132,11 +137,54 @@ async fn respond(line: &str, firewall: &Arc<Mutex<Firewall>>) -> String {
     let args: Vec<&str> = tokens.collect();
     let limit = parse_limit(args.first().copied());
     match verb {
+        "reload" => {
+            let Some(path) = config else {
+                return "error: node is controller-managed or has no config file\n".into();
+            };
+            match velstra_config::load_file(path) {
+                Err(e) => format!("error: invalid configuration: {e:#}\n"),
+                Ok(cfg) => {
+                    let mut fw = firewall.lock().await;
+                    if fw.requires_restart(&cfg) {
+                        return "restart-required\n".into();
+                    }
+                    match fw.reconfigure(&cfg) {
+                        Ok(()) => "ok\n".into(),
+                        Err(e) => format!("error: applying configuration: {e:#}\n"),
+                    }
+                }
+            }
+        }
+        "reconcile-links" => match firewall.lock().await.reconcile_links() {
+            Ok(()) => "ok\n".into(),
+            Err(e) => format!("error: reconciling packet hooks: {e:#}\n"),
+        },
         "stats" => {
             let fw = firewall.lock().await;
             match fw.read_stats() {
                 Ok(stats) => stats.render(),
                 Err(e) => format!("error: reading statistics: {e:#}\n"),
+            }
+        }
+        "firewall-states" => {
+            let fw = firewall.lock().await;
+            match fw.read_firewall_states() {
+                Ok(value) => format!("{value}\n"),
+                Err(e) => format!("error: reading firewall states: {e:#}\n"),
+            }
+        }
+        "rule-stats" => {
+            let fw = firewall.lock().await;
+            match fw.read_rule_counters() {
+                Ok(value) => format!("{value}\n"),
+                Err(e) => format!("error: reading rule counters: {e:#}\n"),
+            }
+        }
+        "packet-events" => {
+            let mut fw = firewall.lock().await;
+            match fw.read_packet_events(limit.unwrap_or(100)) {
+                Ok(rows) => rows.into_iter().map(|row| format!("{row}\n")).collect(),
+                Err(e) => format!("error: reading packet events: {e:#}\n"),
             }
         }
         "flows" | "top" => {

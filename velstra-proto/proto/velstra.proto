@@ -591,6 +591,7 @@ message NodeConfig {
   repeated Srv6LocalSid srv6_local_sids = 23; // SIDs this node terminates
   repeated Srv6Flood srv6_floods = 24;       // per-VNI End.DT2M flood set
   repeated Srv6IrbRoute srv6_irb_routes = 25; // symmetric-IRB routed subnets
+  ConntrackTimeouts conntrack = 26; // absent preserves documented defaults
 }
 
 // Encapsulation format for the overlay.
@@ -799,6 +800,7 @@ message InterfaceAssignment {
   optional uint32 rate_limit_mbit = 7;
   // Source-NAT traffic leaving this interface to its own public address.
   bool masquerade = 8;
+  optional string snat_address = 11;
   // Deterministic CGNAT: the first WAN port handed out, and how many each
   // internal address gets. Both zero = plain hash-spread NAPT.
   uint32 cgnat_base_port = 9;
@@ -806,6 +808,7 @@ message InterfaceAssignment {
 }
 
 message PortRule {
+  string name = 14; // stable operator identity for counters and packet events
   Proto proto = 1;
   uint32 port = 2;
   Action action = 3;
@@ -895,4 +898,14 @@ message StatsReport {
 message Counter {
   string name = 1;
   uint64 value = 2;
+}
+
+// Stateful-firewall idle timeouts in seconds; an absent message uses defaults.
+message ConntrackTimeouts {
+  uint32 tcp_syn = 1;
+  uint32 tcp_established = 2;
+  uint32 tcp_closing = 3;
+  uint32 udp = 4;
+  uint32 udp_stream = 5;
+  uint32 icmp = 6;
 }

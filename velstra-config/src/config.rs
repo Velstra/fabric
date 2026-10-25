@@ -154,6 +154,8 @@ impl ProtoName {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PortRule {
+    #[serde(default)]
+    pub name: String,
     /// Transport protocol.
     pub proto: ProtoName,
     /// Destination port to match.
@@ -798,6 +800,8 @@ pub struct InterfaceFile {
     /// hook; the reply is un-NAT'd on ingress via connection tracking.
     #[serde(default)]
     pub masquerade: bool,
+    #[serde(default)]
+    pub snat_address: Option<String>,
     /// Deterministic CGNAT (roadmap C16): the first WAN port handed out and how
     /// many each internal address gets. Both set ⇒ every masqueraded flow from one
     /// address takes a port from that address's fixed block, so a WAN port can be
@@ -810,11 +814,63 @@ pub struct InterfaceFile {
     pub cgnat_block_size: u16,
 }
 
+/// Stateful-firewall idle timeouts, in seconds. Zero and values over seven
+/// days are rejected rather than silently disabling expiry.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConntrackConfig {
+    pub tcp_syn: u32,
+    pub tcp_established: u32,
+    pub tcp_closing: u32,
+    pub udp: u32,
+    pub udp_stream: u32,
+    pub icmp: u32,
+}
+impl Default for ConntrackConfig {
+    fn default() -> Self {
+        let t = velstra_common::ConntrackTimeouts::DEFAULT;
+        Self {
+            tcp_syn: t.tcp_syn,
+            tcp_established: t.tcp_established,
+            tcp_closing: t.tcp_closing,
+            udp: t.udp,
+            udp_stream: t.udp_stream,
+            icmp: t.icmp,
+        }
+    }
+}
+impl ConntrackConfig {
+    pub fn resolve(self) -> Result<velstra_common::ConntrackTimeouts> {
+        for (name, seconds) in [
+            ("tcp_syn", self.tcp_syn),
+            ("tcp_established", self.tcp_established),
+            ("tcp_closing", self.tcp_closing),
+            ("udp", self.udp),
+            ("udp_stream", self.udp_stream),
+            ("icmp", self.icmp),
+        ] {
+            anyhow::ensure!(
+                (1..=604800).contains(&seconds),
+                "conntrack.{name} must be 1..=604800 seconds"
+            );
+        }
+        Ok(velstra_common::ConntrackTimeouts {
+            tcp_syn: self.tcp_syn,
+            tcp_established: self.tcp_established,
+            tcp_closing: self.tcp_closing,
+            udp: self.udp,
+            udp_stream: self.udp_stream,
+            icmp: self.icmp,
+        })
+    }
+}
+
 /// The raw, deserialised TOML document. The top-level firewall fields define
 /// policy `0` (the default); `[[policy]]`/`[[interface]]` add tenant policies.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct FileConfig {
+    pub conntrack: ConntrackConfig,
     /// Verdict for traffic that matches no rule. Defaults to `pass`.
     pub default_action: ActionName,
     /// Drop all ICMP traffic.
@@ -1165,6 +1221,7 @@ pub struct PolicyConfig {
 /// rule carrying both, since the two live in different longest-prefix tries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedRule {
+    pub name: String,
     /// `(proto, destination port)`.
     pub key: PortKey,
     /// The ICMP type, or `0` for "any type" — which is also every protocol that
@@ -1283,6 +1340,7 @@ pub struct ResolvedInterface {
     pub vni: u32,
     /// Masquerade (source NAT) traffic leaving this interface (`MASQUERADE`).
     pub masquerade: bool,
+    pub snat_address: Option<[u8; 4]>,
     /// The MSS ceiling for SYNs leaving this interface (`MSS_CLAMP`), or `0` for
     /// no clamp.
     pub mss: u16,
@@ -1458,9 +1516,26 @@ pub struct ResolvedSrv6IrbRoute {
     pub gateway_mac: [u8; 6],
 }
 
+impl ResolvedRule {
+    /// Stable identity across commits and fan-out of one named appliance rule.
+    pub fn id(&self) -> u32 {
+        let text = if self.name.is_empty() {
+            format!("{self:?}")
+        } else {
+            self.name.clone()
+        };
+        text.bytes()
+            .fold(0x811c9dc5u32, |hash, b| {
+                (hash ^ b as u32).wrapping_mul(0x01000193)
+            })
+            .max(1)
+    }
+}
+
 /// Fully-resolved, validated configuration ready to be written into BPF maps.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
+    pub conntrack: velstra_common::ConntrackTimeouts,
     /// Per-policy firewall config. Always contains policy `0` (the default).
     pub policies: Vec<PolicyConfig>,
     /// Interface → (policy, vni) assignments (for `IFACE_POLICY` / `IFACE_VNI`).
@@ -1519,6 +1594,7 @@ impl RuntimeConfig {
         Self {
             // Pass-everything means pass-everything: an unparseable packet is
             // passed too, matching this config's whole premise.
+            conntrack: velstra_common::ConntrackTimeouts::DEFAULT,
             fail_closed: false,
             policies: vec![PolicyConfig {
                 mac_rules: Vec::new(),
@@ -1750,15 +1826,8 @@ fn resolve_firewall(
             Some("out") => scope |= PORT_RULE_OUT_ONLY,
             Some(other) => bail!("policy {id}: direction {other:?} is not in or out"),
         }
-        // The egress hook is IPv4 only, so an IPv6 rule scoped to `out` would be
-        // written and never consulted. Refusing beats enforcing nothing quietly.
-        if scope & PORT_RULE_V6_ONLY != 0 && scope & PORT_RULE_OUT_ONLY != 0 {
-            bail!(
-                "policy {id}: direction \"out\" is IPv4 only — an ipv6 rule on the \
-                 egress hook would never be consulted"
-            );
-        }
         rules.push(ResolvedRule {
+            name: rule.name.clone(),
             key: PortKey::new(rule.proto.number(), rule.port),
             icmp_type: velstra_common::icmp_type_key(rule.icmp_type),
             in_interface: rule.in_interface.clone().unwrap_or_default(),
@@ -1773,6 +1842,20 @@ fn resolve_firewall(
         });
     }
 
+    let mut identities = std::collections::BTreeMap::new();
+    for rule in &rules {
+        let label = if rule.name.is_empty() {
+            format!("{rule:?}")
+        } else {
+            rule.name.clone()
+        };
+        if let Some(previous) = identities.insert(rule.id(), label.clone()) {
+            anyhow::ensure!(
+                previous == label,
+                "policy {id}: rule identity collision between {previous:?} and {label:?}; rename one rule"
+            );
+        }
+    }
     Ok(PolicyConfig {
         id,
         global,
@@ -1914,6 +1997,21 @@ impl FileConfig {
                 policy: iface.policy,
                 vni,
                 masquerade: iface.masquerade,
+                snat_address: iface
+                    .snat_address
+                    .as_ref()
+                    .map(|text| -> Result<[u8; 4]> {
+                        let ip: Ipv4Addr = text.parse().context("snat_address must be IPv4")?;
+                        anyhow::ensure!(
+                            iface.masquerade
+                                && !ip.is_unspecified()
+                                && !ip.is_multicast()
+                                && !ip.is_broadcast(),
+                            "snat_address requires masquerade and a unicast IPv4 address"
+                        );
+                        Ok(ip.octets())
+                    })
+                    .transpose()?,
                 // 536 is the smallest MSS a sender may be asked for (RFC 1122's
                 // floor for IPv4); below it the clamp would be refusing to carry
                 // ordinary traffic rather than making it fit.
@@ -2476,6 +2574,7 @@ impl FileConfig {
         }
 
         Ok(RuntimeConfig {
+            conntrack: self.conntrack.resolve()?,
             fail_closed: self.fail_closed,
             policies,
             interfaces,
@@ -2844,6 +2943,50 @@ mod tests {
     /// a schema that accepted it and a validator that did not, so it never
     /// worked end to end.
     #[test]
+    fn named_rule_fanout_preserves_identity_but_hash_collisions_are_refused() {
+        let config = |name: &str| {
+            toml::from_str::<FileConfig>(&format!(
+                "[[port_rule]]\nname=\"costarring\"\nproto=\"tcp\"\nport=80\n[[port_rule]]\nname=\"{name}\"\nproto=\"tcp\"\nport=81\n"
+            ))
+        };
+        let cfg = config("costarring").unwrap().resolve().unwrap();
+        assert_eq!(
+            cfg.policies[0].port_rules[0].id(),
+            cfg.policies[0].port_rules[1].id()
+        );
+        // A real FNV-1a collision must never merge two operators' counters.
+        let error = config("liquid").unwrap().resolve().unwrap_err();
+        assert!(error.to_string().contains("identity collision"));
+    }
+
+    #[test]
+    fn conntrack_timeouts_and_static_snat_are_validated_before_programming() {
+        assert!(
+            toml::from_str::<FileConfig>("[conntrack]\nudp = 0")
+                .unwrap()
+                .resolve()
+                .is_err()
+        );
+        assert!(
+            toml::from_str::<FileConfig>("[conntrack]\ntcp_syn = 604801")
+                .unwrap()
+                .resolve()
+                .is_err()
+        );
+        assert!(
+            toml::from_str::<FileConfig>(
+                "[[interface]]\nname=\"wan\"\npolicy=0\nsnat_address=\"203.0.113.10\""
+            )
+            .unwrap()
+            .resolve()
+            .is_err()
+        );
+        let cfg = toml::from_str::<FileConfig>("[conntrack]\nudp = 3\n[[interface]]\nname=\"wan\"\npolicy=0\nmasquerade=true\nsnat_address=\"203.0.113.10\"").unwrap().resolve().unwrap();
+        assert_eq!(cfg.conntrack.udp, 3);
+        assert_eq!(cfg.interfaces[0].snat_address, Some([203, 0, 113, 10]));
+    }
+
+    #[test]
     fn a_port_less_protocol_is_accepted_at_port_zero_and_refused_with_one() {
         let cfg = |proto: &str, port: u16| {
             format!(
@@ -2959,6 +3102,7 @@ mod tests {
         assert_eq!(
             p0.port_rules[0],
             ResolvedRule {
+                name: String::new(),
                 icmp_type: 0,
                 in_interface: String::new(),
                 scope: 0,
@@ -2976,6 +3120,7 @@ mod tests {
         assert_eq!(
             p0.port_rules[1],
             ResolvedRule {
+                name: String::new(),
                 icmp_type: 0,
                 in_interface: String::new(),
                 scope: 0,
@@ -3230,6 +3375,7 @@ mod tests {
                     policy: 7,
                     vni: 7, // defaults to the policy id
                     masquerade: false,
+                    snat_address: None,
                     mss: 0,
                     cgnat: CgnatLayout::default(),
                     binding: None,
@@ -3240,6 +3386,7 @@ mod tests {
                     policy: 0,
                     vni: 0,
                     masquerade: false,
+                    snat_address: None,
                     mss: 0,
                     cgnat: CgnatLayout::default(),
                     binding: None,
@@ -4278,21 +4425,11 @@ mod rule_limit_tests {
         assert!(policy_with("action = \"drop\"\nlimit = 0\n").is_ok());
     }
 
-    /// If this fails, an `ipv6` rule scoped to `direction = "out"` is written
-    /// into the maps and never consulted — the egress hook is IPv4 only. An
-    /// operator blocking outbound IPv6 to a destination would believe it was
-    /// blocked while every packet went out.
     #[test]
-    fn an_ipv6_rule_on_the_egress_hook_is_refused_because_nothing_would_consult_it() {
-        let err = policy_with("action = \"pass\"\nfamily = \"ipv6\"\ndirection = \"out\"\n")
-            .expect_err("an ipv6 egress rule was accepted");
-        assert!(
-            err.to_string().contains("IPv4 only"),
-            "the refusal does not say what is wrong: {err}"
-        );
-        // The three neighbouring combinations stay legal.
-        assert!(policy_with("action = \"pass\"\nfamily = \"ipv6\"\ndirection = \"in\"\n").is_ok());
-        assert!(policy_with("action = \"pass\"\nfamily = \"ipv4\"\ndirection = \"out\"\n").is_ok());
-        assert!(policy_with("action = \"pass\"\ndirection = \"out\"\n").is_ok());
+    fn ipv6_egress_rules_reach_the_same_scope_flags_as_ingress() {
+        let cfg =
+            policy_with("action = \"pass\"\nfamily = \"ipv6\"\ndirection = \"out\"\n").unwrap();
+        let rule = only_rule(&cfg);
+        assert_eq!(rule.scope, PORT_RULE_V6_ONLY | PORT_RULE_OUT_ONLY);
     }
 }

@@ -33,6 +33,7 @@
 mod cgnat;
 mod cidr;
 mod config;
+mod conntrack;
 mod forward;
 mod lb;
 mod mac;
@@ -46,17 +47,19 @@ mod ratelimit;
 mod reject;
 pub mod srv6;
 mod synproxy;
+mod telemetry;
 
 pub use cgnat::CgnatLayout;
 pub use cidr::{Cidr4, Cidr6, CidrError, mask_v4, mask_v6, parse_cidr_v4, parse_cidr_v6};
 pub use config::{ConfigFlags, GlobalConfig, SourceValidation};
+pub use conntrack::{ConntrackTimeouts, FirewallKey, FirewallState};
 pub use forward::{
     ForwardOutcome, Rewrite, RouteEntry, csum_replace_u16, decrement_ttl, ipv4_checksum,
     plan_forward,
 };
 pub use lb::{
-    Backend, FlowKey, FlowState, Nat, PortFwd, ServiceKey, ServiceValue, plan_dnat, plan_nat,
-    select_backend, session_hash,
+    Backend, FlowKey, FlowState, Nat, PortFwd, ServiceKey, ServiceValue, plan_dnat,
+    plan_icmp_echo_nat, plan_nat, select_backend, session_hash,
 };
 pub use mac::{MacError, parse_mac};
 pub use npt::{Npt66, npt66_rewrite, oc_add};
@@ -101,3 +104,4 @@ pub use synproxy::{
     check_cookie, csum_replace_u32, epoch_of, make_cookie, mss_index, plan_server_ack,
     plan_server_syn, plan_syn_ack, seq_delta, translate_to_client, translate_to_server,
 };
+pub use telemetry::{PacketEvent, RuleCounterKey, RuleCounters, tag_rule, winning_tagged_rule};

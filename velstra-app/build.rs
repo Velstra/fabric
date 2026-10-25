@@ -32,5 +32,15 @@ fn main() -> anyhow::Result<()> {
         std::env::var("VELSTRA_EBPF_TOOLCHAIN").unwrap_or_else(|_| "nightly-2026-08-01".to_owned());
     let toolchain = Toolchain::Custom(&pinned);
     println!("cargo:rerun-if-env-changed=VELSTRA_EBPF_TOOLCHAIN");
+    // The kernel program also embeds shared ABI/packet logic. Track these
+    // explicitly instead of declaring a binary crate as an unused dependency.
+    for path in [
+        "../velstra-common/src",
+        "../velstra-common/Cargo.toml",
+        "../Cargo.lock",
+        "../Cargo.toml",
+    ] {
+        println!("cargo:rerun-if-changed={path}");
+    }
     aya_build::build_ebpf([ebpf_package], toolchain)
 }

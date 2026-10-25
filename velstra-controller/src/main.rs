@@ -1165,6 +1165,7 @@ fn proto_to_proto(p: ProtoName) -> Proto {
 
 fn config_rule_from_proto(r: &PortRule) -> ConfigPortRule {
     ConfigPortRule {
+        name: r.name.clone(),
         src_mac: None,
         in_interface: (!r.in_interface.is_empty()).then(|| r.in_interface.clone()),
         proto: proto_from_proto(r.proto()),
@@ -1183,6 +1184,7 @@ fn config_rule_from_proto(r: &PortRule) -> ConfigPortRule {
 
 fn proto_rule_from_config(r: &ConfigPortRule) -> PortRule {
     PortRule {
+        name: r.name.clone(),
         proto: proto_to_proto(r.proto) as i32,
         port: r.port as u32,
         icmp_type: u32::from(r.icmp_type.unwrap_or(0)),
@@ -3218,6 +3220,7 @@ fn parse_cli_rule(spec: &str, action: Action) -> Result<PortRule> {
         .parse()
         .with_context(|| format!("bad port in rule {spec:?}"))?;
     Ok(PortRule {
+        name: String::new(),
         src_mac: String::new(),
         proto: proto as i32,
         port: port as u32,

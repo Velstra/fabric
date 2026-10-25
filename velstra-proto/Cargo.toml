@@ -6,7 +6,6 @@ rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 description = "gRPC wire types and tonic client/server stubs for the Velstra eBPF/XDP SDN control plane."
 repository.workspace = true
-homepage.workspace = true
 keywords = ["sdn", "grpc", "networking", "ebpf", "velstra"]
 categories = ["network-programming", "api-bindings"]
 readme = "README.md"
