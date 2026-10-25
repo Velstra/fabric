@@ -18,6 +18,7 @@ mod controller_client;
 mod firewall;
 mod flows;
 mod flowspec;
+mod ha;
 mod ipfix;
 mod mapping;
 mod portal;
@@ -53,6 +54,8 @@ struct Cli {
 enum Command {
     /// Load the firewall, attach it to an interface and serve (requires root).
     Run(RunArgs),
+    /// Install or explicitly disable the persistent HA kernel guard.
+    HaGuard(ValidateArgs),
     /// Parse a config file and print the resolved ruleset. No privileges needed.
     Validate(ValidateArgs),
     /// Load every program into the kernel verifier without attaching to a NIC.
@@ -251,6 +254,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Validate(args) => validate(args),
+        Command::HaGuard(args) => ha::prepare_guard(&velstra_config::load_file(&args.config)?),
         Command::VerifyEbpf(args) => {
             let object = args.object.map(std::fs::read).transpose()?;
             Firewall::verify_object(object.as_deref())
@@ -322,6 +326,14 @@ async fn run(args: RunArgs) -> Result<()> {
     };
 
     log_policy("policy", &initial);
+    if initial.ha.is_some() {
+        anyhow::ensure!(
+            args.xdp_mode != AttachMode::Hw,
+            "HA fencing does not support NIC offload"
+        );
+        ha::prepare_guard(&initial)?;
+    }
+    let ha_state = ha::State::new(initial.ha.clone())?;
 
     let firewall = Arc::new(Mutex::new(Firewall::load_and_attach(
         &args.iface,
@@ -506,6 +518,10 @@ async fn run(args: RunArgs) -> Result<()> {
         }
     }
 
+    if let Some(ha) = initial.ha.clone() {
+        tokio::spawn(ha::monitor(firewall.clone(), ha_state.clone(), ha));
+    }
+
     if let Some(cts) = initial.conntrack_sync.clone() {
         // Take both flow tables the datapath keys on: CONNTRACK (NAT) and FW_FLOWS
         // (stateful-firewall replies). Both must cross to the backup or a failover
@@ -532,6 +548,7 @@ async fn run(args: RunArgs) -> Result<()> {
                                 conntrack,
                                 fw_flows,
                                 synproxy,
+                                ha_state.clone(),
                                 cts,
                             ));
                         }

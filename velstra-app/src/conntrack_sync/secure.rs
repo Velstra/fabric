@@ -43,12 +43,15 @@ use super::{
     Datagram, decode_datagram, decode_key, encode_firewall_batch, encode_key, encode_nat_batch,
     monotonic_ns,
 };
-use crate::firewall::Firewall;
+use crate::{
+    firewall::Firewall,
+    ha::{self, Authority},
+};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_FRAME: usize = 32_768;
 // Each of CONNTRACK, FW_FLOWS and SYN_FLOWS has at most 65,536 entries.
-const MAX_ENTRIES: usize = 196_608;
+const MAX_ENTRIES: usize = 196_608 + 4096;
 const BEGIN: u8 = 0;
 const UPSERT: u8 = 1;
 const DELETE: u8 = 2;
@@ -63,11 +66,18 @@ enum Record {
     Nat(FlowKey, FlowState),
     Firewall(FirewallKey, FirewallState),
     SynProxy(FlowKey, SynFlow),
+    Wireguard(ha::wireguard::Endpoint),
 }
 
 impl Record {
     fn key(self) -> Key {
         match self {
+            Self::Wireguard(endpoint) => {
+                let mut key = vec![5];
+                key.extend_from_slice(&endpoint.interface);
+                key.extend_from_slice(&endpoint.public_key);
+                key
+            }
             Self::Nat(key, _) => {
                 let mut out = vec![3];
                 encode_key(&key, &mut out);
@@ -90,6 +100,15 @@ impl Record {
         // The parent codec intentionally excludes ages over seven days. Such
         // entries are omitted by the producer before calling this method.
         match self {
+            Self::Wireguard(endpoint) => {
+                let mut wire = b"VWG1".to_vec();
+                wire.extend_from_slice(&endpoint.interface);
+                wire.extend_from_slice(&endpoint.public_key);
+                wire.extend_from_slice(&endpoint.ip);
+                wire.extend_from_slice(&endpoint.port.to_le_bytes());
+                wire.push(endpoint.family);
+                wire
+            }
             Self::SynProxy(key, state) => {
                 // Secure-stream-only record: legacy UDP never accepts SYN state.
                 let mut out = b"VSP1".to_vec();
@@ -114,6 +133,21 @@ impl Record {
         }
     }
     fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.starts_with(b"VWG1") {
+            ensure!(
+                bytes.len() == 71,
+                "invalid WireGuard endpoint record length"
+            );
+            let endpoint = ha::wireguard::Endpoint {
+                interface: bytes[4..20].try_into()?,
+                public_key: bytes[20..52].try_into()?,
+                ip: bytes[52..68].try_into()?,
+                port: u16::from_le_bytes(bytes[68..70].try_into()?),
+                family: bytes[70],
+            };
+            endpoint.validate()?;
+            return Ok(Self::Wireguard(endpoint));
+        }
         if bytes.starts_with(b"VSP1") {
             ensure!(bytes.len() == 40, "invalid SYN-proxy record length");
             let key = decode_key(&bytes[4..24]);
@@ -151,7 +185,7 @@ impl Record {
     }
     fn received(self, now: u64) -> Self {
         match self {
-            Self::SynProxy(_, _) => self,
+            Self::SynProxy(_, _) | Self::Wireguard(_) => self,
             Self::Nat(key, state) => Self::Nat(
                 key,
                 FlowState {
@@ -172,6 +206,7 @@ impl Record {
 
 #[derive(Clone)]
 struct Snapshot {
+    authority: Option<Authority>,
     policy: [u8; 32],
     entries: Entries,
 }
@@ -183,6 +218,7 @@ struct Store {
     nat: NatMap,
     firewall: HashMap<MapData, FirewallKey, FirewallState>,
     synproxy: HashMap<MapData, FlowKey, SynFlow>,
+    endpoints: BTreeMap<Key, ha::wireguard::Endpoint>,
     imported: BTreeMap<Key, Imported>,
     policy: Option<[u8; 32]>,
 }
@@ -218,12 +254,42 @@ impl Store {
         self.imported
             .retain(|key, imported| entries.get(key) == Some(&imported.record));
         entries.retain(|key, _| !self.imported.contains_key(key));
-        Ok(Snapshot { policy, entries })
+        Ok(Snapshot {
+            authority: None,
+            policy,
+            entries,
+        })
     }
     async fn apply(&mut self, peer: IpAddr, kind: u8, record: Record) -> Result<()> {
+        self.apply_inner(peer, kind, record, false).await
+    }
+    async fn apply_inner(
+        &mut self,
+        peer: IpAddr,
+        kind: u8,
+        mut record: Record,
+        authoritative: bool,
+    ) -> Result<()> {
         let key = record.key();
+        if let Record::Wireguard(endpoint) = record {
+            ensure!(
+                authoritative,
+                "WireGuard endpoint requires witness authority"
+            );
+            if kind == DELETE {
+                self.endpoints.remove(&key);
+            } else {
+                ensure!(
+                    self.endpoints.len() < 4096 || self.endpoints.contains_key(&key),
+                    "too many WireGuard endpoints"
+                );
+                self.endpoints.insert(key, endpoint);
+            }
+            return Ok(());
+        }
         let mut nat = self.nat.lock().await;
         let local = match record {
+            Record::Wireguard(_) => unreachable!("handled above"),
             Record::SynProxy(k, _) => self
                 .synproxy
                 .get(&k, 0)
@@ -242,12 +308,13 @@ impl Store {
             .imported
             .get(&key)
             .is_some_and(|i| i.peer == peer && local == Some(i.record));
-        if local.is_some() && !ours {
+        if local.is_some() && !ours && !authoritative {
             return Ok(());
         }
         if kind == DELETE {
-            if ours {
+            if ours || authoritative && local.is_some() {
                 match record {
+                    Record::Wireguard(_) => unreachable!("handled above"),
                     Record::SynProxy(k, _) => self.synproxy.remove(&k)?,
                     Record::Nat(k, _) => nat.remove(&k)?,
                     Record::Firewall(k, _) => self.firewall.remove(&k)?,
@@ -259,13 +326,55 @@ impl Store {
                 self.imported.len() < MAX_ENTRIES || self.imported.contains_key(&key),
                 "peer state exceeds bounded map capacity"
             );
+            // A successor owns flow state, while accounting stays local even
+            // when the former master rejoins with older, locally owned values.
+            if let (Record::Nat(key, incoming), Some(Record::Nat(_, old))) = (&mut record, local) {
+                let _ = key;
+                incoming.packets = old.packets;
+                incoming.bytes = old.bytes;
+            }
             let record = record.received(monotonic_ns());
             match record {
+                Record::Wireguard(_) => unreachable!("handled above"),
                 Record::SynProxy(k, v) => self.synproxy.insert(k, v, 0)?,
                 Record::Nat(k, v) => nat.insert(k, v, 0)?,
                 Record::Firewall(k, v) => self.firewall.insert(k, v, 0)?,
             }
             self.imported.insert(key, Imported { peer, record });
+        }
+        Ok(())
+    }
+    /// Called only while HA's kernel lease is closed and its authority lock is
+    /// held. A complete successor snapshot supersedes old locally owned state.
+    async fn replace_ha(&mut self, peer: IpAddr, records: Entries) -> Result<()> {
+        let absent_nat: Vec<_> = batch_read(&*self.nat.lock().await)?
+            .into_iter()
+            .filter(|(k, v)| !records.contains_key(&Record::Nat(*k, *v).key()))
+            .collect();
+        let absent_fw: Vec<_> = batch_read(&self.firewall)?
+            .into_iter()
+            .filter(|(k, v)| !records.contains_key(&Record::Firewall(*k, *v).key()))
+            .collect();
+        let absent_syn: Vec<_> = batch_read(&self.synproxy)?
+            .into_iter()
+            .filter(|(k, v)| !records.contains_key(&Record::SynProxy(*k, *v).key()))
+            .collect();
+        {
+            let mut nat = self.nat.lock().await;
+            for (key, _) in absent_nat {
+                nat.remove(&key)?;
+            }
+        }
+        for (key, _) in absent_fw {
+            self.firewall.remove(&key)?;
+        }
+        for (key, _) in absent_syn {
+            self.synproxy.remove(&key)?;
+        }
+        self.imported.clear();
+        self.endpoints.clear();
+        for record in records.into_values() {
+            self.apply_inner(peer, UPSERT, record, true).await?;
         }
         Ok(())
     }
@@ -512,7 +621,7 @@ fn unpack(mut bytes: &[u8]) -> Result<Vec<Record>> {
         ensure!(bytes.len() >= 2, "truncated state record size");
         let length = u16::from_le_bytes(bytes[..2].try_into()?) as usize;
         ensure!(
-            length <= 68 && bytes.len() >= 2 + length,
+            length <= 96 && bytes.len() >= 2 + length,
             "invalid state record size"
         );
         records.push(Record::decode(&bytes[2..2 + length])?);
@@ -548,9 +657,16 @@ async fn push(
         if let Some(next) = next {
             if previous
                 .as_ref()
-                .is_none_or(|old| old.policy != next.policy)
+                .is_none_or(|old| old.policy != next.policy || old.authority != next.authority)
             {
-                write_frame(&mut stream, &mut session, next.policy, BEGIN, &[]).await?;
+                write_frame(
+                    &mut stream,
+                    &mut session,
+                    next.policy,
+                    BEGIN,
+                    &encode_authority(&next.authority),
+                )
+                .await?;
                 send_records(
                     &mut stream,
                     &mut session,
@@ -585,15 +701,51 @@ async fn push(
     }
 }
 
+fn encode_authority(authority: &Option<Authority>) -> Vec<u8> {
+    let Some(a) = authority else {
+        return Vec::new();
+    };
+    let mut bytes = a.term.to_le_bytes().to_vec();
+    bytes.push(a.owner);
+    bytes.extend_from_slice(&a.boot);
+    bytes
+}
+fn decode_authority(bytes: &[u8], policy: [u8; 32]) -> Result<Option<Authority>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    ensure!(bytes.len() == 25, "invalid HA authority length");
+    let term = u64::from_le_bytes(bytes[..8].try_into()?);
+    let owner = bytes[8];
+    ensure!(term > 0 && (1..=2).contains(&owner), "invalid HA authority");
+    Ok(Some(Authority {
+        term,
+        owner,
+        boot: bytes[9..25].try_into()?,
+        policy,
+    }))
+}
+
+struct Receiver {
+    firewall: Arc<Mutex<Firewall>>,
+    store: Arc<Mutex<Store>>,
+    ha: ha::Shared,
+    generation: Arc<AtomicU64>,
+    idle_timeout: Duration,
+}
 async fn receive(
     mut stream: TcpStream,
     peer: IpAddr,
     secret: Arc<String>,
-    firewall: Arc<Mutex<Firewall>>,
-    store: Arc<Mutex<Store>>,
-    generation: Arc<AtomicU64>,
-    idle_timeout: Duration,
+    context: Receiver,
 ) -> Result<()> {
+    let Receiver {
+        firewall,
+        store,
+        ha,
+        generation,
+        idle_timeout,
+    } = context;
     stream.set_nodelay(true)?;
     let key = timeout(IO_TIMEOUT, handshake(&mut stream, secret.as_bytes(), false)).await??;
     // A reconnect supersedes the previous authenticated stream. Its queued
@@ -602,6 +754,8 @@ async fn receive(
     let mut session = Session { key, sequence: 0 };
     let mut seen: Option<HashSet<Key>> = None;
     let mut initialized = false;
+    let mut authority = None;
+    let mut staged = Entries::new();
     loop {
         let bytes = timeout(idle_timeout, read_frame(&mut stream)).await??;
         let (policy, kind, payload) = session.verify(&bytes)?;
@@ -618,34 +772,70 @@ async fn receive(
             fw.sync_policy()? == policy,
             "peer firewall policy differs; refusing state"
         );
+        let mut ha = ha.lock().await;
+        if kind == BEGIN {
+            authority = decode_authority(payload, policy)?;
+        }
+        ha.receive_authority(&authority, policy, peer)?;
         let mut store = store.lock().await;
         store.generation(policy);
         match kind {
             BEGIN => {
-                ensure!(
-                    payload.is_empty() && seen.is_none(),
-                    "invalid snapshot start"
-                );
+                ensure!(seen.is_none(), "invalid snapshot start");
                 seen = Some(HashSet::new());
+                staged.clear();
                 initialized = true;
             }
             UPSERT | DELETE => {
+                let mut endpoints_changed = false;
                 for record in unpack(payload)? {
+                    endpoints_changed |= matches!(record, Record::Wireguard(_));
                     if let Some(seen) = &mut seen {
                         ensure!(kind == UPSERT, "deletion inside snapshot");
                         seen.insert(record.key());
                         ensure!(seen.len() <= MAX_ENTRIES, "oversized peer snapshot");
                     }
-                    store.apply(peer, kind, record).await?;
+                    if authority.is_some() && seen.is_some() {
+                        staged.insert(record.key(), record);
+                    } else {
+                        store
+                            .apply_inner(peer, kind, record, authority.is_some())
+                            .await?;
+                    }
+                }
+                if let Some(authority) = authority
+                    .as_ref()
+                    .filter(|_| seen.is_none() && endpoints_changed)
+                {
+                    ha::wireguard::publish(
+                        &ha,
+                        authority,
+                        store.endpoints.values().copied().collect(),
+                    )?;
                 }
             }
             END => {
                 ensure!(payload.is_empty(), "invalid snapshot end");
-                store
-                    .finish_snapshot(peer, &seen.take().context("snapshot end without start")?)
-                    .await?;
+                let seen = seen.take().context("snapshot end without start")?;
+                if let Some(authority) = &authority {
+                    ha.begin_install();
+                    store.replace_ha(peer, std::mem::take(&mut staged)).await?;
+                    ha::wireguard::publish(
+                        &ha,
+                        authority,
+                        store.endpoints.values().copied().collect(),
+                    )?;
+                    ha.snapshot_ready(authority);
+                } else {
+                    store.finish_snapshot(peer, &seen).await?;
+                }
             }
-            HEARTBEAT => ensure!(payload.is_empty() && seen.is_none(), "incomplete snapshot"),
+            HEARTBEAT => {
+                ensure!(payload.is_empty() && seen.is_none(), "incomplete snapshot");
+                if let Some(authority) = &authority {
+                    ha.heartbeat(authority);
+                }
+            }
             _ => bail!("unknown state frame operation"),
         }
     }
@@ -656,6 +846,7 @@ pub async fn run(
     nat: NatMap,
     flows: HashMap<MapData, FirewallKey, FirewallState>,
     synproxy: HashMap<MapData, FlowKey, SynFlow>,
+    ha: ha::Shared,
     config: ResolvedConntrackSync,
 ) {
     let secret = Arc::new(
@@ -668,6 +859,7 @@ pub async fn run(
         nat,
         firewall: flows,
         synproxy,
+        endpoints: BTreeMap::new(),
         imported: BTreeMap::new(),
         policy: None,
     }));
@@ -701,6 +893,7 @@ pub async fn run(
     let idle_timeout = IO_TIMEOUT.max(Duration::from_millis(config.interval_ms.saturating_mul(3)));
     let mut ticker = tokio::time::interval(Duration::from_millis(config.interval_ms));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut export_authority = None;
     loop {
         let listener = match TcpListener::bind(config.listen).await {
             Ok(listener) => listener,
@@ -723,18 +916,39 @@ pub async fn run(
                     let Ok((stream, remote)) = accepted else { break; };
                     let Some(generation) = generations.get(&remote.ip()).cloned() else { continue; };
                     let Ok(permit) = permits.clone().try_acquire_owned() else { continue; };
-                    let secret = secret.clone(); let firewall = firewall.clone(); let store = store.clone();
+                    let secret = secret.clone(); let firewall = firewall.clone(); let store = store.clone(); let ha = ha.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
-                        if let Err(error) = receive(stream, remote.ip(), secret, firewall, store, generation, idle_timeout).await { log::debug!("conntrack-sync: rejected/closed session from {remote}: {error:#}"); }
+                        if let Err(error) = receive(stream, remote.ip(), secret, Receiver{firewall, store, ha, generation, idle_timeout}).await { log::debug!("conntrack-sync: rejected/closed session from {remote}: {error:#}"); }
                     });
                 }
                 _ = ticker.tick() => {
-                    let fw = firewall.lock().await;
-                    let result = match fw.sync_policy() { Ok(policy) => store.lock().await.snapshot(policy).await, Err(error) => Err(error) };
+                    // Batch dumps can be large. Do not hold the configuration
+                    // or lease-heartbeat lock while scanning kernel maps. The
+                    // epoch and authority are rechecked after the bounded dump.
+                    let result = async {
+                        let generation = firewall.lock().await.sync_generation()?;
+                        let policy = generation.0;
+                        let (authority,wg_interfaces) = {
+                            let ha=ha.lock().await;
+                            (ha.authority_for_send(policy)?,ha.config.as_ref().map(|c|c.wireguard.clone()).unwrap_or_default())
+                        };
+                        let endpoints = if authority.is_some(){ha::wireguard::scan(&wg_interfaces).await?}else{Vec::new()};
+                        let mut snapshot = {
+                            let mut store = store.lock().await;
+                            if authority.is_some() && export_authority != authority { store.imported.clear(); }
+                            store.snapshot(policy).await?
+                        };
+                        for endpoint in endpoints {let record=Record::Wireguard(endpoint);snapshot.entries.insert(record.key(),record);}
+                        let fw = firewall.lock().await;
+                        ensure!(fw.sync_generation()? == generation, "policy changed during state dump");
+                        ensure!(ha.lock().await.authority_for_send(policy)? == authority, "HA authority changed during state dump");
+                        snapshot.authority = authority.clone(); export_authority = authority;
+                        Ok::<_,anyhow::Error>(snapshot)
+                    }.await;
                     match result {
                         Ok(snapshot) => { snapshots.send_replace(Some(Arc::new(snapshot))); }
-                        Err(error) => { snapshots.send_replace(None); log::debug!("conntrack-sync: snapshot unavailable: {error:#}"); }
+                        Err(error) => { export_authority = None; snapshots.send_replace(None); log::debug!("conntrack-sync: snapshot unavailable: {error:#}"); }
                     }
                 }
             }
@@ -809,7 +1023,7 @@ pub(crate) fn policy_fingerprint(cfg: &RuntimeConfig) -> [u8; 32] {
             ])
         })
         .collect();
-    let bytes = json!({"version":3,"policies":policies,"interfaces":interfaces,"forwards":forwards,"services":services,
+    let bytes = json!({"version":4,"ha":cfg.ha.as_ref().map(|h|json!([h.cluster,h.interfaces,h.wireguard_ports,h.wireguard,h.wireguard_policy])),"policies":policies,"interfaces":interfaces,"forwards":forwards,"services":services,
         "timeouts":[cfg.conntrack.tcp_syn,cfg.conntrack.tcp_established,cfg.conntrack.tcp_closing,cfg.conntrack.udp,cfg.conntrack.udp_stream,cfg.conntrack.icmp],
         "synproxy":cfg.synproxy.iter().map(|s|(s.port,s.mss)).collect::<Vec<_>>(),"fail_closed":cfg.fail_closed}).to_string();
     digest::digest(&digest::SHA256, bytes.as_bytes())
@@ -861,6 +1075,7 @@ mod tests {
             nat: Arc::new(Mutex::new(kernel_map())),
             firewall: kernel_map(),
             synproxy: kernel_map(),
+            endpoints: BTreeMap::new(),
             imported: BTreeMap::new(),
             policy: None,
         }
@@ -1059,6 +1274,88 @@ mod tests {
         assert!(target.synproxy.get(&key, 0).is_err());
     }
 
+    #[test]
+    fn wireguard_records_roundtrip_and_reject_noncanonical_endpoints() {
+        let mut endpoint = ha::wireguard::Endpoint {
+            interface: [0; 16],
+            public_key: [3; 32],
+            ip: [0; 16],
+            port: 51820,
+            family: 4,
+        };
+        endpoint.interface[..3].copy_from_slice(b"wg0");
+        endpoint.ip[..4].copy_from_slice(&[192, 0, 2, 1]);
+        let record = Record::Wireguard(endpoint);
+        let bytes = record.encode(0);
+        assert_eq!(Record::decode(&bytes).unwrap(), record);
+        assert_eq!(unpack(&pack(&[record], 0)).unwrap(), vec![record]);
+        for n in 0..bytes.len() {
+            assert!(Record::decode(&bytes[..n]).is_err());
+        }
+        let mut invalid = bytes;
+        invalid[70] = 7;
+        assert!(Record::decode(&invalid).is_err());
+        endpoint.interface = [b'a'; 16];
+        assert!(endpoint.validate().is_err());
+    }
+    #[tokio::test]
+    #[ignore = "requires CAP_BPF/CAP_SYS_ADMIN; runs in the HA kernel VM"]
+    async fn kernel_ha_successor_replaces_former_master_locals_without_resetting_counters() {
+        let peer = "10.0.0.2".parse().unwrap();
+        let mut store = kernel_store();
+        let key = FlowKey::new(0, [10, 0, 0, 1], [198, 51, 100, 1], 12345, 443, 6);
+        let old = FlowState {
+            packets: 31,
+            bytes: 991,
+            ..FlowState::forward([192, 0, 2, 1], 0)
+        };
+        store.nat.lock().await.insert(key, old, 0).unwrap();
+        let mut successor = old;
+        successor.nat_ip = [192, 0, 2, 254];
+        successor.packets = 999;
+        successor.bytes = 9999;
+        let record = Record::Nat(key, successor);
+        let mut records = Entries::new();
+        records.insert(record.key(), record);
+        let fw_key = FirewallKey::ipv4(key);
+        let old_fw = FirewallState {
+            last_seen_ns: monotonic_ns(),
+            age_ns: 0,
+            phase: FirewallState::ESTABLISHED,
+            reply: 1,
+        };
+        store.firewall.insert(fw_key, old_fw, 0).unwrap();
+        let successor_fw = FirewallState {
+            phase: FirewallState::CLOSING,
+            ..old_fw
+        };
+        let fw_record = Record::Firewall(fw_key, successor_fw);
+        records.insert(fw_record.key(), fw_record);
+        let Record::SynProxy(syn_key, successor_syn) = syn_record() else {
+            unreachable!()
+        };
+        store
+            .synproxy
+            .insert(syn_key, SynFlow::pending(123, 456), 0)
+            .unwrap();
+        let syn_record = Record::SynProxy(syn_key, successor_syn);
+        records.insert(syn_record.key(), syn_record);
+        store.replace_ha(peer, records).await.unwrap();
+        let imported = store.nat.lock().await.get(&key, 0).unwrap();
+        assert_eq!(imported.nat_ip, [192, 0, 2, 254]);
+        assert_eq!(imported.packets, 31);
+        assert_eq!(imported.bytes, 991);
+        assert_eq!(
+            store.firewall.get(&fw_key, 0).unwrap().phase,
+            FirewallState::CLOSING
+        );
+        assert_eq!(store.synproxy.get(&syn_key, 0).unwrap(), successor_syn);
+        store.replace_ha(peer, Entries::new()).await.unwrap();
+        assert!(store.nat.lock().await.get(&key, 0).is_err());
+        assert!(store.firewall.get(&fw_key, 0).is_err());
+        assert!(store.synproxy.get(&syn_key, 0).is_err());
+    }
+
     fn session() -> Session {
         Session {
             key: hmac::Key::new(hmac::HMAC_SHA256, b"test-only session key"),
@@ -1082,6 +1379,7 @@ mod tests {
             nat: nat.clone(),
             firewall: flows,
             synproxy,
+            endpoints: BTreeMap::new(),
             imported: BTreeMap::new(),
             policy: None,
         }));
@@ -1098,10 +1396,13 @@ mod tests {
                     stream,
                     peer.ip(),
                     secret,
-                    fw,
-                    store,
-                    Arc::new(AtomicU64::new(0)),
-                    IO_TIMEOUT,
+                    Receiver {
+                        firewall: fw,
+                        store,
+                        ha: ha::State::new(None).unwrap(),
+                        generation: Arc::new(AtomicU64::new(0)),
+                        idle_timeout: IO_TIMEOUT,
+                    },
                 )
                 .await
             })
@@ -1126,6 +1427,7 @@ mod tests {
             unreachable!()
         };
         let (snapshots, watcher) = watch::channel(Some(Arc::new(Snapshot {
+            authority: None,
             policy,
             entries: BTreeMap::from([(record.key(), record), (splice.key(), splice)]),
         })));
@@ -1158,6 +1460,7 @@ mod tests {
             syn_state
         );
         snapshots.send_replace(Some(Arc::new(Snapshot {
+            authority: None,
             policy,
             entries: Entries::new(),
         })));
@@ -1179,6 +1482,7 @@ mod tests {
         changed.policies[0].global.flags ^= velstra_common::ConfigFlags::STATEFUL;
         fw.lock().await.reconfigure(&changed).unwrap();
         snapshots.send_replace(Some(Arc::new(Snapshot {
+            authority: None,
             policy,
             entries: BTreeMap::from([(record.key(), record), (splice.key(), splice)]),
         })));

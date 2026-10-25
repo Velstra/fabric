@@ -870,6 +870,8 @@ impl ConntrackConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct FileConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ha: Option<HaConfig>,
     pub conntrack: ConntrackConfig,
     /// Verdict for traffic that matches no rule. Defaults to `pass`.
     pub default_action: ActionName,
@@ -1540,9 +1542,29 @@ impl ResolvedRule {
     }
 }
 
+/// Node-local HA identity. Authority/lease and readiness are published by Wren
+/// in root-owned runtime files; the credential never enters this configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HaConfig {
+    pub enabled: bool,
+    #[serde(default)]
+    pub disabled: Vec<String>,
+    #[serde(default)]
+    pub wireguard_ports: Vec<u16>,
+    #[serde(default)]
+    pub wireguard: Vec<String>,
+    #[serde(default)]
+    pub wireguard_policy: String,
+    pub cluster: String,
+    pub node: u8,
+    pub interfaces: Vec<String>,
+}
+
 /// Fully-resolved, validated configuration ready to be written into BPF maps.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
+    pub ha: Option<HaConfig>,
     pub conntrack: velstra_common::ConntrackTimeouts,
     /// Per-policy firewall config. Always contains policy `0` (the default).
     pub policies: Vec<PolicyConfig>,
@@ -1599,6 +1621,63 @@ impl RuntimeConfig {
     /// Refuse configurations that cannot be represented by the shared firewall
     /// maps, before a live update removes or replaces any existing rules.
     pub fn validate_firewall_capacity(&self) -> Result<()> {
+        if let Some(ha) = &self.ha {
+            anyhow::ensure!(
+                (1..=2).contains(&ha.node)
+                    && ((!ha.enabled && ha.cluster.is_empty())
+                        || ((16..=128).contains(&ha.cluster.len())
+                            && ha
+                                .cluster
+                                .bytes()
+                                .all(|c| c.is_ascii_alphanumeric() || c == b'-'))),
+                "invalid HA cluster/member"
+            );
+            anyhow::ensure!(
+                !ha.interfaces.is_empty() && ha.interfaces.len() <= 128,
+                "HA needs 1..128 guarded interfaces"
+            );
+            anyhow::ensure!(
+                ha.wireguard_ports.iter().all(|p| *p > 0),
+                "HA WireGuard ports must be nonzero"
+            );
+            anyhow::ensure!(
+                ha.disabled.iter().all(|n| ha.interfaces.contains(n)),
+                "HA disabled links must be guarded"
+            );
+            anyhow::ensure!(
+                ha.wireguard.iter().all(|n| ha.interfaces.contains(n)),
+                "HA WireGuard interfaces must be fenced data links"
+            );
+            anyhow::ensure!(
+                !ha.enabled || ha.wireguard.len() == ha.wireguard_ports.len(),
+                "enabled HA WireGuard needs explicit listen ports"
+            );
+            anyhow::ensure!(
+                ha.wireguard.is_empty()
+                    || ha.wireguard_policy.len() == 64
+                        && ha.wireguard_policy.bytes().all(|b| b.is_ascii_hexdigit()),
+                "HA WireGuard requires a SHA-256 desired-policy digest"
+            );
+            for name in &ha.interfaces {
+                anyhow::ensure!(
+                    !name.is_empty()
+                        && name.len() < 16
+                        && name
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.')),
+                    "invalid HA interface"
+                );
+            }
+            anyhow::ensure!(
+                !ha.enabled
+                    || self
+                        .conntrack_sync
+                        .as_ref()
+                        .is_some_and(|s| s.secret.is_some() && s.peers.len() == 1),
+                "HA requires one authenticated state-sync peer"
+            );
+        }
+
         for (family, count) in [
             (
                 "IPv4",
@@ -1667,6 +1746,7 @@ impl RuntimeConfig {
             nd_neighbors: Vec::new(),
             flood_vteps: Vec::new(),
             npt66: Vec::new(),
+            ha: None,
             conntrack_sync: None,
             flow_export: None,
             srv6: None,
@@ -2639,6 +2719,7 @@ impl FileConfig {
             nd_neighbors,
             flood_vteps,
             npt66,
+            ha: self.ha.clone(),
             conntrack_sync: self
                 .conntrack_sync
                 .as_ref()
@@ -2986,6 +3067,23 @@ impl fmt::Display for RuntimeConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prepared_ha_fences_without_an_enrolled_cluster_or_state_peer() {
+        let mut cfg = super::RuntimeConfig::passthrough();
+        cfg.ha = Some(
+            toml::from_str("enabled=false\ncluster=\"\"\nnode=1\ninterfaces=[\"wan0\"]\n").unwrap(),
+        );
+        cfg.validate_firewall_capacity().unwrap();
+        let ha = cfg.ha.as_mut().unwrap();
+        ha.enabled = true;
+        ha.cluster = "test-cluster-0123456789".into();
+        assert!(
+            cfg.validate_firewall_capacity()
+                .unwrap_err()
+                .to_string()
+                .contains("authenticated state-sync peer")
+        );
+    }
 
     /// A protocol with no ports is keyed at port 0 — that is what "match every
     /// packet of this protocol" compiles to. Refusing such a rule outright, as
