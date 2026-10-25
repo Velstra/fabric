@@ -20,16 +20,14 @@
 //! flowspec          → the BGP FlowSpec rules in force, and what was refused
 //! block <cidr> [s]  → block a source for a while (roadmap C11)
 //! unblock <cidr>    → lift one early (`all` lifts every one)
+//! reload            → reconcile the validated local configuration in place
+//! reload-reset      → also invalidate the previous policy namespace's state
 //! ```
 //!
-//! Mostly read-only, and **nothing here can open anything**. `block` is the only
-//! command that changes what the data plane does, and it can only ever add a
-//! drop — there is no verb that admits traffic, lifts a configured block, or
-//! alters the configuration. So the worst an unwanted caller achieves is denial
-//! of service against an address, which is loud, visible in `blocks`, and expires
-//! on its own; it can never be used to let something through. The socket is bound
-//! wherever the caller says (a root-owned `/run` directory in the appliance), and
-//! the socket's directory is what governs who may ask.
+//! This is a privileged local control interface: reload commands apply the
+//! validated file and block/unblock manage transient source blocks. The socket
+//! lives in the appliance's root-owned 0700 `/run` directory; its directory
+//! permissions govern access to these mutations as well as the diagnostics.
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -80,7 +78,7 @@ pub async fn expire_blocks_loop(firewall: Arc<Mutex<Firewall>>) {
 /// A stale socket file from a previous run is removed first: the agent is
 /// restarted far more often than the path changes, and refusing to start because
 /// yesterday's socket file is still there would be a self-inflicted outage.
-pub async fn serve(path: PathBuf, firewall: Arc<Mutex<Firewall>>) {
+pub async fn serve(path: PathBuf, firewall: Arc<Mutex<Firewall>>, config: Option<PathBuf>) {
     if path.exists() {
         let _ = std::fs::remove_file(&path);
     }
@@ -100,7 +98,8 @@ pub async fn serve(path: PathBuf, firewall: Arc<Mutex<Firewall>>) {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let fw = firewall.clone();
-                tokio::spawn(async move { handle(stream, fw).await });
+                let source = config.clone();
+                tokio::spawn(async move { handle(stream, fw, source).await });
             }
             Err(e) => {
                 warn!("query socket accept failed: {e}");
@@ -114,18 +113,22 @@ pub async fn serve(path: PathBuf, firewall: Arc<Mutex<Firewall>>) {
 
 /// Answer one request. Errors are reported to the caller as text rather than
 /// logged and dropped — someone is waiting on this socket for an answer.
-async fn handle(stream: UnixStream, firewall: Arc<Mutex<Firewall>>) {
+async fn handle(stream: UnixStream, firewall: Arc<Mutex<Firewall>>, config: Option<PathBuf>) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     if reader.read_line(&mut line).await.is_err() {
         return;
     }
-    let reply = respond(line.trim(), &firewall).await;
+    let reply = respond(line.trim(), &firewall, config.as_deref()).await;
     let _ = reader.get_mut().write_all(reply.as_bytes()).await;
 }
 
 /// Dispatch one command to its rendering.
-async fn respond(line: &str, firewall: &Arc<Mutex<Firewall>>) -> String {
+async fn respond(
+    line: &str,
+    firewall: &Arc<Mutex<Firewall>>,
+    config: Option<&std::path::Path>,
+) -> String {
     let mut tokens = line.split_whitespace();
     let verb = tokens.next().unwrap_or("");
     // Collected rather than consumed one at a time: reading the limit off the
@@ -135,6 +138,28 @@ async fn respond(line: &str, firewall: &Arc<Mutex<Firewall>>) -> String {
     let args: Vec<&str> = tokens.collect();
     let limit = parse_limit(args.first().copied());
     match verb {
+        "reload" | "reload-reset" => {
+            let Some(path) = config else {
+                return "error: node is controller-managed or has no config file\n".into();
+            };
+            match velstra_config::load_file(path) {
+                Err(e) => format!("error: invalid configuration: {e:#}\n"),
+                Ok(cfg) => {
+                    let mut fw = firewall.lock().await;
+                    if fw.requires_restart(&cfg) {
+                        return "restart-required\n".into();
+                    }
+                    match fw.reconfigure_with_reset(&cfg, verb == "reload-reset") {
+                        Ok(()) => "ok\n".into(),
+                        Err(e) => format!("error: applying configuration: {e:#}\n"),
+                    }
+                }
+            }
+        }
+        "reconcile-links" => match firewall.lock().await.reconcile_links() {
+            Ok(()) => "ok\n".into(),
+            Err(e) => format!("error: reconciling packet hooks: {e:#}\n"),
+        },
         "status" => match firewall.lock().await.configuration_status() {
             Ok(status) => status,
             Err(error) => format!("error: reading configuration state: {error:#}\n"),
@@ -144,6 +169,27 @@ async fn respond(line: &str, firewall: &Arc<Mutex<Firewall>>) -> String {
             match fw.read_stats() {
                 Ok(stats) => stats.render(),
                 Err(e) => format!("error: reading statistics: {e:#}\n"),
+            }
+        }
+        "firewall-states" => {
+            let fw = firewall.lock().await;
+            match fw.read_firewall_states() {
+                Ok(value) => format!("{value}\n"),
+                Err(e) => format!("error: reading firewall states: {e:#}\n"),
+            }
+        }
+        "rule-stats" => {
+            let fw = firewall.lock().await;
+            match fw.read_rule_counters() {
+                Ok(value) => format!("{value}\n"),
+                Err(e) => format!("error: reading rule counters: {e:#}\n"),
+            }
+        }
+        "packet-events" => {
+            let mut fw = firewall.lock().await;
+            match fw.read_packet_events(limit.unwrap_or(100)) {
+                Ok(rows) => rows.into_iter().map(|row| format!("{row}\n")).collect(),
+                Err(e) => format!("error: reading packet events: {e:#}\n"),
             }
         }
         "flows" | "top" => {

@@ -1817,6 +1817,7 @@ impl Topology {
                     });
                 }
                 cfg.interfaces.push(InterfaceFile {
+                    snat_address: None,
                     mss: None,
                     // B13: the port's own send ceiling, carried straight
                     // through. Unset on a port nobody gave one.
@@ -3108,6 +3109,7 @@ mod tests {
     /// A `[[port_rule]]`-shaped rule for tests.
     fn rule(proto: velstra_config::ProtoName, port: u16, action: ActionName) -> PortRule {
         PortRule {
+            name: String::new(),
             icmp_type: None,
             src_mac: None,
             in_interface: None,

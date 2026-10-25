@@ -12,6 +12,7 @@
 //! velstra validate rules.toml                                   # parse + print
 //! ```
 
+mod btf;
 mod conntrack_sync;
 mod controller_client;
 mod firewall;
@@ -54,6 +55,8 @@ enum Command {
     Run(RunArgs),
     /// Parse a config file and print the resolved ruleset. No privileges needed.
     Validate(ValidateArgs),
+    /// Load every program into the kernel verifier without attaching to a NIC.
+    VerifyEbpf(VerifyEbpfArgs),
 }
 
 #[derive(Debug, Args)]
@@ -214,6 +217,12 @@ struct ValidateArgs {
     config: PathBuf,
 }
 
+#[derive(Debug, Args)]
+struct VerifyEbpfArgs {
+    /// ELF object to verify; omit to verify the embedded release object.
+    object: Option<PathBuf>,
+}
+
 /// Encapsulation advertised when the agent self-registers its host.
 #[derive(Copy, Clone, Debug, Default, clap::ValueEnum)]
 enum EncapArg {
@@ -242,6 +251,10 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Validate(args) => validate(args),
+        Command::VerifyEbpf(args) => {
+            let object = args.object.map(std::fs::read).transpose()?;
+            Firewall::verify_object(object.as_deref())
+        }
         Command::Run(args) => run(args).await,
     }
 }
@@ -324,7 +337,12 @@ async fn run(args: RunArgs) -> Result<()> {
     // Read-only diagnostics socket (C23): the agent owns the maps, so it is the
     // only process that can answer what the data plane is currently doing.
     if let Some(path) = args.query_socket.clone() {
-        tokio::spawn(query::serve(path, firewall.clone()));
+        let source = args
+            .controllers
+            .is_empty()
+            .then(|| args.config.clone())
+            .flatten();
+        tokio::spawn(query::serve(path, firewall.clone(), source));
         // A run-time block carries a deadline; this is what makes the deadline
         // real rather than something only honoured when someone asks.
         tokio::spawn(query::expire_blocks_loop(firewall.clone()));
@@ -494,7 +512,7 @@ async fn run(args: RunArgs) -> Result<()> {
         // drops established connections.
         let handles = {
             let mut fw = firewall.lock().await;
-            match (fw.conntrack_handle(), fw.take_fw_flows()) {
+            match (fw.conntrack_handle(), fw.fw_flows_handle()) {
                 (Ok(ct), Ok(ff)) => Ok((ct, ff)),
                 (Err(e), _) | (_, Err(e)) => Err(e),
             }

@@ -4,7 +4,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -27,14 +27,14 @@ use log::warn;
 use tokio::sync::Mutex;
 use velstra_common::{
     Action, ArpEntry, ArpKey, Backend, CONFIG_FAILED, CONFIG_READY, CONFIG_UPDATING, CgnatLayout,
-    Cidr4, Cidr6, ConfigFlags, Counter, FloodSet, FlowKey, FlowState, GlobalConfig, IrbEndpoint,
-    LocalMac, LocalMacKey, MAX_RULE_LIMITS, MacFdbKey, NdKey, Npt66, OverlayConfig,
-    PORT_RULE_OUT_ONLY, PolicyId, PortAddr4, PortAddr6, PortBinding, PortFwd, PortalClientKey,
-    PortalGate, PortalSeenKey, RateBucket, RouteEntry, ScopedAddr, ScopedAddr6, ScopedDstPortKey,
-    ScopedDstPortKey6, ScopedMac, ScopedPortKey, ScopedSrcPortKey, ScopedSrcPortKey6, ServiceKey,
-    ServiceValue, Srv6Config, Srv6Endpoint, Srv6FloodSet, Srv6IrbEndpoint, Srv6LocalSid,
-    Srv6SidKey, SynProxyCfg, SynProxyKey, TunnelEndpoint, TunnelKey, parse_cidr_v4, parse_cidr_v6,
-    parse_mac, port_rule_value, port_rule_with_limit,
+    Cidr4, Cidr6, ConfigFlags, Counter, FirewallKey, FirewallState, FloodSet, FlowKey, FlowState,
+    GlobalConfig, IrbEndpoint, LocalMac, LocalMacKey, MAX_RULE_LIMITS, MacFdbKey, NdKey, Npt66,
+    OverlayConfig, PORT_RULE_OUT_ONLY, PolicyId, PortAddr4, PortAddr6, PortBinding, PortFwd,
+    PortalClientKey, PortalGate, PortalSeenKey, RateBucket, RouteEntry, ScopedAddr, ScopedAddr6,
+    ScopedDstPortKey, ScopedDstPortKey6, ScopedMac, ScopedPortKey, ScopedSrcPortKey,
+    ScopedSrcPortKey6, ServiceKey, ServiceValue, Srv6Config, Srv6Endpoint, Srv6FloodSet,
+    Srv6IrbEndpoint, Srv6LocalSid, Srv6SidKey, SynFlow, SynProxyCfg, SynProxyKey, TunnelEndpoint,
+    TunnelKey, parse_cidr_v4, parse_cidr_v6, parse_mac, port_rule_value, port_rule_with_limit,
 };
 use velstra_config::{
     PolicyConfig, PortIdentity, ResolvedFloodVtep, ResolvedInterface, ResolvedIrbRoute,
@@ -120,6 +120,8 @@ pub struct Firewall {
     /// bidirectional NAT work: requests ingress one NIC, replies another.
     pub attached: Vec<(String, XdpMode)>,
     xdp_links: BTreeMap<String, InterfaceLink<XdpLink>>,
+    primary: Vec<String>,
+    attach_mode: AttachMode,
     /// The currently-applied config, kept so a live [`reconfigure`] can remove
     /// the entries that are no longer present before writing the new set.
     ///
@@ -219,6 +221,52 @@ type MappingValue = ([u8; 4], u16, Instant);
 const MAX_RUNTIME_MAPPINGS: usize = 256;
 
 impl Firewall {
+    /// Exercise the real kernel verifier for every shipped XDP/TC entry point.
+    /// No packet hook is attached and dropping the object releases all maps.
+    pub fn verify_object(object: Option<&[u8]>) -> Result<()> {
+        bump_memlock_rlimit();
+        let object = crate::btf::kernel_object(object.unwrap_or(aya::include_bytes_aligned!(
+            concat!(env!("OUT_DIR"), "/velstra")
+        )))?;
+        let mut ebpf = Ebpf::load(&object).context("loading eBPF object for verification")?;
+        for name in [
+            "velstra",
+            "velstra_main",
+            "velstra_guest_delivery",
+            "velstra_forward",
+            "velstra_v6",
+            "velstra_local",
+            "velstra_v6_state",
+            "velstra_icmp_nat",
+        ] {
+            let program: &mut Xdp = ebpf
+                .program_mut(name)
+                .ok_or_else(|| anyhow!("missing {name}"))?
+                .try_into()?;
+            program
+                .load()
+                .with_context(|| format!("verifying {name}"))?;
+            println!("verified {name}");
+        }
+        for name in [
+            "velstra_egress",
+            "velstra_egress_v4",
+            "velstra_egress_v6",
+            "velstra_egress_icmp",
+            "velstra_bum",
+        ] {
+            let program: &mut SchedClassifier = ebpf
+                .program_mut(name)
+                .ok_or_else(|| anyhow!("missing {name}"))?
+                .try_into()?;
+            program
+                .load()
+                .with_context(|| format!("verifying {name}"))?;
+            println!("verified {name}");
+        }
+        Ok(())
+    }
+
     /// Load the embedded eBPF object, program the maps from `cfg`, and attach
     /// to every interface in `ifaces`.
     ///
@@ -237,12 +285,11 @@ impl Firewall {
         ensure_reader_barrier_supported()?;
         bump_memlock_rlimit();
 
-        // The eBPF object is embedded at compile time by the build script.
-        let mut ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
+        let object = crate::btf::kernel_object(aya::include_bytes_aligned!(concat!(
             env!("OUT_DIR"),
             "/velstra"
-        )))
-        .context("loading embedded eBPF object")?;
+        )))?;
+        let mut ebpf = Ebpf::load(&object).context("loading embedded eBPF object")?;
 
         spawn_log_forwarder(&mut ebpf);
         {
@@ -255,7 +302,7 @@ impl Firewall {
                 .context("closing the initial datapath gate")?;
         }
         let prepared = prepare_host_config(cfg)?;
-        apply_config(&mut ebpf, cfg, None, &prepared)?;
+        apply_config(&mut ebpf, cfg, None, &prepared, false)?;
 
         // Load the tail-call target (`velstra_forward`) and register it in the
         // `VELSTRA_PROGS` program array, so the main program's
@@ -330,8 +377,29 @@ impl Firewall {
                 .set(1, &main_fd, 0)
                 .context("registering velstra_main in VELSTRA_PROGS")?;
             prog_array
-                .set(2, &delivery_fd, 0)
+                .set(6, &delivery_fd, 0)
                 .context("registering guest delivery in VELSTRA_PROGS")?;
+        }
+
+        for (slot, name) in [
+            (2, "velstra_v6"),
+            (3, "velstra_local"),
+            (4, "velstra_v6_state"),
+            (5, "velstra_icmp_nat"),
+        ] {
+            let fd = {
+                let program: &mut Xdp = ebpf
+                    .program_mut(name)
+                    .ok_or_else(|| anyhow!("missing {name}"))?
+                    .try_into()?;
+                program.load().with_context(|| format!("loading {name}"))?;
+                program.fd()?.try_clone()?
+            };
+            let mut programs = ProgramArray::try_from(
+                ebpf.map_mut("VELSTRA_PROGS")
+                    .ok_or_else(|| anyhow!("VELSTRA_PROGS missing"))?,
+            )?;
+            programs.set(slot, &fd, 0)?;
         }
 
         let program: &mut Xdp = ebpf
@@ -351,6 +419,10 @@ impl Firewall {
             let (chosen, link) = attach_with_fallback(program, iface, mode)?;
             xdp_links.insert(iface.clone(), link);
             attached.push((iface.clone(), chosen));
+        }
+
+        for name in ifaces {
+            program_link_layer(&mut ebpf, name)?;
         }
 
         // Which interfaces need the TC egress hook, and why — see
@@ -380,6 +452,8 @@ impl Firewall {
             ebpf,
             attached,
             xdp_links,
+            primary: ifaces.to_vec(),
+            attach_mode: mode,
             applied: cfg.clone(),
             applied_host: prepared.clone(),
             last_apply_error: None,
@@ -400,7 +474,29 @@ impl Firewall {
         };
         fw.sync_bum_attachments(cfg);
         fw.reopen_configuration()?;
+        fw.reconcile_links()?;
         Ok(fw)
+    }
+
+    pub fn reconcile_links(&mut self) -> Result<()> {
+        let present = std::fs::read_dir("/sys/class/net")?
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<std::io::Result<Vec<String>>>()?;
+        self.reconcile_config_interfaces(&present, self.attach_mode);
+        let desired = self.applied.clone();
+        self.sync_egress_attachments(&desired)?;
+        self.retire_egress_attachments(&desired);
+        anyhow::ensure!(
+            self.configuration_state()? == CONFIG_READY,
+            "{}",
+            self.configuration_status()?
+        );
+        for iface in self.primary.clone() {
+            if if_nametoindex(&iface).is_ok() && !self.xdp_links.contains_key(&iface) {
+                self.attach_iface(&iface, self.attach_mode, 0)?;
+            }
+        }
+        Ok(())
     }
 
     fn prune_stale_links(&mut self) {
@@ -450,6 +546,12 @@ impl Firewall {
             .interfaces
             .iter()
             .filter(|i| i.vni != 0 && !self.bum_attached.contains_key(&i.name))
+            .filter(|i| {
+                std::fs::read_to_string(format!("/sys/class/net/{}/type", i.name))
+                    .ok()
+                    .and_then(|v| v.trim().parse().ok())
+                    .is_some_and(|kind| !raw_ip_link(kind))
+            })
             .filter_map(|i| {
                 if_nametoindex(&i.name)
                     .ok()
@@ -474,10 +576,26 @@ impl Firewall {
     /// A newly declared tenant tap needs the egress classifier before its
     /// policy is programmed. Otherwise ingress allowances and default-deny
     /// rules exist in maps but no hook ever evaluates packets bound for it.
+    fn egress_candidates(&self, cfg: &RuntimeConfig) -> Vec<String> {
+        let mut names = self.explicit_egress_ifaces.clone();
+        if cfg
+            .policies
+            .iter()
+            .any(|p| p.global.has_flag(ConfigFlags::STATEFUL))
+        {
+            for (name, _) in &self.attached {
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+        }
+        names
+    }
+
     fn sync_egress_attachments(&mut self, cfg: &RuntimeConfig) -> Result<()> {
         // A tap can disappear and return under the same name between two
         // config updates. Its old classifier vanished with the old ifindex.
-        let desired = egress_interfaces(cfg, &self.explicit_egress_ifaces, true);
+        let desired = egress_interfaces(cfg, &self.egress_candidates(cfg), true);
         // Keep every old hook until either the complete candidate or the old
         // configuration has been installed. Detaching a removed tenant's TC
         // hook here bypasses its closed gate during a failed update.
@@ -503,7 +621,7 @@ impl Firewall {
 
     /// Retire obsolete hooks only after map application or rollback succeeds.
     fn retire_egress_attachments(&mut self, cfg: &RuntimeConfig) {
-        let desired = egress_interfaces(cfg, &self.explicit_egress_ifaces, true);
+        let desired = egress_interfaces(cfg, &self.egress_candidates(cfg), true);
         self.egress_attached
             .retain(|name, link| desired.contains(name) && link.is_current(name));
     }
@@ -516,6 +634,7 @@ impl Firewall {
         mode: AttachMode,
         policy_id: PolicyId,
     ) -> Result<XdpMode> {
+        program_link_layer(&mut self.ebpf, iface)?;
         {
             let ifindex = if_nametoindex(iface)?;
             let mut iface_policy: HashMap<_, u32, PolicyId> = HashMap::try_from(
@@ -604,6 +723,8 @@ impl Firewall {
         policy_id: PolicyId,
         vni: u32,
     ) -> Result<XdpMode> {
+        let raw_ip = program_link_layer(&mut self.ebpf, iface)?;
+        let vni = if raw_ip { 0 } else { vni };
         {
             let ifindex = if_nametoindex(iface)?;
             {
@@ -740,12 +861,20 @@ impl Firewall {
     /// removed first, then the new set is written. `CONNTRACK` is left alone (it
     /// is owned by the data plane), so existing flows keep working across a
     /// reconfigure. This is what the controller-driven live updates call.
+    pub fn requires_restart(&self, cfg: &RuntimeConfig) -> bool {
+        self.base.conntrack_sync != cfg.conntrack_sync || self.base.flow_export != cfg.flow_export
+    }
+
     pub fn reconfigure(&mut self, cfg: &RuntimeConfig) -> Result<()> {
+        self.reconfigure_with_reset(cfg, false)
+    }
+
+    pub fn reconfigure_with_reset(&mut self, cfg: &RuntimeConfig, reset: bool) -> Result<()> {
         let previous = std::mem::replace(&mut self.base, cfg.clone());
-        if let Err(error) = self.reprogram() {
+        if let Err(cause) = self.reprogram_with_reset(reset) {
             self.base = previous;
-            self.last_apply_error = Some(format!("{error:#}"));
-            return Err(error);
+            self.last_apply_error = Some(format!("{cause:#}"));
+            return Err(cause);
         }
         Ok(())
     }
@@ -813,9 +942,8 @@ impl Firewall {
 
     /// Remove the `FW_FLOWS` entries the advertised discards match.
     ///
-    /// Narrow by construction — see `crate::flowspec::flow_is_discarded`. The map
-    /// may have been taken by the C9 sync task, in which case there is nothing
-    /// here to clear and that is not an error.
+    /// Narrow by construction — see `crate::flowspec::flow_is_discarded`.
+    /// HA owns a duplicate FD so this remains effective while state sync runs.
     fn purge_discarded_flows(&mut self) -> Result<()> {
         let drops: Vec<_> = self
             .flowspec
@@ -831,16 +959,18 @@ impl Firewall {
         };
         // An LRU hash map is read and written through the same userspace handle
         // as an ordinary one; the eviction policy is the kernel's business.
-        let mut flows: HashMap<_, FlowKey, u8> = HashMap::try_from(map)?;
+        let mut flows: HashMap<_, FirewallKey, FirewallState> = HashMap::try_from(map)?;
         // Collected first: deleting while iterating a BPF map is how a scan
         // silently skips entries.
-        let doomed: Vec<FlowKey> = flows
+        let doomed: Vec<FirewallKey> = flows
             .keys()
             .flatten()
             .filter(|key| {
-                drops
-                    .iter()
-                    .any(|r| crate::flowspec::flow_is_discarded(r, key))
+                key.as_ipv4().is_some_and(|key| {
+                    drops
+                        .iter()
+                        .any(|r| crate::flowspec::flow_is_discarded(r, &key))
+                })
             })
             .collect();
         let count = doomed.len();
@@ -860,7 +990,7 @@ impl Firewall {
     /// `crate::flowspec`. `remove_stale` runs against the previously *merged*
     /// config, so a withdrawn advertised rule is taken out as surely as a
     /// deleted configured one.
-    fn reprogram(&mut self) -> Result<()> {
+    fn merged_config(&self) -> RuntimeConfig {
         let mut merged = if self.flowspec.is_empty() {
             self.base.clone()
         } else {
@@ -877,6 +1007,15 @@ impl Firewall {
                 merged.routes.push(learned.clone());
             }
         }
+        merged
+    }
+
+    fn reprogram(&mut self) -> Result<()> {
+        self.reprogram_with_reset(false)
+    }
+
+    fn reprogram_with_reset(&mut self, reset: bool) -> Result<()> {
+        let merged = self.merged_config();
         merged.validate_firewall_capacity()?;
         // Resolve fallible host identity before changing any active hooks/maps.
         let prepared = prepare_host_config(&merged)?;
@@ -884,6 +1023,11 @@ impl Firewall {
         let previous_host = self.applied_host.clone();
         let forwards = self.port_forward_snapshot()?;
         self.set_configuration_state(CONFIG_UPDATING)?;
+        if reset {
+            self.runtime_blocks.clear();
+            self.portal_sessions.clear();
+            self.runtime_mappings.clear();
+        }
         if let Err(error) = synchronize_packet_readers() {
             let _ = self.set_configuration_state(CONFIG_FAILED);
             self.last_apply_error = Some(format!("could not drain packet readers: {error:#}"));
@@ -891,7 +1035,7 @@ impl Firewall {
         }
         let update = (|| -> Result<HashSet<MappingKey>> {
             self.sync_egress_attachments(&merged)?;
-            apply_config(&mut self.ebpf, &merged, Some(&previous), &prepared)?;
+            apply_config(&mut self.ebpf, &merged, Some(&previous), &prepared, reset)?;
             self.reapply_runtime_mappings(&merged)
         })();
         let retained_mappings = match update {
@@ -899,7 +1043,13 @@ impl Firewall {
             Err(error) => {
                 let rollback = (|| -> Result<()> {
                     self.sync_egress_attachments(&previous)?;
-                    apply_config(&mut self.ebpf, &previous, Some(&merged), &previous_host)?;
+                    apply_config(
+                        &mut self.ebpf,
+                        &previous,
+                        Some(&merged),
+                        &previous_host,
+                        reset,
+                    )?;
                     self.restore_port_forward_snapshot(&forwards)?;
                     let blocks: Vec<String> = self
                         .runtime_blocks
@@ -1489,6 +1639,139 @@ impl Firewall {
     }
 
     /// Read and sum the per-CPU statistics into a flat [`Stats`] snapshot.
+    /// Snapshot of live firewall state. Expired entries do not grant a reply
+    /// permission and are not reported as active connections.
+    pub fn read_firewall_states(&self) -> Result<serde_json::Value> {
+        let map = HashMap::<_, FirewallKey, FirewallState>::try_from(
+            self.ebpf
+                .map("FW_FLOWS")
+                .ok_or_else(|| anyhow!("FW_FLOWS map missing"))?,
+        )?;
+        let now = crate::conntrack_sync::monotonic_ns();
+        let mut rows = Vec::new();
+        for (key, state) in map.iter().flatten() {
+            if state.expired(key.proto, now, self.applied.conntrack) {
+                continue;
+            }
+            let address = |bytes: [u8; 16]| {
+                if key.family == 4 {
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                        bytes[0], bytes[1], bytes[2], bytes[3],
+                    ))
+                    .to_string()
+                } else {
+                    std::net::IpAddr::V6(std::net::Ipv6Addr::from(bytes)).to_string()
+                }
+            };
+            rows.push(serde_json::json!({"policy":key.policy,"src":address(key.src),"dst":address(key.dst),
+                "src_port":key.src_port,"dst_port":key.dst_port,"protocol":key.proto,
+                "phase":state.phase,"reply":state.reply == 1,
+                "idle_ns":state.idle_ns(now)}));
+        }
+        Ok(serde_json::Value::Array(rows))
+    }
+
+    /// Exact per-rule packet counters. The kernel keeps one value per CPU;
+    /// aggregate here without contending a shared cache line on the hot path.
+    pub fn read_rule_counters(&self) -> Result<serde_json::Value> {
+        let map = aya::maps::PerCpuHashMap::<
+            _,
+            velstra_common::RuleCounterKey,
+            velstra_common::RuleCounters,
+        >::try_from(
+            self.ebpf
+                .map("RULE_COUNTERS")
+                .ok_or_else(|| anyhow!("RULE_COUNTERS map missing"))?,
+        )?;
+        let mut rows = Vec::new();
+        for item in map.iter() {
+            let (key, per_cpu) = item?;
+            let mut totals = velstra_common::RuleCounters::default();
+            for c in per_cpu.iter() {
+                totals.packets = totals.packets.wrapping_add(c.packets);
+                totals.bytes = totals.bytes.wrapping_add(c.bytes);
+                totals.accepted = totals.accepted.wrapping_add(c.accepted);
+                totals.dropped = totals.dropped.wrapping_add(c.dropped);
+            }
+            let name = self
+                .applied
+                .policies
+                .iter()
+                .find(|p| p.id == key.policy)
+                .and_then(|p| p.port_rules.iter().find(|r| r.id() == key.rule_id))
+                .map(|r| r.name.as_str());
+            rows.push(
+                serde_json::json!({"policy": key.policy, "rule_id": key.rule_id,
+                "rule": name, "packets": totals.packets, "bytes": totals.bytes,
+                "accepted": totals.accepted, "dropped": totals.dropped}),
+            );
+        }
+        rows.sort_by_key(|r| (r["policy"].as_u64(), r["rule_id"].as_u64()));
+        let lost = aya::maps::PerCpuArray::<_, u64>::try_from(
+            self.ebpf
+                .map("PACKET_EVENTS_LOST")
+                .ok_or_else(|| anyhow!("PACKET_EVENTS_LOST map missing"))?,
+        )?
+        .get(&0, 0)?
+        .iter()
+        .copied()
+        .sum::<u64>();
+        Ok(serde_json::json!({"rules": rows, "events_lost": lost}))
+    }
+
+    /// Drain a bounded batch from the kernel ring. Consumption is explicit;
+    /// counters above remain available even if a slow reader loses events.
+    pub fn read_packet_events(&mut self, limit: usize) -> Result<Vec<serde_json::Value>> {
+        let names: BTreeMap<(u32, u32), String> = self
+            .applied
+            .policies
+            .iter()
+            .flat_map(|p| {
+                p.port_rules
+                    .iter()
+                    .map(move |r| ((p.id, r.id()), r.name.clone()))
+            })
+            .collect();
+        let mut ring = aya::maps::RingBuf::try_from(
+            self.ebpf
+                .map_mut("PACKET_EVENTS")
+                .ok_or_else(|| anyhow!("PACKET_EVENTS map missing"))?,
+        )?;
+        let mut rows = Vec::new();
+        for _ in 0..limit.clamp(1, 4096) {
+            let Some(item) = ring.next() else {
+                break;
+            };
+            anyhow::ensure!(
+                item.len() == std::mem::size_of::<velstra_common::PacketEvent>(),
+                "packet-event ABI mismatch"
+            );
+            // The shared POD layout contains integers/bytes only. Ring payloads
+            // need not be aligned to the Rust struct's alignment.
+            let event = unsafe {
+                std::ptr::read_unaligned(item.as_ptr().cast::<velstra_common::PacketEvent>())
+            };
+            let address = |bytes: [u8; 16]| {
+                if event.family == 4 {
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                        bytes[0], bytes[1], bytes[2], bytes[3],
+                    ))
+                    .to_string()
+                } else {
+                    std::net::IpAddr::V6(std::net::Ipv6Addr::from(bytes)).to_string()
+                }
+            };
+            rows.push(serde_json::json!({"timestamp_ns": event.timestamp_ns,
+                "policy": event.policy, "rule_id": event.rule_id,
+                "rule": names.get(&(event.policy,event.rule_id)), "interface": event.ifindex,
+                "length": event.length, "family": event.family, "src": address(event.src), "dst": address(event.dst),
+                "src_port": event.src_port, "dst_port": event.dst_port, "protocol": event.proto,
+                "action": match event.action { 0 => "accept", 1 => "drop", _ => "reject" },
+                "direction": if event.direction == 0 { "in" } else { "out" }, "reason": event.reason}));
+        }
+        Ok(rows)
+    }
+
     pub fn read_stats(&self) -> Result<Stats> {
         let map: PerCpuArray<_, u64> = PerCpuArray::try_from(
             self.ebpf
@@ -1507,53 +1790,30 @@ impl Firewall {
         Ok(Stats { rows })
     }
 
-    /// Take ownership of the `LOCAL_MACS` map handle out of the loaded eBPF
-    /// object, for the B4b learn-and-advertise background task.
-    ///
-    /// The XDP program is already loaded and its map references are resolved, so
-    /// moving the userspace handle out of the `Ebpf` collection is safe — the
-    /// kernel map lives on (the returned handle owns its fd), the data plane keeps
-    /// populating it, and nothing else in the control plane touches `LOCAL_MACS`.
-    /// The background task reads through the returned handle; when it is dropped
-    /// the map is freed. (aya reads an LRU hash map through the same userspace
-    /// `HashMap` type as a regular hash map.)
+    /// Duplicate `LOCAL_MACS` for the learn-and-advertise task. Keep the map in
+    /// the firewall too, so a policy-namespace reset can clear learned state.
     pub fn take_local_macs(&mut self) -> Result<HashMap<MapData, LocalMacKey, LocalMac>> {
-        let map = self
-            .ebpf
-            .take_map("LOCAL_MACS")
-            .ok_or_else(|| anyhow!("LOCAL_MACS map missing"))?;
-        HashMap::try_from(map).context("LOCAL_MACS as a HashMap")
+        let Some(aya::maps::Map::LruHashMap(data)) = self.ebpf.map("LOCAL_MACS") else {
+            bail!("LOCAL_MACS LRU map missing");
+        };
+        let duplicate = MapData::from_fd(data.fd().as_fd().try_clone_to_owned()?)?;
+        HashMap::try_from(aya::maps::Map::LruHashMap(duplicate)).context("LOCAL_MACS as a HashMap")
     }
 
-    /// Take ownership of the `CONNTRACK` map handle out of the loaded eBPF object,
-    /// for the C9 stateful-HA conntrack-sync background task.
-    ///
-    /// Same rationale as [`take_local_macs`]: the XDP program's map references are
-    /// already resolved, so moving the userspace handle out is safe — the kernel
-    /// map lives on, the data plane keeps recording NAT flows into it, and nothing
-    /// else in the control plane touches `CONNTRACK` (a live [`reconfigure`] leaves
-    /// it alone by design). The sync task both **reads** it (dump-and-push) and
-    /// **writes** it (apply a peer's entries) through this one handle. (aya reads
-    /// and writes an LRU hash map through the same userspace `HashMap` type.)
-    ///
-    /// The handle is **shared**, not surrendered: the first call moves the map out
-    /// of the eBPF object and every later call clones the same `Arc`. aya allows
-    /// only one owner of a taken map, so handing it to the sync task outright would
-    /// mean that turning HA on silently takes the flow table away from everything
-    /// else that wants to read it — the diagnostics view included.
-    ///
-    /// [`take_local_macs`]: Firewall::take_local_macs
-    /// [`reconfigure`]: Firewall::reconfigure
+    /// Share a duplicate `CONNTRACK` FD between diagnostics and HA sync. Retain
+    /// the original map handle for fenced policy-namespace resets. Every handle
+    /// addresses the same kernel map; no flow entries are copied.
     pub fn conntrack_handle(&mut self) -> Result<Arc<Mutex<HashMap<MapData, FlowKey, FlowState>>>> {
         if let Some(handle) = &self.conntrack {
             return Ok(handle.clone());
         }
-        let map = self
-            .ebpf
-            .take_map("CONNTRACK")
-            .ok_or_else(|| anyhow!("CONNTRACK map missing"))?;
+        let Some(aya::maps::Map::LruHashMap(data)) = self.ebpf.map("CONNTRACK") else {
+            bail!("CONNTRACK LRU map missing");
+        };
+        let duplicate = MapData::from_fd(data.fd().as_fd().try_clone_to_owned()?)?;
         let handle = Arc::new(Mutex::new(
-            HashMap::try_from(map).context("CONNTRACK as a HashMap")?,
+            HashMap::try_from(aya::maps::Map::LruHashMap(duplicate))
+                .context("CONNTRACK as a HashMap")?,
         ));
         self.conntrack = Some(handle.clone());
         Ok(handle)
@@ -1575,29 +1835,29 @@ impl Firewall {
         let map = handle.lock().await;
         let mut out = Vec::new();
         for key in map.keys().flatten() {
-            if let Ok(state) = map.get(&key, 0) {
-                out.push((key, state));
-            }
+            let Some(state) = map.get(&key, 0).ok().filter(|state| {
+                !state.expired(
+                    key.proto,
+                    crate::conntrack_sync::monotonic_ns(),
+                    self.applied.conntrack,
+                )
+            }) else {
+                continue;
+            };
+            out.push((key, state));
         }
         Ok(out)
     }
 
-    /// Take ownership of the `FW_FLOWS` map handle for the same C9 conntrack-sync
-    /// task. `FW_FLOWS` is the stateful-firewall reply table (`FlowKey → present`,
-    /// value a mere presence flag); replicating it alongside `CONNTRACK` is what
-    /// lets an established but *non-NAT'd* stateful flow's reply survive a VRRP
-    /// failover — without it the reply misses `FW_FLOWS` on the new master and the
-    /// deny-by-default zone drops it. Same take-out rationale as [`take_conntrack`]:
-    /// the XDP map reference is already resolved, the kernel map lives on, and
-    /// nothing else in the control plane touches `FW_FLOWS`.
-    ///
-    /// [`take_conntrack`]: Firewall::take_conntrack
-    pub fn take_fw_flows(&mut self) -> Result<HashMap<MapData, FlowKey, u8>> {
-        let map = self
-            .ebpf
-            .take_map("FW_FLOWS")
-            .ok_or_else(|| anyhow!("FW_FLOWS map missing"))?;
-        HashMap::try_from(map).context("FW_FLOWS as a HashMap")
+    /// Duplicate the userspace FD for HA sync while retaining the map in the
+    /// firewall. Diagnostics and FlowSpec purges must keep working with HA on.
+    /// All handles address the same kernel map; no state or counters are copied.
+    pub fn fw_flows_handle(&self) -> Result<HashMap<MapData, FirewallKey, FirewallState>> {
+        let Some(aya::maps::Map::LruHashMap(data)) = self.ebpf.map("FW_FLOWS") else {
+            bail!("FW_FLOWS LRU map missing");
+        };
+        let duplicate = MapData::from_fd(data.fd().as_fd().try_clone_to_owned()?)?;
+        HashMap::try_from(aya::maps::Map::LruHashMap(duplicate)).context("FW_FLOWS as a HashMap")
     }
 }
 
@@ -1769,7 +2029,7 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
         }
     }
     {
-        let mut rules: LpmTrie<_, ScopedSrcPortKey, u32> = LpmTrie::try_from(
+        let mut rules: LpmTrie<_, ScopedSrcPortKey, u64> = LpmTrie::try_from(
             ebpf.map_mut("PORT_RULES")
                 .ok_or_else(|| anyhow!("PORT_RULES map missing"))?,
         )?;
@@ -1802,7 +2062,7 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
         // The v6 tries are cleared the same way: a rule that survives the sweep
         // because nobody looked in its trie is a rule the operator deleted and
         // the data plane still enforces.
-        let mut rules: LpmTrie<_, ScopedSrcPortKey6, u32> = LpmTrie::try_from(
+        let mut rules: LpmTrie<_, ScopedSrcPortKey6, u64> = LpmTrie::try_from(
             ebpf.map_mut("PORT_RULES6")
                 .ok_or_else(|| anyhow!("PORT_RULES6 map missing"))?,
         )?;
@@ -1828,7 +2088,7 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
         }
     }
     {
-        let mut rules: LpmTrie<_, ScopedDstPortKey6, u32> = LpmTrie::try_from(
+        let mut rules: LpmTrie<_, ScopedDstPortKey6, u64> = LpmTrie::try_from(
             ebpf.map_mut("DST_RULES6")
                 .ok_or_else(|| anyhow!("DST_RULES6 map missing"))?,
         )?;
@@ -1854,7 +2114,7 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
         }
     }
     {
-        let mut rules: LpmTrie<_, ScopedDstPortKey, u32> = LpmTrie::try_from(
+        let mut rules: LpmTrie<_, ScopedDstPortKey, u64> = LpmTrie::try_from(
             ebpf.map_mut("DST_RULES")
                 .ok_or_else(|| anyhow!("DST_RULES map missing"))?,
         )?;
@@ -1883,6 +2143,17 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
         let mut iface_policy: HashMap<_, u32, PolicyId> = HashMap::try_from(
             ebpf.map_mut("IFACE_POLICY")
                 .ok_or_else(|| anyhow!("IFACE_POLICY map missing"))?,
+        )?;
+        for iface in &old.interfaces {
+            if let Ok(ifindex) = if_nametoindex(&iface.name) {
+                let _ = iface_policy.remove(&ifindex);
+            }
+        }
+    }
+    {
+        let mut iface_policy: HashMap<_, u32, PolicyId> = HashMap::try_from(
+            ebpf.map_mut("IFACE_L3")
+                .ok_or_else(|| anyhow!("IFACE_L3 map missing"))?,
         )?;
         for iface in &old.interfaces {
             if let Ok(ifindex) = if_nametoindex(&iface.name) {
@@ -2154,13 +2425,66 @@ fn apply_config(
     cfg: &RuntimeConfig,
     old: Option<&RuntimeConfig>,
     prepared: &PreparedHostConfig,
+    reset: bool,
 ) -> Result<()> {
     cfg.validate_firewall_capacity()?;
+    let writing = {
+        let mut epoch = Array::<_, u64>::try_from(
+            ebpf.map_mut("CONFIG_EPOCH")
+                .ok_or_else(|| anyhow!("CONFIG_EPOCH map missing"))?,
+        )?;
+        let before = epoch.get(&0, 0)?;
+        let writing = if before & 1 == 0 {
+            before.wrapping_add(1)
+        } else {
+            before
+        };
+        epoch.set(0, writing, 0)?;
+        writing
+    };
     if let Some(old) = old {
+        synchronize_packet_readers()?;
+        if reset {
+            reset_runtime_namespace(ebpf)?;
+        }
         remove_stale(ebpf, old)?;
     }
 
+    if old.is_some() {
+        let wanted: BTreeSet<(u32, u32)> = cfg
+            .policies
+            .iter()
+            .flat_map(|p| {
+                std::iter::once((p.id, 0)).chain(p.port_rules.iter().map(move |r| (p.id, r.id())))
+            })
+            .collect();
+        let mut counters = aya::maps::PerCpuHashMap::<
+            _,
+            velstra_common::RuleCounterKey,
+            velstra_common::RuleCounters,
+        >::try_from(
+            ebpf.map_mut("RULE_COUNTERS")
+                .ok_or_else(|| anyhow!("RULE_COUNTERS map missing"))?,
+        )?;
+        let stale: Vec<_> = counters
+            .keys()
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|k| !wanted.contains(&(k.policy, k.rule_id)))
+            .collect();
+        for key in stale {
+            counters.remove(&key)?;
+        }
+    }
     program_fail_closed(ebpf, cfg.fail_closed)?;
+    let mut timeouts = Array::<_, velstra_common::ConntrackTimeouts>::try_from(
+        ebpf.map_mut("CT_TIMEOUTS")
+            .ok_or_else(|| anyhow!("CT_TIMEOUTS map missing"))?,
+    )?;
+    timeouts
+        .set(0, cfg.conntrack, 0)
+        .context("programming conntrack timeouts")?;
+
     program_policies(ebpf, &cfg.policies)?;
     program_interfaces(ebpf, &cfg.interfaces)?;
     program_routes(ebpf, &cfg.routes)?;
@@ -2194,6 +2518,55 @@ fn apply_config(
         &cfg.srv6_irb_routes,
     )?;
 
+    Array::<_, u64>::try_from(
+        ebpf.map_mut("CONFIG_EPOCH")
+            .ok_or_else(|| anyhow!("CONFIG_EPOCH map missing"))?,
+    )?
+    .set(0, writing.wrapping_add(1), 0)?;
+    Ok(())
+}
+
+/// Called only with CONFIG_EPOCH odd and all earlier packet readers drained.
+/// State from a previous policy-ID owner must not authorize its new owner.
+fn reset_runtime_namespace(ebpf: &mut Ebpf) -> Result<()> {
+    fn clear<K: aya::Pod, V: aya::Pod>(ebpf: &mut Ebpf, name: &str) -> Result<()> {
+        let mut map: HashMap<_, K, V> = HashMap::try_from(
+            ebpf.map_mut(name)
+                .ok_or_else(|| anyhow!("{name} map missing"))?,
+        )?;
+        let keys = map.keys().collect::<std::result::Result<Vec<_>, _>>()?;
+        for key in keys {
+            map.remove(&key)?;
+        }
+        Ok(())
+    }
+    clear::<FirewallKey, FirewallState>(ebpf, "FW_FLOWS")?;
+    clear::<FlowKey, FlowState>(ebpf, "CONNTRACK")?;
+    clear::<FlowKey, SynFlow>(ebpf, "SYN_FLOWS")?;
+    clear::<PortalClientKey, u8>(ebpf, "PORTAL_CLIENTS")?;
+    clear::<PortalSeenKey, [u8; 6]>(ebpf, "PORTAL_SEEN")?;
+    clear::<LocalMacKey, LocalMac>(ebpf, "LOCAL_MACS")?;
+    clear::<ArpKey, ArpEntry>(ebpf, "ARP_TABLE")?;
+    clear::<NdKey, ArpEntry>(ebpf, "ND_TABLE")?;
+    let mut counters = aya::maps::PerCpuHashMap::<
+        _,
+        velstra_common::RuleCounterKey,
+        velstra_common::RuleCounters,
+    >::try_from(
+        ebpf.map_mut("RULE_COUNTERS")
+            .ok_or_else(|| anyhow!("RULE_COUNTERS missing"))?,
+    )?;
+    let keys = counters
+        .keys()
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for key in keys {
+        counters.remove(&key)?;
+    }
+    let mut events = aya::maps::RingBuf::try_from(
+        ebpf.map_mut("PACKET_EVENTS")
+            .ok_or_else(|| anyhow!("PACKET_EVENTS missing"))?,
+    )?;
+    while events.next().is_some() {}
     Ok(())
 }
 
@@ -2327,7 +2700,7 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
         }
     }
     {
-        let mut rules: LpmTrie<_, ScopedSrcPortKey, u32> = LpmTrie::try_from(
+        let mut rules: LpmTrie<_, ScopedSrcPortKey, u64> = LpmTrie::try_from(
             ebpf.map_mut("PORT_RULES")
                 .ok_or_else(|| anyhow!("PORT_RULES map missing"))?,
         )?;
@@ -2361,7 +2734,8 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
                             port_rule_value(rule.action, rule.log, cidr_bits(&rule.src))
                                 | rule.scope,
                             slot,
-                        ),
+                        ) as u64
+                            | ((rule.id() as u64) << 32),
                         0,
                     )
                     .context("inserting port rule")?;
@@ -2372,7 +2746,7 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
         // The IPv6 source trie. A rule lands in exactly one of the four tries —
         // the family follows from what the operator wrote, and a rule that named
         // a v6 prefix used to land in none of them at all.
-        let mut rules: LpmTrie<_, ScopedSrcPortKey6, u32> = LpmTrie::try_from(
+        let mut rules: LpmTrie<_, ScopedSrcPortKey6, u64> = LpmTrie::try_from(
             ebpf.map_mut("PORT_RULES6")
                 .ok_or_else(|| anyhow!("PORT_RULES6 map missing"))?,
         )?;
@@ -2406,7 +2780,8 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
                             port_rule_value(rule.action, rule.log, cidr6_bits(&rule.src6))
                                 | rule.scope,
                             slot,
-                        ),
+                        ) as u64
+                            | ((rule.id() as u64) << 32),
                         0,
                     )
                     .context("inserting IPv6 port rule")?;
@@ -2415,7 +2790,7 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
     }
     {
         // The IPv6 destination trie.
-        let mut rules: LpmTrie<_, ScopedDstPortKey6, u32> = LpmTrie::try_from(
+        let mut rules: LpmTrie<_, ScopedDstPortKey6, u64> = LpmTrie::try_from(
             ebpf.map_mut("DST_RULES6")
                 .ok_or_else(|| anyhow!("DST_RULES6 map missing"))?,
         )?;
@@ -2449,7 +2824,8 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
                             port_rule_value(rule.action, rule.log, cidr6_bits(&rule.dst6))
                                 | rule.scope,
                             slot,
-                        ),
+                        ) as u64
+                            | ((rule.id() as u64) << 32),
                         0,
                     )
                     .context("inserting IPv6 destination rule")?;
@@ -2459,7 +2835,7 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
     {
         // Destination-constrained rules live in their own trie: a longest-prefix
         // match ranks one address field, and it is the *last* one in the key.
-        let mut rules: LpmTrie<_, ScopedDstPortKey, u32> = LpmTrie::try_from(
+        let mut rules: LpmTrie<_, ScopedDstPortKey, u64> = LpmTrie::try_from(
             ebpf.map_mut("DST_RULES")
                 .ok_or_else(|| anyhow!("DST_RULES map missing"))?,
         )?;
@@ -2493,7 +2869,8 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
                             port_rule_value(rule.action, rule.log, cidr_bits(&rule.dst))
                                 | rule.scope,
                             slot,
-                        ),
+                        ) as u64
+                            | ((rule.id() as u64) << 32),
                         0,
                     )
                     .context("inserting destination rule")?;
@@ -2524,7 +2901,38 @@ fn admitted_vnis(cfg: &RuntimeConfig) -> BTreeSet<u32> {
 /// Map each configured interface to its policy id (`IFACE_POLICY`) and overlay
 /// segment (`IFACE_VNI`). The two are independent: a port's firewall ruleset and
 /// its virtual network are separate concerns.
+fn raw_ip_link(kind: u32) -> bool {
+    // Linux ARPHRD_PPP, RAWIP, TUNNEL, TUNNEL6, SIT, NONE (WireGuard/TUN).
+    matches!(kind, 512 | 519 | 768 | 769 | 776 | 65534)
+}
+
+fn program_link_layer(ebpf: &mut Ebpf, name: &str) -> Result<bool> {
+    let index = if_nametoindex(name)?;
+    let kind: u32 = std::fs::read_to_string(format!("/sys/class/net/{name}/type"))
+        .with_context(|| format!("reading link type of {name}"))?
+        .trim()
+        .parse()
+        .context("invalid kernel link type")?;
+    let raw = raw_ip_link(kind);
+    let mut map: HashMap<_, u32, u32> = HashMap::try_from(
+        ebpf.map_mut("IFACE_L3")
+            .ok_or_else(|| anyhow!("IFACE_L3 map missing"))?,
+    )?;
+    if raw {
+        map.insert(index, 1, 0)?;
+    } else if map.get(&index, 0).is_ok() {
+        map.remove(&index)?;
+    }
+    Ok(raw)
+}
+
 fn program_interfaces(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Result<()> {
+    let mut raw_links = HashSet::new();
+    for iface in interfaces {
+        if if_nametoindex(&iface.name).is_ok() && program_link_layer(ebpf, &iface.name)? {
+            raw_links.insert(iface.name.as_str());
+        }
+    }
     if interfaces.is_empty() {
         return Ok(());
     }
@@ -2535,7 +2943,15 @@ fn program_interfaces(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Resu
     let prepared: Vec<(u32, PolicyId, u32)> = interfaces
         .iter()
         .filter_map(|i| match if_nametoindex(&i.name) {
-            Ok(ifindex) => Some((ifindex, i.policy, i.vni)),
+            Ok(ifindex) => Some((
+                ifindex,
+                i.policy,
+                if raw_links.contains(i.name.as_str()) {
+                    0
+                } else {
+                    i.vni
+                },
+            )),
             Err(_) => {
                 log::debug!("interface {} not present yet; deferring its maps", i.name);
                 None
@@ -2787,8 +3203,13 @@ fn program_masquerade(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Resu
     let prepared: Vec<(u32, [u8; 4])> = interfaces
         .iter()
         .filter(|i| i.masquerade)
-        .filter_map(
-            |i| match (if_nametoindex(&i.name), read_iface_ipv4(&i.name)) {
+        .filter_map(|i| {
+            match (
+                if_nametoindex(&i.name),
+                i.snat_address
+                    .map(Ok)
+                    .unwrap_or_else(|| read_iface_ipv4(&i.name)),
+            ) {
                 (Ok(ifindex), Ok(ip)) => Some((ifindex, ip)),
                 _ => {
                     warn!(
@@ -2797,19 +3218,20 @@ fn program_masquerade(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Resu
                     );
                     None
                 }
-            },
-        )
+            }
+        })
         .collect();
-    if prepared.is_empty() {
-        return Ok(());
-    }
     let mut map: HashMap<_, u32, [u8; 4]> = HashMap::try_from(
         ebpf.map_mut("MASQUERADE")
             .ok_or_else(|| anyhow!("MASQUERADE map missing"))?,
     )?;
+    let keep: HashSet<_> = prepared.iter().map(|(index, _)| *index).collect();
+    drop_unlisted(&mut map, &keep)?;
     for (ifindex, ip) in prepared {
-        map.insert(ifindex, ip, 0)
-            .with_context(|| format!("inserting masquerade ifindex {ifindex}"))?;
+        if map.get(&ifindex, 0).ok() != Some(ip) {
+            map.insert(ifindex, ip, 0)
+                .with_context(|| format!("inserting masquerade ifindex {ifindex}"))?;
+        }
     }
     Ok(())
 }
@@ -2881,7 +3303,7 @@ fn program_mac_rules(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
                 .map(move |(mac, _)| ScopedMac::new(p.id, *mac))
         })
         .collect();
-    let mut map: HashMap<_, ScopedMac, u32> = HashMap::try_from(
+    let mut map: HashMap<_, ScopedMac, u64> = HashMap::try_from(
         ebpf.map_mut("MAC_RULES")
             .ok_or_else(|| anyhow!("MAC_RULES map missing"))?,
     )?;
@@ -2890,7 +3312,7 @@ fn program_mac_rules(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
         for (mac, action) in &policy.mac_rules {
             map.insert(
                 ScopedMac::new(policy.id, *mac),
-                port_rule_value(*action, false, 0),
+                port_rule_value(*action, false, 0) as u64,
                 0,
             )
             .with_context(|| format!("inserting mac rule for policy {}", policy.id))?;
@@ -4017,10 +4439,7 @@ fn egress_interfaces(cfg: &RuntimeConfig, ifaces: &[String], egress: bool) -> Ve
     let needs_reply_state: Vec<PolicyId> = cfg
         .policies
         .iter()
-        .filter(|p| {
-            p.global.has_flag(ConfigFlags::STATEFUL)
-                && p.global.default_action != Action::Pass as u32
-        })
+        .filter(|p| p.global.has_flag(ConfigFlags::STATEFUL))
         .map(|p| p.id)
         .collect();
     for i in &cfg.interfaces {
@@ -4030,6 +4449,16 @@ fn egress_interfaces(cfg: &RuntimeConfig, ifaces: &[String], egress: bool) -> Ve
             .any(|p| p.id == i.policy && p.global.has_flag(ConfigFlags::EGRESS_DEFAULT_DROP));
         if out_scoped.contains(&i.policy) || needs_reply_state.contains(&i.policy) || drops_egress {
             push(&i.name, &mut out);
+        }
+    }
+    for name in ifaces {
+        let policy = cfg
+            .interfaces
+            .iter()
+            .find(|i| &i.name == name)
+            .map_or(0, |i| i.policy);
+        if needs_reply_state.contains(&policy) || out_scoped.contains(&policy) {
+            push(name, &mut out);
         }
     }
     for r in &cfg.npt66 {
@@ -4045,6 +4474,28 @@ fn attach_egress(
     ebpf: &mut Ebpf,
     ifaces: &[String],
 ) -> Result<BTreeMap<String, InterfaceLink<SchedClassifierLink>>> {
+    for (slot, name) in [
+        (0, "velstra_egress_v4"),
+        (1, "velstra_egress_v6"),
+        (2, "velstra_egress_icmp"),
+    ] {
+        let fd = {
+            let program: &mut SchedClassifier = ebpf
+                .program_mut(name)
+                .ok_or_else(|| anyhow!("missing {name}"))?
+                .try_into()?;
+            match program.load() {
+                Ok(()) | Err(ProgramError::AlreadyLoaded) => {}
+                Err(e) => return Err(e).with_context(|| format!("loading {name}")),
+            }
+            program.fd()?.try_clone()?
+        };
+        let mut tails = ProgramArray::try_from(
+            ebpf.map_mut("EGRESS_PROGS")
+                .ok_or_else(|| anyhow!("EGRESS_PROGS missing"))?,
+        )?;
+        tails.set(slot, &fd, 0)?;
+    }
     let program: &mut SchedClassifier = ebpf
         .program_mut("velstra_egress")
         .ok_or_else(|| anyhow!("eBPF object has no `velstra_egress` program"))?
@@ -4207,6 +4658,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn raw_ip_kernel_types_do_not_use_ethernet_classification() {
+        for kind in [512, 519, 768, 769, 776, 65534] {
+            assert!(raw_ip_link(kind));
+        }
+        for kind in [1, 772] {
+            assert!(!raw_ip_link(kind));
+        }
+    }
+
+    #[test]
     fn interface_lookup_reports_the_kernel_index() {
         let expected: u32 = std::fs::read_to_string("/sys/class/net/lo/ifindex")
             .unwrap()
@@ -4243,6 +4704,7 @@ mod tests {
             policy: 100,
             vni: 100,
             masquerade: false,
+            snat_address: None,
             mss: 0,
             cgnat: CgnatLayout::default(),
             binding: None,
@@ -4254,6 +4716,7 @@ mod tests {
             policy: 0,
             vni: 0,
             masquerade: true,
+            snat_address: None,
             mss: 0,
             cgnat: CgnatLayout::default(),
             binding: None,
@@ -4292,6 +4755,7 @@ mod tests {
             policy,
             vni: 0,
             masquerade: false,
+            snat_address: None,
             mss: 0,
             cgnat: CgnatLayout::default(),
             binding: None,
@@ -4327,16 +4791,20 @@ mod tests {
         cfg.policies = vec![policy(1, Action::Drop, false)];
         assert!(egress_interfaces(&cfg, &[], false).is_empty());
 
-        // Stateful but passing by default: the reply gets through on its own, and
-        // a hook that is not needed is a verdict stage nobody asked for.
+        // Even a default-pass policy must observe the SYN-ACK to advance its
+        // TCP state before the client's ACK arrives at ingress.
         cfg.policies = vec![policy(1, Action::Pass, true)];
-        assert!(egress_interfaces(&cfg, &[], false).is_empty());
+        assert_eq!(egress_interfaces(&cfg, &[], false), ["eth0"]);
+        cfg.policies = vec![policy(0, Action::Pass, true)];
+        cfg.interfaces.clear();
+        assert_eq!(egress_interfaces(&cfg, &["wan0".into()], false), ["wan0"]);
 
         // The other reasons still hold, and a name is listed once however many
         // reasons name it.
         cfg.policies = vec![policy(1, Action::Drop, true)];
         cfg.interfaces = vec![ResolvedInterface {
             masquerade: true,
+            snat_address: None,
             ..iface("eth0", 1)
         }];
         assert_eq!(egress_interfaces(&cfg, &["eth0".into()], true), ["eth0"]);

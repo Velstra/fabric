@@ -626,13 +626,27 @@ them periodically and on exit:
 ```shell
 cargo test -p velstra-common   # policy, parser, CIDR, map ABI (no root)
 make test                       # whole workspace incl. config + control plane
-cargo clippy --workspace
+cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
 The kernel program cannot be unit tested directly, so its parsing and policy are
 mirrored by `velstra-common`'s slice-based reference parser and the shared
 `decide()` / `plan_forward()` / `plan_dnat()` functions, all exhaustively tested.
+
+Verify all embedded XDP/TC entry points against the running kernel without
+attaching to an interface:
+
+```shell
+sudo ./target/release/velstra verify-ebpf
+# Or verify a separately built ELF object:
+sudo ./target/release/velstra verify-ebpf /path/to/velstra-ebpf
+```
+
+Sentinel also runs this in its appliance kernel with `nix build
+.#checks.x86_64-linux.ebpf-verifier`. Live rule updates preserve the loaded maps
+and connection state; a configuration generation closes packet processing while
+the previous kernel readers drain and the new policy is installed.
 
 **End-to-end (root).** A suite under [`tests/e2e/`](tests/e2e) loads the *real*
 XDP + TC programs onto throwaway veth/netns topologies and asserts on live

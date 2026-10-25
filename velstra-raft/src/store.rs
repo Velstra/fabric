@@ -1437,6 +1437,7 @@ mod tests {
                     stateful: true,
                     blocklist: vec![],
                     rules: vec![PortRule {
+                        name: String::new(),
                         icmp_type: None,
                         src_mac: None,
                         in_interface: None,

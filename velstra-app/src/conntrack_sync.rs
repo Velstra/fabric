@@ -60,7 +60,7 @@ use std::{net::SocketAddr, sync::Arc};
 use aya::maps::{HashMap, MapData};
 use log::{info, warn};
 use tokio::{net::UdpSocket, sync::Mutex};
-use velstra_common::{FlowKey, FlowState};
+use velstra_common::{FirewallKey, FirewallState, FlowKey, FlowState};
 
 /// Datagram magic + version tag (`VCS1` = Velstra Conntrack Sync v1).
 const MAGIC: [u8; 4] = *b"VCS1";
@@ -84,7 +84,7 @@ const HEADER_LEN: usize = 8;
 /// the same cap and is smaller (20-byte records), so it also fits.
 const MAX_RECORDS: usize = 32;
 /// Receive buffer: one maximum-size (CONNTRACK) datagram.
-const RECV_BUF: usize = HEADER_LEN + MAX_RECORDS * RECORD_LEN;
+const RECV_BUF: usize = HEADER_LEN + 20 * 60;
 
 /// A decoded datagram: one map's worth of records, tagged by which map it came
 /// from so the receiver applies it to the right kernel table.
@@ -92,8 +92,10 @@ const RECV_BUF: usize = HEADER_LEN + MAX_RECORDS * RECORD_LEN;
 pub enum Datagram {
     /// CONNTRACK entries (NAT flow key + state).
     Conntrack(Vec<(FlowKey, FlowState)>),
+    Nat(Vec<(FlowKey, FlowState)>),
     /// FW_FLOWS entries (stateful-firewall flow keys; the value is presence).
     FwFlows(Vec<FlowKey>),
+    Firewall(Vec<(FirewallKey, FirewallState)>),
 }
 
 /// Encode one flow key into 20 little-endian bytes.
@@ -140,6 +142,8 @@ fn decode_key(b: &[u8]) -> FlowKey {
 /// Decode a 16-byte value. Caller guarantees `b.len() == VAL_LEN`.
 fn decode_val(b: &[u8]) -> FlowState {
     FlowState {
+        last_seen_ns: 0,
+        age_ns: 0,
         nat_ip: [b[0], b[1], b[2], b[3]],
         nat2_ip: [b[4], b[5], b[6], b[7]],
         nat_port: u16::from_le_bytes([b[8], b[9]]),
@@ -161,6 +165,7 @@ fn push_header(buf: &mut Vec<u8>, count: usize, kind: u16) {
 
 /// Split CONNTRACK `entries` into one or more datagrams of at most
 /// [`MAX_RECORDS`] records. An empty input yields no datagrams (nothing to send).
+#[cfg(test)]
 pub fn encode_conntrack_batch(entries: &[(FlowKey, FlowState)]) -> Vec<Vec<u8>> {
     entries
         .chunks(MAX_RECORDS)
@@ -178,6 +183,7 @@ pub fn encode_conntrack_batch(entries: &[(FlowKey, FlowState)]) -> Vec<Vec<u8>> 
 
 /// Split FW_FLOWS `keys` into one or more key-only datagrams of at most
 /// [`MAX_RECORDS`] records. An empty input yields no datagrams.
+#[cfg(test)]
 pub fn encode_fwflows_batch(keys: &[FlowKey]) -> Vec<Vec<u8>> {
     keys.chunks(MAX_RECORDS)
         .map(|chunk| {
@@ -218,6 +224,24 @@ pub fn decode_datagram(buf: &[u8]) -> Option<Datagram> {
             }
             Some(Datagram::Conntrack(out))
         }
+        3 => {
+            if count > 26 || buf.len() != HEADER_LEN + count * 44 {
+                return None;
+            }
+            let mut records = Vec::with_capacity(count);
+            for i in 0..count {
+                let r = &buf[HEADER_LEN + i * 44..HEADER_LEN + (i + 1) * 44];
+                let key = decode_key(&r[..20]);
+                let mut state = decode_val(&r[20..36]);
+                state.age_ns = u64::from_le_bytes(r[36..44].try_into().ok()?);
+                if state.age_ns > 604_800_000_000_000 {
+                    return None;
+                }
+                records.push((key, state));
+            }
+            Some(Datagram::Nat(records))
+        }
+        2 => decode_firewall(buf, count),
         KIND_FW_FLOWS => {
             if buf.len() != HEADER_LEN + count * KEY_LEN {
                 return None;
@@ -247,11 +271,112 @@ fn read_conntrack(map: &HashMap<MapData, FlowKey, FlowState>) -> Vec<(FlowKey, F
     out
 }
 
-/// Read every key of the `FW_FLOWS` LRU map into an owned vector. Only the key
-/// matters (the value is a presence flag), so no per-entry `get` is needed; a key
-/// that was evicted concurrently is harmless (a stale re-insert on the peer).
-fn read_fw_flows(map: &HashMap<MapData, FlowKey, u8>) -> Vec<FlowKey> {
-    map.keys().flatten().collect()
+/// Read state together with each key. A concurrently evicted key is skipped.
+fn read_fw_flows(
+    map: &HashMap<MapData, FirewallKey, FirewallState>,
+) -> Vec<(FirewallKey, FirewallState)> {
+    map.iter().filter_map(Result::ok).collect()
+}
+
+pub(crate) fn monotonic_ns() -> u64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // CLOCK_MONOTONIC is the same clock used by bpf_ktime_get_ns.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } != 0 {
+        return 0;
+    }
+    time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
+}
+
+// Kind 2 carries family, complete state and relative age. It avoids copying an
+// absolute monotonic timestamp between machines with different uptimes.
+fn encode_nat_batch(records: &[(FlowKey, FlowState)], now: u64) -> Vec<Vec<u8>> {
+    let records: Vec<_> = records
+        .iter()
+        .copied()
+        .filter(|(_, state)| state.idle_ns(now) <= 604_800_000_000_000)
+        .collect();
+    records
+        .chunks(26)
+        .map(|chunk| {
+            let mut buf = Vec::with_capacity(8 + chunk.len() * 44);
+            push_header(&mut buf, chunk.len(), 3);
+            for (key, state) in chunk {
+                encode_key(key, &mut buf);
+                encode_val(state, &mut buf);
+                buf.extend_from_slice(&state.idle_ns(now).to_le_bytes());
+            }
+            buf
+        })
+        .collect()
+}
+
+fn encode_firewall_batch(records: &[(FirewallKey, FirewallState)], now: u64) -> Vec<Vec<u8>> {
+    let records: Vec<_> = records
+        .iter()
+        .copied()
+        .filter(|(_, state)| state.idle_ns(now) <= 604_800_000_000_000)
+        .collect();
+    records
+        .chunks(20)
+        .map(|chunk| {
+            let mut buf = Vec::with_capacity(8 + chunk.len() * 60);
+            push_header(&mut buf, chunk.len(), 2);
+            for (k, state) in chunk {
+                buf.extend_from_slice(&k.policy.to_le_bytes());
+                buf.extend_from_slice(&k.src);
+                buf.extend_from_slice(&k.dst);
+                buf.extend_from_slice(&k.src_port.to_le_bytes());
+                buf.extend_from_slice(&k.dst_port.to_le_bytes());
+                buf.push(k.proto);
+                buf.push(k.family);
+                buf.extend_from_slice(&[0; 2]);
+                buf.extend_from_slice(&state.idle_ns(now).to_le_bytes());
+                buf.extend_from_slice(&state.phase.to_le_bytes());
+                buf.extend_from_slice(&state.reply.to_le_bytes());
+            }
+            buf
+        })
+        .collect()
+}
+
+fn decode_firewall(buf: &[u8], count: usize) -> Option<Datagram> {
+    if count > 20 || buf.len() != HEADER_LEN + count * 60 {
+        return None;
+    }
+    let mut records = Vec::with_capacity(count);
+    for i in 0..count {
+        let r = &buf[HEADER_LEN + i * 60..HEADER_LEN + (i + 1) * 60];
+        let k = FirewallKey {
+            policy: u32::from_le_bytes(r[0..4].try_into().ok()?),
+            src: r[4..20].try_into().ok()?,
+            dst: r[20..36].try_into().ok()?,
+            src_port: u16::from_le_bytes(r[36..38].try_into().ok()?),
+            dst_port: u16::from_le_bytes(r[38..40].try_into().ok()?),
+            proto: r[40],
+            family: r[41],
+            _pad: [0; 2],
+        };
+        let state = FirewallState {
+            last_seen_ns: 0,
+            age_ns: u64::from_le_bytes(r[44..52].try_into().ok()?),
+            phase: u32::from_le_bytes(r[52..56].try_into().ok()?),
+            reply: u32::from_le_bytes(r[56..60].try_into().ok()?),
+        };
+        if !matches!(k.family, 4 | 6)
+            || !matches!(k.proto, 1 | 6 | 17 | 58)
+            || !(1..=5).contains(&state.phase)
+            || state.reply > 1
+            || r[42..44] != [0, 0]
+            || state.age_ns > 604_800_000_000_000
+        {
+            return None;
+        }
+        records.push((k, state));
+    }
+    Some(Datagram::Firewall(records))
 }
 
 /// Long-lived task: own the `CONNTRACK` and `FW_FLOWS` handles and a bound UDP
@@ -264,7 +389,7 @@ fn read_fw_flows(map: &HashMap<MapData, FlowKey, u8>) -> Vec<FlowKey> {
 /// loop can panic the agent.
 pub async fn run(
     conntrack: Arc<Mutex<HashMap<MapData, FlowKey, FlowState>>>,
-    mut fw_flows: HashMap<MapData, FlowKey, u8>,
+    mut fw_flows: HashMap<MapData, FirewallKey, FirewallState>,
     listen: SocketAddr,
     peers: Vec<SocketAddr>,
     interval_secs: u64,
@@ -296,8 +421,8 @@ pub async fn run(
                 if ct.is_empty() && fw.is_empty() {
                     continue;
                 }
-                let mut datagrams = encode_conntrack_batch(&ct);
-                datagrams.extend(encode_fwflows_batch(&fw));
+                let mut datagrams = encode_nat_batch(&ct, monotonic_ns());
+                datagrams.extend(encode_firewall_batch(&fw, monotonic_ns()));
                 for peer in &peers {
                     for dg in &datagrams {
                         if let Err(e) = socket.send_to(dg, peer).await {
@@ -318,8 +443,16 @@ pub async fn run(
                     Ok(v) => v,
                     Err(e) => { warn!("conntrack-sync: recv failed: {e}"); continue; }
                 };
-                match decode_datagram(&rx[..n]) {
-                    Some(Datagram::Conntrack(records)) => {
+                let decoded = match decode_datagram(&rx[..n]) {
+                    Some(Datagram::Nat(mut entries)) => {
+                        let now = monotonic_ns();
+                        for (_, state) in &mut entries { state.last_seen_ns = now; }
+                        Some(Datagram::Nat(entries))
+                    }
+                    other => other,
+                };
+                match decoded {
+                    Some(Datagram::Conntrack(records)) | Some(Datagram::Nat(records)) => {
                         let mut applied = 0usize;
                         for (k, v) in &records {
                             let mut map = conntrack.lock().await;
@@ -329,7 +462,9 @@ pub async fn run(
                             // node pushes, so that would happen every interval — the
                             // counters would never get past one tick's worth of traffic.
                             let mut v = *v;
+                            if v.last_seen_ns == 0 { v.last_seen_ns = monotonic_ns(); }
                             if let Ok(local) = map.get(k, 0) {
+                                if local.idle_ns(monotonic_ns()) < v.idle_ns(monotonic_ns()) { continue; }
                                 v.packets = local.packets;
                                 v.bytes = local.bytes;
                             }
@@ -345,13 +480,27 @@ pub async fn run(
                     Some(Datagram::FwFlows(keys)) => {
                         let mut applied = 0usize;
                         for k in &keys {
-                            match fw_flows.insert(k, 1u8, 0) {
+                            let k = FirewallKey::ipv4(*k);
+                            let state = FirewallState { last_seen_ns: monotonic_ns(), age_ns: 0, phase: FirewallState::ESTABLISHED, reply: 0 };
+                            match fw_flows.insert(k, state, 0) {
                                 Ok(()) => applied += 1,
                                 Err(e) => warn!("conntrack-sync: apply fw-flow entry from {from} failed: {e}"),
                             }
                         }
                         if applied > 0 {
                             info!("conntrack-sync: applied {applied} fw-flow entries from {from}");
+                        }
+                    }
+                    Some(Datagram::Firewall(records)) => {
+                        let now = monotonic_ns();
+                        for (key, age) in records {
+                            let state = FirewallState { last_seen_ns: now, ..age };
+                            // Do not replace state that has seen a more recent
+                            // packet locally with an older peer snapshot.
+                            if fw_flows.get(&key, 0).is_ok_and(|s| s.idle_ns(now) < state.idle_ns(now)) { continue; }
+                            if let Err(e) = fw_flows.insert(key, state, 0) {
+                                warn!("conntrack-sync: applying firewall state from {from} failed: {e}");
+                            }
                         }
                     }
                     None => warn!("conntrack-sync: dropped malformed datagram from {from}"),
@@ -364,6 +513,70 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn firewall_state_wire_carries_age_and_rejects_truncation() {
+        let key = FirewallKey::ipv4(sample_key(1));
+        let state = FirewallState {
+            last_seen_ns: 10_000_000_000,
+            age_ns: 2_000_000_000,
+            phase: FirewallState::ESTABLISHED,
+            reply: 1,
+        };
+        let packets = encode_firewall_batch(&[(key, state)], 13_000_000_000);
+        assert_eq!(packets[0].len(), 68);
+        let Some(Datagram::Firewall(records)) = decode_datagram(&packets[0]) else {
+            panic!("firewall record missing")
+        };
+        assert_eq!(records[0].0, key);
+        assert_eq!(records[0].1.age_ns, 5_000_000_000);
+        assert_eq!(records[0].1.phase, state.phase);
+        assert_eq!(records[0].1.reply, 1);
+        assert!(decode_datagram(&packets[0][..67]).is_none());
+        let mut invalid = packets[0].clone();
+        invalid[49] = 3; // unsupported address family
+        assert!(decode_datagram(&invalid).is_none());
+        let mut stale = packets[0].clone();
+        stale[52..60].copy_from_slice(&604_800_000_000_001u64.to_le_bytes());
+        assert!(decode_datagram(&stale).is_none());
+    }
+
+    #[test]
+    fn relative_nat_state_does_not_copy_a_peer_clock_or_its_counters() {
+        let (key, mut state) = sample_entry(1);
+        state.last_seen_ns = 10_000_000_000;
+        state.age_ns = 2_000_000_000;
+        state.packets = 100;
+        state.bytes = 10000;
+        let packets = encode_nat_batch(&[(key, state)], 13_000_000_000);
+        let Some(Datagram::Nat(records)) = decode_datagram(&packets[0]) else {
+            panic!("NAT record missing")
+        };
+        assert_eq!(records[0].0, key);
+        assert_eq!(records[0].1.age_ns, 5_000_000_000);
+        assert_eq!(records[0].1.last_seen_ns, 0);
+        assert_eq!(records[0].1.packets, 0);
+        assert_eq!(records[0].1.bytes, 0);
+        assert!(decode_datagram(&packets[0][..51]).is_none());
+    }
+
+    #[test]
+    fn ancient_lru_records_do_not_poison_replication_of_live_connections() {
+        let (key, mut state) = sample_entry(1);
+        state.last_seen_ns = 1;
+        assert!(encode_nat_batch(&[(key, state)], 700_000_000_000_000).is_empty());
+        let live = FirewallState {
+            last_seen_ns: 700_000_000_000_000,
+            age_ns: 0,
+            phase: 3,
+            reply: 0,
+        };
+        assert_eq!(
+            encode_firewall_batch(&vec![(FirewallKey::ipv4(key), live); 41], live.last_seen_ns)
+                .len(),
+            3
+        );
+    }
 
     fn sample_entry(seed: u8) -> (FlowKey, FlowState) {
         let key = sample_key(seed);

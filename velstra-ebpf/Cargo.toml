@@ -19,3 +19,7 @@ which = { workspace = true }
 [[bin]]
 name = "velstra"
 path = "src/main.rs"
+# This no_main kernel program has no host test entry point. Packet logic is
+# tested in velstra-common; loading/verifier coverage belongs to the VM tests.
+test = false
+bench = false

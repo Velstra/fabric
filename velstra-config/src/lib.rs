@@ -10,14 +10,14 @@ mod config;
 mod proto_convert;
 
 pub use config::{
-    ActionName, BackendCfg, EncapName, FileConfig, FloodVtepCfg, ForwardMode, InterfaceFile,
-    IrbRouteCfg, MacRouteCfg, Nd6Cfg, NeighborCfg, Npt66Cfg, OverlayCfg, PolicyConfig, PolicyFile,
-    PortForwardCfg, PortIdentity, PortRule, ProtoName, ResolvedFloodVtep, ResolvedFlowExport,
-    ResolvedInterface, ResolvedIrbRoute, ResolvedMacRoute, ResolvedNd6, ResolvedNeighbor,
-    ResolvedNpt66, ResolvedOverlay, ResolvedPortForward, ResolvedRoute, ResolvedRule,
-    ResolvedService, ResolvedSrv6, ResolvedSrv6Flood, ResolvedSrv6IrbRoute, ResolvedSrv6LocalSid,
-    ResolvedSrv6Route, ResolvedSynProxy, ResolvedTunnel, RouteCfg, RuntimeConfig, ServiceCfg,
-    SourceValidationName, Srv6Cfg, Srv6FloodCfg, Srv6IrbRouteCfg, Srv6LocalSidCfg, Srv6RouteCfg,
-    TunnelCfg, load_file,
+    ActionName, BackendCfg, ConntrackConfig, EncapName, FileConfig, FloodVtepCfg, ForwardMode,
+    InterfaceFile, IrbRouteCfg, MacRouteCfg, Nd6Cfg, NeighborCfg, Npt66Cfg, OverlayCfg,
+    PolicyConfig, PolicyFile, PortForwardCfg, PortIdentity, PortRule, ProtoName, ResolvedFloodVtep,
+    ResolvedFlowExport, ResolvedInterface, ResolvedIrbRoute, ResolvedMacRoute, ResolvedNd6,
+    ResolvedNeighbor, ResolvedNpt66, ResolvedOverlay, ResolvedPortForward, ResolvedRoute,
+    ResolvedRule, ResolvedService, ResolvedSrv6, ResolvedSrv6Flood, ResolvedSrv6IrbRoute,
+    ResolvedSrv6LocalSid, ResolvedSrv6Route, ResolvedSynProxy, ResolvedTunnel, RouteCfg,
+    RuntimeConfig, ServiceCfg, SourceValidationName, Srv6Cfg, Srv6FloodCfg, Srv6IrbRouteCfg,
+    Srv6LocalSidCfg, Srv6RouteCfg, TunnelCfg, load_file,
 };
 pub use proto_convert::{file_config_from_proto, file_config_to_proto, runtime_from_proto};

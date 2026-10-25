@@ -18,6 +18,7 @@ use crate::config::{
 
 fn port_rule_to_proto(r: &PortRule) -> proto::PortRule {
     proto::PortRule {
+        name: r.name.clone(),
         proto: proto_to_proto(r.proto) as i32,
         port: u32::from(r.port),
         action: action_to_proto(r.action) as i32,
@@ -39,6 +40,7 @@ fn port_rule_to_proto(r: &PortRule) -> proto::PortRule {
 
 fn port_rule_from_proto(r: &proto::PortRule) -> PortRule {
     PortRule {
+        name: r.name.clone(),
         src_mac: (!r.src_mac.is_empty()).then(|| r.src_mac.clone()),
         in_interface: (!r.in_interface.is_empty()).then(|| r.in_interface.clone()),
         proto: proto_from_proto(r.proto()),
@@ -171,6 +173,14 @@ pub fn file_config_to_proto(cfg: &FileConfig, version: u64) -> proto::NodeConfig
         log: cfg.log,
         stateful: cfg.stateful,
         source_validation: rpf_to_proto(cfg.source_validation) as i32,
+        conntrack: Some(proto::ConntrackTimeouts {
+            tcp_syn: cfg.conntrack.tcp_syn,
+            tcp_established: cfg.conntrack.tcp_established,
+            tcp_closing: cfg.conntrack.tcp_closing,
+            udp: cfg.conntrack.udp,
+            udp_stream: cfg.conntrack.udp_stream,
+            icmp: cfg.conntrack.icmp,
+        }),
         fail_closed: cfg.fail_closed,
         blocklist: cfg.blocklist.clone(),
         port_rules: cfg.port_rules.iter().map(port_rule_to_proto).collect(),
@@ -202,6 +212,7 @@ pub fn file_config_to_proto(cfg: &FileConfig, version: u64) -> proto::NodeConfig
                 bind_addresses: i.bind_addresses.clone(),
                 rate_limit_mbit: i.rate_limit_mbit,
                 masquerade: i.masquerade,
+                snat_address: i.snat_address.clone(),
                 cgnat_base_port: u32::from(i.cgnat_base_port),
                 cgnat_block_size: u32::from(i.cgnat_block_size),
             })
@@ -380,6 +391,18 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
         // node.
         portal: None,
         source_validation: rpf_from_proto(cfg.source_validation()),
+        conntrack: cfg
+            .conntrack
+            .as_ref()
+            .map(|t| crate::ConntrackConfig {
+                tcp_syn: t.tcp_syn,
+                tcp_established: t.tcp_established,
+                tcp_closing: t.tcp_closing,
+                udp: t.udp,
+                udp_stream: t.udp_stream,
+                icmp: t.icmp,
+            })
+            .unwrap_or_default(),
         fail_closed: cfg.fail_closed,
         blocklist: cfg.blocklist.clone(),
         port_rules: cfg.port_rules.iter().map(port_rule_from_proto).collect(),
@@ -422,6 +445,7 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
                 policy: i.policy,
                 vni: i.vni,
                 masquerade: i.masquerade,
+                snat_address: i.snat_address.clone(),
                 cgnat_base_port: i.cgnat_base_port as u16,
                 cgnat_block_size: i.cgnat_block_size as u16,
             })
@@ -928,6 +952,7 @@ mod every_field_survives {
             rate_limit_mbit: Some(100),
             bind_addresses: vec!["10.0.0.5".into(), "fd00::5".into()],
             masquerade: true,
+            snat_address: Some("203.0.113.99".into()),
             cgnat_base_port: 20000,
             cgnat_block_size: 512,
         }
@@ -957,6 +982,7 @@ mod every_field_survives {
             rate_limit_mbit,
             bind_addresses,
             masquerade,
+            snat_address,
             cgnat_base_port,
             cgnat_block_size,
         } = after;
@@ -976,6 +1002,7 @@ mod every_field_survives {
             *bind_addresses, before.bind_addresses,
             "bind_addresses — port security is off, a guest may claim any address"
         );
+        assert_eq!(*snat_address, before.snat_address, "static SNAT address");
         assert_eq!(*masquerade, before.masquerade, "masquerade — NAT is off");
         assert_eq!(*cgnat_base_port, before.cgnat_base_port, "cgnat_base_port");
         assert_eq!(
@@ -986,6 +1013,7 @@ mod every_field_survives {
 
     fn rule() -> PortRule {
         PortRule {
+            name: "public-web".into(),
             proto: ProtoName::Tcp,
             port: 443,
             icmp_type: Some(8),
@@ -1013,6 +1041,7 @@ mod every_field_survives {
         let after = port_rule_from_proto(&there);
 
         let PortRule {
+            name,
             proto,
             port,
             icmp_type,
@@ -1027,6 +1056,7 @@ mod every_field_survives {
             limit,
             burst,
         } = &after;
+        assert_eq!(name, &before.name, "name");
         assert_eq!(*proto, before.proto, "proto");
         assert_eq!(*port, before.port, "port");
         assert_eq!(*icmp_type, before.icmp_type, "icmp_type");
