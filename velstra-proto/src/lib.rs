@@ -11,6 +11,9 @@
 /// The `velstra.v1` package: messages, the `VelstraControl` service client
 /// (`velstra_control_client`) and server (`velstra_control_server`).
 pub mod v1 {
+    // tonic/async-trait mark generated futures must_use as well as their
+    // methods. The redundant annotation is generator-owned, not an API error.
+    #![allow(clippy::double_must_use)]
     tonic::include_proto!("velstra.v1");
 }
 
