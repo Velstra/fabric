@@ -1019,6 +1019,7 @@ mod tests {
     async fn kernel_synproxy_snapshot_splice_deletion_and_local_ownership() {
         let mut source = kernel_store();
         let mut target = kernel_store();
+        target.generation([1; 32]);
         let peer = "192.0.2.1".parse().unwrap();
         let Record::SynProxy(key, spliced) = syn_record() else {
             unreachable!()
