@@ -9,8 +9,8 @@ use aya_ebpf::{
 use velstra_common::{Counter, FlowKey, FlowState, ip_proto, plan_icmp_echo_nat};
 
 use super::{
-    CONNTRACK, IFACE_POLICY, MASQUERADE, O_IP_CSUM, O_IP_DST, O_IP_SRC, SCRATCH, account_flow,
-    bump,
+    CONNTRACK, IFACE_POLICY, MASQUERADE, O_IP_CSUM, O_IP_DST, O_IP_SRC, SCRATCH, VELSTRA_PROGS,
+    account_flow, bump,
     conntrack::{ct_control, ct_key4, ct_record, timeouts},
     epoch, insert_nat, link_layer, napt_port, napt_seed, ptr_at,
 };
@@ -33,13 +33,12 @@ pub fn velstra_icmp_nat(ctx: XdpContext) -> u32 {
 #[inline(always)]
 fn reply(ctx: &XdpContext) -> Result<u32, ()> {
     let scratch = SCRATCH.get(0).ok_or(())?;
-    bump(Counter::from_u32(scratch.fw_counter).unwrap_or(Counter::PassedRule));
     if scratch.ihl_bytes != 20 {
-        return Ok(xdp_action::XDP_PASS);
+        return forward(ctx);
     }
     let echo = unsafe { *ptr_at::<[u8; 8]>(ctx, ICMP)? };
     if echo[0] != 0 || echo[1] != 0 {
-        return Ok(xdp_action::XDP_PASS);
+        return forward(ctx);
     }
     let id = u16::from_be_bytes([echo[4], echo[5]]);
     let key = FlowKey::new(
@@ -51,7 +50,7 @@ fn reply(ctx: &XdpContext) -> Result<u32, ()> {
         ip_proto::ICMP,
     );
     let Some(state) = account_flow(&key, (ctx.data_end() - ctx.data()) as u64) else {
-        return Ok(xdp_action::XDP_PASS);
+        return forward(ctx);
     };
     let nat = plan_icmp_echo_nat(
         scratch.dst_addr,
@@ -71,7 +70,16 @@ fn reply(ctx: &XdpContext) -> Result<u32, ()> {
         *((data + CHECK) as *mut [u8; 2]) = nat.new_l4_checksum.to_be_bytes();
         *((data + ID) as *mut [u8; 2]) = nat.new_port.to_be_bytes();
     }
+    bump(Counter::from_u32(scratch.fw_counter).unwrap_or(Counter::PassedRule));
     Ok(xdp_action::XDP_PASS)
+}
+
+#[inline(always)]
+fn forward(ctx: &XdpContext) -> Result<u32, ()> {
+    // Ordinary ICMP still needs overlay/local-port/routing transforms. Only a
+    // matching SNAT reply terminates here. A missing forwarding tail fails closed.
+    let _ = unsafe { VELSTRA_PROGS.tail_call(ctx, 0) };
+    Ok(xdp_action::XDP_DROP)
 }
 
 #[classifier]
