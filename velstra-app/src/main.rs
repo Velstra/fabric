@@ -524,13 +524,22 @@ async fn run(args: RunArgs) -> Result<()> {
                     cts.listen,
                     cts.peers.len()
                 );
-                tokio::spawn(conntrack_sync::run(
-                    conntrack,
-                    fw_flows,
-                    cts.listen,
-                    cts.peers,
-                    cts.interval_secs,
-                ));
+                if cts.secret.is_some() {
+                    tokio::spawn(conntrack_sync::secure::run(
+                        firewall.clone(),
+                        conntrack,
+                        fw_flows,
+                        cts,
+                    ));
+                } else {
+                    tokio::spawn(conntrack_sync::run(
+                        conntrack,
+                        fw_flows,
+                        cts.listen,
+                        cts.peers,
+                        cts.interval_secs,
+                    ));
+                }
             }
             Err(e) => warn!("could not start conntrack-sync: {e:#}"),
         }

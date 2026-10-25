@@ -1134,6 +1134,18 @@ impl Firewall {
         Ok(output)
     }
 
+    /// Read under the same lock as live policy application. A failed or
+    /// incomplete apply must never admit state from a previously valid policy.
+    pub(crate) fn sync_policy(&self) -> Result<[u8; 32]> {
+        anyhow::ensure!(
+            self.configuration_state()? == CONFIG_READY,
+            "firewall is not ready for state replication"
+        );
+        Ok(crate::conntrack_sync::secure::policy_fingerprint(
+            &self.applied,
+        ))
+    }
+
     /// Keep unexpired temporary grants across a successful policy refresh,
     /// while configured forwards and removal of their policy take precedence.
     fn reapply_runtime_mappings(&mut self, cfg: &RuntimeConfig) -> Result<HashSet<MappingKey>> {

@@ -2922,6 +2922,7 @@ dependencies = [
  "libc",
  "log",
  "object",
+ "ring",
  "serde_json",
  "tokio",
  "tokio-stream",

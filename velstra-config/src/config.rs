@@ -1027,15 +1027,14 @@ pub struct ResolvedFlowExport {
 }
 
 /// C9 stateful-HA conntrack-state sync (a pfsync-analog for the eBPF `CONNTRACK`
-/// map). Spelled `[conntrack_sync]` in TOML. When present, the agent binds a UDP
-/// socket on `listen`, periodically pushes its live conntrack entries to each
-/// `peer`, and applies entries received from peers into its own `CONNTRACK` map —
-/// so a VRRP failover onto the backup keeps established (NAT'd) flows alive
-/// instead of dropping every connection.
+/// map and `FW_FLOWS`). With `secret`, a mutually authenticated TCP stream sends
+/// an initial snapshot, deltas and deletions. Without it, the legacy UDP stream
+/// requires a trusted link. Endpoint, protocol and credential changes restart
+/// the agent; policy-only updates reconcile live and fence stale peer state.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ConntrackSyncCfg {
-    /// UDP endpoint to bind for receiving peer state, e.g. `"0.0.0.0:5429"`.
+    /// Bind endpoint for receiving peer state, e.g. `"0.0.0.0:5429"`.
     pub listen: String,
     /// Peer endpoints to push local conntrack state to, e.g. `"10.0.0.2:5429"`.
     #[serde(default)]
@@ -1043,6 +1042,13 @@ pub struct ConntrackSyncCfg {
     /// Seconds between pushes. Defaults to 1.
     #[serde(default = "default_ct_interval_secs")]
     pub interval_secs: u64,
+    /// Enables mutually authenticated TCP replication. Legacy UDP is used only
+    /// when absent and requires a protected network.
+    #[serde(default)]
+    pub secret: Option<String>,
+    /// Secure replication polling period (10..=3600000 ms; default 50 ms).
+    #[serde(default)]
+    pub interval_ms: Option<u64>,
 }
 
 /// Default conntrack-sync push interval (seconds).
@@ -1055,12 +1061,14 @@ fn default_ct_interval_secs() -> u64 {
 /// runtime — the failure surfaces at config-load time instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedConntrackSync {
-    /// Local UDP bind endpoint.
+    /// Local bind endpoint (TCP with a secret, otherwise UDP).
     pub listen: SocketAddr,
     /// Peer endpoints pushed to each interval.
     pub peers: Vec<SocketAddr>,
     /// Seconds between pushes (at least 1).
     pub interval_secs: u64,
+    pub secret: Option<String>,
+    pub interval_ms: u64,
 }
 
 /// A resolved load-balancer service: a service key and its (validated) backends.
@@ -1672,6 +1680,26 @@ impl RuntimeConfig {
 
 /// Parse and validate a `[conntrack_sync]` block into its resolved form.
 fn resolve_conntrack_sync(cfg: &ConntrackSyncCfg) -> Result<ResolvedConntrackSync> {
+    if let Some(secret) = &cfg.secret {
+        anyhow::ensure!(
+            secret.len() >= 32,
+            "conntrack_sync.secret must contain at least 32 bytes"
+        );
+        anyhow::ensure!(
+            !cfg.peer.is_empty(),
+            "authenticated conntrack_sync requires explicit peers"
+        );
+    }
+    if let Some(interval) = cfg.interval_ms {
+        anyhow::ensure!(
+            cfg.secret.is_some(),
+            "conntrack_sync.interval_ms requires authenticated replication"
+        );
+        anyhow::ensure!(
+            (10..=3600000).contains(&interval),
+            "conntrack_sync.interval_ms must be 10..=3600000"
+        );
+    }
     let listen: SocketAddr = cfg
         .listen
         .parse()
@@ -1688,6 +1716,8 @@ fn resolve_conntrack_sync(cfg: &ConntrackSyncCfg) -> Result<ResolvedConntrackSyn
         peers,
         // Never sleep zero seconds — a `0` in TOML would spin the push loop.
         interval_secs: cfg.interval_secs.max(1),
+        secret: cfg.secret.clone(),
+        interval_ms: cfg.interval_ms.unwrap_or(50),
     })
 }
 

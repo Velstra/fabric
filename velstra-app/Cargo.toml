@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 object = { version = "0.39.1", default-features = false, features = ["read_core", "elf", "std"] }
 serde_json.workspace = true
+ring = "0.17.14"
 velstra-common = { path = "../velstra-common", features = ["user"] }
 velstra-config = { path = "../velstra-config" }
 velstra-proto = { path = "../velstra-proto" }
@@ -25,6 +26,7 @@ tokio = { workspace = true, features = [
     "net",
     "signal",
     "time",
+    "io-util",
 ] }
 clap = { workspace = true, features = ["derive"] }
 tonic = { workspace = true }
