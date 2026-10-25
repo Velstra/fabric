@@ -168,6 +168,32 @@ action = "drop"
 
 **Precedence** (highest first): blocklist → ICMP filter → port rule → default.
 
+### Live policy updates
+
+A running agent closes a shared packet gate before rewriting policy maps and
+waits for existing kernel packet readers to finish. Traffic is briefly dropped
+while an update is installed. If a map write fails, the previous configuration
+and temporary port mappings are restored before traffic is admitted again.
+If restoration fails, the gate stays closed and reconciliation retries; the
+query socket's `status` command reports `Failed (traffic blocked)` and the last
+error. Obsolete TC egress hooks are retired only after a complete apply or
+successful rollback. Configured port forwards take precedence over temporary
+grants on the same policy, protocol and port.
+
+Learned Wren routes keep their desired snapshot after a failed apply and retry
+without waiting for a duplicate advertisement. A failed neighbor-table read
+keeps active routes in place; it is not interpreted as an empty table. A complete
+withdrawal needs no neighbor lookup.
+Resolved next hops are re-observed every five seconds, so a changed gateway MAC
+converges even when Wren has no new route to advertise. Identical resolved routes
+do not rewrite the packet maps.
+
+This update barrier requires Linux `MEMBARRIER_CMD_GLOBAL` support, as provided
+by the appliance's Linux 6.12 kernel; `nohz_full` must be disabled. The agent
+refuses startup when this barrier is unavailable. This protects updates within
+the running agent; it does not provide persistent firewall attachment across
+agent termination.
+
 ### Dual-stack (IPv6)
 
 The firewall is **dual-stack**. IPv6 frames take a parallel, stateless path that

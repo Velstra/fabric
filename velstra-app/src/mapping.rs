@@ -103,7 +103,9 @@ pub async fn serve(path: PathBuf, firewall: Arc<Mutex<Firewall>>) {
             }
             Err(e) => {
                 warn!("mapping socket accept failed: {e}");
-                return;
+                // Keep the listener alive across transient descriptor/resource
+                // exhaustion, without spinning on an immediately-ready error.
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
         }
     }

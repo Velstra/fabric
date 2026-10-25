@@ -33,9 +33,9 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use velstra_common::{
     Action, Backend, CgnatLayout, Cidr4, Cidr6, ConfigFlags, GENEVE_PORT, GlobalConfig,
-    MAX_BLOCKLIST, Npt66, PORT_RULE_IN_ONLY, PORT_RULE_OUT_ONLY, PORT_RULE_V4_ONLY,
-    PORT_RULE_V6_ONLY, PolicyId, PortKey, PortalGate, RouteEntry, ServiceKey, SourceValidation,
-    VXLAN_PORT, encap_kind, ip_proto, parse_cidr_v4, parse_cidr_v6, parse_mac,
+    MAX_BLOCKLIST, MAX_RULE_LIMITS, Npt66, PORT_RULE_IN_ONLY, PORT_RULE_OUT_ONLY,
+    PORT_RULE_V4_ONLY, PORT_RULE_V6_ONLY, PolicyId, PortKey, PortalGate, RouteEntry, ServiceKey,
+    SourceValidation, VXLAN_PORT, encap_kind, ip_proto, parse_cidr_v4, parse_cidr_v6, parse_mac,
 };
 
 /// A firewall verdict as written in TOML (`"pass"` / `"drop"`).
@@ -1588,6 +1588,47 @@ pub struct RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    /// Refuse configurations that cannot be represented by the shared firewall
+    /// maps, before a live update removes or replaces any existing rules.
+    pub fn validate_firewall_capacity(&self) -> Result<()> {
+        for (family, count) in [
+            (
+                "IPv4",
+                self.policies
+                    .iter()
+                    .map(|p| p.blocklist.len())
+                    .sum::<usize>(),
+            ),
+            (
+                "IPv6",
+                self.policies
+                    .iter()
+                    .map(|p| p.blocklist6.len())
+                    .sum::<usize>(),
+            ),
+        ] {
+            if count > MAX_BLOCKLIST as usize {
+                bail!(
+                    "blocklist: {count} {family} entries across all policies exceeds the \
+                     data plane's {MAX_BLOCKLIST}"
+                );
+            }
+        }
+
+        let limited = self
+            .policies
+            .iter()
+            .flat_map(|policy| &policy.port_rules)
+            .filter(|rule| rule.limit.is_some())
+            .count();
+        if limited > MAX_RULE_LIMITS as usize {
+            bail!(
+                "rate limits: {limited} rate-limited rules across all policies exceeds the data plane's {MAX_RULE_LIMITS}"
+            );
+        }
+        Ok(())
+    }
+
     /// A do-nothing, fail-open config (pass everything). Used when `run` is
     /// invoked without a `--config` file.
     pub fn passthrough() -> Self {
@@ -1939,28 +1980,6 @@ impl FileConfig {
                 &policy.port_rules,
                 policy.portal.as_ref(),
             )?);
-        }
-
-        // The blocklist tries are one map each across every policy, so the limit
-        // is a total. Refusing here beats discovering it as a half-programmed
-        // firewall: the insert that hits the ceiling fails, and the entries after
-        // it are simply never written.
-        for (family, count) in [
-            (
-                "IPv4",
-                policies.iter().map(|p| p.blocklist.len()).sum::<usize>(),
-            ),
-            (
-                "IPv6",
-                policies.iter().map(|p| p.blocklist6.len()).sum::<usize>(),
-            ),
-        ] {
-            if count > MAX_BLOCKLIST as usize {
-                bail!(
-                    "blocklist: {count} {family} entries across all policies exceeds the \
-                     data plane's {MAX_BLOCKLIST}"
-                );
-            }
         }
 
         // "This box encapsulates" — true for either wire family. It gates the
@@ -2573,7 +2592,7 @@ impl FileConfig {
             });
         }
 
-        Ok(RuntimeConfig {
+        let config = RuntimeConfig {
             conntrack: self.conntrack.resolve()?,
             fail_closed: self.fail_closed,
             policies,
@@ -2619,7 +2638,9 @@ impl FileConfig {
             srv6_local_sids,
             srv6_floods,
             srv6_irb_routes,
-        })
+        };
+        config.validate_firewall_capacity()?;
+        Ok(config)
     }
 }
 
@@ -4386,6 +4407,66 @@ mod rule_limit_tests {
             .find(|p| p.id == 1)
             .expect("policy 1 resolved");
         policy.port_rules.first().expect("one rule")
+    }
+
+    fn counted_rules(count: usize, split_policies: bool, limited: bool) -> FileConfig {
+        let mut text = String::from("default_action = \"drop\"\n");
+        for index in 0..count {
+            if split_policies && index == count / 2 {
+                text.push_str("[[policy]]\nid = 1\nname = \"second\"\ndefault_action = \"drop\"\n");
+            }
+            let prefix = if split_policies && index >= count / 2 {
+                "policy."
+            } else {
+                ""
+            };
+            text.push_str(&format!(
+                "[[{prefix}port_rule]]\nproto = \"tcp\"\nport = {}\naction = \"pass\"\n",
+                10000 + index
+            ));
+            if limited {
+                text.push_str("limit = 100\n");
+            }
+        }
+        toml::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn rule_limit_capacity_accepts_the_exact_boundary() {
+        assert!(counted_rules(127, false, true).resolve().is_ok());
+        assert!(counted_rules(127, true, true).resolve().is_ok());
+        assert!(counted_rules(256, true, false).resolve().is_ok());
+    }
+
+    #[test]
+    fn rule_limit_capacity_refuses_overflow_across_all_policies() {
+        for split in [false, true] {
+            let error = counted_rules(128, split, true).resolve().unwrap_err();
+            assert!(
+                error.to_string().contains("128 rate-limited rules"),
+                "{error:#}"
+            );
+            assert!(error.to_string().contains("127"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn resolved_policy_capacity_is_checked_before_live_programming() {
+        let mut config = counted_rules(127, false, true).resolve().unwrap();
+        let extra = config.policies[0].port_rules[0].clone();
+        config.policies[0].port_rules.push(extra);
+        assert!(config.validate_firewall_capacity().is_err());
+    }
+
+    #[test]
+    fn rule_limit_capacity_is_enforced_on_controller_wire_configs() {
+        let file = counted_rules(128, true, true);
+        let wire = crate::file_config_to_proto(&file, 1);
+        let error = crate::runtime_from_proto(&wire).unwrap_err();
+        assert!(
+            error.to_string().contains("128 rate-limited rules"),
+            "{error:#}"
+        );
     }
 
     /// If this fails, a plain `limit = 100` compiles to a bucket of one packet:

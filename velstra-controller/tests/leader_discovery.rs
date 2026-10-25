@@ -1,7 +1,8 @@
 //! A real three-controller Raft cluster exposes the current write leader.
 
+mod support;
+
 use std::{
-    net::TcpListener,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -17,15 +18,6 @@ impl Drop for Controller {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
-}
-
-fn free_ports() -> [u16; 9] {
-    let sockets: Vec<_> = (0..9)
-        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    let ports = std::array::from_fn(|i| sockets[i].local_addr().unwrap().port());
-    drop(sockets);
-    ports
 }
 
 async fn client(port: u16) -> Option<VelstraOrchestratorClient<tonic::transport::Channel>> {
@@ -63,7 +55,7 @@ async fn leader(admin: &[u16; 3], excluded: Option<usize>) -> usize {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn leader_probe_tracks_election_and_failover() {
-    let ports = free_ports();
+    let ports: [u16; 9] = support::free_ports();
     let raft = [ports[0], ports[1], ports[2]];
     let agent = [ports[3], ports[4], ports[5]];
     let admin = [ports[6], ports[7], ports[8]];

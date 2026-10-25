@@ -33,7 +33,7 @@ use std::{
 use anyhow::{Result, bail};
 use velstra_common::{Cidr4, Cidr6, PolicyId, mask_v4, mask_v6};
 use velstra_config::{
-    ActionName, BackendCfg, EncapName, FileConfig, InterfaceFile, NeighborCfg, OverlayCfg,
+    ActionName, BackendCfg, EncapName, FileConfig, InterfaceFile, Nd6Cfg, NeighborCfg, OverlayCfg,
     PolicyFile, PortRule, ProtoName, ServiceCfg, SourceValidationName, Srv6Cfg, Srv6FloodCfg,
     Srv6LocalSidCfg, Srv6RouteCfg, TunnelCfg,
 };
@@ -1740,6 +1740,35 @@ impl Topology {
             });
         }
 
+        // A routed segment's first hop is an anycast address. Without this
+        // neighbor entry the guest repeatedly ARPs for its DHCP gateway while
+        // every host silently floods the request; no IRB frame can ever reach
+        // the routing path because it never obtains the gateway MAC.
+        for vni in &vnis {
+            let Some(vrf) = self.ip_vrf_of_network(*vni) else {
+                continue;
+            };
+            let mut gateways: Vec<IpAddr> = self
+                .network_subnets(*vni)
+                .filter_map(|subnet| subnet.gateway)
+                .collect();
+            gateways.sort_unstable();
+            for gateway in gateways {
+                match gateway {
+                    IpAddr::V4(_) => cfg.neighbors.push(NeighborCfg {
+                        vni: *vni,
+                        ip: gateway.to_string(),
+                        mac: fmt_mac(vrf.gateway_mac),
+                    }),
+                    IpAddr::V6(_) => cfg.nd_neighbors.push(Nd6Cfg {
+                        vni: *vni,
+                        ip: gateway.to_string(),
+                        mac: fmt_mac(vrf.gateway_mac),
+                    }),
+                }
+            }
+        }
+
         // Security groups (B5): every group a *local* port binds (its
         // `effective_policy` is a security-group policy id, not the VNI) becomes
         // a `[[policy]]` block carrying that group's rules, so the interface the
@@ -1986,6 +2015,35 @@ impl Topology {
             .collect();
         lbs.sort_by(|a, b| a.id.cmp(&b.id)); // deterministic output
         for lb in lbs {
+            // The service is looked up only after a guest has resolved its VIP
+            // to a MAC. No port owns that address, so without a neighbor entry
+            // the guest never sends the TCP/UDP packet to the datapath at all.
+            // Use the router's anycast MAC on routed segments; a plain segment
+            // gets a stable, locally administered MAC scoped by its VNI.
+            let service_mac = self.ip_vrf_of_network(lb.vni).map_or_else(
+                || {
+                    [
+                        0x02,
+                        0x56,
+                        0x00,
+                        (lb.vni >> 16) as u8,
+                        (lb.vni >> 8) as u8,
+                        lb.vni as u8,
+                    ]
+                },
+                |vrf| vrf.gateway_mac,
+            );
+            if !cfg
+                .neighbors
+                .iter()
+                .any(|n| n.vni == lb.vni && n.ip == lb.vip.to_string())
+            {
+                cfg.neighbors.push(NeighborCfg {
+                    vni: lb.vni,
+                    ip: lb.vip.to_string(),
+                    mac: fmt_mac(service_mac),
+                });
+            }
             let backends: Vec<BackendCfg> = lb
                 .members
                 .iter()
@@ -3960,6 +4018,11 @@ mod tests {
         let mut policies: Vec<u32> = cfg.services.iter().map(|s| s.policy).collect();
         policies.sort_unstable();
         assert_eq!(policies, vec![100, sg_pid]);
+        assert!(
+            cfg.neighbors.iter().any(|n| {
+                n.vni == 100 && n.ip == "192.168.50.200" && n.mac == "02:56:00:00:00:64"
+            })
+        );
         // Same pool under both scopings, resolved to the member port's address.
         let port_a_ip = t.ports().iter().find(|p| p.id == a).unwrap().ip.to_string();
         for svc in &cfg.services {
@@ -3968,6 +4031,13 @@ mod tests {
             assert_eq!(svc.backends[0].ip, port_a_ip);
             assert_eq!(svc.backends[0].port, Some(8080));
         }
+
+        t.add_ip_vrf(vrf(50100, "tenant-a", vec![100])).unwrap();
+        assert!(
+            t.derive("h1").unwrap().neighbors.iter().any(|n| {
+                n.vni == 100 && n.ip == "192.168.50.200" && n.mac == "02:00:5e:00:00:aa"
+            })
+        );
 
         // Removing a member's port drains it from the pool instead of leaving a
         // member the derive silently skips.
@@ -3982,6 +4052,13 @@ mod tests {
         );
         assert!(t.remove_load_balancer("web").unwrap());
         assert!(!t.remove_load_balancer("web").unwrap());
+        assert!(
+            !t.derive("h1")
+                .unwrap()
+                .neighbors
+                .iter()
+                .any(|n| n.ip == "192.168.50.200")
+        );
     }
 
     /// Declaring an IP-VRF again is how a reconciler works.
@@ -4037,6 +4114,34 @@ mod tests {
             gateway_mac: [0x02, 0x00, 0x5e, 0x00, 0x00, 0xaa],
             networks,
         }
+    }
+
+    #[test]
+    fn routed_guests_can_resolve_their_anycast_first_hop() {
+        let mut t = topo_with_segments();
+        t.add_host(host("h1", "10.10.0.1", 0x11)).unwrap();
+        let mut routed = v4_subnet("routed", 10100, "10.100.0.0/24");
+        routed.gateway = Some(ip("10.100.0.1"));
+        t.add_subnet(routed).unwrap();
+        let mut plain = v4_subnet("plain", 10300, "10.30.0.0/24");
+        plain.gateway = Some(ip("10.30.0.1"));
+        t.add_subnet(plain).unwrap();
+        t.create_port(10100, "h1", "tapR", None, None, None)
+            .unwrap();
+        t.create_port(10300, "h1", "tapP", None, None, None)
+            .unwrap();
+        let before = t.derive("h1").unwrap();
+        assert!(!before.neighbors.iter().any(|n| n.ip == "10.100.0.1"));
+
+        t.add_ip_vrf(vrf(50100, "tenant-a", vec![10100, 10200]))
+            .unwrap();
+        let cfg = t.derive("h1").unwrap();
+        assert!(
+            cfg.neighbors.iter().any(|n| {
+                n.vni == 10100 && n.ip == "10.100.0.1" && n.mac == "02:00:5e:00:00:aa"
+            })
+        );
+        assert!(!cfg.neighbors.iter().any(|n| n.ip == "10.30.0.1"));
     }
 
     /// A topology with the three tenant segments the IP-VRF tests route over —

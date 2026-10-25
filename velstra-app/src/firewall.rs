@@ -4,8 +4,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
-    ffi::CString,
-    os::fd::AsFd,
+    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -19,30 +18,29 @@ use aya::{
     },
     programs::{
         ProgramError, Xdp, XdpMode,
-        tc::{SchedClassifier, SchedClassifierLinkId, TcAttachType, qdisc_add_clsact},
-        xdp::XdpLinkId,
+        tc::{SchedClassifier, SchedClassifierLink, TcAttachType, qdisc_add_clsact},
+        xdp::XdpLink,
     },
 };
 use clap::ValueEnum;
 use log::warn;
 use tokio::sync::Mutex;
 use velstra_common::{
-    Action, ArpEntry, ArpKey, Backend, CgnatLayout, Cidr4, Cidr6, ConfigFlags, Counter,
-    FirewallKey, FirewallState, FloodSet, FlowKey, FlowState, GlobalConfig, IrbEndpoint, LocalMac,
-    LocalMacKey, MAX_RULE_LIMITS, MacFdbKey, NdKey, Npt66, OverlayConfig, PORT_RULE_OUT_ONLY,
-    PolicyId, PortAddr4, PortAddr6, PortBinding, PortFwd, PortalClientKey, PortalGate,
-    PortalSeenKey, RateBucket, RouteEntry, ScopedAddr, ScopedAddr6, ScopedDstPortKey,
-    ScopedDstPortKey6, ScopedMac, ScopedPortKey, ScopedSrcPortKey, ScopedSrcPortKey6, ServiceKey,
-    ServiceValue, Srv6Config, Srv6Endpoint, Srv6FloodSet, Srv6IrbEndpoint, Srv6LocalSid,
-    Srv6SidKey, SynFlow, SynProxyCfg, SynProxyKey, TunnelEndpoint, TunnelKey, parse_cidr_v4,
-    parse_cidr_v6, parse_mac, port_rule_value, port_rule_with_limit,
+    Action, ArpEntry, ArpKey, Backend, CONFIG_FAILED, CONFIG_READY, CONFIG_UPDATING, CgnatLayout,
+    Cidr4, Cidr6, ConfigFlags, Counter, FirewallKey, FirewallState, FloodSet, FlowKey, FlowState,
+    GlobalConfig, IrbEndpoint, LocalMac, LocalMacKey, MAX_RULE_LIMITS, MacFdbKey, NdKey, Npt66,
+    OverlayConfig, PORT_RULE_OUT_ONLY, PolicyId, PortAddr4, PortAddr6, PortBinding, PortFwd,
+    PortalClientKey, PortalGate, PortalSeenKey, RateBucket, RouteEntry, ScopedAddr, ScopedAddr6,
+    ScopedDstPortKey, ScopedDstPortKey6, ScopedMac, ScopedPortKey, ScopedSrcPortKey,
+    ScopedSrcPortKey6, ServiceKey, ServiceValue, Srv6Config, Srv6Endpoint, Srv6FloodSet,
+    Srv6IrbEndpoint, Srv6LocalSid, Srv6SidKey, SynFlow, SynProxyCfg, SynProxyKey, TunnelEndpoint,
+    TunnelKey, parse_cidr_v4, parse_cidr_v6, parse_mac, port_rule_value, port_rule_with_limit,
 };
 use velstra_config::{
     PolicyConfig, PortIdentity, ResolvedFloodVtep, ResolvedInterface, ResolvedIrbRoute,
-    ResolvedMacRoute, ResolvedNd6, ResolvedNeighbor, ResolvedNpt66, ResolvedOverlay,
-    ResolvedPortForward, ResolvedRoute, ResolvedService, ResolvedSrv6, ResolvedSrv6Flood,
-    ResolvedSrv6IrbRoute, ResolvedSrv6LocalSid, ResolvedSrv6Route, ResolvedSynProxy,
-    ResolvedTunnel, RuntimeConfig,
+    ResolvedMacRoute, ResolvedNd6, ResolvedNeighbor, ResolvedNpt66, ResolvedPortForward,
+    ResolvedRoute, ResolvedService, ResolvedSrv6, ResolvedSrv6Flood, ResolvedSrv6IrbRoute,
+    ResolvedSrv6LocalSid, ResolvedSrv6Route, ResolvedSynProxy, ResolvedTunnel, RuntimeConfig,
 };
 
 /// How to attach the XDP program to the interface.
@@ -71,10 +69,48 @@ impl AttachMode {
     }
 }
 
+/// An attachment owns its kernel link instead of leaving it in Aya's program
+/// collection. Removing a stale interface drops the link and closes its FD.
+struct InterfaceLink<L> {
+    ifindex: u32,
+    _link: L,
+}
+
+impl<L> InterfaceLink<L> {
+    fn new(iface: &str, ifindex: u32, link: L) -> Result<Self> {
+        if if_nametoindex(iface)? != ifindex {
+            bail!("interface {iface:?} changed while attaching its datapath");
+        }
+        Ok(Self {
+            ifindex,
+            _link: link,
+        })
+    }
+
+    fn is_current(&self, iface: &str) -> bool {
+        match if_nametoindex(iface) {
+            Ok(index) => index == self.ifindex,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(interface_missing) =>
+            {
+                false
+            }
+            Err(error) => {
+                // A failed observation is not evidence that a live firewall
+                // should be detached. Retry the inventory on the next tick.
+                warn!("checking datapath interface {iface} failed; retaining link: {error:#}");
+                true
+            }
+        }
+    }
+}
+
 /// A loaded-and-attached Velstra firewall.
 ///
-/// Owns the [`Ebpf`] object; dropping it detaches the program and frees the
-/// maps. The XDP program therefore stays attached exactly as long as this value
+/// Owns the [`Ebpf`] object and its interface links; dropping the firewall
+/// detaches the programs and frees the maps. The XDP program therefore stays attached exactly as long as this value
 /// (and hence the daemon) lives.
 pub struct Firewall {
     ebpf: Ebpf,
@@ -83,16 +119,16 @@ pub struct Firewall {
     /// shares the maps (notably `CONNTRACK`) across them, which is what makes
     /// bidirectional NAT work: requests ingress one NIC, replies another.
     pub attached: Vec<(String, XdpMode)>,
-    xdp_links: BTreeMap<String, (u32, XdpLinkId)>,
-    egress_links: BTreeMap<String, (u32, SchedClassifierLinkId)>,
+    xdp_links: BTreeMap<String, InterfaceLink<XdpLink>>,
     primary: Vec<String>,
     attach_mode: AttachMode,
-    explicit_egress: bool,
     /// The currently-applied config, kept so a live [`reconfigure`] can remove
     /// the entries that are no longer present before writing the new set.
     ///
     /// [`reconfigure`]: Firewall::reconfigure
     applied: RuntimeConfig,
+    applied_host: PreparedHostConfig,
+    last_apply_error: Option<String>,
     /// The configuration as it arrived, before the advertised rules were merged
     /// into it.
     ///
@@ -117,14 +153,21 @@ pub struct Firewall {
     /// because the attach is now re-tried on every reprogram — a tap that appears
     /// after startup has to be picked up — and attaching twice would put two
     /// classifiers on one ingress, replicating every broadcast frame twice.
-    bum_attached: HashSet<String>,
+    bum_attached: BTreeMap<String, InterfaceLink<SchedClassifierLink>>,
+    /// TC egress classifiers installed for current interfaces. Controller-driven
+    /// tenant taps appear after startup, so their firewall hook is reconciled.
+    egress_attached: BTreeMap<String, InterfaceLink<SchedClassifierLink>>,
+    /// Explicit --egress coverage survives interface disappearance/recreation.
+    explicit_egress_ifaces: Vec<String>,
     /// Interfaces attached dynamically by auto-attach, tracked separately so they
     /// can be dropped again when the interface disappears (a VM tap going away).
     auto_attached: HashSet<String>,
     /// Interfaces attached because the **config** named them (e.g. pod veths the
     /// controller declared). Tracked separately from auto-attach so each is
     /// forgotten when its netdev disappears.
-    config_attached: HashSet<String>,
+    config_attached: BTreeMap<String, u32>,
+    /// Route egress devices can appear without being declared as firewall ports.
+    route_ifindices: BTreeMap<String, u32>,
     /// The `CONNTRACK` handle once it has been moved out of [`Self::ebpf`],
     /// **shared** rather than given away: both the C9 sync task and the flow
     /// query path read it. Keeping it here is what stops enabling HA from taking
@@ -189,6 +232,7 @@ impl Firewall {
         for name in [
             "velstra",
             "velstra_main",
+            "velstra_guest_delivery",
             "velstra_forward",
             "velstra_v6",
             "velstra_local",
@@ -238,9 +282,9 @@ impl Firewall {
         cfg: &RuntimeConfig,
         egress: bool,
     ) -> Result<Self> {
+        ensure_reader_barrier_supported()?;
         bump_memlock_rlimit();
 
-        // The eBPF object is embedded at compile time by the build script.
         let object = crate::btf::kernel_object(aya::include_bytes_aligned!(concat!(
             env!("OUT_DIR"),
             "/velstra"
@@ -248,7 +292,17 @@ impl Firewall {
         let mut ebpf = Ebpf::load(&object).context("loading embedded eBPF object")?;
 
         spawn_log_forwarder(&mut ebpf);
-        apply_config(&mut ebpf, cfg, None, false)?;
+        {
+            let mut state: Array<_, u32> =
+                Array::try_from(ebpf.map_mut("APPLY_STATE").ok_or_else(|| {
+                    anyhow!("APPLY_STATE map missing; agent and datapath are incompatible")
+                })?)?;
+            state
+                .set(0, CONFIG_UPDATING, 0)
+                .context("closing the initial datapath gate")?;
+        }
+        let prepared = prepare_host_config(cfg)?;
+        apply_config(&mut ebpf, cfg, None, &prepared, false)?;
 
         // Load the tail-call target (`velstra_forward`) and register it in the
         // `VELSTRA_PROGS` program array, so the main program's
@@ -294,6 +348,22 @@ impl Firewall {
             main.fd()?.try_clone()?
         };
         {
+            let delivery: &mut Xdp = ebpf
+                .program_mut("velstra_guest_delivery")
+                .ok_or_else(|| anyhow!("eBPF object has no `velstra_guest_delivery` program"))?
+                .try_into()?;
+            delivery
+                .load()
+                .context("loading XDP guest delivery program into the kernel")?;
+        }
+        let delivery_fd = {
+            let delivery: &Xdp = ebpf
+                .program("velstra_guest_delivery")
+                .ok_or_else(|| anyhow!("eBPF object has no `velstra_guest_delivery` program"))?
+                .try_into()?;
+            delivery.fd()?.try_clone()?
+        };
+        {
             let mut prog_array = ProgramArray::try_from(
                 ebpf.map_mut("VELSTRA_PROGS")
                     .ok_or_else(|| anyhow!("VELSTRA_PROGS map missing"))?,
@@ -306,6 +376,9 @@ impl Firewall {
             prog_array
                 .set(1, &main_fd, 0)
                 .context("registering velstra_main in VELSTRA_PROGS")?;
+            prog_array
+                .set(6, &delivery_fd, 0)
+                .context("registering guest delivery in VELSTRA_PROGS")?;
         }
 
         for (slot, name) in [
@@ -340,34 +413,99 @@ impl Firewall {
         let mut attached = Vec::with_capacity(ifaces.len());
         let mut xdp_links = BTreeMap::new();
         for iface in ifaces {
+            if xdp_links.contains_key(iface) {
+                continue;
+            }
             let (chosen, link) = attach_with_fallback(program, iface, mode)?;
-            xdp_links.insert(iface.clone(), (if_nametoindex(iface)?, link));
+            xdp_links.insert(iface.clone(), link);
             attached.push((iface.clone(), chosen));
         }
 
+        for name in ifaces {
+            program_link_layer(&mut ebpf, name)?;
+        }
+
+        // Which interfaces need the TC egress hook, and why — see
+        // [`egress_interfaces`]. Kept out of here so the rule can be read and
+        // tested without loading an eBPF object.
+        let egress_ifaces: Vec<String> = egress_interfaces(cfg, ifaces, egress)
+            .into_iter()
+            .filter(|n| if_nametoindex(n).is_ok())
+            .collect();
+        let egress_attached = if egress_ifaces.is_empty() {
+            BTreeMap::new()
+        } else {
+            attach_egress(&mut ebpf, &egress_ifaces)?
+        };
+
+        let config_attached = cfg
+            .interfaces
+            .iter()
+            .filter(|i| attached.iter().any(|(name, _)| name == &i.name))
+            .filter_map(|i| {
+                if_nametoindex(&i.name)
+                    .ok()
+                    .map(|index| (i.name.clone(), index))
+            })
+            .collect();
         let mut fw = Self {
             ebpf,
             attached,
             xdp_links,
-            egress_links: BTreeMap::new(),
             primary: ifaces.to_vec(),
             attach_mode: mode,
-            explicit_egress: egress,
             applied: cfg.clone(),
+            applied_host: prepared.clone(),
+            last_apply_error: None,
             base: cfg.clone(),
             flowspec: Vec::new(),
             dynamic_routes: Vec::new(),
             flowspec_refused: Vec::new(),
             auto_attached: HashSet::new(),
-            config_attached: HashSet::new(),
-            bum_attached: HashSet::new(),
+            config_attached,
+            route_ifindices: prepared.route_ifindices,
+            bum_attached: BTreeMap::new(),
+            egress_attached,
+            explicit_egress_ifaces: if egress { ifaces.to_vec() } else { Vec::new() },
             conntrack: None,
             runtime_blocks: BTreeMap::new(),
             portal_sessions: BTreeMap::new(),
             runtime_mappings: BTreeMap::new(),
         };
+        fw.sync_bum_attachments(cfg);
+        fw.reopen_configuration()?;
         fw.reconcile_links()?;
         Ok(fw)
+    }
+
+    pub fn reconcile_links(&mut self) -> Result<()> {
+        let present = std::fs::read_dir("/sys/class/net")?
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<std::io::Result<Vec<String>>>()?;
+        self.reconcile_config_interfaces(&present, self.attach_mode);
+        let desired = self.applied.clone();
+        self.sync_egress_attachments(&desired)?;
+        self.retire_egress_attachments(&desired);
+        anyhow::ensure!(
+            self.configuration_state()? == CONFIG_READY,
+            "{}",
+            self.configuration_status()?
+        );
+        for iface in self.primary.clone() {
+            if if_nametoindex(&iface).is_ok() && !self.xdp_links.contains_key(&iface) {
+                self.attach_iface(&iface, self.attach_mode, 0)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn prune_stale_links(&mut self) {
+        self.xdp_links.retain(|name, link| link.is_current(name));
+        self.bum_attached.retain(|name, link| link.is_current(name));
+        self.egress_attached
+            .retain(|name, link| link.is_current(name));
+        self.attached
+            .retain(|(name, _)| self.xdp_links.contains_key(name));
     }
 
     /// Attach the BUM head-end replication classifier to every tenant tap the
@@ -394,6 +532,7 @@ impl Firewall {
         // gating the attach on the VXLAN one alone left an SRv6 host without a
         // classifier at all.
         if cfg.overlay.is_none() && cfg.srv6.is_none() {
+            self.bum_attached.clear();
             return;
         }
         // Forget taps whose netdev has gone (the TC classifier detached with it).
@@ -402,27 +541,89 @@ impl Firewall {
         // and it never gets a classifier again — `bum_replicated`/`srv6_bum_replicated`
         // stall until the agent restarts. Mirrors how `reconcile_auto_attach` and
         // `reconcile_config_interfaces` prune their attach sets.
-        self.bum_attached.retain(|n| if_nametoindex(n).is_ok());
-        let wanted: Vec<String> = cfg
+        self.bum_attached.retain(|name, link| link.is_current(name));
+        let wanted: Vec<(String, u32)> = cfg
             .interfaces
             .iter()
-            .filter(|i| i.vni != 0 && !self.bum_attached.contains(&i.name))
+            .filter(|i| i.vni != 0 && !self.bum_attached.contains_key(&i.name))
             .filter(|i| {
                 std::fs::read_to_string(format!("/sys/class/net/{}/type", i.name))
                     .ok()
-                    .and_then(|s| s.trim().parse().ok())
+                    .and_then(|v| v.trim().parse().ok())
                     .is_some_and(|kind| !raw_ip_link(kind))
             })
-            .filter(|i| if_nametoindex(&i.name).is_ok())
-            .map(|i| i.name.clone())
+            .filter_map(|i| {
+                if_nametoindex(&i.name)
+                    .ok()
+                    .map(|index| (i.name.clone(), index))
+            })
             .collect();
         if wanted.is_empty() {
             return;
         }
-        match attach_bum_ingress(&mut self.ebpf, &wanted) {
-            Ok(()) => self.bum_attached.extend(wanted),
+        match attach_bum_ingress(
+            &mut self.ebpf,
+            &wanted
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>(),
+        ) {
+            Ok(links) => self.bum_attached.extend(links),
             Err(e) => warn!("BUM replication attach failed: {e:#}"),
         }
+    }
+
+    /// A newly declared tenant tap needs the egress classifier before its
+    /// policy is programmed. Otherwise ingress allowances and default-deny
+    /// rules exist in maps but no hook ever evaluates packets bound for it.
+    fn egress_candidates(&self, cfg: &RuntimeConfig) -> Vec<String> {
+        let mut names = self.explicit_egress_ifaces.clone();
+        if cfg
+            .policies
+            .iter()
+            .any(|p| p.global.has_flag(ConfigFlags::STATEFUL))
+        {
+            for (name, _) in &self.attached {
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+        }
+        names
+    }
+
+    fn sync_egress_attachments(&mut self, cfg: &RuntimeConfig) -> Result<()> {
+        // A tap can disappear and return under the same name between two
+        // config updates. Its old classifier vanished with the old ifindex.
+        let desired = egress_interfaces(cfg, &self.egress_candidates(cfg), true);
+        // Keep every old hook until either the complete candidate or the old
+        // configuration has been installed. Detaching a removed tenant's TC
+        // hook here bypasses its closed gate during a failed update.
+        self.egress_attached
+            .retain(|name, link| link.is_current(name));
+        let wanted: Vec<(String, u32)> = desired
+            .into_iter()
+            .filter(|name| !self.egress_attached.contains_key(name))
+            .filter_map(|name| if_nametoindex(&name).ok().map(|index| (name, index)))
+            .collect();
+        if !wanted.is_empty() {
+            let links = attach_egress(
+                &mut self.ebpf,
+                &wanted
+                    .iter()
+                    .map(|(name, _)| name.clone())
+                    .collect::<Vec<_>>(),
+            )?;
+            self.egress_attached.extend(links);
+        }
+        Ok(())
+    }
+
+    /// Retire obsolete hooks only after map application or rollback succeeds.
+    fn retire_egress_attachments(&mut self, cfg: &RuntimeConfig) {
+        let desired = egress_interfaces(cfg, &self.egress_candidates(cfg), true);
+        self.egress_attached
+            .retain(|name, link| desired.contains(name) && link.is_current(name));
     }
 
     /// Attach the (already-loaded) program to one more interface and assign it a
@@ -445,25 +646,13 @@ impl Firewall {
                 .insert(ifindex, policy_id, 0)
                 .with_context(|| format!("assigning {iface} to policy {policy_id}"))?;
         }
-        if self
-            .applied
-            .policies
-            .iter()
-            .any(|p| p.id == policy_id && p.global.has_flag(ConfigFlags::STATEFUL))
-            && !self.egress_links.contains_key(iface)
-        {
-            let link = attach_egress(&mut self.ebpf, iface)?;
-            self.egress_links
-                .insert(iface.to_string(), (if_nametoindex(iface)?, link));
-        }
         let program: &mut Xdp = self
             .ebpf
             .program_mut("velstra")
             .ok_or_else(|| anyhow!("eBPF object has no `velstra` program"))?
             .try_into()?;
         let (chosen, link) = attach_with_fallback(program, iface, mode)?;
-        self.xdp_links
-            .insert(iface.to_string(), (if_nametoindex(iface)?, link));
+        self.xdp_links.insert(iface.to_owned(), link);
         self.attached.push((iface.to_string(), chosen));
         Ok(chosen)
     }
@@ -481,10 +670,7 @@ impl Firewall {
         mode: AttachMode,
         default_policy: PolicyId,
     ) {
-        if let Err(e) = self.prune_links() {
-            warn!("pruning disappeared interfaces failed: {e:#}");
-            return;
-        }
+        self.prune_stale_links();
         // Collect new candidates first (ends the immutable borrow before we mutate).
         let candidates: Vec<(String, PolicyId)> = present
             .iter()
@@ -514,11 +700,10 @@ impl Firewall {
         // Drop auto-attached interfaces that have gone away (the XDP link
         // detached with the interface; we just forget it so a recreated
         // same-named interface re-attaches).
-        let present_set: HashSet<&str> = present.iter().map(String::as_str).collect();
         let gone: Vec<String> = self
             .auto_attached
             .iter()
-            .filter(|n| !present_set.contains(n.as_str()))
+            .filter(|n| !self.xdp_links.contains_key(*n))
             .cloned()
             .collect();
         for name in gone {
@@ -589,143 +774,84 @@ impl Firewall {
             .ok_or_else(|| anyhow!("eBPF object has no `velstra` program"))?
             .try_into()?;
         let (chosen, link) = attach_with_fallback(program, iface, mode)?;
-        self.xdp_links
-            .insert(iface.to_string(), (if_nametoindex(iface)?, link));
+        self.xdp_links.insert(iface.to_owned(), link);
         self.attached.push((iface.to_string(), chosen));
         Ok(chosen)
     }
 
-    fn desired_egress(&self) -> Result<Vec<String>> {
-        let mut wanted = egress_interfaces(&self.applied, &self.primary, self.explicit_egress);
-        let policies = HashMap::<_, u32, u32>::try_from(
-            self.ebpf
-                .map("IFACE_POLICY")
-                .ok_or_else(|| anyhow!("IFACE_POLICY missing"))?,
-        )?;
-        for name in &self.auto_attached {
-            if let Ok(index) = if_nametoindex(name) {
-                let id = policies.get(&index, 0).unwrap_or(0);
-                if self
-                    .applied
-                    .policies
-                    .iter()
-                    .any(|p| p.id == id && p.global.has_flag(ConfigFlags::STATEFUL))
-                    && !wanted.contains(name)
-                {
-                    wanted.push(name.clone());
-                }
-            }
-        }
-        Ok(wanted)
-    }
+    /// Reconcile the **config-named** interfaces against `present`: attach (and
+    /// program the policy + VNI for) any that have appeared, and forget any whose
+    /// netdev has since gone (its XDP link detached with it).
+    ///
+    /// This is what attaches the XDP firewall/LB to a pod veth the controller
+    /// declared — possibly *before* the CNI created it — without relying on an
+    /// `--auto-attach` prefix. `program_interfaces` defers a not-yet-present
+    /// interface's maps; this loop completes the job when it appears.
+    pub fn reconcile_config_interfaces(&mut self, present: &[String], mode: AttachMode) {
+        self.prune_stale_links();
+        let present_set: HashSet<&str> = present.iter().map(String::as_str).collect();
 
-    /// Reconcile device identity, not just its name: recreating a VLAN can
-    /// replace its ifindex between two polls without ever disappearing by name.
-    fn prune_links(&mut self) -> Result<bool> {
-        let stale: Vec<_> = self
-            .xdp_links
+        // A guest can recreate a TAP under the same name between two polls.
+        // Its old XDP and TC links vanished with the old ifindex, even though
+        // a name-only inventory would still claim the interface is attached.
+        let stale: Vec<String> = self
+            .config_attached
             .iter()
-            .filter(|(name, (index, _))| {
-                if_nametoindex(name).ok() != Some(*index)
-                    || (!self.primary.contains(name)
-                        && !self.auto_attached.contains(*name)
-                        && !self.applied.interfaces.iter().any(|i| &i.name == *name))
-            })
+            .filter(|(name, _)| !self.xdp_links.contains_key(*name))
             .map(|(name, _)| name.clone())
             .collect();
-        let changed = !stale.is_empty();
+        let route_devices_changed = match route_interface_indices(&self.applied.routes) {
+            Ok(indices) => indices != self.route_ifindices,
+            Err(error) => {
+                warn!("checking route interfaces failed; keeping current routes: {error:#}");
+                false
+            }
+        };
+        let recovery_required = self
+            .configuration_state()
+            .map(|state| state != CONFIG_READY)
+            .unwrap_or(true);
+        if recovery_required {
+            log::info!("retrying configuration recovery while traffic remains blocked");
+        }
+        let mut changed = !stale.is_empty() || route_devices_changed || recovery_required;
         for name in stale {
-            let (index, link) = self.xdp_links.remove(&name).expect("collected link");
-            let program: &mut Xdp = self.ebpf.program_mut("velstra").unwrap().try_into()?;
-            // Deleting a netdev already detached its kernel link. Aya must
-            // still forget the owned link so a reused name can attach again.
-            if let Err(e) = program.detach(link)
-                && if_nametoindex(&name).ok() == Some(index)
-            {
-                return Err(e).with_context(|| format!("detaching XDP from {name}"));
-            }
-            for map in ["IFACE_POLICY", "IFACE_VNI", "IFACE_L3"] {
-                let mut map = HashMap::<_, u32, u32>::try_from(self.ebpf.map_mut(map).unwrap())?;
-                if map.get(&index, 0).is_ok() {
-                    map.remove(&index)?;
-                }
-            }
-            self.attached.retain(|(n, _)| n != &name);
-            self.auto_attached.remove(&name);
             self.config_attached.remove(&name);
-            self.bum_attached.remove(&name);
+            self.attached.retain(|(attached, _)| attached != &name);
+            log::info!("config interface {name} disappeared or changed ifindex");
         }
-        let wanted = self.desired_egress()?;
-        let stale: Vec<_> = self
-            .egress_links
-            .iter()
-            .filter(|(name, (index, _))| {
-                !wanted.contains(name) || if_nametoindex(name).ok() != Some(*index)
-            })
-            .map(|(name, _)| name.clone())
-            .collect();
-        for name in stale {
-            let (index, link) = self.egress_links.remove(&name).expect("collected link");
-            let program: &mut SchedClassifier = self
-                .ebpf
-                .program_mut("velstra_egress")
-                .unwrap()
-                .try_into()?;
-            if let Err(e) = program.detach(link)
-                && if_nametoindex(&name).ok() == Some(index)
-            {
-                return Err(e).with_context(|| format!("detaching TC egress from {name}"));
-            }
-        }
-        Ok(changed)
-    }
 
-    /// Synchronous management boundary, also retried by the interface watcher.
-    /// Maps and both packet hooks are installed before acknowledging a newly
-    /// present interface. DHCP address changes refresh masquerading here too.
-    pub fn reconcile_links(&mut self) -> Result<()> {
-        let changed = self.prune_links()?;
-        let todo: Vec<_> = self
+        // Attach config interfaces that are present but not yet attached.
+        let todo: Vec<(String, PolicyId, u32)> = self
             .applied
             .interfaces
             .iter()
-            .filter(|i| if_nametoindex(&i.name).is_ok() && !self.xdp_links.contains_key(&i.name))
+            .filter(|i| present_set.contains(i.name.as_str()))
+            .filter(|i| !self.attached.iter().any(|(n, _)| n == &i.name))
             .map(|i| (i.name.clone(), i.policy, i.vni))
             .collect();
-        if changed || !todo.is_empty() {
-            apply_config(&mut self.ebpf, &self.applied, Some(&self.applied), false)?;
-        }
-        // TC must exist before XDP admits a SYN whose reply it has to track.
-        for name in self.desired_egress()? {
-            if let Ok(index) = if_nametoindex(&name)
-                && !self.egress_links.contains_key(&name)
-            {
-                let link = attach_egress(&mut self.ebpf, &name)?;
-                self.egress_links.insert(name, (index, link));
-            }
-        }
         for (name, policy, vni) in todo {
-            self.attach_config_iface(&name, self.attach_mode, policy, vni)?;
-            self.config_attached.insert(name);
-        }
-        for name in self.primary.clone() {
-            if if_nametoindex(&name).is_ok() && !self.xdp_links.contains_key(&name) {
-                self.attach_iface(
-                    &name,
-                    self.attach_mode,
-                    self.applied.policies.first().map_or(0, |p| p.id),
-                )?;
+            match self.attach_config_iface(&name, mode, policy, vni) {
+                Ok(chosen) => {
+                    if let Ok(index) = if_nametoindex(&name) {
+                        self.config_attached.insert(name.clone(), index);
+                    }
+                    changed = true;
+                    log::info!(
+                        "attached config interface {name} -> policy {policy} vni {vni} ({chosen:?})"
+                    );
+                }
+                Err(e) => warn!("attaching config interface {name} failed: {e:#}"),
             }
         }
-        program_masquerade(&mut self.ebpf, &self.applied.interfaces)?;
-        let cfg = self.applied.clone();
-        self.sync_bum_attachments(&cfg);
-        Ok(())
-    }
 
-    pub fn reconcile_config_interfaces(&mut self, _present: &[String], _mode: AttachMode) {
-        if let Err(e) = self.reconcile_links() {
-            warn!("reconciling configured interfaces failed: {e:#}");
+        if changed {
+            // Refresh every ifindex-keyed map, including the guest firewall
+            // and BUM hooks. A controller need not resend an unchanged config
+            // just because Linux gave a recreated TAP a new interface ID.
+            if let Err(error) = self.reprogram() {
+                warn!("reprogramming recreated interfaces failed: {error:#}");
+            }
         }
     }
 
@@ -743,12 +869,11 @@ impl Firewall {
         self.reconfigure_with_reset(cfg, false)
     }
 
-    /// Policy-ID reuse needs a new runtime namespace, while keeping packet
-    /// hooks attached and fenced throughout the reset and configuration write.
     pub fn reconfigure_with_reset(&mut self, cfg: &RuntimeConfig, reset: bool) -> Result<()> {
         let previous = std::mem::replace(&mut self.base, cfg.clone());
         if let Err(cause) = self.reprogram_with_reset(reset) {
             self.base = previous;
+            self.last_apply_error = Some(format!("{cause:#}"));
             return Err(cause);
         }
         Ok(())
@@ -773,9 +898,9 @@ impl Firewall {
             return Ok(());
         }
         let previous = std::mem::replace(&mut self.flowspec, rules);
-        if let Err(cause) = self.reprogram() {
+        if let Err(error) = self.reprogram() {
             self.flowspec = previous;
-            return Err(cause);
+            return Err(error);
         }
         // A rule that only stops flows which have not started yet is not a
         // mitigation: a flood with a stable five-tuple keeps being admitted by
@@ -804,9 +929,9 @@ impl Firewall {
             return Ok(false);
         }
         let previous = std::mem::replace(&mut self.dynamic_routes, routes);
-        if let Err(cause) = self.reprogram() {
+        if let Err(error) = self.reprogram() {
             self.dynamic_routes = previous;
-            return Err(cause);
+            return Err(error);
         }
         Ok(true)
     }
@@ -891,43 +1016,175 @@ impl Firewall {
 
     fn reprogram_with_reset(&mut self, reset: bool) -> Result<()> {
         let merged = self.merged_config();
+        merged.validate_firewall_capacity()?;
+        // Resolve fallible host identity before changing any active hooks/maps.
+        let prepared = prepare_host_config(&merged)?;
         let previous = self.applied.clone();
-        let attempt = (|| {
-            apply_config(&mut self.ebpf, &merged, Some(&previous), reset)?;
-            self.applied = merged.clone();
-            self.reconcile_links()
+        let previous_host = self.applied_host.clone();
+        let forwards = self.port_forward_snapshot()?;
+        self.set_configuration_state(CONFIG_UPDATING)?;
+        if reset {
+            self.runtime_blocks.clear();
+            self.portal_sessions.clear();
+            self.runtime_mappings.clear();
+        }
+        if let Err(error) = synchronize_packet_readers() {
+            let _ = self.set_configuration_state(CONFIG_FAILED);
+            self.last_apply_error = Some(format!("could not drain packet readers: {error:#}"));
+            return Err(error).context("configuration update blocked; firewall remains closed");
+        }
+        let update = (|| -> Result<HashSet<MappingKey>> {
+            self.sync_egress_attachments(&merged)?;
+            apply_config(&mut self.ebpf, &merged, Some(&previous), &prepared, reset)?;
+            self.reapply_runtime_mappings(&merged)
         })();
-        if let Err(cause) = attempt {
-            self.applied = previous.clone();
-            // Fence the entire restore, including removal of keys a partially
-            // successful attempt may have installed. The interface stage can
-            // fail after apply_config has already reopened the generation.
-            let rollback = apply_config(&mut self.ebpf, &previous, Some(&merged), reset)
-                .and_then(|()| self.reconcile_links());
-            return match rollback {
-                Ok(()) => {
-                    Err(cause).context("applying config failed; previous data plane restored")
+        let retained_mappings = match update {
+            Ok(retained) => retained,
+            Err(error) => {
+                let rollback = (|| -> Result<()> {
+                    self.sync_egress_attachments(&previous)?;
+                    apply_config(
+                        &mut self.ebpf,
+                        &previous,
+                        Some(&merged),
+                        &previous_host,
+                        reset,
+                    )?;
+                    self.restore_port_forward_snapshot(&forwards)?;
+                    let blocks: Vec<String> = self
+                        .runtime_blocks
+                        .iter()
+                        .filter(|(_, expiry)| **expiry > Instant::now())
+                        .map(|(cidr, _)| cidr.clone())
+                        .collect();
+                    for cidr in blocks {
+                        self.write_block(&cidr, true)?;
+                    }
+                    self.sync_bum_attachments(&previous);
+                    self.retire_egress_attachments(&previous);
+                    Ok(())
+                })();
+                match rollback {
+                    Ok(()) => {
+                        self.last_apply_error = Some(format!("{error:#}"));
+                        self.reopen_configuration()?;
+                        return Err(error)
+                            .context("update failed; previous configuration restored");
+                    }
+                    Err(rollback_error) => {
+                        let message = format!(
+                            "update failed: {error:#}; rollback failed: {rollback_error:#}"
+                        );
+                        self.last_apply_error = Some(message.clone());
+                        let _ = self.set_configuration_state(CONFIG_FAILED);
+                        bail!("{message}; firewall remains closed until reconciliation succeeds");
+                    }
                 }
-                Err(e) => {
-                    let fence = (|| -> Result<()> {
-                        let mut epoch = Array::<_, u64>::try_from(
-                            self.ebpf
-                                .map_mut("CONFIG_EPOCH")
-                                .ok_or_else(|| anyhow!("CONFIG_EPOCH missing"))?,
-                        )?;
-                        let generation = epoch.get(&0, 0)?;
-                        epoch.set(0, generation | 1, 0)?;
-                        Ok(())
-                    })();
-                    let status = match fence {
-                        Ok(()) => "data plane fenced closed".to_string(),
-                        Err(f) => format!("closing the data plane also failed: {f:#}"),
-                    };
-                    Err(cause).context(format!(
-                        "applying config failed; rollback failed: {e:#}; {status}"
-                    ))
-                }
-            };
+            }
+        };
+        self.runtime_mappings
+            .retain(|key, _| retained_mappings.contains(key));
+        self.sync_bum_attachments(&merged);
+        self.retire_egress_attachments(&merged);
+        self.applied = merged;
+        self.route_ifindices = prepared.route_ifindices.clone();
+        self.applied_host = prepared;
+        self.reopen_configuration()?;
+        self.last_apply_error = None;
+        Ok(())
+    }
+
+    fn configuration_state(&self) -> Result<u32> {
+        let map: Array<_, u32> = Array::try_from(
+            self.ebpf
+                .map("APPLY_STATE")
+                .ok_or_else(|| anyhow!("APPLY_STATE map missing"))?,
+        )?;
+        map.get(&0, 0).context("reading configuration state")
+    }
+
+    fn set_configuration_state(&mut self, state: u32) -> Result<()> {
+        let mut map: Array<_, u32> = Array::try_from(
+            self.ebpf
+                .map_mut("APPLY_STATE")
+                .ok_or_else(|| anyhow!("APPLY_STATE map missing"))?,
+        )?;
+        map.set(0, state, 0).context("writing configuration state")
+    }
+
+    fn reopen_configuration(&mut self) -> Result<()> {
+        if let Err(error) = self.set_configuration_state(CONFIG_READY) {
+            self.last_apply_error = Some(format!("could not reopen the datapath: {error:#}"));
+            let _ = self.set_configuration_state(CONFIG_FAILED);
+            return Err(error).context("configuration remains blocked; traffic is not admitted");
+        }
+        Ok(())
+    }
+
+    pub fn configuration_status(&self) -> Result<String> {
+        let state = match self.configuration_state()? {
+            CONFIG_READY => "Ready",
+            CONFIG_UPDATING if self.last_apply_error.is_none() => "Updating",
+            _ => "Failed (traffic blocked)",
+        };
+        let mut output = format!("{state}\n");
+        if let Some(error) = &self.last_apply_error {
+            output.push_str(&format!("Last update: {error}\n"));
+        }
+        Ok(output)
+    }
+
+    /// Keep unexpired temporary grants across a successful policy refresh,
+    /// while configured forwards and removal of their policy take precedence.
+    fn reapply_runtime_mappings(&mut self, cfg: &RuntimeConfig) -> Result<HashSet<MappingKey>> {
+        let now = Instant::now();
+        let active: Vec<_> = self
+            .runtime_mappings
+            .iter()
+            .filter(|(key, value)| {
+                value.2 > now
+                    && cfg.policies.iter().any(|policy| policy.id == key.0)
+                    && !cfg.port_forwards.iter().any(|forward| {
+                        forward.policy == key.0 && forward.proto == key.1 && forward.port == key.2
+                    })
+            })
+            .map(|(key, value)| (*key, *value))
+            .collect();
+        let mut retained = HashSet::new();
+        for ((policy, proto, port), (internal, internal_port, _)) in active {
+            let reply = resolve_reply_policy(internal, &cfg.interfaces);
+            let value = PortFwd::new(internal, internal_port).with_reply_policy(reply);
+            self.write_mapping(policy, proto, port, Some(value))?;
+            retained.insert((policy, proto, port));
+        }
+        Ok(retained)
+    }
+
+    fn port_forward_snapshot(&self) -> Result<Vec<(ScopedPortKey, PortFwd)>> {
+        let map: HashMap<_, ScopedPortKey, PortFwd> = HashMap::try_from(
+            self.ebpf
+                .map("PORT_FORWARDS")
+                .ok_or_else(|| anyhow!("PORT_FORWARDS map missing"))?,
+        )?;
+        map.iter()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("snapshotting configured and temporary port forwards")
+    }
+
+    fn restore_port_forward_snapshot(
+        &mut self,
+        entries: &[(ScopedPortKey, PortFwd)],
+    ) -> Result<()> {
+        let mut map: HashMap<_, ScopedPortKey, PortFwd> = HashMap::try_from(
+            self.ebpf
+                .map_mut("PORT_FORWARDS")
+                .ok_or_else(|| anyhow!("PORT_FORWARDS map missing"))?,
+        )?;
+        let keep = entries.iter().map(|(key, _)| *key).collect();
+        drop_unlisted(&mut map, &keep)?;
+        for (key, value) in entries {
+            map.insert(key, value, 0)
+                .context("restoring port forward")?;
         }
         Ok(())
     }
@@ -2098,32 +2355,79 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
     Ok(())
 }
 
-/// Drain pre-existing networking RCU readers after closing CONFIG_EPOCH.
-/// Linux's non-expedited MEMBARRIER_CMD_GLOBAL waits for synchronize_rcu()
-/// (or returns immediately on a single CPU, where no BPF program can run in
-/// parallel). This also drains packets that might otherwise create conntrack
-/// from a partially replaced policy despite their final verdict being dropped.
-/// Keep the non-expedited command: GLOBAL_EXPEDITED only sends userspace IPIs.
-/// Kernel contract used by the appliance's 6.12 kernel:
-/// https://github.com/torvalds/linux/blob/v6.12/kernel/sched/membarrier.c#L614
-fn quiesce_dataplane() -> Result<()> {
-    const MEMBARRIER_CMD_GLOBAL: libc::c_int = 1;
-    let result = unsafe { libc::syscall(libc::SYS_membarrier, MEMBARRIER_CMD_GLOBAL, 0, 0) };
-    if result == -1 {
-        return Err(std::io::Error::last_os_error())
-            .context("waiting for packet readers; live reload needs MEMBARRIER_CMD_GLOBAL (without nohz_full)");
+/// Host-dependent values must be observed before a candidate changes policy.
+#[derive(Clone)]
+struct PreparedHostConfig {
+    overlay: OverlayConfig,
+    srv6: Srv6Config,
+    route_ifindices: BTreeMap<String, u32>,
+}
+
+fn prepare_host_config(cfg: &RuntimeConfig) -> Result<PreparedHostConfig> {
+    let overlay = match cfg.overlay.as_ref() {
+        Some(o) => {
+            let local_mac = match o.local_mac {
+                Some(mac) => mac,
+                None => read_iface_mac(&o.underlay_iface)?,
+            };
+            OverlayConfig::new(
+                o.local_vtep_ip,
+                local_mac,
+                o.udp_port,
+                o.encap,
+                o.underlay_mtu,
+            )
+        }
+        None => OverlayConfig::DISABLED,
+    };
+    let srv6 = match cfg.srv6.as_ref() {
+        Some(s) => {
+            let local_mac = match s.local_mac {
+                Some(mac) => mac,
+                None => read_iface_mac(&s.underlay_iface)?,
+            };
+            Srv6Config::new(s.local_src, local_mac, s.underlay_mtu)
+        }
+        None => Srv6Config::DISABLED,
+    };
+    Ok(PreparedHostConfig {
+        overlay,
+        srv6,
+        route_ifindices: route_interface_indices(&cfg.routes)?,
+    })
+}
+
+fn route_interface_indices(routes: &[ResolvedRoute]) -> Result<BTreeMap<String, u32>> {
+    let mut indices = BTreeMap::new();
+    for name in routes
+        .iter()
+        .map(|route| &route.out_iface)
+        .collect::<BTreeSet<_>>()
+    {
+        match if_nametoindex(name) {
+            Ok(index) => {
+                indices.insert(name.clone(), index);
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(interface_missing) => {}
+            Err(error) => return Err(error).context("checking route interface dependencies"),
+        }
     }
-    Ok(())
+    Ok(indices)
 }
 
 /// Write a [`RuntimeConfig`] into the policy maps. When `old` is `Some`, its
-/// entries are removed first so a live reconfigure can't leave stale rules.
+/// entries are removed first so a live reconfigure cannot leave stale rules.
 fn apply_config(
     ebpf: &mut Ebpf,
     cfg: &RuntimeConfig,
     old: Option<&RuntimeConfig>,
+    prepared: &PreparedHostConfig,
     reset: bool,
 ) -> Result<()> {
+    cfg.validate_firewall_capacity()?;
     let writing = {
         let mut epoch = Array::<_, u64>::try_from(
             ebpf.map_mut("CONFIG_EPOCH")
@@ -2139,7 +2443,7 @@ fn apply_config(
         writing
     };
     if let Some(old) = old {
-        quiesce_dataplane()?;
+        synchronize_packet_readers()?;
         if reset {
             reset_runtime_namespace(ebpf)?;
         }
@@ -2180,6 +2484,7 @@ fn apply_config(
     timeouts
         .set(0, cfg.conntrack, 0)
         .context("programming conntrack timeouts")?;
+
     program_policies(ebpf, &cfg.policies)?;
     program_interfaces(ebpf, &cfg.interfaces)?;
     program_routes(ebpf, &cfg.routes)?;
@@ -2195,7 +2500,7 @@ fn apply_config(
     program_npt66(ebpf, &cfg.npt66)?;
     program_overlay(
         ebpf,
-        cfg.overlay.as_ref(),
+        prepared.overlay,
         &cfg.tunnels,
         &cfg.mac_routes,
         &cfg.irb_routes,
@@ -2206,6 +2511,7 @@ fn apply_config(
     program_srv6(
         ebpf,
         cfg.srv6.as_ref(),
+        prepared.srv6,
         &cfg.srv6_routes,
         &cfg.srv6_local_sids,
         &cfg.srv6_floods,
@@ -2286,10 +2592,8 @@ fn program_fail_closed(ebpf: &mut Ebpf, fail_closed: bool) -> Result<()> {
 /// rule's packed value carries for "unlimited". Returns the slot for each
 /// `(policy id, rule index)` so the trie writers can stamp it into the value.
 ///
-/// A config with more limited rules than the value's 7 bits can name gets the
-/// excess **left unlimited and logged**, rather than wrapping into another rule's
-/// bucket — sharing a limiter with an unrelated rule is a silent, very confusing
-/// failure.
+/// Capacity is validated before any live rules are changed. Keep the defensive
+/// check here too: an unrepresentable limit must never become an unlimited rule.
 fn program_rate_limits(
     ebpf: &mut Ebpf,
     policies: &[PolicyConfig],
@@ -2303,12 +2607,9 @@ fn program_rate_limits(
             };
             let slot = buckets.len() as u32 + 1;
             if slot > MAX_RULE_LIMITS {
-                warn!(
-                    "policy {}: more than {MAX_RULE_LIMITS} rate-limited rules; the rule \
-                     on port {} stays unlimited",
-                    policy.id, rule.key.port
+                bail!(
+                    "more than {MAX_RULE_LIMITS} rate-limited rules; refusing an unlimited fallback"
                 );
-                continue;
             }
             slots.insert((policy.id, index), slot);
             buckets.push((slot, RateBucket::new(rate, burst)));
@@ -3395,7 +3696,7 @@ fn read_iface_ipv4(iface: &str) -> Result<[u8; 4]> {
 #[allow(clippy::too_many_arguments)]
 fn program_overlay(
     ebpf: &mut Ebpf,
-    overlay: Option<&ResolvedOverlay>,
+    config: OverlayConfig,
     tunnels: &[ResolvedTunnel],
     mac_routes: &[ResolvedMacRoute],
     irb_routes: &[ResolvedIrbRoute],
@@ -3403,24 +3704,6 @@ fn program_overlay(
     nd_neighbors: &[ResolvedNd6],
     flood_vteps: &[ResolvedFloodVtep],
 ) -> Result<()> {
-    // Resolve the host config (MAC + port) before borrowing any map.
-    let config = match overlay {
-        Some(o) => {
-            let local_mac = match o.local_mac {
-                Some(mac) => mac,
-                None => read_iface_mac(&o.underlay_iface)?,
-            };
-            OverlayConfig::new(
-                o.local_vtep_ip,
-                local_mac,
-                o.udp_port,
-                o.encap,
-                o.underlay_mtu,
-            )
-        }
-        None => OverlayConfig::DISABLED,
-    };
-
     {
         let mut cfg_map: Array<_, OverlayConfig> = Array::try_from(
             ebpf.map_mut("OVERLAY_CONFIG")
@@ -3722,23 +4005,12 @@ fn program_overlay(
 fn program_srv6(
     ebpf: &mut Ebpf,
     srv6: Option<&ResolvedSrv6>,
+    config: Srv6Config,
     routes: &[ResolvedSrv6Route],
     local_sids: &[ResolvedSrv6LocalSid],
     floods: &[ResolvedSrv6Flood],
     irb_routes: &[ResolvedSrv6IrbRoute],
 ) -> Result<()> {
-    // Resolve the host config (source MAC) before borrowing any map.
-    let config = match srv6 {
-        Some(s) => {
-            let local_mac = match s.local_mac {
-                Some(mac) => mac,
-                None => read_iface_mac(&s.underlay_iface)?,
-            };
-            Srv6Config::new(s.local_src, local_mac, s.underlay_mtu)
-        }
-        None => Srv6Config::DISABLED,
-    };
-
     {
         let mut cfg_map: Array<_, Srv6Config> = Array::try_from(
             ebpf.map_mut("SRV6_CONFIG")
@@ -4025,15 +4297,88 @@ fn prepare_route(route: &ResolvedRoute) -> Result<PreparedRoute> {
     })
 }
 
-/// Look up an interface index by name via `if_nametoindex(3)`.
-fn if_nametoindex(iface: &str) -> Result<u32> {
-    let cstr = CString::new(iface).with_context(|| format!("interface name {iface:?}"))?;
-    // SAFETY: `cstr` is a valid NUL-terminated string that outlives the call.
-    let index = unsafe { libc::if_nametoindex(cstr.as_ptr()) };
-    if index == 0 {
-        bail!("interface {iface:?} not found");
+/// `MEMBARRIER_CMD_GLOBAL` waits for a kernel RCU grace period on Linux.
+/// XDP/NAPI and TC readers finish before map mutation starts. Do not replace
+/// this with an expedited userspace-only barrier or a timing-based sleep.
+/// See Linux kernel/sched/membarrier.c and Documentation/RCU/checklist.rst.
+fn ensure_reader_barrier_supported() -> Result<()> {
+    // SAFETY: membarrier QUERY takes integer arguments and no pointers.
+    let supported =
+        unsafe { libc::syscall(libc::SYS_membarrier, libc::MEMBARRIER_CMD_QUERY, 0, 0) };
+    if supported < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("querying kernel packet-reader barrier");
     }
-    Ok(index)
+    if supported & libc::MEMBARRIER_CMD_GLOBAL as libc::c_long == 0 {
+        bail!(
+            "kernel does not support MEMBARRIER_CMD_GLOBAL; safe live configuration requires it (nohz_full must be disabled)"
+        );
+    }
+    Ok(())
+}
+
+fn synchronize_packet_readers() -> Result<()> {
+    loop {
+        // SAFETY: GLOBAL takes integer arguments and no pointers. Its kernel
+        // RCU grace period drains readers that passed the now-closed gate.
+        if unsafe { libc::syscall(libc::SYS_membarrier, libc::MEMBARRIER_CMD_GLOBAL, 0, 0) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error).context("draining packet readers");
+        }
+    }
+}
+
+/// Query the kernel directly so an unavailable observation cannot be mistaken
+/// for a removed interface. Some libc `if_nametoindex` implementations replace
+/// socket creation failures (including EMFILE) with ENOENT.
+fn if_nametoindex(iface: &str) -> Result<u32> {
+    if iface.is_empty() || iface.len() >= libc::IFNAMSIZ || iface.as_bytes().contains(&0) {
+        bail!("invalid interface name {iface:?}");
+    }
+    let socket = loop {
+        // SAFETY: socket has no pointer arguments; a successful descriptor is
+        // owned below and closed on every return path.
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+        if fd >= 0 {
+            // SAFETY: fd is a newly created, exclusively owned descriptor.
+            break unsafe { OwnedFd::from_raw_fd(fd) };
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error).context("opening interface lookup socket");
+        }
+    };
+    // SAFETY: an all-zero ifreq is valid; its name is filled and terminated
+    // below before the kernel receives it.
+    let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+    for (destination, source) in request.ifr_name.iter_mut().zip(iface.bytes()) {
+        *destination = source as libc::c_char;
+    }
+    loop {
+        // SAFETY: request is a valid writable ifreq and socket stays open.
+        let result = unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFINDEX, &mut request) };
+        if result == 0 {
+            // SAFETY: SIOCGIFINDEX initialized this union member on success.
+            return Ok(unsafe { request.ifr_ifru.ifru_ifindex } as u32);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        let context = if interface_missing(&error) {
+            format!("interface {iface:?} not found")
+        } else {
+            format!("looking up interface {iface:?}")
+        };
+        return Err(error).context(context);
+    }
+}
+
+fn interface_missing(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::ENODEV | libc::ENXIO))
 }
 
 /// Read an interface's MAC address from `/sys/class/net/<iface>/address`.
@@ -4055,6 +4400,9 @@ fn read_iface_mac(iface: &str) -> Result<[u8; 6]> {
 /// * a policy carrying a rule scoped to the way **out** — otherwise the rule
 ///   loads, matches nothing and says nothing, and the operator who wrote
 ///   `direction out` gets silence;
+/// * a policy with **egress default drop**. On a guest tap this hook sees
+///   packets entering the guest, so omitting it makes a cloud security group
+///   look active while every inbound packet passes;
 /// * a **stateful** policy that does not pass by default. The ingress hook
 ///   records a flow when it admits one, so a reply to something that *arrived*
 ///   is covered — but a connection the box itself starts never crosses that hook
@@ -4095,7 +4443,11 @@ fn egress_interfaces(cfg: &RuntimeConfig, ifaces: &[String], egress: bool) -> Ve
         .map(|p| p.id)
         .collect();
     for i in &cfg.interfaces {
-        if out_scoped.contains(&i.policy) || needs_reply_state.contains(&i.policy) {
+        let drops_egress = cfg
+            .policies
+            .iter()
+            .any(|p| p.id == i.policy && p.global.has_flag(ConfigFlags::EGRESS_DEFAULT_DROP));
+        if out_scoped.contains(&i.policy) || needs_reply_state.contains(&i.policy) || drops_egress {
             push(&i.name, &mut out);
         }
     }
@@ -4118,7 +4470,10 @@ fn egress_interfaces(cfg: &RuntimeConfig, ifaces: &[String], egress: bool) -> Ve
 /// Load the `velstra_egress` TC classifier and attach it at **egress** on each
 /// interface. Requires a `clsact` qdisc, which we create first (ignoring the
 /// "already exists" case so a restart is idempotent).
-fn attach_egress(ebpf: &mut Ebpf, iface: &str) -> Result<SchedClassifierLinkId> {
+fn attach_egress(
+    ebpf: &mut Ebpf,
+    ifaces: &[String],
+) -> Result<BTreeMap<String, InterfaceLink<SchedClassifierLink>>> {
     for (slot, name) in [
         (0, "velstra_egress_v4"),
         (1, "velstra_egress_v6"),
@@ -4149,10 +4504,22 @@ fn attach_egress(ebpf: &mut Ebpf, iface: &str) -> Result<SchedClassifierLinkId> 
         Ok(()) | Err(ProgramError::AlreadyLoaded) => {}
         Err(e) => return Err(e).context("loading TC egress program into the kernel"),
     }
-    let _ = qdisc_add_clsact(iface);
-    program
-        .attach(iface, TcAttachType::Egress)
-        .with_context(|| format!("attaching TC egress program to {iface}"))
+    let mut links = BTreeMap::new();
+    for iface in ifaces {
+        let ifindex = if_nametoindex(iface)?;
+        // Idempotent: a pre-existing clsact qdisc is fine.
+        let _ = qdisc_add_clsact(iface);
+        let id = program
+            .attach(iface, TcAttachType::Egress)
+            .with_context(|| format!("attaching TC egress program to {iface}"))?;
+        let link = program
+            .take_link(id)
+            .context("owning TC egress attachment")?;
+        links.insert(iface.clone(), InterfaceLink::new(iface, ifindex, link)?);
+        log::info!("attached egress firewall to {iface}");
+    }
+    // On a partial failure, the links collected so far drop and detach too.
+    Ok(links)
 }
 
 /// Load the B2 `velstra_bum` TC classifier and attach it at **ingress** on each
@@ -4160,11 +4527,13 @@ fn attach_egress(ebpf: &mut Ebpf, iface: &str) -> Result<SchedClassifierLinkId> 
 /// is head-end replicated to the VNI's flood set. Requires a `clsact` qdisc,
 /// created first (idempotent, like [`attach_egress`]).
 ///
-/// B2 datapath note: the `velstra_bum` program is COMPILE-verified only and
-/// awaits kernel-load iteration, so this attach is called **best-effort** by the
-/// caller (a verifier rejection must not take the agent down); the flood-set
-/// control plane (`FLOOD_LIST`/`VTEP_PEERS`/`TX_PORTS`) is programmed regardless.
-fn attach_bum_ingress(ebpf: &mut Ebpf, ifaces: &[String]) -> Result<()> {
+/// The caller retries failed replication attachments without taking down
+/// working firewall links. Newly attached links are owned by the returned map,
+/// so a partial failure also releases every link created by this attempt.
+fn attach_bum_ingress(
+    ebpf: &mut Ebpf,
+    ifaces: &[String],
+) -> Result<BTreeMap<String, InterfaceLink<SchedClassifierLink>>> {
     let program: &mut SchedClassifier = ebpf
         .program_mut("velstra_bum")
         .ok_or_else(|| anyhow!("eBPF object has no `velstra_bum` program"))?
@@ -4183,15 +4552,19 @@ fn attach_bum_ingress(ebpf: &mut Ebpf, ifaces: &[String]) -> Result<()> {
         Ok(()) | Err(ProgramError::AlreadyLoaded) => {}
         Err(e) => return Err(e).context("loading TC BUM-replication program into the kernel"),
     }
+    let mut links = BTreeMap::new();
     for iface in ifaces {
+        let ifindex = if_nametoindex(iface)?;
         // Idempotent: a pre-existing clsact qdisc is fine.
         let _ = qdisc_add_clsact(iface);
-        program
+        let id = program
             .attach(iface, TcAttachType::Ingress)
             .with_context(|| format!("attaching TC BUM-replication program to {iface}"))?;
+        let link = program.take_link(id).context("owning TC BUM attachment")?;
+        links.insert(iface.clone(), InterfaceLink::new(iface, ifindex, link)?);
         log::info!("attached BUM head-end replication (ingress) to {iface}");
     }
-    Ok(())
+    Ok(links)
 }
 
 /// Attach `program`, walking the candidate modes for `mode` until one succeeds.
@@ -4199,11 +4572,15 @@ fn attach_with_fallback(
     program: &mut Xdp,
     iface: &str,
     mode: AttachMode,
-) -> Result<(XdpMode, XdpLinkId)> {
+) -> Result<(XdpMode, InterfaceLink<XdpLink>)> {
+    let ifindex = if_nametoindex(iface)?;
     let mut last_err = None;
     for candidate in mode.candidates() {
         match program.attach(iface, *candidate) {
-            Ok(link_id) => return Ok((*candidate, link_id)),
+            Ok(id) => {
+                let link = program.take_link(id).context("owning XDP attachment")?;
+                return Ok((*candidate, InterfaceLink::new(iface, ifindex, link)?));
+            }
             Err(e) => {
                 warn!("attach to {iface} in {candidate:?} mode failed: {e}");
                 last_err = Some(e);
@@ -4290,15 +4667,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn interface_lookup_reports_the_kernel_index() {
+        let expected: u32 = std::fs::read_to_string("/sys/class/net/lo/ifindex")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(if_nametoindex("lo").unwrap(), expected);
+    }
+
+    #[test]
+    fn interface_lookup_preserves_a_missing_device_error() {
+        let error = if_nametoindex("vs-no-such-if").unwrap_err();
+        assert!(interface_missing(
+            error.downcast_ref::<std::io::Error>().unwrap()
+        ));
+    }
+
+    #[test]
+    fn interface_lookup_rejects_truncated_or_nul_names() {
+        for name in ["", "lo\0other", "0123456789abcdef"] {
+            assert!(if_nametoindex(name).is_err(), "accepted {name:?}");
+        }
+    }
+
     /// `LOCAL_VNIS` is a tenant-isolation boundary — a VNI left in it lets any
     /// trusted peer VTEP keep injecting frames into a segment this host no longer
     /// serves — so the reconcile has to name every VNI the old config could have
     /// registered, including the routed ones no interface mentions.
-    #[test]
-    fn live_generation_can_wait_for_kernel_packet_readers() {
-        quiesce_dataplane().expect("Linux must support the appliance's RCU grace-period barrier");
-    }
-
     #[test]
     fn admitted_vnis_covers_ports_and_routed_vnis() {
         let mut cfg = RuntimeConfig::passthrough();
@@ -4378,6 +4775,15 @@ mod tests {
         let mut cfg = RuntimeConfig::passthrough();
         cfg.policies = vec![policy(1, Action::Drop, true)];
         cfg.interfaces = vec![iface("eth0", 1)];
+        assert_eq!(egress_interfaces(&cfg, &[], false), ["eth0"]);
+
+        // Cloud port policies pass traffic leaving the guest at XDP but
+        // default-deny traffic entering it at TC egress. An empty group still
+        // needs this hook or its promised ingress isolation disappears.
+        cfg.policies = vec![PolicyConfig {
+            global: GlobalConfig::new(Action::Pass, ConfigFlags::EGRESS_DEFAULT_DROP),
+            ..policy(1, Action::Pass, false)
+        }];
         assert_eq!(egress_interfaces(&cfg, &[], false), ["eth0"]);
 
         // Deny by default but NOT stateful: nothing is tracked, so there is
@@ -4625,6 +5031,10 @@ mod every_map_is_reconciled {
     /// A slot is safe when it is either always rewritten, or only ever reached
     /// through a map that *is* reconciled.
     const EXEMPT: &[(&str, &str)] = &[
+        (
+            "APPLY_STATE",
+            "slot zero belongs to the guarded update engine; reopening follows only a complete apply or rollback",
+        ),
         (
             "FAIL_CLOSED",
             "slot 0 is written on every apply, including the false default",
