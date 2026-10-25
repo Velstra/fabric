@@ -34,8 +34,8 @@ use velstra_common::{
     PortalSeenKey, RateBucket, RouteEntry, ScopedAddr, ScopedAddr6, ScopedDstPortKey,
     ScopedDstPortKey6, ScopedMac, ScopedPortKey, ScopedSrcPortKey, ScopedSrcPortKey6, ServiceKey,
     ServiceValue, Srv6Config, Srv6Endpoint, Srv6FloodSet, Srv6IrbEndpoint, Srv6LocalSid,
-    Srv6SidKey, SynProxyCfg, SynProxyKey, TunnelEndpoint, TunnelKey, parse_cidr_v4, parse_cidr_v6,
-    parse_mac, port_rule_value, port_rule_with_limit,
+    Srv6SidKey, SynFlow, SynProxyCfg, SynProxyKey, TunnelEndpoint, TunnelKey, parse_cidr_v4,
+    parse_cidr_v6, parse_mac, port_rule_value, port_rule_with_limit,
 };
 use velstra_config::{
     PolicyConfig, PortIdentity, ResolvedFloodVtep, ResolvedInterface, ResolvedIrbRoute,
@@ -248,7 +248,7 @@ impl Firewall {
         let mut ebpf = Ebpf::load(&object).context("loading embedded eBPF object")?;
 
         spawn_log_forwarder(&mut ebpf);
-        apply_config(&mut ebpf, cfg, None)?;
+        apply_config(&mut ebpf, cfg, None, false)?;
 
         // Load the tail-call target (`velstra_forward`) and register it in the
         // `VELSTRA_PROGS` program array, so the main program's
@@ -693,7 +693,7 @@ impl Firewall {
             .map(|i| (i.name.clone(), i.policy, i.vni))
             .collect();
         if changed || !todo.is_empty() {
-            apply_config(&mut self.ebpf, &self.applied, Some(&self.applied))?;
+            apply_config(&mut self.ebpf, &self.applied, Some(&self.applied), false)?;
         }
         // TC must exist before XDP admits a SYN whose reply it has to track.
         for name in self.desired_egress()? {
@@ -740,8 +740,14 @@ impl Firewall {
     }
 
     pub fn reconfigure(&mut self, cfg: &RuntimeConfig) -> Result<()> {
+        self.reconfigure_with_reset(cfg, false)
+    }
+
+    /// Policy-ID reuse needs a new runtime namespace, while keeping packet
+    /// hooks attached and fenced throughout the reset and configuration write.
+    pub fn reconfigure_with_reset(&mut self, cfg: &RuntimeConfig, reset: bool) -> Result<()> {
         let previous = std::mem::replace(&mut self.base, cfg.clone());
-        if let Err(cause) = self.reprogram() {
+        if let Err(cause) = self.reprogram_with_reset(reset) {
             self.base = previous;
             return Err(cause);
         }
@@ -880,10 +886,14 @@ impl Firewall {
     }
 
     fn reprogram(&mut self) -> Result<()> {
+        self.reprogram_with_reset(false)
+    }
+
+    fn reprogram_with_reset(&mut self, reset: bool) -> Result<()> {
         let merged = self.merged_config();
         let previous = self.applied.clone();
         let attempt = (|| {
-            apply_config(&mut self.ebpf, &merged, Some(&previous))?;
+            apply_config(&mut self.ebpf, &merged, Some(&previous), reset)?;
             self.applied = merged.clone();
             self.reconcile_links()
         })();
@@ -892,7 +902,7 @@ impl Firewall {
             // Fence the entire restore, including removal of keys a partially
             // successful attempt may have installed. The interface stage can
             // fail after apply_config has already reopened the generation.
-            let rollback = apply_config(&mut self.ebpf, &previous, Some(&merged))
+            let rollback = apply_config(&mut self.ebpf, &previous, Some(&merged), reset)
                 .and_then(|()| self.reconcile_links());
             return match rollback {
                 Ok(()) => {
@@ -1523,53 +1533,30 @@ impl Firewall {
         Ok(Stats { rows })
     }
 
-    /// Take ownership of the `LOCAL_MACS` map handle out of the loaded eBPF
-    /// object, for the B4b learn-and-advertise background task.
-    ///
-    /// The XDP program is already loaded and its map references are resolved, so
-    /// moving the userspace handle out of the `Ebpf` collection is safe — the
-    /// kernel map lives on (the returned handle owns its fd), the data plane keeps
-    /// populating it, and nothing else in the control plane touches `LOCAL_MACS`.
-    /// The background task reads through the returned handle; when it is dropped
-    /// the map is freed. (aya reads an LRU hash map through the same userspace
-    /// `HashMap` type as a regular hash map.)
+    /// Duplicate `LOCAL_MACS` for the learn-and-advertise task. Keep the map in
+    /// the firewall too, so a policy-namespace reset can clear learned state.
     pub fn take_local_macs(&mut self) -> Result<HashMap<MapData, LocalMacKey, LocalMac>> {
-        let map = self
-            .ebpf
-            .take_map("LOCAL_MACS")
-            .ok_or_else(|| anyhow!("LOCAL_MACS map missing"))?;
-        HashMap::try_from(map).context("LOCAL_MACS as a HashMap")
+        let Some(aya::maps::Map::LruHashMap(data)) = self.ebpf.map("LOCAL_MACS") else {
+            bail!("LOCAL_MACS LRU map missing");
+        };
+        let duplicate = MapData::from_fd(data.fd().as_fd().try_clone_to_owned()?)?;
+        HashMap::try_from(aya::maps::Map::LruHashMap(duplicate)).context("LOCAL_MACS as a HashMap")
     }
 
-    /// Take ownership of the `CONNTRACK` map handle out of the loaded eBPF object,
-    /// for the C9 stateful-HA conntrack-sync background task.
-    ///
-    /// Same rationale as [`take_local_macs`]: the XDP program's map references are
-    /// already resolved, so moving the userspace handle out is safe — the kernel
-    /// map lives on, the data plane keeps recording NAT flows into it, and nothing
-    /// else in the control plane touches `CONNTRACK` (a live [`reconfigure`] leaves
-    /// it alone by design). The sync task both **reads** it (dump-and-push) and
-    /// **writes** it (apply a peer's entries) through this one handle. (aya reads
-    /// and writes an LRU hash map through the same userspace `HashMap` type.)
-    ///
-    /// The handle is **shared**, not surrendered: the first call moves the map out
-    /// of the eBPF object and every later call clones the same `Arc`. aya allows
-    /// only one owner of a taken map, so handing it to the sync task outright would
-    /// mean that turning HA on silently takes the flow table away from everything
-    /// else that wants to read it — the diagnostics view included.
-    ///
-    /// [`take_local_macs`]: Firewall::take_local_macs
-    /// [`reconfigure`]: Firewall::reconfigure
+    /// Share a duplicate `CONNTRACK` FD between diagnostics and HA sync. Retain
+    /// the original map handle for fenced policy-namespace resets. Every handle
+    /// addresses the same kernel map; no flow entries are copied.
     pub fn conntrack_handle(&mut self) -> Result<Arc<Mutex<HashMap<MapData, FlowKey, FlowState>>>> {
         if let Some(handle) = &self.conntrack {
             return Ok(handle.clone());
         }
-        let map = self
-            .ebpf
-            .take_map("CONNTRACK")
-            .ok_or_else(|| anyhow!("CONNTRACK map missing"))?;
+        let Some(aya::maps::Map::LruHashMap(data)) = self.ebpf.map("CONNTRACK") else {
+            bail!("CONNTRACK LRU map missing");
+        };
+        let duplicate = MapData::from_fd(data.fd().as_fd().try_clone_to_owned()?)?;
         let handle = Arc::new(Mutex::new(
-            HashMap::try_from(map).context("CONNTRACK as a HashMap")?,
+            HashMap::try_from(aya::maps::Map::LruHashMap(duplicate))
+                .context("CONNTRACK as a HashMap")?,
         ));
         self.conntrack = Some(handle.clone());
         Ok(handle)
@@ -2131,7 +2118,12 @@ fn quiesce_dataplane() -> Result<()> {
 
 /// Write a [`RuntimeConfig`] into the policy maps. When `old` is `Some`, its
 /// entries are removed first so a live reconfigure can't leave stale rules.
-fn apply_config(ebpf: &mut Ebpf, cfg: &RuntimeConfig, old: Option<&RuntimeConfig>) -> Result<()> {
+fn apply_config(
+    ebpf: &mut Ebpf,
+    cfg: &RuntimeConfig,
+    old: Option<&RuntimeConfig>,
+    reset: bool,
+) -> Result<()> {
     let writing = {
         let mut epoch = Array::<_, u64>::try_from(
             ebpf.map_mut("CONFIG_EPOCH")
@@ -2148,6 +2140,9 @@ fn apply_config(ebpf: &mut Ebpf, cfg: &RuntimeConfig, old: Option<&RuntimeConfig
     };
     if let Some(old) = old {
         quiesce_dataplane()?;
+        if reset {
+            reset_runtime_namespace(ebpf)?;
+        }
         remove_stale(ebpf, old)?;
     }
 
@@ -2222,6 +2217,50 @@ fn apply_config(ebpf: &mut Ebpf, cfg: &RuntimeConfig, old: Option<&RuntimeConfig
             .ok_or_else(|| anyhow!("CONFIG_EPOCH map missing"))?,
     )?
     .set(0, writing.wrapping_add(1), 0)?;
+    Ok(())
+}
+
+/// Called only with CONFIG_EPOCH odd and all earlier packet readers drained.
+/// State from a previous policy-ID owner must not authorize its new owner.
+fn reset_runtime_namespace(ebpf: &mut Ebpf) -> Result<()> {
+    fn clear<K: aya::Pod, V: aya::Pod>(ebpf: &mut Ebpf, name: &str) -> Result<()> {
+        let mut map: HashMap<_, K, V> = HashMap::try_from(
+            ebpf.map_mut(name)
+                .ok_or_else(|| anyhow!("{name} map missing"))?,
+        )?;
+        let keys = map.keys().collect::<std::result::Result<Vec<_>, _>>()?;
+        for key in keys {
+            map.remove(&key)?;
+        }
+        Ok(())
+    }
+    clear::<FirewallKey, FirewallState>(ebpf, "FW_FLOWS")?;
+    clear::<FlowKey, FlowState>(ebpf, "CONNTRACK")?;
+    clear::<FlowKey, SynFlow>(ebpf, "SYN_FLOWS")?;
+    clear::<PortalClientKey, u8>(ebpf, "PORTAL_CLIENTS")?;
+    clear::<PortalSeenKey, [u8; 6]>(ebpf, "PORTAL_SEEN")?;
+    clear::<LocalMacKey, LocalMac>(ebpf, "LOCAL_MACS")?;
+    clear::<ArpKey, ArpEntry>(ebpf, "ARP_TABLE")?;
+    clear::<NdKey, ArpEntry>(ebpf, "ND_TABLE")?;
+    let mut counters = aya::maps::PerCpuHashMap::<
+        _,
+        velstra_common::RuleCounterKey,
+        velstra_common::RuleCounters,
+    >::try_from(
+        ebpf.map_mut("RULE_COUNTERS")
+            .ok_or_else(|| anyhow!("RULE_COUNTERS missing"))?,
+    )?;
+    let keys = counters
+        .keys()
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for key in keys {
+        counters.remove(&key)?;
+    }
+    let mut events = aya::maps::RingBuf::try_from(
+        ebpf.map_mut("PACKET_EVENTS")
+            .ok_or_else(|| anyhow!("PACKET_EVENTS missing"))?,
+    )?;
+    while events.next().is_some() {}
     Ok(())
 }
 

@@ -19,16 +19,14 @@
 //! flowspec          → the BGP FlowSpec rules in force, and what was refused
 //! block <cidr> [s]  → block a source for a while (roadmap C11)
 //! unblock <cidr>    → lift one early (`all` lifts every one)
+//! reload            → reconcile the validated local configuration in place
+//! reload-reset      → also invalidate the previous policy namespace's state
 //! ```
 //!
-//! Mostly read-only, and **nothing here can open anything**. `block` is the only
-//! command that changes what the data plane does, and it can only ever add a
-//! drop — there is no verb that admits traffic, lifts a configured block, or
-//! alters the configuration. So the worst an unwanted caller achieves is denial
-//! of service against an address, which is loud, visible in `blocks`, and expires
-//! on its own; it can never be used to let something through. The socket is bound
-//! wherever the caller says (a root-owned `/run` directory in the appliance), and
-//! the socket's directory is what governs who may ask.
+//! This is a privileged local control interface: reload commands apply the
+//! validated file and block/unblock manage transient source blocks. The socket
+//! lives in the appliance's root-owned 0700 `/run` directory; its directory
+//! permissions govern access to these mutations as well as the diagnostics.
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -137,7 +135,7 @@ async fn respond(
     let args: Vec<&str> = tokens.collect();
     let limit = parse_limit(args.first().copied());
     match verb {
-        "reload" => {
+        "reload" | "reload-reset" => {
             let Some(path) = config else {
                 return "error: node is controller-managed or has no config file\n".into();
             };
@@ -148,7 +146,7 @@ async fn respond(
                     if fw.requires_restart(&cfg) {
                         return "restart-required\n".into();
                     }
-                    match fw.reconfigure(&cfg) {
+                    match fw.reconfigure_with_reset(&cfg, verb == "reload-reset") {
                         Ok(()) => "ok\n".into(),
                         Err(e) => format!("error: applying configuration: {e:#}\n"),
                     }
