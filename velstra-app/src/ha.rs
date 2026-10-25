@@ -3,7 +3,7 @@
 //! no secrets and are accepted only from a trusted root-owned runtime directory.
 pub mod wireguard;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::OpenOptions,
     io::{Read, Write},
     net::IpAddr,
@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail, ensure};
 use aya::{
     EbpfLoader,
     maps::{Array, HashMap, MapData},
-    programs::SchedClassifier,
+    programs::{RawTracePoint, SchedClassifier, links::FdLink},
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,8 @@ pub const ROLE_PATH: &str = "/run/velstra/ha/role.json";
 pub const AGENT_PATH: &str = "/run/velstra/ha/agent.json";
 pub const PIN_DIRECTORY: &str = "/sys/fs/bpf/velstra-ha";
 pub const DEADLINE_PIN: &str = "/sys/fs/bpf/velstra-ha/deadline";
+pub const OWNER_PIN: &str = "/sys/fs/bpf/velstra-ha/owner";
+const EXIT_PIN: &str = "/sys/fs/bpf/velstra-ha/exit";
 const GUARD_PIN: &str = "/sys/fs/bpf/velstra-ha/guard";
 const FRESH_NS: u64 = 100_000_000;
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +76,9 @@ pub struct State {
     ready_policy: [u8; 32],
     ready_at: u64,
     retained_owner: u64,
+    // Only a new agent with freshly created maps can vote for an empty epoch.
+    // Expired or partially installed state is not empty state.
+    cold: bool,
     pub active_term: u64,
     agent_boot: [u8; 16],
 }
@@ -91,15 +96,19 @@ impl State {
             ready_policy: [0; 32],
             ready_at: 0,
             retained_owner: 0,
+            cold: true,
             active_term: 0,
             agent_boot: boot,
         })))
     }
     fn is_ready(&self, config: &HaConfig, policy: [u8; 32], now: u64) -> bool {
-        self.ready_policy == policy
+        self.ready_term > 0
+            && self.ready_policy == policy
             && (self.retained_owner == self.ready_term
                 && self.role.authority.owner == config.node
-                && self.role.authority.term == self.retained_owner
+                && (self.role.authority.term == self.retained_owner
+                    || self.role.claimed_ready_term == self.retained_owner
+                        && self.role.claimed_agent_boot == self.agent_boot)
                 || now.saturating_sub(self.ready_at) <= 1_500_000_000)
     }
     fn forwarding_allowed(
@@ -121,6 +130,7 @@ impl State {
             && (self.role.authority.term > 0
                 && self.role.claimed_ready_term == 0
                 && self.ready_term == 0
+                && self.cold
                 || ready
                     && self.ready_term >= self.role.claimed_ready_term
                     && self.role.authority.term >= self.ready_term)
@@ -166,12 +176,14 @@ impl State {
     /// Invalidate old readiness before a fallible multi-map installation. A
     /// partial replacement must never be advertised as a complete warm state.
     pub fn begin_install(&mut self) {
+        self.cold = false;
         self.ready_term = 0;
         self.ready_policy = [0; 32];
         self.ready_at = 0;
         self.retained_owner = 0;
     }
     pub fn snapshot_ready(&mut self, authority: &Authority) {
+        self.cold = false;
         self.ready_term = authority.term;
         self.ready_policy = authority.policy;
         self.ready_at = now_ns();
@@ -277,6 +289,70 @@ pub fn attach_guard(interface: &str) -> Result<()> {
     }
     Ok(())
 }
+/// Remove only our reserved filter and verified kernel program from links
+/// removed from declarative HA intent. New data links are fenced first.
+fn obsolete_guard_ids(filters: &[serde_json::Value], owned: &BTreeSet<u32>) -> bool {
+    filters.iter().any(|filter| {
+        filter["kind"] == "bpf"
+            && filter["pref"] == 1
+            && (filter["options"]["handle"] == "0x1" || filter["options"]["handle"] == 1)
+            && filter["options"]["id"]
+                .as_u64()
+                .and_then(|id| u32::try_from(id).ok())
+                .is_some_and(|id| owned.contains(&id))
+    })
+}
+fn remove_obsolete_guards(desired: &[String]) -> Result<()> {
+    let owned: BTreeSet<_> = aya::programs::loaded_programs()
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|program| program.name() == b"velstra_ha_guar")
+        .map(|program| program.id())
+        .collect();
+    if owned.is_empty() {
+        return Ok(());
+    }
+    let tc = std::env::var("VELSTRA_TC_BIN")
+        .or_else(|_| std::env::var("SENTINEL_TC_BIN"))
+        .unwrap_or_else(|_| "tc".into());
+    for entry in std::fs::read_dir("/sys/class/net")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if desired.iter().any(|wanted| wanted == name) {
+            continue;
+        }
+        for direction in ["ingress", "egress"] {
+            let output = Command::new(&tc)
+                .args(["-j", "filter", "show", "dev", name, direction, "pref", "1"])
+                .output()?;
+            if !output.status.success() && !entry.path().exists() {
+                break;
+            }
+            ensure!(
+                output.status.success(),
+                "reading HA filters on {name}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            ensure!(
+                output.stdout.len() <= 1_048_576,
+                "oversized HA filter inventory"
+            );
+            let filters: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
+            if obsolete_guard_ids(&filters, &owned) {
+                tool(
+                    "tc",
+                    &[
+                        "filter", "del", "dev", name, direction, "pref", "1", "handle", "1", "bpf",
+                    ],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
 pub fn prepare_guard(config: &RuntimeConfig) -> Result<()> {
     if let Some(ha) = &config.ha {
         std::fs::create_dir_all(PIN_DIRECTORY)?;
@@ -286,6 +362,7 @@ pub fn prepare_guard(config: &RuntimeConfig) -> Result<()> {
         )))?;
         let mut ebpf = EbpfLoader::new()
             .map_pin_path("HA_DEADLINE", Path::new(DEADLINE_PIN))
+            .map_pin_path("HA_OWNER", Path::new(OWNER_PIN))
             .load(&object)?;
         Array::<_, u64>::try_from(ebpf.map_mut("HA_DEADLINE").context("HA deadline map")?)?
             .set(0, 0, 0)?;
@@ -298,18 +375,77 @@ pub fn prepare_guard(config: &RuntimeConfig) -> Result<()> {
             std::fs::remove_file(GUARD_PIN)?;
         }
         program.pin(GUARD_PIN)?;
+        let exit: &mut RawTracePoint = ebpf
+            .program_mut("velstra_ha_exit")
+            .context("HA exit fence")?
+            .try_into()?;
+        exit.load()?;
+        let id = exit.attach("sched_process_exit")?;
+        let link: FdLink = exit.take_link(id)?.into();
+        if Path::new(EXIT_PIN).exists() {
+            std::fs::remove_file(EXIT_PIN)?;
+        }
+        link.pin(EXIT_PIN)?;
         for interface in &ha.interfaces {
             if Path::new("/sys/class/net").join(interface).exists() {
                 attach_guard(interface)?;
             }
         }
+        remove_obsolete_guards(&ha.interfaces)?;
     } else if Path::new(DEADLINE_PIN).exists() {
+        remove_obsolete_guards(&[])?;
         // Explicit configuration removal, not merely loading a standalone
         // diagnostic object, disables the retained guard.
         let data = MapData::from_pin(DEADLINE_PIN)?;
         Array::<_, u64>::try_from(aya::maps::Map::Array(data))?.set(0, u64::MAX, 0)?;
+        if Path::new(OWNER_PIN).exists() {
+            let data = MapData::from_pin(OWNER_PIN)?;
+            Array::<_, u32>::try_from(aya::maps::Map::Array(data))?.set(0, 0, 0)?;
+        }
+        if Path::new(EXIT_PIN).exists() {
+            std::fs::remove_file(EXIT_PIN)?;
+        }
     }
     Ok(())
+}
+/// Created after ordinary hooks; dropped before their last userspace owner.
+/// Abrupt exit is handled independently by the pinned kernel tracepoint.
+pub struct AgentLifetime {
+    owner: Array<MapData, u32>,
+    pid: u32,
+}
+impl Drop for AgentLifetime {
+    fn drop(&mut self) {
+        match self.owner.get(&0, 0) {
+            Ok(pid) if pid != self.pid => return,
+            Ok(_) => {}
+            Err(error) => {
+                log::error!(
+                    "HA liveness map unavailable during shutdown: {error}; forcing kernel exit fence"
+                );
+                std::process::abort();
+            }
+        }
+        if let Err(error) = self.owner.set(0, 0, 0) {
+            log::error!("HA graceful-exit fence failed: {error}; forcing kernel exit fence");
+            std::process::abort();
+        }
+    }
+}
+
+pub fn register_agent(enabled: bool) -> Result<Option<AgentLifetime>> {
+    if !enabled {
+        return Ok(None);
+    }
+    ensure!(
+        Path::new(EXIT_PIN).exists(),
+        "HA exit fence is not attached"
+    );
+    let mut owner =
+        Array::<_, u32>::try_from(aya::maps::Map::Array(MapData::from_pin(OWNER_PIN)?))?;
+    let pid = std::process::id();
+    owner.set(0, pid, 0)?;
+    Ok(Some(AgentLifetime { owner, pid }))
 }
 /// Called under the firewall configuration lock before admitting a new lease.
 pub fn reconcile_interfaces(
@@ -335,10 +471,21 @@ pub fn reconcile_interfaces(
             if !config.disabled.contains(name) {
                 complete = false;
             }
-            seen.remove(name);
+            if let Some(old) = seen.remove(name) {
+                HashMap::<_, u32, u8>::try_from(
+                    ebpf.map_mut("HA_IFACES").context("HA interface map")?,
+                )?
+                .remove(&old)?;
+            }
             continue;
         };
         if seen.get(name) != Some(&index) {
+            if let Some(old) = seen.remove(name) {
+                HashMap::<_, u32, u8>::try_from(
+                    ebpf.map_mut("HA_IFACES").context("HA interface map")?,
+                )?
+                .remove(&old)?;
+            }
             attach_guard(name)?;
             HashMap::<_, u32, u8>::try_from(
                 ebpf.map_mut("HA_IFACES").context("HA interface map")?,
@@ -399,11 +546,26 @@ pub async fn monitor(firewall: Arc<Mutex<Firewall>>, shared: Shared, config: HaC
         let ready = state.is_ready(&config, policy, now);
         let active = state.forwarding_allowed(&config, policy, links_ready, now);
         let deadline = if active { state.role.deadline_ns } else { 0 };
+        if active != (state.active_term > 0) {
+            log::debug!(
+                "HA forwarding transition: active={active} ready={ready} local_term={} retained={} authority={:?} claim={} vips={} agent_match={} policy_match={} lease_ms={} role_age_ms={}",
+                state.ready_term,
+                state.retained_owner,
+                state.role.authority,
+                state.role.claimed_ready_term,
+                state.role.vips_ready,
+                state.role.claimed_agent_boot == state.agent_boot,
+                state.role.authority.policy == policy,
+                state.role.deadline_ns.saturating_sub(now) / 1_000_000,
+                now.saturating_sub(state.role.updated_ns) / 1_000_000
+            );
+        }
         if let Err(error) = fw.ha_deadline(deadline) {
             log::error!("HA kernel fence update failed: {error:#}");
             continue;
         }
         if active {
+            state.cold = false;
             state.active_term = state.role.authority.term;
             state.ready_term = state.active_term;
             state.ready_policy = policy;
@@ -412,7 +574,9 @@ pub async fn monitor(firewall: Arc<Mutex<Firewall>>, shared: Shared, config: HaC
         } else {
             state.active_term = 0;
         }
-        let ready_term = if ready || active { state.ready_term } else { 0 };
+        // Keep the generation even when stale: reporting zero would falsely
+        // authorize the witness to discard warm state as a two-node cold boot.
+        let ready_term = state.ready_term;
         let agent = Agent {
             cluster: config.cluster.clone(),
             node: config.node,
@@ -421,7 +585,7 @@ pub async fn monitor(firewall: Arc<Mutex<Firewall>>, shared: Shared, config: HaC
             policy,
             ready_term,
             forwarding_term: state.active_term,
-            eligible: config.enabled && links_ready,
+            eligible: config.enabled && links_ready && (state.cold || ready || active),
             updated_ns: now,
         };
         if let Err(error) = write_agent(&agent) {
@@ -445,6 +609,25 @@ mod tests {
             cluster: "test-cluster-0123456789".into(),
             node: 1,
             interfaces: vec!["wan".into()],
+        }
+    }
+    #[test]
+    fn guard_scope_cleanup_requires_reserved_coordinates_and_verified_kernel_owner() {
+        use serde_json::json;
+        let owned = [17].into_iter().collect();
+        let filter = json!({"kind":"bpf","pref":1,"options":{"handle":"0x1","id":17}});
+        assert!(obsolete_guard_ids(std::slice::from_ref(&filter), &owned));
+        for different in [
+            json!({"kind":"bpf","pref":2,"options":{"handle":"0x1","id":17}}),
+            json!({"kind":"bpf","pref":1,"options":{"handle":"0x2","id":17}}),
+            json!({"kind":"bpf","pref":1,"options":{"handle":"0x1","id":18}}),
+            json!({"kind":"bpf","pref":1}),
+            json!({"kind":"flower","pref":1,"options":{"handle":"0x1","id":17}}),
+        ] {
+            assert!(
+                !obsolete_guard_ids(&[different], &owned),
+                "unrelated filters must survive HA scope changes"
+            );
         }
     }
     #[tokio::test]
@@ -484,6 +667,12 @@ mod tests {
         state.ready_at = now;
         assert!(state.forwarding_allowed(&cfg, [8; 32], true, now));
         state.begin_install();
+        state.role.claimed_ready_term = 0;
+        assert!(
+            !state.forwarding_allowed(&cfg, [8; 32], true, now),
+            "a partial snapshot cannot accept a cold grant"
+        );
+        state.role.claimed_ready_term = 4;
         assert!(!state.forwarding_allowed(&cfg, [8; 32], true, now));
         assert_eq!(state.ready_term, 0);
         state.snapshot_ready(&Authority {
@@ -495,6 +684,76 @@ mod tests {
         assert!(state.forwarding_allowed(&cfg, [8; 32], true, now));
         state.ready_at = now.saturating_sub(2_000_000_000);
         assert!(!state.forwarding_allowed(&cfg, [8; 32], true, now));
+    }
+    #[tokio::test]
+    async fn retained_owner_can_accept_its_explicit_successor_grant_after_long_witness_outage() {
+        let cfg = config();
+        let shared = State::new(Some(cfg.clone())).unwrap();
+        let mut state = shared.lock().await;
+        let now = now_ns() + 3_000_000_000;
+        state.ready_term = 4;
+        state.retained_owner = 4;
+        state.ready_policy = [3; 32];
+        state.role = Role {
+            authority: Authority {
+                term: 5,
+                owner: 1,
+                boot: [7; 16],
+                policy: [3; 32],
+            },
+            coordinator_boot: [7; 16],
+            claimed_ready_term: 4,
+            claimed_agent_boot: state.agent_boot,
+            vips_ready: true,
+            deadline_ns: now + 100_000_000,
+            ..Role::default()
+        };
+        assert!(
+            state.forwarding_allowed(&cfg, [3; 32], true, now),
+            "a witness grant based on this exact retained baseline must reopen the owner"
+        );
+        state.role.claimed_ready_term = 3;
+        assert!(
+            !state.forwarding_allowed(&cfg, [3; 32], true, now),
+            "a different baseline is not authorized"
+        );
+        state.role.claimed_ready_term = 4;
+        state.role.claimed_agent_boot = [0; 16];
+        assert!(
+            !state.forwarding_allowed(&cfg, [3; 32], true, now),
+            "retained state cannot cross agent incarnations"
+        );
+        state.role.claimed_agent_boot = state.agent_boot;
+        state.role.authority.owner = 2;
+        assert!(
+            !state.is_ready(&cfg, [3; 32], now),
+            "a known successor invalidates indefinite local retention"
+        );
+    }
+    #[tokio::test]
+    async fn expired_snapshot_is_never_a_cold_vote() {
+        let shared = State::new(Some(config())).unwrap();
+        let mut state = shared.lock().await;
+        assert!(state.cold);
+        state.snapshot_ready(&Authority {
+            term: 7,
+            owner: 2,
+            policy: [3; 32],
+            boot: [2; 16],
+        });
+        let later = now_ns() + 2_000_000_000;
+        assert!(!state.is_ready(&config(), [3; 32], later));
+        assert!(!state.cold);
+        assert_eq!(
+            state.ready_term, 7,
+            "retain evidence that the maps are not empty"
+        );
+        state.begin_install();
+        assert!(
+            !state.cold,
+            "failed installation must await a full snapshot"
+        );
+        assert_eq!(state.ready_term, 0);
     }
     #[tokio::test]
     async fn receiver_rejects_stale_authority_and_active_node_imports() {

@@ -341,6 +341,7 @@ async fn run(args: RunArgs) -> Result<()> {
         &initial,
         args.egress,
     )?));
+    let _ha_lifetime = ha::register_agent(initial.ha.is_some())?;
     for (iface, mode) in &firewall.lock().await.attached {
         info!("attached to {iface} in {mode:?} mode");
     }

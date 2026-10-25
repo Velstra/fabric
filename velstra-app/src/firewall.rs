@@ -265,6 +265,12 @@ impl Firewall {
                 .with_context(|| format!("verifying {name}"))?;
             println!("verified {name}");
         }
+        let exit: &mut aya::programs::RawTracePoint = ebpf
+            .program_mut("velstra_ha_exit")
+            .ok_or_else(|| anyhow!("missing velstra_ha_exit"))?
+            .try_into()?;
+        exit.load().context("verifying velstra_ha_exit")?;
+        println!("verified velstra_ha_exit");
         Ok(())
     }
 
@@ -293,6 +299,7 @@ impl Firewall {
         let mut loader = aya::EbpfLoader::new();
         if cfg.ha.is_some() {
             loader.map_pin_path("HA_DEADLINE", std::path::Path::new(crate::ha::DEADLINE_PIN));
+            loader.map_pin_path("HA_OWNER", std::path::Path::new(crate::ha::OWNER_PIN));
         }
         let mut ebpf = loader
             .load(&object)

@@ -53,12 +53,13 @@ use aya_ebpf::{
         BPF_FIB_LKUP_RET_SUCCESS, TC_ACT_OK, TC_ACT_SHOT, bpf_fib_lookup, xdp_action,
     },
     helpers::{
-        bpf_fib_lookup as fib_lookup, bpf_ktime_get_boot_ns, bpf_ktime_get_ns, bpf_skb_change_tail,
-        bpf_skb_load_bytes, bpf_skb_store_bytes, bpf_xdp_adjust_head, bpf_xdp_adjust_tail,
+        bpf_fib_lookup as fib_lookup, bpf_get_current_pid_tgid, bpf_ktime_get_boot_ns,
+        bpf_ktime_get_ns, bpf_skb_change_tail, bpf_skb_load_bytes, bpf_skb_store_bytes,
+        bpf_xdp_adjust_head, bpf_xdp_adjust_tail,
     },
-    macros::{classifier, map, xdp},
+    macros::{classifier, map, raw_tracepoint, xdp},
     maps::{Array, DevMap, HashMap, LpmTrie, LruHashMap, PerCpuArray, ProgramArray, lpm_trie::Key},
-    programs::{TcContext, XdpContext},
+    programs::{RawTracePointContext, TcContext, XdpContext},
 };
 mod conntrack;
 mod epoch;
@@ -105,6 +106,8 @@ use velstra_common::{
 #[map]
 static HA_DEADLINE: Array<u64> = Array::with_max_entries(1, 0);
 #[map]
+static HA_OWNER: Array<u32> = Array::with_max_entries(1, 0);
+#[map]
 static HA_IFACES: HashMap<u32, u8> = HashMap::with_max_entries(1024, 0);
 #[map]
 static HA_WG_PORTS: HashMap<u16, u8> = HashMap::with_max_entries(1024, 0);
@@ -117,6 +120,9 @@ fn ha_permits(ifindex: u32) -> bool {
 }
 #[inline(always)]
 fn ha_lease_valid() -> bool {
+    if !HA_OWNER.get(0).is_some_and(|owner| *owner != 0) {
+        return false;
+    }
     HA_DEADLINE
         .get(0)
         .is_some_and(|deadline| unsafe { bpf_ktime_get_boot_ns() } < *deadline)
@@ -129,6 +135,21 @@ fn ha_redirect(target: u32) -> u32 {
         return xdp_action::XDP_DROP;
     }
     TX_PORTS.redirect(target, 0).unwrap_or(xdp_action::XDP_DROP)
+}
+/// sched_process_exit precedes exit_files, so revoke liveness before the
+/// agent's last file-table reference can detach its ordinary NAT/TCX hooks.
+/// The separate owner word cannot be reopened by a racing userspace heartbeat.
+#[raw_tracepoint(tracepoint = "sched_process_exit")]
+pub fn velstra_ha_exit(_ctx: RawTracePointContext) -> u32 {
+    let tid = bpf_get_current_pid_tgid() as u32;
+    if let Some(owner) = HA_OWNER.get_ptr_mut(0) {
+        unsafe {
+            if *owner != 0 && *owner == tid {
+                *owner = 0;
+            }
+        }
+    }
+    0
 }
 /// Netlink-attached ingress AND egress fallback. Its kernel attachment and map
 /// pins survive agent exit, including orderly shutdown of the ordinary hooks.
