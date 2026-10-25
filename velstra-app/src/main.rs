@@ -525,12 +525,18 @@ async fn run(args: RunArgs) -> Result<()> {
                     cts.peers.len()
                 );
                 if cts.secret.is_some() {
-                    tokio::spawn(conntrack_sync::secure::run(
-                        firewall.clone(),
-                        conntrack,
-                        fw_flows,
-                        cts,
-                    ));
+                    match firewall.lock().await.syn_flows_handle() {
+                        Ok(synproxy) => {
+                            tokio::spawn(conntrack_sync::secure::run(
+                                firewall.clone(),
+                                conntrack,
+                                fw_flows,
+                                synproxy,
+                                cts,
+                            ));
+                        }
+                        Err(error) => warn!("could not start authenticated state sync: {error:#}"),
+                    }
                 } else {
                     tokio::spawn(conntrack_sync::run(
                         conntrack,

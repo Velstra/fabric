@@ -3,7 +3,7 @@
 //! every bounded frame. This provides authenticity, not confidentiality: use a
 //! dedicated HA link or WireGuard when flow metadata must be encrypted.
 //!
-//! One producer reads both LRU maps in kernel batches. Each peer gets an initial
+//! One producer reads all three LRU maps in kernel batches. Each peer gets an initial
 //! snapshot followed by changes and deletions. Imported entries are not echoed;
 //! once a local packet changes one, the local dataplane owns it. All application
 //! is fenced by the firewall's configuration lock and policy fingerprint.
@@ -36,17 +36,19 @@ use tokio::{
     sync::{Mutex, Semaphore, watch},
     time::timeout,
 };
-use velstra_common::{FirewallKey, FirewallState, FlowKey, FlowState};
+use velstra_common::{FirewallKey, FirewallState, FlowKey, FlowState, SynFlow};
 use velstra_config::{ResolvedConntrackSync, RuntimeConfig};
 
 use super::{
-    Datagram, decode_datagram, encode_firewall_batch, encode_key, encode_nat_batch, monotonic_ns,
+    Datagram, decode_datagram, decode_key, encode_firewall_batch, encode_key, encode_nat_batch,
+    monotonic_ns,
 };
 use crate::firewall::Firewall;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_FRAME: usize = 32_768;
-const MAX_ENTRIES: usize = 131_072;
+// Each of CONNTRACK, FW_FLOWS and SYN_FLOWS has at most 65,536 entries.
+const MAX_ENTRIES: usize = 196_608;
 const BEGIN: u8 = 0;
 const UPSERT: u8 = 1;
 const DELETE: u8 = 2;
@@ -60,6 +62,7 @@ type NatMap = Arc<Mutex<HashMap<MapData, FlowKey, FlowState>>>;
 enum Record {
     Nat(FlowKey, FlowState),
     Firewall(FirewallKey, FirewallState),
+    SynProxy(FlowKey, SynFlow),
 }
 
 impl Record {
@@ -67,6 +70,11 @@ impl Record {
         match self {
             Self::Nat(key, _) => {
                 let mut out = vec![3];
+                encode_key(&key, &mut out);
+                out
+            }
+            Self::SynProxy(key, _) => {
+                let mut out = vec![4];
                 encode_key(&key, &mut out);
                 out
             }
@@ -82,6 +90,17 @@ impl Record {
         // The parent codec intentionally excludes ages over seven days. Such
         // entries are omitted by the producer before calling this method.
         match self {
+            Self::SynProxy(key, state) => {
+                // Secure-stream-only record: legacy UDP never accepts SYN state.
+                let mut out = b"VSP1".to_vec();
+                encode_key(&key, &mut out);
+                out.extend_from_slice(&state.cookie.to_le_bytes());
+                out.extend_from_slice(&state.delta.to_le_bytes());
+                out.extend_from_slice(&state.client_isn.to_le_bytes());
+                out.extend_from_slice(&state.flags.to_le_bytes());
+                out.extend_from_slice(&[0; 2]);
+                out
+            }
             Self::Nat(key, mut state) => {
                 state.age_ns = state.idle_ns(now).min(604_800_000_000_000);
                 state.last_seen_ns = 0;
@@ -95,6 +114,29 @@ impl Record {
         }
     }
     fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.starts_with(b"VSP1") {
+            ensure!(bytes.len() == 40, "invalid SYN-proxy record length");
+            let key = decode_key(&bytes[4..24]);
+            let state = SynFlow {
+                cookie: u32::from_le_bytes(bytes[24..28].try_into()?),
+                delta: u32::from_le_bytes(bytes[28..32].try_into()?),
+                client_isn: u32::from_le_bytes(bytes[32..36].try_into()?),
+                flags: u16::from_le_bytes(bytes[36..38].try_into()?),
+                _pad: 0,
+            };
+            ensure!(
+                key.policy == 0
+                    && key.dst_ip == [0; 4]
+                    && key.proto == 6
+                    && key.src_port != 0
+                    && key.dst_port != 0
+                    && bytes[21..24] == [0; 3]
+                    && bytes[38..40] == [0; 2]
+                    && (state.flags == SynFlow::SPLICED || (state.flags == 0 && state.delta == 0)),
+                "invalid SYN-proxy state"
+            );
+            return Ok(Self::SynProxy(key, state));
+        }
         match decode_datagram(bytes) {
             Some(Datagram::Nat(mut entries)) if entries.len() == 1 => {
                 let (key, value) = entries.remove(0);
@@ -109,6 +151,7 @@ impl Record {
     }
     fn received(self, now: u64) -> Self {
         match self {
+            Self::SynProxy(_, _) => self,
             Self::Nat(key, state) => Self::Nat(
                 key,
                 FlowState {
@@ -139,6 +182,7 @@ struct Imported {
 struct Store {
     nat: NatMap,
     firewall: HashMap<MapData, FirewallKey, FirewallState>,
+    synproxy: HashMap<MapData, FlowKey, SynFlow>,
     imported: BTreeMap<Key, Imported>,
     policy: Option<[u8; 32]>,
 }
@@ -167,6 +211,10 @@ impl Store {
                 entries.insert(record.key(), record);
             }
         }
+        for (key, state) in batch_read(&self.synproxy)? {
+            let record = Record::SynProxy(key, state);
+            entries.insert(record.key(), record);
+        }
         self.imported
             .retain(|key, imported| entries.get(key) == Some(&imported.record));
         entries.retain(|key, _| !self.imported.contains_key(key));
@@ -176,6 +224,11 @@ impl Store {
         let key = record.key();
         let mut nat = self.nat.lock().await;
         let local = match record {
+            Record::SynProxy(k, _) => self
+                .synproxy
+                .get(&k, 0)
+                .ok()
+                .map(|v| Record::SynProxy(k, v)),
             Record::Nat(k, _) => nat.get(&k, 0).ok().map(|v| Record::Nat(k, v)),
             Record::Firewall(k, _) => self
                 .firewall
@@ -195,6 +248,7 @@ impl Store {
         if kind == DELETE {
             if ours {
                 match record {
+                    Record::SynProxy(k, _) => self.synproxy.remove(&k)?,
                     Record::Nat(k, _) => nat.remove(&k)?,
                     Record::Firewall(k, _) => self.firewall.remove(&k)?,
                 }
@@ -207,6 +261,7 @@ impl Store {
             );
             let record = record.received(monotonic_ns());
             match record {
+                Record::SynProxy(k, v) => self.synproxy.insert(k, v, 0)?,
                 Record::Nat(k, v) => nat.insert(k, v, 0)?,
                 Record::Firewall(k, v) => self.firewall.insert(k, v, 0)?,
             }
@@ -600,6 +655,7 @@ pub async fn run(
     firewall: Arc<Mutex<Firewall>>,
     nat: NatMap,
     flows: HashMap<MapData, FirewallKey, FirewallState>,
+    synproxy: HashMap<MapData, FlowKey, SynFlow>,
     config: ResolvedConntrackSync,
 ) {
     let secret = Arc::new(
@@ -611,6 +667,7 @@ pub async fn run(
     let store = Arc::new(Mutex::new(Store {
         nat,
         firewall: flows,
+        synproxy,
         imported: BTreeMap::new(),
         policy: None,
     }));
@@ -752,7 +809,7 @@ pub(crate) fn policy_fingerprint(cfg: &RuntimeConfig) -> [u8; 32] {
             ])
         })
         .collect();
-    let bytes = json!({"version":2,"policies":policies,"interfaces":interfaces,"forwards":forwards,"services":services,
+    let bytes = json!({"version":3,"policies":policies,"interfaces":interfaces,"forwards":forwards,"services":services,
         "timeouts":[cfg.conntrack.tcp_syn,cfg.conntrack.tcp_established,cfg.conntrack.tcp_closing,cfg.conntrack.udp,cfg.conntrack.udp_stream,cfg.conntrack.icmp],
         "synproxy":cfg.synproxy.iter().map(|s|(s.port,s.mss)).collect::<Vec<_>>(),"fail_closed":cfg.fail_closed}).to_string();
     digest::digest(&digest::SHA256, bytes.as_bytes())
@@ -803,6 +860,7 @@ mod tests {
         Store {
             nat: Arc::new(Mutex::new(kernel_map())),
             firewall: kernel_map(),
+            synproxy: kernel_map(),
             imported: BTreeMap::new(),
             policy: None,
         }
@@ -901,6 +959,105 @@ mod tests {
         let empty = kernel_store();
         assert!(batch_read(&*empty.nat.lock().await).unwrap().is_empty());
     }
+    fn syn_record() -> Record {
+        let key = FlowKey::new(0, [10, 2, 0, 10], [0; 4], 12345, 8443, 6);
+        let mut state = SynFlow::pending(u32::MAX - 3, 42);
+        state.splice(9); // The sequence adjustment wraps around u32.
+        Record::SynProxy(key, state)
+    }
+
+    #[test]
+    fn synproxy_wire_preserves_splice_and_rejects_malformed_state() {
+        let record = syn_record();
+        let wire = record.encode(0);
+        assert_eq!(Record::decode(&wire).unwrap(), record);
+        assert_eq!(unpack(&pack(&[record], 0)).unwrap(), vec![record]);
+        assert!(
+            decode_datagram(&wire).is_none(),
+            "legacy UDP must not import SYN state"
+        );
+        for length in 0..wire.len() {
+            assert!(Record::decode(&wire[..length]).is_err());
+        }
+        let mut extra = wire.clone();
+        extra.push(0);
+        assert!(Record::decode(&extra).is_err());
+        for (index, value) in [
+            (4, 1),
+            (12, 1),
+            (16, 0),
+            (20, 17),
+            (21, 1),
+            (36, 2),
+            (38, 1),
+        ] {
+            let mut invalid = wire.clone();
+            invalid[index] = value;
+            if index == 16 {
+                invalid[17] = 0;
+            }
+            assert!(
+                Record::decode(&invalid).is_err(),
+                "accepted invalid field at {index}"
+            );
+        }
+        let Record::SynProxy(key, _) = record else {
+            unreachable!()
+        };
+        let pending = Record::SynProxy(key, SynFlow::pending(123, 456));
+        assert_eq!(Record::decode(&pending.encode(0)).unwrap(), pending);
+        let mut invalid = wire;
+        invalid[36..38].copy_from_slice(&0u16.to_le_bytes());
+        assert!(
+            Record::decode(&invalid).is_err(),
+            "pending state cannot carry a splice delta"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CAP_BPF/CAP_SYS_ADMIN; runs in the HA kernel VM"]
+    async fn kernel_synproxy_snapshot_splice_deletion_and_local_ownership() {
+        let mut source = kernel_store();
+        let mut target = kernel_store();
+        let peer = "192.0.2.1".parse().unwrap();
+        let Record::SynProxy(key, spliced) = syn_record() else {
+            unreachable!()
+        };
+        let pending = SynFlow::pending(spliced.cookie, spliced.client_isn);
+        source.synproxy.insert(key, pending, 0).unwrap();
+        for state in [pending, spliced] {
+            source.synproxy.insert(key, state, 0).unwrap();
+            let snapshot = source.snapshot([1; 32]).await.unwrap();
+            assert_eq!(snapshot.entries.len(), 1);
+            let record = snapshot.entries.values().copied().next().unwrap();
+            target
+                .apply(peer, UPSERT, Record::decode(&record.encode(0)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(target.synproxy.get(&key, 0).unwrap(), state);
+            assert!(
+                target.snapshot([1; 32]).await.unwrap().entries.is_empty(),
+                "import echoed"
+            );
+        }
+        // An independently completed local splice must survive a queued update
+        // or deletion from the peer. Reconciliation keeps the same map FD.
+        let mut local = spliced;
+        local.splice(200);
+        target.synproxy.insert(key, local, 0).unwrap();
+        target
+            .apply(peer, UPSERT, Record::SynProxy(key, pending))
+            .await
+            .unwrap();
+        target.finish_snapshot(peer, &HashSet::new()).await.unwrap();
+        assert_eq!(target.synproxy.get(&key, 0).unwrap(), local);
+        assert_eq!(target.snapshot([1; 32]).await.unwrap().entries.len(), 1);
+        let mut target = kernel_store();
+        target.apply(peer, UPSERT, syn_record()).await.unwrap();
+        target.finish_snapshot(peer, &HashSet::new()).await.unwrap();
+        assert!(target.synproxy.get(&key, 0).is_err());
+    }
+
     fn session() -> Session {
         Session {
             key: hmac::Key::new(hmac::HMAC_SHA256, b"test-only session key"),
@@ -917,11 +1074,13 @@ mod tests {
                 .unwrap();
         let nat = fw.conntrack_handle().unwrap();
         let flows = fw.fw_flows_handle().unwrap();
+        let synproxy = fw.syn_flows_handle().unwrap();
         let policy = fw.sync_policy().unwrap();
         let fw = Arc::new(Mutex::new(fw));
         let store = Arc::new(Mutex::new(Store {
             nat: nat.clone(),
             firewall: flows,
+            synproxy,
             imported: BTreeMap::new(),
             policy: None,
         }));
@@ -961,9 +1120,13 @@ mod tests {
             bytes: 10000,
         };
         let record = Record::Nat(key, state);
+        let splice = syn_record();
+        let Record::SynProxy(syn_key, syn_state) = splice else {
+            unreachable!()
+        };
         let (snapshots, watcher) = watch::channel(Some(Arc::new(Snapshot {
             policy,
-            entries: BTreeMap::from([(record.key(), record)]),
+            entries: BTreeMap::from([(record.key(), record), (splice.key(), splice)]),
         })));
         let sender = tokio::spawn(push(
             TcpStream::connect(address).await.unwrap(),
@@ -982,6 +1145,17 @@ mod tests {
             [192, 0, 2, 100]
         );
         assert_eq!(nat.lock().await.get(&key, 0).unwrap().packets, 0);
+        timeout(IO_TIMEOUT, async {
+            while store.lock().await.synproxy.get(&syn_key, 0).is_err() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            store.lock().await.synproxy.get(&syn_key, 0).unwrap(),
+            syn_state
+        );
         snapshots.send_replace(Some(Arc::new(Snapshot {
             policy,
             entries: Entries::new(),
@@ -993,12 +1167,19 @@ mod tests {
         })
         .await
         .unwrap();
+        timeout(IO_TIMEOUT, async {
+            while store.lock().await.synproxy.get(&syn_key, 0).is_ok() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
         let mut changed = initial.clone();
         changed.policies[0].global.flags ^= velstra_common::ConfigFlags::STATEFUL;
         fw.lock().await.reconfigure(&changed).unwrap();
         snapshots.send_replace(Some(Arc::new(Snapshot {
             policy,
-            entries: BTreeMap::from([(record.key(), record)]),
+            entries: BTreeMap::from([(record.key(), record), (splice.key(), splice)]),
         })));
         let error = timeout(IO_TIMEOUT, receiver)
             .await
@@ -1007,6 +1188,7 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("policy differs"), "{error:#}");
         assert!(nat.lock().await.get(&key, 0).is_err());
+        assert!(store.lock().await.synproxy.get(&syn_key, 0).is_err());
         sender.abort();
     }
     #[test]

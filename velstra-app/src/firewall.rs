@@ -1871,6 +1871,15 @@ impl Firewall {
         let duplicate = MapData::from_fd(data.fd().as_fd().try_clone_to_owned()?)?;
         HashMap::try_from(aya::maps::Map::LruHashMap(duplicate)).context("FW_FLOWS as a HashMap")
     }
+    /// Keep the sequence-number splice alive on a standby without moving the
+    /// map out of the firewall: configuration reconciliation must still clear it.
+    pub fn syn_flows_handle(&self) -> Result<HashMap<MapData, FlowKey, SynFlow>> {
+        let Some(aya::maps::Map::LruHashMap(data)) = self.ebpf.map("SYN_FLOWS") else {
+            bail!("SYN_FLOWS LRU map missing");
+        };
+        let duplicate = MapData::from_fd(data.fd().as_fd().try_clone_to_owned()?)?;
+        HashMap::try_from(aya::maps::Map::LruHashMap(duplicate)).context("SYN_FLOWS as a HashMap")
+    }
 }
 
 /// Raise the locked-memory rlimit so map allocation succeeds on older kernels

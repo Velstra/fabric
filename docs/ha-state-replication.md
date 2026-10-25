@@ -17,8 +17,8 @@ WireGuard or a private HA network for confidentiality. Without `secret`, existin
 configurations retain the original unauthenticated UDP protocol and second-based
 `interval_secs`. Do not expose that listener to an untrusted network.
 
-The producer uses `BPF_MAP_LOOKUP_BATCH` on the NAT and dual-stack firewall LRU
-maps. A new TCP connection sends a full snapshot; subsequent frames carry changed
+The producer uses `BPF_MAP_LOOKUP_BATCH` on the NAT, dual-stack firewall and SYN-proxy
+LRU maps. A new replication connection sends a full snapshot; subsequent frames carry changed
 records and deletions. Interrupted streams reconnect with a fresh session and
 snapshot. Relative idle ages cross the wire; a peer's monotonic clock and traffic
 counters never replace local clock values or accounting. Locally advanced state
@@ -42,3 +42,14 @@ The Sentinel `ha-kernel` NixOS check exercises actual LRU maps, authenticated TC
 deltas, deletion, local ownership and rejection of obsolete policy state. The
 `ha-failover` check uses four VMs and an established TCP socket through shared
 SNAT while terminating the active VM without a graceful VRRP withdrawal.
+
+The authenticated transport also replicates `SYN_FLOWS`: admitted pending
+handshakes and completed sequence-number splices, including wrapping deltas.
+The legacy UDP protocol does not import these records. The policy fingerprint
+format is version 3; both members must run a compatible build. Local SYN-cookie
+secrets stay local: an already admitted flow carries its cookie and splice, but
+an unacknowledged cookie minted before failure can require a fresh handshake.
+The `ha-synproxy-failover` VM check keeps one real proxied TCP socket alive
+through an ungraceful master crash; successful traffic after the crash verifies
+sequence and checksum translation in both directions. This does not qualify
+cold-start readiness, partition fencing or failback authority handover.
