@@ -253,14 +253,20 @@ impl Store {
         self.generation(policy);
         let nat = self.nat.lock().await;
         let mut entries = Entries::new();
+        // Kernel writers continue while LOOKUP_BATCH copies the map. Sample
+        // time after each dump: a timestamp refreshed during the syscall must
+        // not look like a foreign-clock entry and become a false tombstone.
+        let nat_entries = batch_read(&*nat)?;
         let now = monotonic_ns();
-        for (key, state) in batch_read(&*nat)? {
+        for (key, state) in nat_entries {
             if state.idle_ns(now) <= 604_800_000_000_000 {
                 let record = Record::Nat(key, state);
                 entries.insert(record.key(), record);
             }
         }
-        for (key, state) in batch_read(&self.firewall)? {
+        let firewall_entries = batch_read(&self.firewall)?;
+        let now = monotonic_ns();
+        for (key, state) in firewall_entries {
             if self.local_firewall(&key) {
                 continue;
             }
@@ -1451,6 +1457,84 @@ mod tests {
         assert!(store.nat.lock().await.get(&key, 0).is_err());
         assert!(store.firewall.get(&fw_key, 0).is_err());
         assert!(store.synproxy.get(&syn_key, 0).is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CAP_BPF/CAP_SYS_ADMIN; runs in the HA kernel VM"]
+    async fn kernel_snapshot_keeps_flows_refreshed_during_batch_dumps() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        fn duplicate<K: Pod, V: Pod>(map: &HashMap<MapData, K, V>) -> HashMap<MapData, K, V> {
+            let data =
+                MapData::from_fd(map.map().fd().as_fd().try_clone_to_owned().unwrap()).unwrap();
+            HashMap::try_from(aya::maps::Map::LruHashMap(data)).unwrap()
+        }
+        struct Writer(Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>);
+        impl Drop for Writer {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+                self.1.take().unwrap().join().unwrap();
+            }
+        }
+        let mut store = kernel_store();
+        let keys: Vec<_> = (1..=1025)
+            .map(|port| FlowKey::new(7, [10, 0, 0, 1], [198, 51, 100, 1], port, 443, 6))
+            .collect();
+        let mut nat = duplicate(&*store.nat.lock().await);
+        let mut firewall = duplicate(&store.firewall);
+        fn refresh(
+            nat: &mut HashMap<MapData, FlowKey, FlowState>,
+            firewall: &mut HashMap<MapData, FirewallKey, FirewallState>,
+            keys: &[FlowKey],
+        ) {
+            for key in keys {
+                nat.insert(
+                    key,
+                    FlowState {
+                        last_seen_ns: monotonic_ns(),
+                        age_ns: 0,
+                        nat_ip: [192, 0, 2, 100],
+                        nat2_ip: [0; 4],
+                        nat_port: 47000,
+                        nat2_port: 0,
+                        flags: 0,
+                        _pad: 0,
+                        packets: 1,
+                        bytes: 64,
+                    },
+                    0,
+                )
+                .unwrap();
+                firewall
+                    .insert(
+                        FirewallKey::ipv4(*key),
+                        FirewallState {
+                            last_seen_ns: monotonic_ns(),
+                            age_ns: 0,
+                            phase: FirewallState::ESTABLISHED,
+                            reply: 0,
+                        },
+                        0,
+                    )
+                    .unwrap();
+            }
+        }
+        refresh(&mut nat, &mut firewall, &keys);
+        let stop = Arc::new(AtomicBool::new(false));
+        let signal = stop.clone();
+        let writer = std::thread::spawn(move || {
+            while !signal.load(Ordering::Relaxed) {
+                refresh(&mut nat, &mut firewall, &keys);
+            }
+        });
+        let _writer = Writer(stop, Some(writer));
+        for _ in 0..32 {
+            let snapshot = store.snapshot([8; 32], true).await.unwrap();
+            assert_eq!(
+                snapshot.entries.len(),
+                2050,
+                "concurrently refreshed live entries must never become deletion tombstones"
+            );
+        }
     }
 
     #[tokio::test]
