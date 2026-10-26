@@ -17,7 +17,9 @@
 //! firewall-states   → complete active firewall-state table
 //! firewall-state-summary [limit] → active total and bounded state sample
 //! rule-stats [limit] → exact counters, total-rule count and ring overflows
-//! packet-events [limit] → drain a bounded packet-ring batch
+//! packet-events [limit] → events not yet returned to this (legacy) request
+//! packet-events-since <id> [limit] → events after a reader's cursor, as JSON
+//! packet-events-tail [limit] → the newest events; consumes nothing
 //! flows [limit]     → the live NAT flow table (0 = all; default 100)
 //! top [limit]       → hosts ranked by the traffic volume attributed to them
 //! cgnat <ip>        → the WAN port block an internal address holds
@@ -176,10 +178,16 @@ async fn respond(
                 }
             }
         }
-        "reconcile-links" => match firewall.lock().await.reconcile_links() {
-            Ok(()) => "ok\n".into(),
-            Err(e) => format!("error: reconciling packet hooks: {e:#}\n"),
-        },
+        "reconcile-links" => {
+            let mut fw = firewall.lock().await;
+            match fw
+                .reconcile_links()
+                .and_then(|()| fw.ensure_held_links_up())
+            {
+                Ok(()) => "ok\n".into(),
+                Err(e) => format!("error: reconciling packet hooks: {e:#}\n"),
+            }
+        }
         "status" => match firewall.lock().await.configuration_status() {
             Ok(status) => status,
             Err(error) => format!("error: reading configuration state: {error:#}\n"),
@@ -227,6 +235,25 @@ async fn respond(
                 Err(e) => format!("error: reading packet events: {e:#}\n"),
             }
         }
+        // Readers keep their own cursor; none of them consumes another's events.
+        "packet-events-since" => {
+            let Some(cursor) = args.first().and_then(|t| t.parse::<u64>().ok()) else {
+                return "usage: packet-events-since <id> [limit]\n".to_string();
+            };
+            let limit = parse_limit(args.get(1).copied()).unwrap_or(512);
+            match firewall.lock().await.packet_events_since(cursor, limit) {
+                Ok(page) => format!("{page}\n"),
+                Err(e) => format!("error: reading packet events: {e:#}\n"),
+            }
+        }
+        "packet-events-tail" => match firewall
+            .lock()
+            .await
+            .packet_events_tail(limit.unwrap_or(100))
+        {
+            Ok(rows) => rows.into_iter().map(|row| format!("{row}\n")).collect(),
+            Err(e) => format!("error: reading packet events: {e:#}\n"),
+        },
         "flows" | "top" => {
             let mut fw = firewall.lock().await;
             match fw.read_flows().await {

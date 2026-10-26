@@ -37,6 +37,7 @@ mod conntrack;
 mod forward;
 mod lb;
 mod mac;
+mod masquerade;
 mod npt;
 mod overlay;
 mod packet;
@@ -62,6 +63,7 @@ pub use lb::{
     plan_icmp_echo_nat, plan_nat, select_backend, session_hash,
 };
 pub use mac::{MacError, parse_mac};
+pub use masquerade::{UNADDRESSED, unaddressed_uplink_drops};
 pub use npt::{Npt66, npt66_rewrite, oc_add};
 pub use overlay::{
     ARP_REPLY, ARP_REQUEST, ArpEntry, ArpKey, ArpReply, ETHERTYPE_ARP, Encap, FloodSet,

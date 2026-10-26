@@ -448,6 +448,8 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
                 snat_address: i.snat_address.clone(),
                 cgnat_base_port: i.cgnat_base_port as u16,
                 cgnat_block_size: i.cgnat_block_size as u16,
+                // Not carried: nothing holds a controller's ports down.
+                activate: false,
             })
             .collect(),
         routes: cfg
@@ -956,6 +958,7 @@ mod every_field_survives {
             snat_address: Some("203.0.113.99".into()),
             cgnat_base_port: 20000,
             cgnat_block_size: 512,
+            activate: false,
         }
     }
 
@@ -986,6 +989,9 @@ mod every_field_survives {
             snat_address,
             cgnat_base_port,
             cgnat_block_size,
+            // A file-mode setting (an appliance's held links); a controller's
+            // ports are created by whoever plugs a guest in, nothing holds them.
+            activate: _,
         } = after;
         assert_eq!(*name, before.name, "name");
         assert_eq!(*policy, before.policy, "policy");

@@ -97,8 +97,8 @@ use velstra_common::{
     is_ipv6_ext, is_overlay_dport, lpm_key_addr, make_cookie, plan_arp_reply, plan_forward,
     plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_server_ack, plan_server_syn,
     plan_srv6_irb, plan_syn_ack, plan_tcp_rst, select_backend, session_hash, tcp_flags,
-    translate_to_client, translate_to_server, v6_source_is_v4_mapped, write_encap,
-    write_srv6_encap,
+    translate_to_client, translate_to_server, unaddressed_uplink_drops, v6_source_is_v4_mapped,
+    write_encap, write_srv6_encap,
 };
 
 /// Absolute CLOCK_BOOTTIME deadline, shared with the persistent TC guard. Zero
@@ -1862,6 +1862,14 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
     // must leave even though the WAN zone's ingress posture is deny-by-default,
     // so the egress firewall's drop logic must not apply here.
     let nat_ip = unsafe { MASQUERADE.get(&ifindex) }.copied();
+    // A masquerade uplink without an address keeps its entry, unaddressed, so
+    // that nothing leaves it un-translated: only the box's own DHCP client
+    // (source 0.0.0.0) may still go out, to get the address back. See
+    // `velstra_common::UNADDRESSED`.
+    if unaddressed_uplink_drops(nat_ip, src_addr) {
+        bump(Counter::EgressDropped);
+        return Ok(TC_ACT_SHOT as i32);
+    }
 
     let policy_id = unsafe { IFACE_POLICY.get(&ifindex) }.copied().unwrap_or(0);
     let cfg = unsafe { CONFIG.get(&policy_id) }

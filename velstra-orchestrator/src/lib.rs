@@ -1870,6 +1870,9 @@ impl Topology {
                     // masquerade, so no CGNAT port blocks under it either.
                     cgnat_base_port: 0,
                     cgnat_block_size: 0,
+                    // Created by the hypervisor when a guest is plugged in;
+                    // nothing holds a tenant tap down for the agent.
+                    activate: false,
                 });
             } else if local_vnis.contains(&port.vni) {
                 // Skip a remote port whose host is absent (corrupted/partial
