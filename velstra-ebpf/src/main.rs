@@ -294,6 +294,12 @@ static PORT_FORWARDS: HashMap<ScopedPortKey, PortFwd> = HashMap::with_max_entrie
 #[map]
 static MASQUERADE: HashMap<u32, [u8; 4]> = HashMap::with_max_entries(64, 0);
 
+/// Egress ifindex + an address configured on that interface. A local control
+/// socket must retain its own source even when SNAT selects a different VIP.
+/// `skb.ingress_ifindex` is not a reliable local-origin discriminator at TC.
+#[map]
+static LOCAL_EGRESS_ADDRS: HashMap<[u8; 8], u8> = HashMap::with_max_entries(1024, 0);
+
 /// A source hardware address this policy has a verdict for (`mac-group`).
 ///
 /// Consulted once, from the Ethernet header, and folded into the decision the
@@ -2001,8 +2007,9 @@ fn napt_port(seed: u32, i: u16) -> u16 {
 /// path (shared map), and an `FW_FLOWS` entry lets that reply through the WAN
 /// zone's deny-by-default ingress posture. Only TCP/UDP over a 20-byte IPv4 header
 /// are masqueraded (the 5-tuple conntrack needs ports + constant L4 offsets);
-/// anything else, or a packet whose source is already `wan_ip` (host-originated),
-/// passes unchanged.
+/// anything else, or a packet sourced from this interface (except HA WireGuard sync),
+/// passes unchanged. In particular, routing-control TCP sessions must retain
+/// their configured source address when the shared SNAT VIP differs from it.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn masquerade_egress(
@@ -2024,7 +2031,23 @@ fn masquerade_egress(
     if (proto != ip_proto::TCP && proto != ip_proto::UDP) || ihl_bytes != Ipv4Hdr::LEN {
         return Ok(TC_ACT_OK as i32);
     }
-    if src_addr == wan_ip {
+    let index = egress_ifindex.to_ne_bytes();
+    let local_key = [
+        index[0],
+        index[1],
+        index[2],
+        index[3],
+        src_addr[0],
+        src_addr[1],
+        src_addr[2],
+        src_addr[3],
+    ];
+    let local_source = unsafe { LOCAL_EGRESS_ADDRS.get(&local_key) }.is_some();
+    let local_wg = local_source
+        && proto == ip_proto::UDP
+        && unsafe { HA_IFACES.get(&egress_ifindex) }.is_some()
+        && unsafe { HA_WG_PORTS.get(&src_port) }.is_some();
+    if src_addr == wan_ip || (local_source && !local_wg) {
         let key = ct_key4(
             FlowKey::new(policy_id, src_addr, dst_addr, src_port, dst_port, proto),
             ctx.data(),
@@ -2050,10 +2073,6 @@ fn masquerade_egress(
     // destination on the reply), but the entry additionally records that its NAT
     // target is the client that *originated* the connection — the only place that
     // fact exists, since the entry is keyed on the reply's addresses.
-    let local_wg = proto == ip_proto::UDP
-        && unsafe { (*ctx.skb.skb).ingress_ifindex } == 0
-        && unsafe { HA_IFACES.get(&egress_ifindex) }.is_some()
-        && unsafe { HA_WG_PORTS.get(&src_port) }.is_some();
     let reply_target = if local_wg { wan_ip } else { src_addr };
     let fwd = FlowState::masquerade(reply_target, src_port);
     let seed = napt_seed(src_addr, dst_addr, src_port, dst_port);
