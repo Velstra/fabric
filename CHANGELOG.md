@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Masquerade targets now follow DHCP acquisition, renewal and address withdrawal
+  during normal interface reconciliation, without a configuration resend or
+  conntrack reset. Explicit static SNAT and HA VIP targets retain precedence.
+
 ### Added
 
 - **Wren's forwarding table into `ROUTES`, FPM-style.** `--wren-routes` (with
