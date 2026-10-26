@@ -903,6 +903,14 @@ impl Firewall {
             }
         }
 
+        if !changed {
+            // DHCP can acquire, renew or withdraw an address without changing
+            // the interface name/index or desired configuration. Refresh only
+            // SNAT targets; do not quiesce policy or reset established flows.
+            if let Err(error) = program_masquerade(&mut self.ebpf, &self.applied.interfaces) {
+                warn!("refreshing live masquerade addresses failed: {error:#}");
+            }
+        }
         if changed {
             // Refresh every ifindex-keyed map, including the guest firewall
             // and BUM hooks. A controller need not resend an unchanged config
@@ -3299,37 +3307,35 @@ fn program_synproxy(ebpf: &mut Ebpf, ports: &[ResolvedSynProxy]) -> Result<()> {
     Ok(())
 }
 
-/// Write the Phase 4b `MASQUERADE` map: egress ifindex → that interface's public
-/// IPv4, for every interface marked `masquerade`. The live address is read from
-/// the OS here (the data plane can't), so a not-yet-addressed interface (DHCP not
-/// up, or absent) is skipped with a warning — a later reconfigure picks it up.
-fn program_masquerade(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Result<()> {
-    let prepared: Vec<(u32, [u8; 4])> = interfaces
+/// Resolve live masquerade targets. Explicit SNAT/HA VIP addresses always win
+/// over a member's DHCP address. Missing interfaces/addresses are retried by
+/// the normal two-second interface reconciliation loop.
+fn masquerade_targets(
+    interfaces: &[ResolvedInterface],
+    mut index: impl FnMut(&str) -> Result<u32>,
+    mut address: impl FnMut(&str) -> Result<[u8; 4]>,
+) -> BTreeMap<u32, [u8; 4]> {
+    interfaces
         .iter()
         .filter(|i| i.masquerade)
         .filter_map(|i| {
-            match (
-                if_nametoindex(&i.name),
-                i.snat_address
-                    .map(Ok)
-                    .unwrap_or_else(|| read_iface_ipv4(&i.name)),
-            ) {
-                (Ok(ifindex), Ok(ip)) => Some((ifindex, ip)),
-                _ => {
-                    warn!(
-                        "masquerade interface {} has no IPv4 yet; deferring its SNAT",
-                        i.name
-                    );
-                    None
-                }
-            }
+            let ifindex = index(&i.name).ok()?;
+            let ip = i.snat_address.or_else(|| address(&i.name).ok())?;
+            Some((ifindex, ip))
         })
-        .collect();
+        .collect()
+}
+
+/// Reconcile egress ifindex → public IPv4 without clearing conntrack. This is
+/// called on policy changes AND ordinary link polling: leases can arrive well
+/// after apply and can change while the desired configuration stays identical.
+fn program_masquerade(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Result<()> {
+    let prepared = masquerade_targets(interfaces, if_nametoindex, read_iface_ipv4);
     let mut map: HashMap<_, u32, [u8; 4]> = HashMap::try_from(
         ebpf.map_mut("MASQUERADE")
             .ok_or_else(|| anyhow!("MASQUERADE map missing"))?,
     )?;
-    let keep: HashSet<_> = prepared.iter().map(|(index, _)| *index).collect();
+    let keep: HashSet<_> = prepared.keys().copied().collect();
     drop_unlisted(&mut map, &keep)?;
     for (ifindex, ip) in prepared {
         if map.get(&ifindex, 0).ok() != Some(ip) {
@@ -4760,6 +4766,35 @@ fn is_drop_counter(counter: Counter) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn masquerade_follows_live_addresses_and_preserves_explicit_snat() {
+        let cfg = serde_json::from_value::<velstra_config::FileConfig>(serde_json::json!({
+            "interface": [
+                {"name":"wan0", "policy":0, "masquerade":true},
+                {"name":"wan1", "policy":0, "masquerade":true, "snat_address":"203.0.113.100"},
+                {"name":"lan0", "policy":0}
+            ]
+        }))
+        .unwrap()
+        .resolve()
+        .unwrap();
+        let indices = |name: &str| Ok(if name == "wan0" { 10 } else { 11 });
+        let absent = |_: &str| Err(anyhow!("no lease yet"));
+        assert_eq!(
+            masquerade_targets(&cfg.interfaces, indices, absent),
+            BTreeMap::from([(11, [203, 0, 113, 100])])
+        );
+        for ip in [[198, 51, 100, 2], [198, 51, 100, 9]] {
+            assert_eq!(
+                masquerade_targets(&cfg.interfaces, indices, |_| Ok(ip)),
+                BTreeMap::from([(10, ip), (11, [203, 0, 113, 100])])
+            );
+        }
+        assert!(
+            masquerade_targets(&cfg.interfaces, |_| Err(anyhow!("removed")), absent).is_empty()
+        );
+    }
 
     #[test]
     fn raw_ip_kernel_types_do_not_use_ethernet_classification() {
