@@ -606,6 +606,21 @@ pub async fn monitor(firewall: Arc<Mutex<Firewall>>, shared: Shared, config: HaC
         }
         let ready = state.is_ready(&config, policy, now);
         let active = state.forwarding_allowed(&config, policy, links_ready, now);
+        // A genuinely cold election has a complete empty baseline. Publish
+        // that fact before acknowledging forwarding: Wren may already have
+        // renewed the initial claim by the time its VPN task starts. Warm
+        // replicas instead retain the endpoint cache installed with their
+        // authenticated predecessor snapshot.
+        if active
+            && state.cold
+            && !config.wireguard.is_empty()
+            && let Err(error) = wireguard::publish(&state, &state.role.authority, Vec::new())
+        {
+            let _ = fw.ha_deadline(0);
+            state.active_term = 0;
+            log::warn!("HA cold VPN baseline publish failed: {error:#}");
+            continue;
+        }
         let deadline = if active { state.role.deadline_ns } else { 0 };
         if active != (state.active_term > 0) {
             log::debug!(
