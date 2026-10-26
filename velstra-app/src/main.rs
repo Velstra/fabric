@@ -355,7 +355,12 @@ async fn run(args: RunArgs) -> Result<()> {
             .is_empty()
             .then(|| args.config.clone())
             .flatten();
-        tokio::spawn(query::serve(path, firewall.clone(), source));
+        tokio::spawn(query::serve(
+            path,
+            firewall.clone(),
+            source,
+            ha_state.clone(),
+        ));
         // A run-time block carries a deadline; this is what makes the deadline
         // real rather than something only honoured when someone asks.
         tokio::spawn(query::expire_blocks_loop(firewall.clone()));

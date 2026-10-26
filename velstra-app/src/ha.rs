@@ -101,6 +101,26 @@ impl State {
             agent_boot: boot,
         })))
     }
+    /// Local forwarding authority and replica freshness, never inferred from
+    /// link presence. The active node cannot measure remote apply latency from
+    /// the one-way VCS2 feed; report that measurement as unknown, not zero.
+    pub fn telemetry(&self, now: u64) -> serde_json::Value {
+        let Some(config) = self.config.as_ref().filter(|config| config.enabled) else {
+            return serde_json::json!({"role":"standalone","sync_age_ms":null});
+        };
+        let fresh_role = fresh(self.role.updated_ns, now);
+        let master = fresh_role
+            && self.active_term > 0
+            && self.role.authority.owner == config.node
+            && self.role.deadline_ns > now;
+        serde_json::json!({"role":if master {"Master"} else if fresh_role {"Backup"} else {"Fenced"},
+            "node":config.node,"cluster":config.cluster,"term":self.role.authority.term,
+            "owner":self.role.authority.owner,"lease_remaining_ms":self.role.deadline_ns.saturating_sub(now)/1_000_000,
+            "vips_ready":self.role.vips_ready,"vpn_ready":self.role.vpn_ready,
+            "replica_ready":self.ready_term>0,
+            "sync_age_ms":if !master && self.ready_at>0 {Some(now.saturating_sub(self.ready_at)/1_000_000)}else{None},
+            "sync_age_scope":"local standby: time since the latest complete authenticated state update"})
+    }
     fn is_ready(&self, config: &HaConfig, policy: [u8; 32], now: u64) -> bool {
         self.ready_term > 0
             && self.ready_policy == policy
@@ -686,6 +706,26 @@ mod tests {
             node: 1,
             interfaces: vec!["wan".into()],
         }
+    }
+    #[tokio::test]
+    async fn telemetry_distinguishes_authority_freshness_and_unknown_remote_lag() {
+        let shared = State::new(Some(config())).unwrap();
+        let mut state = shared.lock().await;
+        let now = 5_000_000_000;
+        assert_eq!(state.telemetry(now)["role"], "Fenced");
+        state.role.updated_ns = now;
+        state.ready_at = now - 50_000_000;
+        state.ready_term = 7;
+        assert_eq!(state.telemetry(now)["role"], "Backup");
+        assert_eq!(state.telemetry(now)["sync_age_ms"], 50);
+        state.role.authority.owner = 1;
+        state.active_term = 7;
+        state.role.deadline_ns = now + 100_000_000;
+        assert_eq!(state.telemetry(now)["role"], "Master");
+        assert!(state.telemetry(now)["sync_age_ms"].is_null());
+        assert_eq!(state.telemetry(now + 200_000_000)["role"], "Fenced");
+        state.config = None;
+        assert_eq!(state.telemetry(now)["role"], "standalone");
     }
     #[test]
     fn guard_scope_cleanup_requires_reserved_coordinates_and_verified_kernel_owner() {

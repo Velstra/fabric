@@ -13,6 +13,11 @@
 //! ```text
 //! status            → readiness and the last configuration error
 //! stats             → the per-CPU counter table, summed
+//! ha-status         → actual forwarding authority and standby replica freshness
+//! firewall-states   → complete active firewall-state table
+//! firewall-state-summary [limit] → active total and bounded state sample
+//! rule-stats [limit] → exact counters, total-rule count and ring overflows
+//! packet-events [limit] → drain a bounded packet-ring batch
 //! flows [limit]     → the live NAT flow table (0 = all; default 100)
 //! top [limit]       → hosts ranked by the traffic volume attributed to them
 //! cgnat <ip>        → the WAN port block an internal address holds
@@ -78,7 +83,12 @@ pub async fn expire_blocks_loop(firewall: Arc<Mutex<Firewall>>) {
 /// A stale socket file from a previous run is removed first: the agent is
 /// restarted far more often than the path changes, and refusing to start because
 /// yesterday's socket file is still there would be a self-inflicted outage.
-pub async fn serve(path: PathBuf, firewall: Arc<Mutex<Firewall>>, config: Option<PathBuf>) {
+pub async fn serve(
+    path: PathBuf,
+    firewall: Arc<Mutex<Firewall>>,
+    config: Option<PathBuf>,
+    ha: crate::ha::Shared,
+) {
     if path.exists() {
         let _ = std::fs::remove_file(&path);
     }
@@ -99,7 +109,8 @@ pub async fn serve(path: PathBuf, firewall: Arc<Mutex<Firewall>>, config: Option
             Ok((stream, _)) => {
                 let fw = firewall.clone();
                 let source = config.clone();
-                tokio::spawn(async move { handle(stream, fw, source).await });
+                let ha = ha.clone();
+                tokio::spawn(async move { handle(stream, fw, source, ha).await });
             }
             Err(e) => {
                 warn!("query socket accept failed: {e}");
@@ -113,13 +124,22 @@ pub async fn serve(path: PathBuf, firewall: Arc<Mutex<Firewall>>, config: Option
 
 /// Answer one request. Errors are reported to the caller as text rather than
 /// logged and dropped — someone is waiting on this socket for an answer.
-async fn handle(stream: UnixStream, firewall: Arc<Mutex<Firewall>>, config: Option<PathBuf>) {
+async fn handle(
+    stream: UnixStream,
+    firewall: Arc<Mutex<Firewall>>,
+    config: Option<PathBuf>,
+    ha: crate::ha::Shared,
+) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     if reader.read_line(&mut line).await.is_err() {
         return;
     }
-    let reply = respond(line.trim(), &firewall, config.as_deref()).await;
+    let reply = if line.trim() == "ha-status" {
+        format!("{}\n", ha.lock().await.telemetry(crate::ha::now_ns()))
+    } else {
+        respond(line.trim(), &firewall, config.as_deref()).await
+    };
     let _ = reader.get_mut().write_all(reply.as_bytes()).await;
 }
 
@@ -178,11 +198,26 @@ async fn respond(
                 Err(e) => format!("error: reading firewall states: {e:#}\n"),
             }
         }
-        "rule-stats" => {
+        "firewall-state-summary" => {
             let fw = firewall.lock().await;
-            match fw.read_rule_counters() {
+            match fw.read_firewall_state_summary(limit.unwrap_or(200).clamp(1, 1000)) {
                 Ok(value) => format!("{value}\n"),
-                Err(e) => format!("error: reading rule counters: {e:#}\n"),
+                Err(error) => format!("error: reading firewall state summary: {error:#}\n"),
+            }
+        }
+        "rule-stats" => {
+            let snapshot = { firewall.lock().await.rule_counter_snapshot() };
+            match snapshot {
+                Ok(snapshot) => match tokio::task::spawn_blocking(move || {
+                    snapshot.read(limit.filter(|limit| *limit > 0).unwrap_or(usize::MAX))
+                })
+                .await
+                {
+                    Ok(Ok(value)) => format!("{value}\n"),
+                    Ok(Err(error)) => format!("error: reading rule counters: {error:#}\n"),
+                    Err(error) => format!("error: rule counter task failed: {error}\n"),
+                },
+                Err(error) => format!("error: opening rule counters: {error:#}\n"),
             }
         }
         "packet-events" => {
