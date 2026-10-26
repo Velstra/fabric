@@ -43,6 +43,46 @@ use velstra_config::{
     ResolvedSrv6LocalSid, ResolvedSrv6Route, ResolvedSynProxy, ResolvedTunnel, RuntimeConfig,
 };
 
+/// Duplicated diagnostic FDs and their policy names. Reading per-CPU maps can
+/// be expensive at capacity; do it off the async executor and outside the HA
+/// configuration mutex. The firewall retains ownership of the actual maps.
+pub struct RuleCounterSnapshot {
+    counters: aya::maps::PerCpuHashMap<
+        MapData,
+        velstra_common::RuleCounterKey,
+        velstra_common::RuleCounters,
+    >,
+    lost: aya::maps::PerCpuArray<MapData, u64>,
+    names: BTreeMap<(u32, u32), String>,
+}
+impl RuleCounterSnapshot {
+    pub fn read(&self, limit: usize) -> Result<serde_json::Value> {
+        let mut rows = Vec::new();
+        let mut total = 0;
+        for item in self.counters.iter() {
+            let (key, per_cpu) = item?;
+            total += 1;
+            if rows.len() >= limit {
+                continue;
+            }
+            let mut totals = velstra_common::RuleCounters::default();
+            for counter in per_cpu.iter() {
+                totals.packets = totals.packets.wrapping_add(counter.packets);
+                totals.bytes = totals.bytes.wrapping_add(counter.bytes);
+                totals.accepted = totals.accepted.wrapping_add(counter.accepted);
+                totals.dropped = totals.dropped.wrapping_add(counter.dropped);
+            }
+            rows.push(serde_json::json!({"policy":key.policy,"rule_id":key.rule_id,"rule":self.names.get(&(key.policy,key.rule_id)),
+                "packets":totals.packets,"bytes":totals.bytes,"accepted":totals.accepted,"dropped":totals.dropped}));
+        }
+        rows.sort_by_key(|row| (row["policy"].as_u64(), row["rule_id"].as_u64()));
+        let lost = self.lost.get(&0, 0)?.iter().copied().sum::<u64>();
+        Ok(
+            serde_json::json!({"rules":rows,"events_lost":lost,"total_rules":total,"sample_limit":limit}),
+        )
+    }
+}
+
 /// How to attach the XDP program to the interface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum AttachMode {
@@ -1703,15 +1743,28 @@ impl Firewall {
     /// Snapshot of live firewall state. Expired entries do not grant a reply
     /// permission and are not reported as active connections.
     pub fn read_firewall_states(&self) -> Result<serde_json::Value> {
+        Ok(self.read_firewall_state_summary(usize::MAX)?["states"].take())
+    }
+    /// The live API needs a total and a bounded sample, not 65k JSON objects
+    /// constructed under the HA configuration lock on every sample.
+    pub fn read_firewall_state_summary(&self, limit: usize) -> Result<serde_json::Value> {
         let map = HashMap::<_, FirewallKey, FirewallState>::try_from(
             self.ebpf
                 .map("FW_FLOWS")
                 .ok_or_else(|| anyhow!("FW_FLOWS map missing"))?,
         )?;
+        // Diagnostics share the short HA configuration lock. Read in kernel
+        // batches rather than doing two syscalls per entry while holding it.
+        let entries = crate::conntrack_sync::secure::batch_read(&map)?;
         let now = crate::conntrack_sync::monotonic_ns();
         let mut rows = Vec::new();
-        for (key, state) in map.iter().flatten() {
+        let mut total = 0;
+        for (key, state) in entries {
             if state.expired(key.proto, now, self.applied.conntrack) {
+                continue;
+            }
+            total += 1;
+            if rows.len() >= limit {
                 continue;
             }
             let address = |bytes: [u8; 16]| {
@@ -1729,55 +1782,42 @@ impl Firewall {
                 "phase":state.phase,"reply":state.reply == 1,
                 "idle_ns":state.idle_ns(now)}));
         }
-        Ok(serde_json::Value::Array(rows))
+        Ok(serde_json::json!({"total":total,"states":rows,"sample_limit":limit}))
     }
 
     /// Exact per-rule packet counters. The kernel keeps one value per CPU;
     /// aggregate here without contending a shared cache line on the hot path.
-    pub fn read_rule_counters(&self) -> Result<serde_json::Value> {
-        let map = aya::maps::PerCpuHashMap::<
-            _,
-            velstra_common::RuleCounterKey,
-            velstra_common::RuleCounters,
-        >::try_from(
-            self.ebpf
-                .map("RULE_COUNTERS")
-                .ok_or_else(|| anyhow!("RULE_COUNTERS map missing"))?,
-        )?;
-        let mut rows = Vec::new();
-        for item in map.iter() {
-            let (key, per_cpu) = item?;
-            let mut totals = velstra_common::RuleCounters::default();
-            for c in per_cpu.iter() {
-                totals.packets = totals.packets.wrapping_add(c.packets);
-                totals.bytes = totals.bytes.wrapping_add(c.bytes);
-                totals.accepted = totals.accepted.wrapping_add(c.accepted);
-                totals.dropped = totals.dropped.wrapping_add(c.dropped);
-            }
-            let name = self
+    pub fn rule_counter_snapshot(&self) -> Result<RuleCounterSnapshot> {
+        let duplicate = |name: &str| -> Result<MapData> {
+            let map = self
+                .ebpf
+                .map(name)
+                .ok_or_else(|| anyhow!("{name} map missing"))?;
+            let data = match map {
+                aya::maps::Map::PerCpuHashMap(data) | aya::maps::Map::PerCpuArray(data) => data,
+                _ => bail!("unexpected {name} map type"),
+            };
+            Ok(MapData::from_fd(data.fd().as_fd().try_clone_to_owned()?)?)
+        };
+        Ok(RuleCounterSnapshot {
+            counters: aya::maps::PerCpuHashMap::try_from(aya::maps::Map::PerCpuHashMap(
+                duplicate("RULE_COUNTERS")?,
+            ))?,
+            lost: aya::maps::PerCpuArray::try_from(aya::maps::Map::PerCpuArray(duplicate(
+                "PACKET_EVENTS_LOST",
+            )?))?,
+            names: self
                 .applied
                 .policies
                 .iter()
-                .find(|p| p.id == key.policy)
-                .and_then(|p| p.port_rules.iter().find(|r| r.id() == key.rule_id))
-                .map(|r| r.name.as_str());
-            rows.push(
-                serde_json::json!({"policy": key.policy, "rule_id": key.rule_id,
-                "rule": name, "packets": totals.packets, "bytes": totals.bytes,
-                "accepted": totals.accepted, "dropped": totals.dropped}),
-            );
-        }
-        rows.sort_by_key(|r| (r["policy"].as_u64(), r["rule_id"].as_u64()));
-        let lost = aya::maps::PerCpuArray::<_, u64>::try_from(
-            self.ebpf
-                .map("PACKET_EVENTS_LOST")
-                .ok_or_else(|| anyhow!("PACKET_EVENTS_LOST map missing"))?,
-        )?
-        .get(&0, 0)?
-        .iter()
-        .copied()
-        .sum::<u64>();
-        Ok(serde_json::json!({"rules": rows, "events_lost": lost}))
+                .flat_map(|policy| {
+                    policy
+                        .port_rules
+                        .iter()
+                        .map(move |rule| ((policy.id, rule.id()), rule.name.clone()))
+                })
+                .collect(),
+        })
     }
 
     /// Drain a bounded batch from the kernel ring. Consumption is explicit;
@@ -1894,20 +1934,14 @@ impl Firewall {
     pub async fn read_flows(&mut self) -> Result<Vec<(FlowKey, FlowState)>> {
         let handle = self.conntrack_handle()?;
         let map = handle.lock().await;
-        let mut out = Vec::new();
-        for key in map.keys().flatten() {
-            let Some(state) = map.get(&key, 0).ok().filter(|state| {
-                !state.expired(
-                    key.proto,
-                    crate::conntrack_sync::monotonic_ns(),
-                    self.applied.conntrack,
-                )
-            }) else {
-                continue;
-            };
-            out.push((key, state));
-        }
-        Ok(out)
+        let entries = crate::conntrack_sync::secure::batch_read(&*map)?;
+        drop(map);
+        // A timestamp refreshed during the dump belongs to this sample too.
+        let now = crate::conntrack_sync::monotonic_ns();
+        Ok(entries
+            .into_iter()
+            .filter(|(key, state)| !state.expired(key.proto, now, self.applied.conntrack))
+            .collect())
     }
 
     /// Duplicate the userspace FD for HA sync while retaining the map in the

@@ -435,7 +435,9 @@ impl Store {
 /// BPF_MAP_LOOKUP_BATCH uses one syscall per bucket batch instead of two per
 /// flow. A concurrent dump is bounded; errors never become an empty snapshot
 /// that could accidentally delete a peer's working state.
-fn batch_read<K: Pod, V: Pod>(map: &HashMap<MapData, K, V>) -> Result<Vec<(K, V)>> {
+pub(crate) fn batch_read<T: std::borrow::Borrow<MapData>, K: Pod, V: Pod>(
+    map: &HashMap<T, K, V>,
+) -> Result<Vec<(K, V)>> {
     #[repr(C)]
     struct Attr {
         in_batch: u64,
