@@ -17,7 +17,10 @@
 //! firewall-states   → complete active firewall-state table
 //! firewall-state-summary [limit] → active total and bounded state sample
 //! rule-stats [limit] → exact counters, total-rule count and ring overflows
-//! packet-events [limit] → drain a bounded packet-ring batch
+//! packet-events [limit] → events not yet returned to this (legacy) request
+//! packet-events-since <id> [limit] [epoch] → events after a reader's cursor (from run
+//!                   `epoch`), as JSON
+//! packet-events-tail [limit] → the newest events; consumes nothing
 //! flows [limit]     → the live NAT flow table (0 = all; default 100)
 //! top [limit]       → hosts ranked by the traffic volume attributed to them
 //! cgnat <ip>        → the WAN port block an internal address holds
@@ -27,6 +30,9 @@
 //! unblock <cidr>    → lift one early (`all` lifts every one)
 //! reload            → reconcile the validated local configuration in place
 //! reload-reset      → also invalidate the previous policy namespace's state
+//! reconcile-links   → hook what appeared; `ok`, or `held-down: <link>…` naming
+//!                     the held links still down because their hooks are not
+//!                     in place (everything else reconciled)
 //! ```
 //!
 //! This is a privileged local control interface: reload commands apply the
@@ -176,10 +182,13 @@ async fn respond(
                 }
             }
         }
-        "reconcile-links" => match firewall.lock().await.reconcile_links() {
-            Ok(()) => "ok\n".into(),
-            Err(e) => format!("error: reconciling packet hooks: {e:#}\n"),
-        },
+        "reconcile-links" => {
+            let mut fw = firewall.lock().await;
+            match fw.reconcile_links() {
+                Err(e) => format!("error: reconciling packet hooks: {e:#}\n"),
+                Ok(()) => held_down_reply(&fw.dark_held_links()),
+            }
+        }
         "status" => match firewall.lock().await.configuration_status() {
             Ok(status) => status,
             Err(error) => format!("error: reading configuration state: {error:#}\n"),
@@ -227,6 +236,32 @@ async fn respond(
                 Err(e) => format!("error: reading packet events: {e:#}\n"),
             }
         }
+        // Readers keep their own cursor; none of them consumes another's events.
+        "packet-events-since" => {
+            let Some(cursor) = args.first().and_then(|t| t.parse::<u64>().ok()) else {
+                return "usage: packet-events-since <id> [limit]\n".to_string();
+            };
+            let limit = parse_limit(args.get(1).copied()).unwrap_or(512);
+            // The run the cursor came from, third so a reader that predates it
+            // is unaffected and an older agent simply ignores it.
+            let epoch = args.get(2).and_then(|t| t.parse::<u64>().ok());
+            match firewall
+                .lock()
+                .await
+                .packet_events_since(cursor, epoch, limit)
+            {
+                Ok(page) => format!("{page}\n"),
+                Err(e) => format!("error: reading packet events: {e:#}\n"),
+            }
+        }
+        "packet-events-tail" => match firewall
+            .lock()
+            .await
+            .packet_events_tail(limit.unwrap_or(100))
+        {
+            Ok(rows) => rows.into_iter().map(|row| format!("{row}\n")).collect(),
+            Err(e) => format!("error: reading packet events: {e:#}\n"),
+        },
         "flows" | "top" => {
             let mut fw = firewall.lock().await;
             match fw.read_flows().await {
@@ -392,9 +427,30 @@ fn parse_limit(token: Option<&str>) -> Option<usize> {
     token.and_then(|t| t.parse().ok())
 }
 
+/// The `reconcile-links` answer once everything else reconciled. Held links
+/// still down are their own answer, not an `error:` — their segment is dark,
+/// which is the fail-closed state, not a broken reconcile — so a caller can
+/// tell "this link cannot be hooked" from "the reconcile itself failed" and
+/// decide which of them a commit may not survive.
+fn held_down_reply(dark: &[String]) -> String {
+    if dark.is_empty() {
+        "ok\n".into()
+    } else {
+        format!("held-down: {}\n", dark.join(" "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dark_held_links_are_named_apart_from_a_failed_reconcile() {
+        assert_eq!(held_down_reply(&[]), "ok\n");
+        let reply = held_down_reply(&["lan0".into(), "eth2".into()]);
+        assert_eq!(reply, "held-down: lan0 eth2\n");
+        assert!(!reply.starts_with("error:"));
+    }
 
     #[test]
     fn a_limit_is_optional_and_a_bad_one_falls_back() {
