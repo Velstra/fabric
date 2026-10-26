@@ -21,6 +21,7 @@ mod flowspec;
 mod ha;
 mod ipfix;
 mod mapping;
+mod packet_events;
 mod portal;
 mod query;
 mod routes;
