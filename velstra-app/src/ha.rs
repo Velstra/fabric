@@ -109,6 +109,11 @@ impl State {
                 && (self.role.authority.term == self.retained_owner
                     || self.role.claimed_ready_term == self.retained_owner
                         && self.role.claimed_agent_boot == self.agent_boot)
+                || self.role.authority.owner == config.node
+                    && self.role.authority.boot == self.role.coordinator_boot
+                    && self.role.authority.policy == policy
+                    && self.role.claimed_agent_boot == self.agent_boot
+                    && self.role.claimed_ready_term == self.ready_term
                 || now.saturating_sub(self.ready_at) <= 1_500_000_000)
     }
     fn forwarding_allowed(
@@ -503,6 +508,62 @@ pub fn reconcile_interfaces(
     Ok(complete)
 }
 
+/// Node-local sockets on the unfenced control network must retain their own
+/// connection state across authoritative data-plane snapshot replacement.
+pub fn control_addresses(config: &HaConfig) -> Result<BTreeSet<IpAddr>> {
+    struct Addresses(*mut libc::ifaddrs);
+    impl Drop for Addresses {
+        fn drop(&mut self) {
+            unsafe {
+                libc::freeifaddrs(self.0);
+            }
+        }
+    }
+    let mut head = std::ptr::null_mut();
+    ensure!(
+        unsafe { libc::getifaddrs(&mut head) } == 0,
+        "reading control addresses: {}",
+        std::io::Error::last_os_error()
+    );
+    let _addresses = Addresses(head);
+    let mut current = head;
+    let mut result = BTreeSet::new();
+    while let Some(entry) = unsafe { current.as_ref() } {
+        current = entry.ifa_next;
+        if entry.ifa_name.is_null() || entry.ifa_addr.is_null() {
+            continue;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr(entry.ifa_name) }.to_bytes();
+        if config
+            .interfaces
+            .iter()
+            .any(|name_| name_.as_bytes() == name)
+        {
+            continue;
+        }
+        let family = unsafe { (*entry.ifa_addr).sa_family } as i32;
+        let ip = match family {
+            libc::AF_INET => IpAddr::V4(std::net::Ipv4Addr::from(
+                unsafe {
+                    (*entry.ifa_addr.cast::<libc::sockaddr_in>())
+                        .sin_addr
+                        .s_addr
+                }
+                .to_ne_bytes(),
+            )),
+            libc::AF_INET6 => IpAddr::V6(std::net::Ipv6Addr::from(unsafe {
+                (*entry.ifa_addr.cast::<libc::sockaddr_in6>())
+                    .sin6_addr
+                    .s6_addr
+            })),
+            _ => continue,
+        };
+        if !ip.is_unspecified() {
+            result.insert(ip);
+        }
+    }
+    Ok(result)
+}
 pub async fn monitor(firewall: Arc<Mutex<Firewall>>, shared: Shared, config: HaConfig) {
     let mut links = BTreeMap::new();
     let mut poll = tokio::time::interval(Duration::from_millis(20));
@@ -683,6 +744,11 @@ mod tests {
         });
         assert!(state.forwarding_allowed(&cfg, [8; 32], true, now));
         state.ready_at = now.saturating_sub(2_000_000_000);
+        assert!(
+            state.forwarding_allowed(&cfg, [8; 32], true, now),
+            "the exact committed baseline remains owned"
+        );
+        state.role.claimed_ready_term = 3;
         assert!(!state.forwarding_allowed(&cfg, [8; 32], true, now));
     }
     #[tokio::test]
@@ -729,6 +795,41 @@ mod tests {
             !state.is_ready(&cfg, [3; 32], now),
             "a known successor invalidates indefinite local retention"
         );
+    }
+    #[tokio::test]
+    async fn committed_warm_claim_recovers_standby_after_lost_ack_without_reclassifying_cold() {
+        let cfg = config();
+        let shared = State::new(Some(cfg.clone())).unwrap();
+        let mut state = shared.lock().await;
+        state.snapshot_ready(&Authority {
+            term: 4,
+            owner: 2,
+            policy: [3; 32],
+            boot: [2; 16],
+        });
+        let later = now_ns() + 3_000_000_000;
+        assert!(!state.is_ready(&cfg, [3; 32], later));
+        state.role = Role {
+            authority: Authority {
+                term: 5,
+                owner: 1,
+                boot: [7; 16],
+                policy: [3; 32],
+            },
+            coordinator_boot: [7; 16],
+            claimed_ready_term: 4,
+            claimed_agent_boot: state.agent_boot,
+            vips_ready: true,
+            deadline_ns: later + 100_000_000,
+            ..Role::default()
+        };
+        assert!(state.is_ready(&cfg, [3; 32], later));
+        assert!(state.forwarding_allowed(&cfg, [3; 32], true, later));
+        state.role.claimed_agent_boot = [0; 16];
+        assert!(!state.is_ready(&cfg, [3; 32], later));
+        state.role.claimed_agent_boot = state.agent_boot;
+        state.begin_install();
+        assert!(!state.is_ready(&cfg, [3; 32], later));
     }
     #[tokio::test]
     async fn expired_snapshot_is_never_a_cold_vote() {

@@ -9,7 +9,7 @@
 //! is fenced by the firewall's configuration lock and policy fingerprint.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     io,
     net::IpAddr,
     os::fd::{AsFd, AsRawFd},
@@ -221,16 +221,35 @@ struct Store {
     endpoints: BTreeMap<Key, ha::wireguard::Endpoint>,
     imported: BTreeMap<Key, Imported>,
     policy: Option<[u8; 32]>,
+    local_addresses: BTreeSet<IpAddr>,
 }
 
 impl Store {
+    fn local_firewall(&self, key: &FirewallKey) -> bool {
+        let (src, dst) = if key.family == 4 {
+            (
+                IpAddr::V4(std::net::Ipv4Addr::from(
+                    <[u8; 4]>::try_from(&key.src[..4]).expect("IPv4 key width"),
+                )),
+                IpAddr::V4(std::net::Ipv4Addr::from(
+                    <[u8; 4]>::try_from(&key.dst[..4]).expect("IPv4 key width"),
+                )),
+            )
+        } else {
+            (
+                IpAddr::V6(std::net::Ipv6Addr::from(key.src)),
+                IpAddr::V6(std::net::Ipv6Addr::from(key.dst)),
+            )
+        };
+        self.local_addresses.contains(&src) || self.local_addresses.contains(&dst)
+    }
     fn generation(&mut self, policy: [u8; 32]) {
         if self.policy != Some(policy) {
             self.imported.clear();
             self.policy = Some(policy);
         }
     }
-    async fn snapshot(&mut self, policy: [u8; 32]) -> Result<Snapshot> {
+    async fn snapshot(&mut self, policy: [u8; 32], authoritative: bool) -> Result<Snapshot> {
         self.generation(policy);
         let nat = self.nat.lock().await;
         let mut entries = Entries::new();
@@ -242,6 +261,9 @@ impl Store {
             }
         }
         for (key, state) in batch_read(&self.firewall)? {
+            if self.local_firewall(&key) {
+                continue;
+            }
             if state.idle_ns(now) <= 604_800_000_000_000 {
                 let record = Record::Firewall(key, state);
                 entries.insert(record.key(), record);
@@ -253,7 +275,12 @@ impl Store {
         }
         self.imported
             .retain(|key, imported| entries.get(key) == Some(&imported.record));
-        entries.retain(|key, _| !self.imported.contains_key(key));
+        // A leased owner owns its entire complete baseline, including stable
+        // SYN splices that never change after import. Standalone mesh mode
+        // alone suppresses unchanged imports to prevent echo loops.
+        if !authoritative {
+            entries.retain(|key, _| !self.imported.contains_key(key));
+        }
         Ok(Snapshot {
             authority: None,
             policy,
@@ -271,6 +298,11 @@ impl Store {
         authoritative: bool,
     ) -> Result<()> {
         let key = record.key();
+        if matches!(record,Record::Firewall(key,_) if self.local_firewall(&key)) {
+            self.imported.remove(&key);
+            return Ok(());
+        }
+
         if let Record::Wireguard(endpoint) = record {
             ensure!(
                 authoritative,
@@ -353,7 +385,9 @@ impl Store {
             .collect();
         let absent_fw: Vec<_> = batch_read(&self.firewall)?
             .into_iter()
-            .filter(|(k, v)| !records.contains_key(&Record::Firewall(*k, *v).key()))
+            .filter(|(k, v)| {
+                !self.local_firewall(k) && !records.contains_key(&Record::Firewall(*k, *v).key())
+            })
             .collect();
         let absent_syn: Vec<_> = batch_read(&self.synproxy)?
             .into_iter()
@@ -789,6 +823,12 @@ async fn receive(
             UPSERT | DELETE => {
                 let mut endpoints_changed = false;
                 for record in unpack(payload)? {
+                    if kind == DELETE && matches!(record, Record::SynProxy(..)) {
+                        log::debug!(
+                            "conntrack-sync: deleting SYN state term={} record={record:?}",
+                            authority.as_ref().map_or(0, |a| a.term)
+                        );
+                    }
                     endpoints_changed |= matches!(record, Record::Wireguard(_));
                     if let Some(seen) = &mut seen {
                         ensure!(kind == UPSERT, "deletion inside snapshot");
@@ -818,6 +858,15 @@ async fn receive(
                 ensure!(payload.is_empty(), "invalid snapshot end");
                 let seen = seen.take().context("snapshot end without start")?;
                 if let Some(authority) = &authority {
+                    log::debug!(
+                        "conntrack-sync: installing HA snapshot term={} records={} syn={}",
+                        authority.term,
+                        staged.len(),
+                        staged
+                            .values()
+                            .filter(|r| matches!(r, Record::SynProxy(..)))
+                            .count()
+                    );
                     ha.begin_install();
                     store.replace_ha(peer, std::mem::take(&mut staged)).await?;
                     ha::wireguard::publish(
@@ -841,6 +890,21 @@ async fn receive(
     }
 }
 
+async fn control_scope(
+    ha: &ha::Shared,
+    config: &ResolvedConntrackSync,
+) -> Result<BTreeSet<IpAddr>> {
+    let Some(config_ha) = ha.lock().await.config.clone() else {
+        return Ok(BTreeSet::new());
+    };
+    let mut scope = ha::control_addresses(&config_ha)?;
+    if !config.listen.ip().is_unspecified() {
+        scope.insert(config.listen.ip());
+    }
+    scope.extend(config.peers.iter().map(|peer| peer.ip()));
+    Ok(scope)
+}
+
 pub async fn run(
     firewall: Arc<Mutex<Firewall>>,
     nat: NatMap,
@@ -855,6 +919,15 @@ pub async fn run(
             .clone()
             .expect("authenticated sync configuration"),
     );
+    let initial_scope = loop {
+        match control_scope(&ha, &config).await {
+            Ok(scope) => break scope,
+            Err(error) => {
+                warn!("conntrack-sync: cannot determine control ownership: {error:#}; retrying");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
     let store = Arc::new(Mutex::new(Store {
         nat,
         firewall: flows,
@@ -862,6 +935,7 @@ pub async fn run(
         endpoints: BTreeMap::new(),
         imported: BTreeMap::new(),
         policy: None,
+        local_addresses: initial_scope,
     }));
     let (snapshots, receiver) = watch::channel(None);
     for peer in config.peers.iter().copied() {
@@ -927,6 +1001,8 @@ pub async fn run(
                     // or lease-heartbeat lock while scanning kernel maps. The
                     // epoch and authority are rechecked after the bounded dump.
                     let result = async {
+                        let control=control_scope(&ha,&config).await?;
+                        store.lock().await.local_addresses=control;
                         let generation = firewall.lock().await.sync_generation()?;
                         let policy = generation.0;
                         let (authority,wg_interfaces) = {
@@ -936,9 +1012,11 @@ pub async fn run(
                         let endpoints = if authority.is_some(){ha::wireguard::scan(&wg_interfaces).await?}else{Vec::new()};
                         let mut snapshot = {
                             let mut store = store.lock().await;
-                            if authority.is_some() && export_authority != authority { store.imported.clear(); }
-                            store.snapshot(policy).await?
+                            store.snapshot(policy, authority.is_some()).await?
                         };
+                        if let Some(a) = authority.as_ref().filter(|_| export_authority != authority) {
+                            log::debug!("conntrack-sync: exporting HA snapshot term={} records={} syn={}",a.term,snapshot.entries.len(),snapshot.entries.values().filter(|r|matches!(r,Record::SynProxy(..))).count());
+                        }
                         for endpoint in endpoints {let record=Record::Wireguard(endpoint);snapshot.entries.insert(record.key(),record);}
                         let fw = firewall.lock().await;
                         ensure!(fw.sync_generation()? == generation, "policy changed during state dump");
@@ -1023,7 +1101,7 @@ pub(crate) fn policy_fingerprint(cfg: &RuntimeConfig) -> [u8; 32] {
             ])
         })
         .collect();
-    let bytes = json!({"version":4,"ha":cfg.ha.as_ref().map(|h|json!([h.cluster,h.interfaces,h.wireguard_ports,h.wireguard,h.wireguard_policy])),"policies":policies,"interfaces":interfaces,"forwards":forwards,"services":services,
+    let bytes = json!({"version":5,"ha":cfg.ha.as_ref().map(|h|json!([h.cluster,h.interfaces,h.wireguard_ports,h.wireguard,h.wireguard_policy])),"policies":policies,"interfaces":interfaces,"forwards":forwards,"services":services,
         "timeouts":[cfg.conntrack.tcp_syn,cfg.conntrack.tcp_established,cfg.conntrack.tcp_closing,cfg.conntrack.udp,cfg.conntrack.udp_stream,cfg.conntrack.icmp],
         "synproxy":cfg.synproxy.iter().map(|s|(s.port,s.mss)).collect::<Vec<_>>(),"fail_closed":cfg.fail_closed}).to_string();
     digest::digest(&digest::SHA256, bytes.as_bytes())
@@ -1078,6 +1156,7 @@ mod tests {
             endpoints: BTreeMap::new(),
             imported: BTreeMap::new(),
             policy: None,
+            local_addresses: BTreeSet::new(),
         }
     }
 
@@ -1122,7 +1201,7 @@ mod tests {
                 0,
             )
             .unwrap();
-        let snapshot = source.snapshot([1; 32]).await.unwrap();
+        let snapshot = source.snapshot([1; 32], false).await.unwrap();
         assert_eq!(snapshot.entries.len(), 1026);
         target.generation(snapshot.policy);
         let mut seen = HashSet::new();
@@ -1145,7 +1224,14 @@ mod tests {
             FirewallState::ESTABLISHED
         );
         // Receiving a record must not echo it or import the sender's counters.
-        assert!(target.snapshot([1; 32]).await.unwrap().entries.is_empty());
+        assert!(
+            target
+                .snapshot([1; 32], false)
+                .await
+                .unwrap()
+                .entries
+                .is_empty()
+        );
         let record = *snapshot
             .entries
             .values()
@@ -1165,7 +1251,10 @@ mod tests {
         target.apply(peer, DELETE, record).await.unwrap();
         target.apply(peer, UPSERT, record).await.unwrap();
         assert_eq!(target.nat.lock().await.get(&nat_key, 0).unwrap(), active);
-        assert_eq!(target.snapshot([1; 32]).await.unwrap().entries.len(), 1);
+        assert_eq!(
+            target.snapshot([1; 32], false).await.unwrap().entries.len(),
+            1
+        );
         // Reconnection with an empty full snapshot removes only this peer's
         // unchanged imports, retaining the flow already owned locally.
         target.finish_snapshot(peer, &HashSet::new()).await.unwrap();
@@ -1243,7 +1332,7 @@ mod tests {
         source.synproxy.insert(key, pending, 0).unwrap();
         for state in [pending, spliced] {
             source.synproxy.insert(key, state, 0).unwrap();
-            let snapshot = source.snapshot([1; 32]).await.unwrap();
+            let snapshot = source.snapshot([1; 32], false).await.unwrap();
             assert_eq!(snapshot.entries.len(), 1);
             let record = snapshot.entries.values().copied().next().unwrap();
             target
@@ -1252,7 +1341,12 @@ mod tests {
                 .unwrap();
             assert_eq!(target.synproxy.get(&key, 0).unwrap(), state);
             assert!(
-                target.snapshot([1; 32]).await.unwrap().entries.is_empty(),
+                target
+                    .snapshot([1; 32], false)
+                    .await
+                    .unwrap()
+                    .entries
+                    .is_empty(),
                 "import echoed"
             );
         }
@@ -1267,7 +1361,10 @@ mod tests {
             .unwrap();
         target.finish_snapshot(peer, &HashSet::new()).await.unwrap();
         assert_eq!(target.synproxy.get(&key, 0).unwrap(), local);
-        assert_eq!(target.snapshot([1; 32]).await.unwrap().entries.len(), 1);
+        assert_eq!(
+            target.snapshot([1; 32], false).await.unwrap().entries.len(),
+            1
+        );
         let mut target = kernel_store();
         target.apply(peer, UPSERT, syn_record()).await.unwrap();
         target.finish_snapshot(peer, &HashSet::new()).await.unwrap();
@@ -1356,6 +1453,122 @@ mod tests {
         assert!(store.synproxy.get(&syn_key, 0).is_err());
     }
 
+    #[tokio::test]
+    #[ignore = "requires CAP_BPF/CAP_SYS_ADMIN; runs in the HA kernel VM"]
+    async fn kernel_ha_owner_reexports_unchanged_imported_splices_in_every_snapshot() {
+        let mut store = kernel_store();
+        let peer = "10.3.0.2".parse().unwrap();
+        let record = syn_record();
+        let policy = [8; 32];
+        let mut entries = Entries::new();
+        entries.insert(record.key(), record);
+        store.generation(policy);
+        store.replace_ha(peer, entries).await.unwrap();
+        assert!(
+            store
+                .snapshot(policy, false)
+                .await
+                .unwrap()
+                .entries
+                .is_empty(),
+            "standalone mesh suppresses unchanged imports"
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                store
+                    .snapshot(policy, true)
+                    .await
+                    .unwrap()
+                    .entries
+                    .get(&record.key()),
+                Some(&record),
+                "an HA owner's complete baseline must retain an unchanged imported splice"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CAP_BPF/CAP_SYS_ADMIN; runs in the HA kernel VM"]
+    async fn kernel_ha_preserves_node_local_control_connections_while_replacing_data() {
+        let mut source = kernel_store();
+        let mut target = kernel_store();
+        let peer = "10.3.0.1".parse().unwrap();
+        source.local_addresses.insert(peer);
+        target.local_addresses.insert("10.3.0.2".parse().unwrap());
+        target.local_addresses.insert("fd42:3::2".parse().unwrap());
+        let state = FirewallState {
+            last_seen_ns: monotonic_ns(),
+            age_ns: 0,
+            phase: FirewallState::ESTABLISHED,
+            reply: 1,
+        };
+        let source_control =
+            FirewallKey::ipv4(FlowKey::new(3, [10, 3, 0, 1], [10, 3, 0, 3], 4000, 5440, 6));
+        let target_control =
+            FirewallKey::ipv4(FlowKey::new(3, [10, 3, 0, 2], [10, 3, 0, 3], 4001, 5440, 6));
+        let target6 = FirewallKey {
+            src: "fd42:3::2".parse::<std::net::Ipv6Addr>().unwrap().octets(),
+            dst: "fd42:3::3".parse::<std::net::Ipv6Addr>().unwrap().octets(),
+            family: 6,
+            ..target_control
+        };
+        let data = FirewallKey::ipv4(FlowKey::new(
+            7,
+            [10, 2, 0, 10],
+            [10, 1, 0, 10],
+            12345,
+            8443,
+            6,
+        ));
+        source.firewall.insert(source_control, state, 0).unwrap();
+        source.firewall.insert(data, state, 0).unwrap();
+        target.firewall.insert(target_control, state, 0).unwrap();
+        target.firewall.insert(target6, state, 0).unwrap();
+        let snapshot = source.snapshot([8; 32], false).await.unwrap();
+        assert!(
+            !snapshot
+                .entries
+                .contains_key(&Record::Firewall(source_control, state).key())
+        );
+        assert!(
+            snapshot
+                .entries
+                .contains_key(&Record::Firewall(data, state).key())
+        );
+        target.replace_ha(peer, snapshot.entries).await.unwrap();
+        assert!(target.firewall.get(&data, 0).is_ok());
+        assert_eq!(target.firewall.get(&target_control, 0).unwrap(), state);
+        assert_eq!(target.firewall.get(&target6, 0).unwrap(), state);
+        let closing = Record::Firewall(
+            target_control,
+            FirewallState {
+                phase: FirewallState::CLOSING,
+                ..state
+            },
+        );
+        target
+            .apply_inner(peer, UPSERT, closing, true)
+            .await
+            .unwrap();
+        target
+            .apply_inner(peer, DELETE, closing, true)
+            .await
+            .unwrap();
+        assert_eq!(target.firewall.get(&target_control, 0).unwrap(), state);
+        target.replace_ha(peer, Entries::new()).await.unwrap();
+        assert!(target.firewall.get(&data, 0).is_err());
+        assert_eq!(target.firewall.get(&target_control, 0).unwrap(), state);
+        assert_eq!(target.firewall.get(&target6, 0).unwrap(), state);
+        assert!(
+            target
+                .snapshot([8; 32], false)
+                .await
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+    }
+
     fn session() -> Session {
         Session {
             key: hmac::Key::new(hmac::HMAC_SHA256, b"test-only session key"),
@@ -1382,6 +1595,7 @@ mod tests {
             endpoints: BTreeMap::new(),
             imported: BTreeMap::new(),
             policy: None,
+            local_addresses: BTreeSet::new(),
         }));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
