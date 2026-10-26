@@ -2554,7 +2554,11 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     let ihl_bytes = ipv4.ihl() as usize;
     if ipv4.version() != 4 || ihl_bytes < Ipv4Hdr::LEN {
         bump(Counter::Malformed);
-        return Ok(xdp_action::XDP_PASS);
+        return Ok(if fail_closed() {
+            xdp_action::XDP_DROP
+        } else {
+            xdp_action::XDP_PASS
+        });
     }
 
     let proto = ipv4.proto;
