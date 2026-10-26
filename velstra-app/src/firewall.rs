@@ -3326,11 +3326,51 @@ fn masquerade_targets(
         .collect()
 }
 
+fn local_egress_address_key(ifindex: u32, ip: [u8; 4]) -> [u8; 8] {
+    let index = ifindex.to_ne_bytes();
+    [
+        index[0], index[1], index[2], index[3], ip[0], ip[1], ip[2], ip[3],
+    ]
+}
+
+fn local_egress_addresses(
+    interfaces: &[ResolvedInterface],
+    mut index: impl FnMut(&str) -> Result<u32>,
+    mut addresses: impl FnMut(&str) -> Result<Vec<[u8; 4]>>,
+) -> HashSet<[u8; 8]> {
+    interfaces
+        .iter()
+        .filter(|i| i.masquerade)
+        .flat_map(|i| {
+            let Ok(ifindex) = index(&i.name) else {
+                return Vec::new();
+            };
+            let Ok(ips) = addresses(&i.name) else {
+                return Vec::new();
+            };
+            ips.into_iter()
+                .map(|ip| local_egress_address_key(ifindex, ip))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// Reconcile egress ifindex → public IPv4 without clearing conntrack. This is
 /// called on policy changes AND ordinary link polling: leases can arrive well
 /// after apply and can change while the desired configuration stays identical.
 fn program_masquerade(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Result<()> {
     let prepared = masquerade_targets(interfaces, if_nametoindex, read_iface_ipv4);
+    let local = local_egress_addresses(interfaces, if_nametoindex, read_iface_ipv4_all);
+    {
+        let mut map: HashMap<_, [u8; 8], u8> = HashMap::try_from(
+            ebpf.map_mut("LOCAL_EGRESS_ADDRS")
+                .ok_or_else(|| anyhow!("LOCAL_EGRESS_ADDRS map missing"))?,
+        )?;
+        drop_unlisted(&mut map, &local)?;
+        for key in local {
+            map.insert(key, 1, 0)?;
+        }
+    }
     let mut map: HashMap<_, u32, [u8; 4]> = HashMap::try_from(
         ebpf.map_mut("MASQUERADE")
             .ok_or_else(|| anyhow!("MASQUERADE map missing"))?,
@@ -3760,13 +3800,20 @@ fn read_iface_ipv4_net(iface: &str) -> Result<([u8; 4], [u8; 4])> {
 }
 
 fn read_iface_ipv4(iface: &str) -> Result<[u8; 4]> {
+    read_iface_ipv4_all(iface)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("interface {iface} has no IPv4 address"))
+}
+
+fn read_iface_ipv4_all(iface: &str) -> Result<Vec<[u8; 4]>> {
     use std::os::raw::c_int;
     let mut ifap: *mut libc::ifaddrs = core::ptr::null_mut();
     // SAFETY: `getifaddrs` fills `ifap` with an owned linked list we free below.
     if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
         bail!("getifaddrs failed for {iface}");
     }
-    let mut result: Option<[u8; 4]> = None;
+    let mut result: Vec<[u8; 4]> = Vec::new();
     let mut cur = ifap;
     while !cur.is_null() {
         // SAFETY: `cur` is a valid node for the duration of this iteration.
@@ -3780,15 +3827,19 @@ fn read_iface_ipv4(iface: &str) -> Result<[u8; 4]> {
                 let sin = node.ifa_addr as *const libc::sockaddr_in;
                 // s_addr is in network byte order — its native bytes are the octets.
                 let octets = unsafe { (*sin).sin_addr.s_addr }.to_ne_bytes();
-                result = Some(octets);
-                break;
+                if !result.contains(&octets) {
+                    result.push(octets);
+                }
             }
         }
         cur = node.ifa_next;
     }
     // SAFETY: frees the list `getifaddrs` allocated; `ifap` is not used after.
     unsafe { libc::freeifaddrs(ifap) };
-    result.ok_or_else(|| anyhow!("interface {iface} has no IPv4 address"))
+    if result.is_empty() {
+        bail!("interface {iface} has no IPv4 address")
+    }
+    Ok(result)
 }
 
 /// Program the Phase 4 overlay maps: `OVERLAY_CONFIG` (this host's VTEP, a single
@@ -4794,6 +4845,26 @@ mod tests {
         assert!(
             masquerade_targets(&cfg.interfaces, |_| Err(anyhow!("removed")), absent).is_empty()
         );
+    }
+
+    #[test]
+    fn local_control_sources_are_distinguished_from_forwarded_nat_clients() {
+        let cfg = serde_json::from_value::<velstra_config::FileConfig>(serde_json::json!({
+            "interface": [{"name":"wan0", "policy":0, "masquerade":true},
+                          {"name":"lan0", "policy":0}]
+        }))
+        .unwrap()
+        .resolve()
+        .unwrap();
+        let keys = local_egress_addresses(
+            &cfg.interfaces,
+            |_| Ok(10),
+            |_| Ok(vec![[10, 1, 0, 1], [10, 1, 0, 100]]),
+        );
+        assert!(keys.contains(&local_egress_address_key(10, [10, 1, 0, 1])));
+        assert!(keys.contains(&local_egress_address_key(10, [10, 1, 0, 100])));
+        assert!(!keys.contains(&local_egress_address_key(10, [10, 2, 0, 10])));
+        assert!(!keys.contains(&local_egress_address_key(11, [10, 1, 0, 1])));
     }
 
     #[test]
