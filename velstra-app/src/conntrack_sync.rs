@@ -13,7 +13,8 @@
 //!   after a failover the reply of an established *stateful-firewall* flow
 //!   (even one that is not NAT'd) hits the default-drop and is discarded.
 //!
-//! When `[conntrack_sync]` is configured, a long-lived task [`run`] binds a UDP
+//! With a `secret`, [`secure`] uses authenticated TCP, policy fencing and
+//! batched map differences. Without it the compatibility task [`run`] binds a UDP
 //! socket and, each interval, **pushes** every live entry of *both* maps to the
 //! configured peer(s); symmetrically it **applies** entries received from a peer
 //! into its own maps. So the backup already holds the master's flow *and*
@@ -44,12 +45,11 @@
 //!
 //! ## Trust model
 //!
-//! Like pfsync, the sync stream is **unauthenticated** and must run over a
+//! Like pfsync, the legacy UDP stream is **unauthenticated** and must run over a
 //! trusted link — a dedicated sync interface or a protected segment between the
 //! two appliances. A peer that can reach the `listen` socket can inject conntrack
 //! (hence NAT) and firewall state, so do not expose it to untrusted networks. (A
-//! shared-secret MAC is a later refinement; the appliance config places this on
-//! the HA/sync zone.)
+//! configured `secret` selects the authenticated VCS2 transport instead.)
 //!
 //! The codec ([`encode_conntrack_batch`] / [`encode_fwflows_batch`] /
 //! [`decode_datagram`]) is pure and allocation-only so it is unit-tested without
@@ -61,6 +61,8 @@ use aya::maps::{HashMap, MapData};
 use log::{info, warn};
 use tokio::{net::UdpSocket, sync::Mutex};
 use velstra_common::{FirewallKey, FirewallState, FlowKey, FlowState};
+
+pub mod secure;
 
 /// Datagram magic + version tag (`VCS1` = Velstra Conntrack Sync v1).
 const MAGIC: [u8; 4] = *b"VCS1";

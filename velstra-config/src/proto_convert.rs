@@ -588,6 +588,7 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
         npt66: Vec::new(),
         // Conntrack sync (C9) is a file-config-only HA-appliance feature; the
         // controller never pushes it, so it converts to/from `None`.
+        ha: None,
         conntrack_sync: None,
         srv6: cfg.srv6.as_ref().map(|s| Srv6Cfg {
             local_src: s.local_src.clone(),

@@ -254,6 +254,7 @@ impl Firewall {
             "velstra_egress_v6",
             "velstra_egress_icmp",
             "velstra_bum",
+            "velstra_ha_guard",
         ] {
             let program: &mut SchedClassifier = ebpf
                 .program_mut(name)
@@ -264,6 +265,12 @@ impl Firewall {
                 .with_context(|| format!("verifying {name}"))?;
             println!("verified {name}");
         }
+        let exit: &mut aya::programs::RawTracePoint = ebpf
+            .program_mut("velstra_ha_exit")
+            .ok_or_else(|| anyhow!("missing velstra_ha_exit"))?
+            .try_into()?;
+        exit.load().context("verifying velstra_ha_exit")?;
+        println!("verified velstra_ha_exit");
         Ok(())
     }
 
@@ -289,7 +296,18 @@ impl Firewall {
             env!("OUT_DIR"),
             "/velstra"
         )))?;
-        let mut ebpf = Ebpf::load(&object).context("loading embedded eBPF object")?;
+        let mut loader = aya::EbpfLoader::new();
+        if cfg.ha.is_some() {
+            loader.map_pin_path("HA_DEADLINE", std::path::Path::new(crate::ha::DEADLINE_PIN));
+            loader.map_pin_path("HA_OWNER", std::path::Path::new(crate::ha::OWNER_PIN));
+        }
+        let mut ebpf = loader
+            .load(&object)
+            .context("loading embedded eBPF object")?;
+        if let Some(ha) = &cfg.ha {
+            let mut links = BTreeMap::new();
+            crate::ha::reconcile_interfaces(&mut ebpf, ha, &mut links)?;
+        }
 
         spawn_log_forwarder(&mut ebpf);
         {
@@ -862,7 +880,9 @@ impl Firewall {
     /// is owned by the data plane), so existing flows keep working across a
     /// reconfigure. This is what the controller-driven live updates call.
     pub fn requires_restart(&self, cfg: &RuntimeConfig) -> bool {
-        self.base.conntrack_sync != cfg.conntrack_sync || self.base.flow_export != cfg.flow_export
+        self.base.ha != cfg.ha
+            || self.base.conntrack_sync != cfg.conntrack_sync
+            || self.base.flow_export != cfg.flow_export
     }
 
     pub fn reconfigure(&mut self, cfg: &RuntimeConfig) -> Result<()> {
@@ -1132,6 +1152,47 @@ impl Firewall {
             output.push_str(&format!("Last update: {error}\n"));
         }
         Ok(output)
+    }
+
+    pub(crate) fn sync_generation(&self) -> Result<([u8; 32], u64)> {
+        let policy = self.sync_policy()?;
+        let epoch = Array::<_, u64>::try_from(
+            self.ebpf
+                .map("CONFIG_EPOCH")
+                .ok_or_else(|| anyhow!("configuration epoch missing"))?,
+        )?
+        .get(&0, 0)?;
+        anyhow::ensure!(epoch & 1 == 0, "policy update is incomplete");
+        Ok((policy, epoch))
+    }
+
+    pub(crate) fn ha_deadline(&mut self, deadline: u64) -> Result<()> {
+        Array::<_, u64>::try_from(
+            self.ebpf
+                .map_mut("HA_DEADLINE")
+                .ok_or_else(|| anyhow!("HA deadline missing"))?,
+        )?
+        .set(0, deadline, 0)?;
+        Ok(())
+    }
+    pub(crate) fn ha_interfaces(
+        &mut self,
+        config: &velstra_config::HaConfig,
+        seen: &mut BTreeMap<String, u32>,
+    ) -> Result<bool> {
+        crate::ha::reconcile_interfaces(&mut self.ebpf, config, seen)
+    }
+
+    /// Read under the same lock as live policy application. A failed or
+    /// incomplete apply must never admit state from a previously valid policy.
+    pub(crate) fn sync_policy(&self) -> Result<[u8; 32]> {
+        anyhow::ensure!(
+            self.configuration_state()? == CONFIG_READY,
+            "firewall is not ready for state replication"
+        );
+        Ok(crate::conntrack_sync::secure::policy_fingerprint(
+            &self.applied,
+        ))
     }
 
     /// Keep unexpired temporary grants across a successful policy refresh,
@@ -1858,6 +1919,15 @@ impl Firewall {
         };
         let duplicate = MapData::from_fd(data.fd().as_fd().try_clone_to_owned()?)?;
         HashMap::try_from(aya::maps::Map::LruHashMap(duplicate)).context("FW_FLOWS as a HashMap")
+    }
+    /// Keep the sequence-number splice alive on a standby without moving the
+    /// map out of the firewall: configuration reconciliation must still clear it.
+    pub fn syn_flows_handle(&self) -> Result<HashMap<MapData, FlowKey, SynFlow>> {
+        let Some(aya::maps::Map::LruHashMap(data)) = self.ebpf.map("SYN_FLOWS") else {
+            bail!("SYN_FLOWS LRU map missing");
+        };
+        let duplicate = MapData::from_fd(data.fd().as_fd().try_clone_to_owned()?)?;
+        HashMap::try_from(aya::maps::Map::LruHashMap(duplicate)).context("SYN_FLOWS as a HashMap")
     }
 }
 

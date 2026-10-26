@@ -53,12 +53,13 @@ use aya_ebpf::{
         BPF_FIB_LKUP_RET_SUCCESS, TC_ACT_OK, TC_ACT_SHOT, bpf_fib_lookup, xdp_action,
     },
     helpers::{
-        bpf_fib_lookup as fib_lookup, bpf_ktime_get_ns, bpf_skb_change_tail, bpf_skb_load_bytes,
-        bpf_skb_store_bytes, bpf_xdp_adjust_head, bpf_xdp_adjust_tail,
+        bpf_fib_lookup as fib_lookup, bpf_get_current_pid_tgid, bpf_ktime_get_boot_ns,
+        bpf_ktime_get_ns, bpf_skb_change_tail, bpf_skb_load_bytes, bpf_skb_store_bytes,
+        bpf_xdp_adjust_head, bpf_xdp_adjust_tail,
     },
-    macros::{classifier, map, xdp},
+    macros::{classifier, map, raw_tracepoint, xdp},
     maps::{Array, DevMap, HashMap, LpmTrie, LruHashMap, PerCpuArray, ProgramArray, lpm_trie::Key},
-    programs::{TcContext, XdpContext},
+    programs::{RawTracePointContext, TcContext, XdpContext},
 };
 mod conntrack;
 mod epoch;
@@ -99,6 +100,67 @@ use velstra_common::{
     translate_to_client, translate_to_server, v6_source_is_v4_mapped, write_encap,
     write_srv6_encap,
 };
+
+/// Absolute CLOCK_BOOTTIME deadline, shared with the persistent TC guard. Zero
+/// closes HA links; standalone interfaces are not enrolled in HA_IFACES.
+#[map]
+static HA_DEADLINE: Array<u64> = Array::with_max_entries(1, 0);
+#[map]
+static HA_OWNER: Array<u32> = Array::with_max_entries(1, 0);
+#[map]
+static HA_IFACES: HashMap<u32, u8> = HashMap::with_max_entries(1024, 0);
+#[map]
+static HA_WG_PORTS: HashMap<u16, u8> = HashMap::with_max_entries(1024, 0);
+#[inline(always)]
+fn ha_permits(ifindex: u32) -> bool {
+    if unsafe { HA_IFACES.get(&ifindex) }.is_none() {
+        return true;
+    }
+    ha_lease_valid()
+}
+#[inline(always)]
+fn ha_lease_valid() -> bool {
+    if !HA_OWNER.get(0).is_some_and(|owner| *owner != 0) {
+        return false;
+    }
+    HA_DEADLINE
+        .get(0)
+        .is_some_and(|deadline| unsafe { bpf_ktime_get_boot_ns() } < *deadline)
+}
+/// XDP redirects bypass the kernel TC egress path. An unfenced control ingress
+/// must therefore still check the target data link before redirecting.
+#[inline(never)]
+fn ha_redirect(target: u32) -> u32 {
+    if !ha_permits(target) {
+        return xdp_action::XDP_DROP;
+    }
+    TX_PORTS.redirect(target, 0).unwrap_or(xdp_action::XDP_DROP)
+}
+/// sched_process_exit precedes exit_files, so revoke liveness before the
+/// agent's last file-table reference can detach its ordinary NAT/TCX hooks.
+/// The separate owner word cannot be reopened by a racing userspace heartbeat.
+#[raw_tracepoint(tracepoint = "sched_process_exit")]
+pub fn velstra_ha_exit(_ctx: RawTracePointContext) -> u32 {
+    let tid = bpf_get_current_pid_tgid() as u32;
+    if let Some(owner) = HA_OWNER.get_ptr_mut(0) {
+        unsafe {
+            if *owner != 0 && *owner == tid {
+                *owner = 0;
+            }
+        }
+    }
+    0
+}
+/// Netlink-attached ingress AND egress fallback. Its kernel attachment and map
+/// pins survive agent exit, including orderly shutdown of the ordinary hooks.
+#[classifier]
+pub fn velstra_ha_guard(_ctx: TcContext) -> i32 {
+    if ha_lease_valid() {
+        -1
+    } else {
+        TC_ACT_SHOT as i32
+    }
+}
 
 /// Maps an ingress interface index to its policy id, so one XDP program can
 /// enforce a different firewall per interface/tenant. Interfaces absent here use
@@ -933,9 +995,7 @@ fn try_local_delivery(ctx: &XdpContext, s: &ForwardScratch) -> Result<Option<u32
     if stateful {
         ct_record(key, control);
     }
-    Ok(Some(
-        TX_PORTS.redirect(target, 0).unwrap_or(xdp_action::XDP_DROP),
-    ))
+    Ok(Some(ha_redirect(target)))
 }
 
 /// Phase 4 **trusted VTEP set** (C2): the outer source IPv4 (network order) of
@@ -1119,6 +1179,9 @@ const NEED_GUEST_DELIVERY: u32 = u32::MAX - 1;
 
 #[xdp]
 pub fn velstra_guest_delivery(ctx: XdpContext) -> u32 {
+    if !ha_permits(ctx.ingress_ifindex() as u32) {
+        return xdp_action::XDP_DROP;
+    }
     if !configuration_ready() || !epoch::unchanged(epoch::snapshot()) {
         return xdp_action::XDP_DROP;
     }
@@ -1131,7 +1194,7 @@ pub fn velstra_guest_delivery(ctx: XdpContext) -> u32 {
     if !epoch::unchanged(epoch::snapshot()) {
         return xdp_action::XDP_DROP;
     }
-    TX_PORTS.redirect(target, 0).unwrap_or(xdp_action::XDP_DROP)
+    ha_redirect(target)
 }
 
 /// XDP entry point: port security, then the datapath.
@@ -1150,6 +1213,9 @@ pub fn velstra_guest_delivery(ctx: XdpContext) -> u32 {
 /// the firewall, before ARP.
 #[xdp]
 pub fn velstra(ctx: XdpContext) -> u32 {
+    if !ha_permits(ctx.ingress_ifindex() as u32) {
+        return xdp_action::XDP_DROP;
+    }
     if !configuration_ready() {
         bump(Counter::DroppedDefault);
         return xdp_action::XDP_DROP;
@@ -1196,6 +1262,9 @@ pub fn velstra(ctx: XdpContext) -> u32 {
 /// (fail-closed), per the host-wide [`FAIL_CLOSED`] flag, rather than aborting.
 #[xdp]
 pub fn velstra_main(ctx: XdpContext) -> u32 {
+    if !ha_permits(ctx.ingress_ifindex() as u32) {
+        return xdp_action::XDP_DROP;
+    }
     let before = epoch::snapshot();
     if before & 1 != 0 {
         return xdp_action::XDP_DROP;
@@ -1231,6 +1300,9 @@ pub fn velstra_main(ctx: XdpContext) -> u32 {
 /// IPv6 firewall tail: independent verifier state and stack from IPv4/NAT.
 #[xdp]
 pub fn velstra_v6(ctx: XdpContext) -> u32 {
+    if !ha_permits(ctx.ingress_ifindex() as u32) {
+        return xdp_action::XDP_DROP;
+    }
     let before = epoch::snapshot();
     let action = match try_velstra_v6(&ctx) {
         Ok(action) => action,
@@ -1254,6 +1326,9 @@ pub fn velstra_v6(ctx: XdpContext) -> u32 {
 /// fresh stack before redirecting to a controller-bound local tenant port.
 #[xdp]
 pub fn velstra_local(ctx: XdpContext) -> u32 {
+    if !ha_permits(ctx.ingress_ifindex() as u32) {
+        return xdp_action::XDP_DROP;
+    }
     let before = epoch::snapshot();
     let Some(s) = SCRATCH.get_ptr(0) else {
         return xdp_action::XDP_DROP;
@@ -1276,6 +1351,9 @@ static EGRESS_PROGS: ProgramArray = ProgramArray::with_max_entries(3, 0);
 
 #[classifier]
 pub fn velstra_egress(ctx: TcContext) -> i32 {
+    if !ha_permits(unsafe { (*ctx.skb.skb).ifindex }) {
+        return TC_ACT_SHOT as i32;
+    }
     if !configuration_ready() {
         bump(Counter::DroppedDefault);
         return TC_ACT_SHOT as i32;
@@ -1306,6 +1384,9 @@ pub fn velstra_egress(ctx: TcContext) -> i32 {
 
 #[classifier]
 pub fn velstra_egress_v4(ctx: TcContext) -> i32 {
+    if !ha_permits(unsafe { (*ctx.skb.skb).ifindex }) {
+        return TC_ACT_SHOT as i32;
+    }
     let before = epoch::egress_snapshot();
     let action = match try_egress(&ctx) {
         Ok(action) => action,
@@ -1327,6 +1408,9 @@ pub fn velstra_egress_v4(ctx: TcContext) -> i32 {
 
 #[classifier]
 pub fn velstra_egress_v6(ctx: TcContext) -> i32 {
+    if !ha_permits(unsafe { (*ctx.skb.skb).ifindex }) {
+        return TC_ACT_SHOT as i32;
+    }
     let before = epoch::egress_snapshot();
     let action = try_egress_v6_inner(&ctx).unwrap_or(TC_ACT_SHOT as i32);
     if epoch::unchanged(before) {
@@ -1417,6 +1501,9 @@ fn restore_bum_frame(ctx: &TcContext, frame: *mut [u8; 16384], len: u32) -> i32 
 /// rather than leaking a partially rewritten frame into the local segment.
 #[classifier]
 pub fn velstra_bum(ctx: TcContext) -> i32 {
+    if !ha_permits(unsafe { (*ctx.skb.skb).ifindex }) {
+        return TC_ACT_SHOT as i32;
+    }
     if !configuration_ready() {
         bump(Counter::DroppedDefault);
         return TC_ACT_SHOT as i32;
@@ -1546,7 +1633,9 @@ fn bum_vxlan(ctx: &TcContext, ocfg: &OverlayConfig, vni: u32, dst_mac: [u8; 6]) 
         if !epoch::bum_unchanged() {
             return Ok(TC_ACT_SHOT as i32);
         }
-        if ctx.store(0, &encap.headers, 0).is_ok() && ctx.clone_redirect(ep.out_ifindex, 0).is_ok()
+        if ha_permits(ep.out_ifindex)
+            && ctx.store(0, &encap.headers, 0).is_ok()
+            && ctx.clone_redirect(ep.out_ifindex, 0).is_ok()
         {
             bump(Counter::BumReplicated);
         }
@@ -1645,7 +1734,9 @@ fn bum_srv6(ctx: &TcContext, scfg: &Srv6Config, vni: u32, dst_mac: [u8; 6]) -> R
         if !epoch::bum_unchanged() {
             return Ok(TC_ACT_SHOT as i32);
         }
-        if ctx.store(0, &encap.headers, 0).is_ok() && ctx.clone_redirect(ep.out_ifindex, 0).is_ok()
+        if ha_permits(ep.out_ifindex)
+            && ctx.store(0, &encap.headers, 0).is_ok()
+            && ctx.clone_redirect(ep.out_ifindex, 0).is_ok()
         {
             bump(Counter::Srv6BumReplicated);
         }
@@ -1959,7 +2050,12 @@ fn masquerade_egress(
     // destination on the reply), but the entry additionally records that its NAT
     // target is the client that *originated* the connection — the only place that
     // fact exists, since the entry is keyed on the reply's addresses.
-    let fwd = FlowState::masquerade(src_addr, src_port);
+    let local_wg = proto == ip_proto::UDP
+        && unsafe { (*ctx.skb.skb).ingress_ifindex } == 0
+        && unsafe { HA_IFACES.get(&egress_ifindex) }.is_some()
+        && unsafe { HA_WG_PORTS.get(&src_port) }.is_some();
+    let reply_target = if local_wg { wan_ip } else { src_addr };
+    let fwd = FlowState::masquerade(reply_target, src_port);
     let seed = napt_seed(src_addr, dst_addr, src_port, dst_port);
     // Deterministic CGNAT: when this egress carries a port-block layout, every
     // candidate stays inside the block that belongs to `src_addr`. That is what
@@ -1984,7 +2080,7 @@ fn masquerade_egress(
             }
             Some(s)
                 if s.expired(proto, unsafe { bpf_ktime_get_ns() }, conntrack::timeouts())
-                    || (s.nat_ip == src_addr && s.nat_port == src_port) =>
+                    || (s.nat_ip == reply_target && s.nat_port == src_port) =>
             {
                 wan_port = cand;
                 break;
@@ -2012,7 +2108,9 @@ fn masquerade_egress(
     match CONNTRACK.get_ptr_mut(&rkey) {
         // SAFETY: as in `account_flow` — a pointer into this CPU's map value,
         // read and written before any other operation on the map.
-        Some(entry) if unsafe { (*entry).nat_ip == src_addr && (*entry).nat_port == src_port } => unsafe {
+        Some(entry)
+            if unsafe { (*entry).nat_ip == reply_target && (*entry).nat_port == src_port } =>
+        unsafe {
             (*entry).account(bytes);
             (*entry).last_seen_ns = bpf_ktime_get_ns();
             (*entry).age_ns = 0;
@@ -2851,6 +2949,9 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
 /// program filled immediately before tail-calling.
 #[xdp]
 pub fn velstra_forward(ctx: XdpContext) -> u32 {
+    if !ha_permits(ctx.ingress_ifindex() as u32) {
+        return xdp_action::XDP_DROP;
+    }
     let before = epoch::snapshot();
     if before & 1 != 0 {
         return xdp_action::XDP_DROP;
@@ -3280,6 +3381,9 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
 /// so the verifier does not have to explore their Cartesian product.
 #[xdp]
 pub fn velstra_v6_state(ctx: XdpContext) -> u32 {
+    if !ha_permits(ctx.ingress_ifindex() as u32) {
+        return xdp_action::XDP_DROP;
+    }
     let before = epoch::snapshot();
     if !epoch::unchanged(before) {
         return xdp_action::XDP_DROP;
@@ -4132,11 +4236,7 @@ fn try_srv6_encap(
     }
     // Redirect onto the underlay; an absent devmap entry aborts (the control
     // plane mirrors every overlay egress ifindex into `TX_PORTS`).
-    Ok(Some(
-        TX_PORTS
-            .redirect(out_ifindex, 0)
-            .unwrap_or(xdp_action::XDP_ABORTED),
-    ))
+    Ok(Some(ha_redirect(out_ifindex)))
 }
 
 /// Phase 4 **decapsulation**: validate the inner VNI, then strip the outer
@@ -4371,11 +4471,7 @@ fn try_encap(
     }
     // Redirect onto the underlay; an absent devmap entry aborts (the control
     // plane mirrors every overlay egress ifindex into `TX_PORTS`).
-    Ok(Some(
-        TX_PORTS
-            .redirect(out_ifindex, 0)
-            .unwrap_or(xdp_action::XDP_ABORTED),
-    ))
+    Ok(Some(ha_redirect(out_ifindex)))
 }
 
 /// Phase 3 load balancer. Looks the packet's `(dst, dport, proto)` up in
@@ -5309,9 +5405,7 @@ fn forward(ctx: &XdpContext, rewrite: Rewrite, log: bool) -> Result<u32, ()> {
     }
     // `redirect` returns `XDP_REDIRECT` on success; if the devmap has no entry
     // for this ifindex we abort (the control plane always mirrors live routes).
-    Ok(TX_PORTS
-        .redirect(rewrite.out_ifindex, 0)
-        .unwrap_or(xdp_action::XDP_ABORTED))
+    Ok(ha_redirect(rewrite.out_ifindex))
 }
 
 /// Look up the packed `PORT_RULES` value for `(policy, proto, dst_port)` and the
