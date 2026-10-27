@@ -97,8 +97,8 @@ use velstra_common::{
     is_ipv6_ext, is_overlay_dport, lpm_key_addr, make_cookie, plan_arp_reply, plan_forward,
     plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_server_ack, plan_server_syn,
     plan_srv6_irb, plan_syn_ack, plan_tcp_rst, select_backend, session_hash, tcp_flags,
-    translate_to_client, translate_to_server, v6_source_is_v4_mapped, write_encap,
-    write_srv6_encap,
+    translate_to_client, translate_to_server, unaddressed_uplink_drops, v6_source_is_v4_mapped,
+    write_encap, write_srv6_encap,
 };
 
 /// Absolute CLOCK_BOOTTIME deadline, shared with the persistent TC guard. Zero
@@ -1868,6 +1868,14 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
     // must leave even though the WAN zone's ingress posture is deny-by-default,
     // so the egress firewall's drop logic must not apply here.
     let nat_ip = unsafe { MASQUERADE.get(&ifindex) }.copied();
+    // A masquerade uplink without an address keeps its entry, unaddressed, so
+    // that nothing leaves it un-translated: only the box's own DHCP client
+    // (source 0.0.0.0) may still go out, to get the address back. See
+    // `velstra_common::UNADDRESSED`.
+    if unaddressed_uplink_drops(nat_ip, src_addr) {
+        bump(Counter::EgressDropped);
+        return Ok(TC_ACT_SHOT as i32);
+    }
 
     let policy_id = unsafe { IFACE_POLICY.get(&ifindex) }.copied().unwrap_or(0);
     let cfg = unsafe { CONFIG.get(&policy_id) }
@@ -3435,6 +3443,15 @@ fn try_velstra_v6_state(ctx: &XdpContext) -> Result<u32, ()> {
     let proto = fwkey.proto;
     let dst_port = fwkey.dst_port;
     ct_key6(fwkey, ctx.data(), ctx.data_end(), off);
+    // The connection is tracked under the INTERNAL address on both hooks: the
+    // egress hook records a flow before NPTv6 rewrites its source, so a reply
+    // must be looked up (and recorded) by the address it is about to be
+    // translated back to — not the external one it arrived with, which no flow
+    // carries and which left every TCP reply "new" and the next segment out
+    // invalid.
+    if stateful {
+        npt66_ct_internal_dst(fwkey, ifindex);
+    }
     let control = ct_control(ctx.data(), ctx.data_end(), off, proto);
     let ct = if stateful {
         ct_classify(fwkey, control)
@@ -3633,6 +3650,20 @@ fn npt66_ingress_v6(ctx: &XdpContext, ifindex: u32) -> Result<(), ()> {
         *((data + off) as *mut [u8; 16]) = new_dst;
     }
     Ok(())
+}
+
+/// Rewrite a conntrack key's destination from the external to the internal
+/// NPTv6 prefix when `ifindex` carries a rule and the destination matches — the
+/// key-side twin of [`npt66_ingress_v6`]. Out of line for the same stack reason;
+/// the key is the per-CPU scratch slot, changed in place.
+#[inline(never)]
+fn npt66_ct_internal_dst(key: &mut FirewallKey, ifindex: u32) {
+    let Some(rule) = (unsafe { NPTV6.get(&ifindex) }) else {
+        return;
+    };
+    if rule.matches_external(&key.dst) {
+        key.dst = rule.translate_in(key.dst);
+    }
 }
 
 /// `family` values for [`bpf_fib_lookup`] (`AF_INET` / `AF_INET6` — the kernel's

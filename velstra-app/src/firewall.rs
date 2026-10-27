@@ -189,6 +189,9 @@ pub struct Firewall {
     /// advertised and is doing nothing" is the question somebody asks during an
     /// attack, and a journal that has rotated cannot answer it.
     flowspec_refused: Vec<(String, String)>,
+    /// Packet events drained from the consume-once kernel ring, kept so every
+    /// reader pages through them with its own cursor (see `packet_events`).
+    packet_log: crate::packet_events::PacketEventLog,
     /// Tenant taps already carrying the TC BUM-replication classifier. Tracked
     /// because the attach is now re-tried on every reprogram — a tap that appears
     /// after startup has to be picked up — and attaching twice would put two
@@ -208,6 +211,17 @@ pub struct Firewall {
     config_attached: BTreeMap<String, u32>,
     /// Route egress devices can appear without being declared as firewall ports.
     route_ifindices: BTreeMap<String, u32>,
+    /// Where the HA guard is installed: link name → the ifindex it went on.
+    /// Kept here rather than in the HA monitor because a held link may come
+    /// up only once the guard is on its *current* incarnation, and the one
+    /// that raises it ([`Self::activate_held_links`]) has to be able to tell.
+    ha_guarded: BTreeMap<String, u32>,
+    /// The held links this agent raised or found up: link name → that ifindex.
+    /// Once raised, that incarnation is the operator's: a `networkctl down`
+    /// on it is respected by every reconcile that follows, and only an
+    /// explicit hand-back ([`Self::dark_held_links`], the commit's
+    /// `reconcile-links`) or a recreated link raises it again.
+    raised: BTreeMap<String, u32>,
     /// The `CONNTRACK` handle once it has been moved out of [`Self::ebpf`],
     /// **shared** rather than given away: both the C9 sync task and the flow
     /// query path read it. Keeping it here is what stops enabling HA from taking
@@ -344,9 +358,13 @@ impl Firewall {
         let mut ebpf = loader
             .load(&object)
             .context("loading embedded eBPF object")?;
+        // The guard goes on before anything is attached; the held links among
+        // its links stay down until the firewall's own hooks are in place too.
+        let mut ha_guarded = BTreeMap::new();
         if let Some(ha) = &cfg.ha {
-            let mut links = BTreeMap::new();
-            crate::ha::reconcile_interfaces(&mut ebpf, ha, &mut links)?;
+            crate::ha::reconcile_interfaces(&mut ebpf, ha, &mut ha_guarded, |name| {
+                is_held(&cfg.interfaces, name)
+            })?;
         }
 
         spawn_log_forwarder(&mut ebpf);
@@ -507,6 +525,8 @@ impl Firewall {
             })
             .collect();
         let mut fw = Self {
+            ha_guarded,
+            raised: BTreeMap::new(),
             ebpf,
             attached,
             xdp_links,
@@ -519,6 +539,13 @@ impl Firewall {
             flowspec: Vec::new(),
             dynamic_routes: Vec::new(),
             flowspec_refused: Vec::new(),
+            // The run's start time: distinct across restarts, which is all a
+            // reader needs to know its cursor belongs to a previous run.
+            packet_log: crate::packet_events::PacketEventLog::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_nanos() as u64),
+            ),
             auto_attached: HashSet::new(),
             config_attached,
             route_ifindices: prepared.route_ifindices,
@@ -919,6 +946,104 @@ impl Firewall {
                 warn!("reprogramming recreated interfaces failed: {error:#}");
             }
         }
+        self.activate_held_links(false);
+    }
+
+    /// The check a commit waits on: the held links that exist and are still
+    /// down after one more attempt to raise them. A link that could not be
+    /// hooked stays down — the fail-closed half — and this is the loud half, so
+    /// the commit names the link instead of reporting success over a segment
+    /// that is silently dark.
+    pub fn dark_held_links(&mut self) -> Vec<String> {
+        self.activate_held_links(true);
+        self.applied
+            .interfaces
+            .iter()
+            .filter(|i| i.activate && link_is_down(&i.name))
+            .map(|i| i.name.clone())
+            .collect()
+    }
+
+    /// Bring up the held links that are down and now carry every hook they
+    /// need under a policy in force — and, on an HA member, the HA guard on
+    /// the link as it exists now. A link that cannot come up yet stays down and
+    /// is retried on the next reconcile.
+    ///
+    /// Which links those are is read from the configuration and the links'
+    /// state every time, never remembered from the attach that hooked them: a
+    /// link this process hooked long ago and its owner later took down and
+    /// handed back (disabled, then enabled again) is held just the same, and
+    /// a set filled only by new attaches never learned of it.
+    ///
+    /// Without `handed_back`, a link this agent already raised at its current
+    /// ifindex is left alone: it is down because someone took it down.
+    fn activate_held_links(&mut self, handed_back: bool) {
+        self.note_raised_links();
+        let in_force = self
+            .configuration_state()
+            .is_ok_and(|state| state == CONFIG_READY);
+        if !in_force
+            || !self
+                .applied
+                .interfaces
+                .iter()
+                .any(|i| i.activate && link_is_down(&i.name))
+        {
+            return;
+        }
+        let needs_egress =
+            egress_interfaces(&self.applied, &self.egress_candidates(&self.applied), true);
+        let raised = &self.raised;
+        let ready = links_to_activate(
+            &self.applied.interfaces,
+            |name| {
+                link_is_down(name)
+                    && (handed_back || !raised_here(raised, name, if_nametoindex(name).ok()))
+            },
+            |name| {
+                self.xdp_links.contains_key(name)
+                    && (!needs_egress.iter().any(|n| n == name)
+                        || self.egress_attached.contains_key(name))
+            },
+            |name| self.ha_guard_in_place(name),
+            in_force,
+        );
+        for name in ready {
+            match set_link_up(&name) {
+                Ok(()) => {
+                    if let Ok(index) = if_nametoindex(&name) {
+                        self.raised.insert(name.clone(), index);
+                    }
+                    log::info!("{name}: hooks attached and policy in force; link brought up")
+                }
+                Err(error) => warn!("bringing held link {name} up failed: {error:#}"),
+            }
+        }
+    }
+
+    /// Count every held link that is up now as raised, whoever raised it —
+    /// networkd before a policy change made it held, or an earlier agent
+    /// before a restart. Taking it down after that is an operator's choice.
+    fn note_raised_links(&mut self) {
+        for i in self.applied.interfaces.iter().filter(|i| i.activate) {
+            if let Ok(index) = if_nametoindex(&i.name)
+                && !link_is_down(&i.name)
+            {
+                self.raised.insert(i.name.clone(), index);
+            }
+        }
+    }
+
+    /// Whether the HA guard, where HA guards `name`, is on the link as it
+    /// exists now. A link HA does not guard needs none.
+    fn ha_guard_in_place(&self, name: &str) -> bool {
+        let Some(ha) = &self.applied.ha else {
+            return true;
+        };
+        if !ha.interfaces.iter().any(|n| n == name) {
+            return true;
+        }
+        if_nametoindex(name).is_ok_and(|index| self.ha_guarded.get(name) == Some(&index))
     }
 
     /// Re-program the policy maps in place with a new config, without detaching.
@@ -1223,12 +1348,20 @@ impl Firewall {
         .set(0, deadline, 0)?;
         Ok(())
     }
-    pub(crate) fn ha_interfaces(
-        &mut self,
-        config: &velstra_config::HaConfig,
-        seen: &mut BTreeMap<String, u32>,
-    ) -> Result<bool> {
-        crate::ha::reconcile_interfaces(&mut self.ebpf, config, seen)
+    /// Keep the HA guard on every HA link. When it has just gone onto a link,
+    /// that link may be the last thing a held link was waiting for, so the
+    /// held links are offered up again — by the one place that raises them.
+    pub(crate) fn ha_interfaces(&mut self, config: &velstra_config::HaConfig) -> Result<bool> {
+        let before = self.ha_guarded.clone();
+        let interfaces = &self.applied.interfaces;
+        let complete =
+            crate::ha::reconcile_interfaces(&mut self.ebpf, config, &mut self.ha_guarded, |name| {
+                is_held(interfaces, name)
+            });
+        if self.ha_guarded != before {
+            self.activate_held_links(false);
+        }
+        complete
     }
 
     /// Read under the same lock as live policy application. A failed or
@@ -1828,9 +1961,9 @@ impl Firewall {
         })
     }
 
-    /// Drain a bounded batch from the kernel ring. Consumption is explicit;
-    /// counters above remain available even if a slow reader loses events.
-    pub fn read_packet_events(&mut self, limit: usize) -> Result<Vec<serde_json::Value>> {
+    /// Move what the kernel ring holds into the agent's event log. Only the
+    /// agent consumes the ring; readers page through the log (`packet_log`).
+    fn drain_packet_ring(&mut self) -> Result<()> {
         let names: BTreeMap<(u32, u32), String> = self
             .applied
             .policies
@@ -1846,8 +1979,9 @@ impl Firewall {
                 .map_mut("PACKET_EVENTS")
                 .ok_or_else(|| anyhow!("PACKET_EVENTS map missing"))?,
         )?;
-        let mut rows = Vec::new();
-        for _ in 0..limit.clamp(1, 4096) {
+        // Bounded per call: a ring refilled as fast as it is read must not hold
+        // the firewall lock forever. One log's worth is all a reader could see.
+        for _ in 0..crate::packet_events::CAPACITY {
             let Some(item) = ring.next() else {
                 break;
             };
@@ -1870,7 +2004,7 @@ impl Firewall {
                     std::net::IpAddr::V6(std::net::Ipv6Addr::from(bytes)).to_string()
                 }
             };
-            rows.push(serde_json::json!({"timestamp_ns": event.timestamp_ns,
+            self.packet_log.push(serde_json::json!({"timestamp_ns": event.timestamp_ns,
                 "policy": event.policy, "rule_id": event.rule_id,
                 "rule": names.get(&(event.policy,event.rule_id)), "interface": event.ifindex,
                 "length": event.length, "family": event.family, "src": address(event.src), "dst": address(event.dst),
@@ -1878,7 +2012,44 @@ impl Firewall {
                 "action": match event.action { 0 => "accept", 1 => "drop", _ => "reject" },
                 "direction": if event.direction == 0 { "in" } else { "out" }, "reason": event.reason}));
         }
-        Ok(rows)
+        Ok(())
+    }
+
+    /// `packet-events [limit]`, the pre-cursor request: each event once across
+    /// every client still using it, as the ring used to behave for them.
+    pub fn read_packet_events(&mut self, limit: usize) -> Result<Vec<serde_json::Value>> {
+        self.drain_packet_ring()?;
+        Ok(self.packet_log.legacy(limit.clamp(1, 4096)))
+    }
+
+    /// `packet-events-since <id> [limit] [epoch]`: a page of the log after a
+    /// reader's cursor, plus the kernel's own overflow count — events the ring
+    /// dropped before the agent could drain them, which no cursor can recover.
+    pub fn packet_events_since(
+        &mut self,
+        cursor: u64,
+        epoch: Option<u64>,
+        limit: usize,
+    ) -> Result<serde_json::Value> {
+        self.drain_packet_ring()?;
+        let mut page = self.packet_log.since(cursor, epoch, limit.clamp(1, 4096));
+        let lost: PerCpuArray<_, u64> = PerCpuArray::try_from(
+            self.ebpf
+                .map("PACKET_EVENTS_LOST")
+                .ok_or_else(|| anyhow!("PACKET_EVENTS_LOST map missing"))?,
+        )?;
+        page["ring_lost"] = serde_json::json!(lost.get(&0, 0)?.iter().copied().sum::<u64>());
+        Ok(page)
+    }
+
+    /// `packet-events-tail [limit]`: the newest events, consuming nothing.
+    pub fn packet_events_tail(&mut self, limit: usize) -> Result<Vec<serde_json::Value>> {
+        self.drain_packet_ring()?;
+        Ok(self
+            .packet_log
+            .tail(limit.clamp(1, 4096))
+            .cloned()
+            .collect())
     }
 
     pub fn read_stats(&self) -> Result<Stats> {
@@ -3320,7 +3491,13 @@ fn masquerade_targets(
         .filter(|i| i.masquerade)
         .filter_map(|i| {
             let ifindex = index(&i.name).ok()?;
-            let ip = i.snat_address.or_else(|| address(&i.name).ok())?;
+            // A present uplink with no address keeps its entry, unaddressed:
+            // deleting it would hand the uplink to the plain egress policy and
+            // let LAN traffic leave with its private source address.
+            let ip = i
+                .snat_address
+                .or_else(|| address(&i.name).ok())
+                .unwrap_or(velstra_common::UNADDRESSED);
             Some((ifindex, ip))
         })
         .collect()
@@ -3353,6 +3530,65 @@ fn local_egress_addresses(
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+/// Whether the link's owner holds `name` down for this agent to raise.
+fn is_held(interfaces: &[ResolvedInterface], name: &str) -> bool {
+    interfaces.iter().any(|i| i.activate && i.name == name)
+}
+
+/// The held links that may come up now: declared as held, down, carrying every
+/// hook they need (`attached`) and, where HA guards them, the HA guard
+/// (`guarded`) — and only while the configuration is in force.
+fn links_to_activate(
+    interfaces: &[ResolvedInterface],
+    down: impl Fn(&str) -> bool,
+    attached: impl Fn(&str) -> bool,
+    guarded: impl Fn(&str) -> bool,
+    in_force: bool,
+) -> Vec<String> {
+    if !in_force {
+        return Vec::new();
+    }
+    interfaces
+        .iter()
+        .filter(|i| i.activate)
+        .map(|i| i.name.as_str())
+        .filter(|name| down(name) && attached(name) && guarded(name))
+        .map(String::from)
+        .collect()
+}
+
+/// Whether this agent already raised `name` at the incarnation `index` names.
+/// A recreated link (a new ifindex) or one never raised is not.
+fn raised_here(raised: &BTreeMap<String, u32>, name: &str, index: Option<u32>) -> bool {
+    index.is_some_and(|index| raised.get(name) == Some(&index))
+}
+
+/// Whether `name` exists and is administratively down. A link that is absent
+/// is not dark, it is not there; one whose flags cannot be read is not
+/// claimed down either.
+fn link_is_down(name: &str) -> bool {
+    std::fs::read_to_string(format!("/sys/class/net/{name}/flags"))
+        .ok()
+        .and_then(|flags| u32::from_str_radix(flags.trim().trim_start_matches("0x"), 16).ok())
+        .is_some_and(|flags| flags & libc::IFF_UP as u32 == 0)
+}
+
+/// `ip link set dev <name> up`, through the pinned iproute2 the appliance hands
+/// the agent.
+fn set_link_up(name: &str) -> Result<()> {
+    let ip = std::env::var("VELSTRA_IP_BIN").unwrap_or_else(|_| "ip".into());
+    let output = std::process::Command::new(ip)
+        .args(["link", "set", "dev", name, "up"])
+        .output()
+        .context("running ip link set up")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "ip link set dev {name} up: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
 }
 
 /// Reconcile egress ifindex → public IPv4 without clearing conntrack. This is
@@ -4832,9 +5068,11 @@ mod tests {
         .unwrap();
         let indices = |name: &str| Ok(if name == "wan0" { 10 } else { 11 });
         let absent = |_: &str| Err(anyhow!("no lease yet"));
+        // No lease: the entry stays, unaddressed, so the data plane drops what
+        // would otherwise leave un-translated (see `velstra_common::UNADDRESSED`).
         assert_eq!(
             masquerade_targets(&cfg.interfaces, indices, absent),
-            BTreeMap::from([(11, [203, 0, 113, 100])])
+            BTreeMap::from([(10, velstra_common::UNADDRESSED), (11, [203, 0, 113, 100])])
         );
         for ip in [[198, 51, 100, 2], [198, 51, 100, 9]] {
             assert_eq!(
@@ -4844,6 +5082,113 @@ mod tests {
         }
         assert!(
             masquerade_targets(&cfg.interfaces, |_| Err(anyhow!("removed")), absent).is_empty()
+        );
+    }
+
+    /// A held link comes up only once it carries its hooks and the policy is in
+    /// force: bringing it up any earlier is the unfiltered window the hold
+    /// exists to close.
+    #[test]
+    fn a_held_link_comes_up_only_attached_and_programmed() {
+        let iface = |name: &str, activate: bool| ResolvedInterface {
+            name: name.into(),
+            policy: 0,
+            vni: 0,
+            masquerade: false,
+            snat_address: None,
+            mss: 0,
+            cgnat: CgnatLayout::default(),
+            binding: None,
+            rate_limit_mbit: None,
+            activate,
+        };
+        let interfaces = [
+            iface("lan0", true),
+            iface("wan0", true),
+            iface("tap0", false),
+            iface("up0", true),
+        ];
+        let down = |name: &str| name != "up0";
+        let attached = |name: &str| name != "wan0";
+        let anywhere = |_: &str| true;
+        assert_eq!(
+            links_to_activate(&interfaces, down, attached, anywhere, true),
+            vec!["lan0".to_string()],
+            "wan0 has no hook yet; tap0 is not held; up0 is up already"
+        );
+        assert!(
+            links_to_activate(&interfaces, down, attached, anywhere, false).is_empty(),
+            "a configuration that is not in force must not open a link"
+        );
+    }
+
+    /// A held link the agent raised and an operator then took down stays down
+    /// through every later reconcile; a recreated link (new ifindex) or one
+    /// never raised is the agent's to raise.
+    #[test]
+    fn a_raised_link_taken_down_is_not_raised_again() {
+        let raised = BTreeMap::from([("wan0".to_string(), 7)]);
+        assert!(raised_here(&raised, "wan0", Some(7)));
+        assert!(!raised_here(&raised, "wan0", Some(8)), "recreated link");
+        assert!(!raised_here(&raised, "lan0", Some(3)), "never raised");
+        assert!(!raised_here(&raised, "wan0", None), "absent link");
+    }
+
+    /// On an HA member the guard and the firewall's hooks go on at different
+    /// times — the guard first, at load and within one poll of a link being
+    /// recreated. A held link HA guards comes up only with both in place: the
+    /// guard alone is the unfiltered window, the hooks alone an unfenced one.
+    #[test]
+    fn a_held_ha_link_comes_up_only_with_the_guard_and_the_hooks() {
+        let iface = |name: &str| ResolvedInterface {
+            name: name.into(),
+            policy: 0,
+            vni: 0,
+            masquerade: false,
+            snat_address: None,
+            mss: 0,
+            cgnat: CgnatLayout::default(),
+            binding: None,
+            rate_limit_mbit: None,
+            activate: true,
+        };
+        let interfaces = [iface("vlan10"), iface("br0")];
+        let down = |_: &str| true;
+        let guarded = |name: &str| name == "vlan10";
+        assert_eq!(
+            links_to_activate(&interfaces, down, |_| false, guarded, true),
+            Vec::<String>::new(),
+            "the HA guard alone must not open a held link"
+        );
+        assert_eq!(
+            links_to_activate(&interfaces, down, |_| true, guarded, true),
+            vec!["vlan10".to_string()],
+            "br0 is hooked but its guard is not on the current link yet"
+        );
+    }
+
+    /// A link this process hooked long ago, then disabled by its owner (taken
+    /// down, dropped from the configuration while its hook stayed) and enabled
+    /// again (held: it stays down). Nothing new is attached, so a held set
+    /// filled by new attaches never learned of it and the link stayed dark on
+    /// every commit. The configuration and the link's state decide instead.
+    #[test]
+    fn a_re_enabled_link_hooked_long_ago_is_raised_again() {
+        let lan = ResolvedInterface {
+            name: "lan0".into(),
+            policy: 0,
+            vni: 0,
+            masquerade: false,
+            snat_address: None,
+            mss: 0,
+            cgnat: CgnatLayout::default(),
+            binding: None,
+            rate_limit_mbit: None,
+            activate: true,
+        };
+        assert_eq!(
+            links_to_activate(&[lan], |_| true, |_| true, |_| true, true),
+            vec!["lan0".to_string()]
         );
     }
 
@@ -4919,6 +5264,7 @@ mod tests {
             cgnat: CgnatLayout::default(),
             binding: None,
             rate_limit_mbit: None,
+            activate: false,
         });
         // An uplink with no tenant segment must not register VNI 0.
         cfg.interfaces.push(ResolvedInterface {
@@ -4931,6 +5277,7 @@ mod tests {
             cgnat: CgnatLayout::default(),
             binding: None,
             rate_limit_mbit: None,
+            activate: false,
         });
         cfg.irb_routes.push(ResolvedIrbRoute {
             vni: 100,
@@ -4970,6 +5317,7 @@ mod tests {
             cgnat: CgnatLayout::default(),
             binding: None,
             rate_limit_mbit: None,
+            activate: false,
         };
         let policy = |id: PolicyId, action: Action, stateful: bool| PolicyConfig {
             mac_rules: Vec::new(),
