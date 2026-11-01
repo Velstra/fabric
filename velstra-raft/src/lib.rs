@@ -227,29 +227,38 @@ mod tests {
         }
     }
 
-    /// Spawn a node's gRPC raft server on `addr` and return immediately.
-    async fn spawn_server(node: &RaftNode, addr: std::net::SocketAddr) {
+    /// Bind before returning: no fixed ports, reserve/rebind race, ignored
+    /// bind errors or readiness sleep shared with another test process.
+    async fn spawn_server(
+        node: &RaftNode,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
         let svc = node.service();
-        tokio::spawn(async move {
-            let _ = tonic::transport::Server::builder()
+        let task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
                 .add_service(svc)
-                .serve(addr)
-                .await;
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
         });
+        (addr, task)
     }
 
     #[tokio::test]
     async fn three_node_cluster_replicates_a_port_to_all_members() {
-        // Three nodes, each with a raft gRPC server on a localhost port.
-        let addrs = ["127.0.0.1:24021", "127.0.0.1:24022", "127.0.0.1:24023"];
+        let mut addrs = Vec::new();
+        let mut servers = Vec::new();
         let mut nodes = Vec::new();
-        for (i, addr) in addrs.iter().enumerate() {
-            let node = RaftNode::start(i as u64 + 1).await.unwrap();
-            spawn_server(&node, addr.parse().unwrap()).await;
+        for id in 1..=3 {
+            let node = RaftNode::start(id).await.unwrap();
+            let (addr, server) = spawn_server(&node).await;
+            addrs.push(addr);
+            servers.push(server);
             nodes.push(node);
         }
-        // Give the servers a moment to bind.
-        tokio::time::sleep(Duration::from_millis(300)).await;
 
         // Form the 3-node cluster from node 1.
         let members: BTreeMap<NodeId, String> = addrs
@@ -370,6 +379,13 @@ mod tests {
                 "node {} never received the replicated security group",
                 node.id
             );
+        }
+        for node in &nodes {
+            node.shutdown().await.unwrap();
+        }
+        for server in servers {
+            server.abort();
+            assert!(server.await.unwrap_err().is_cancelled());
         }
     }
 

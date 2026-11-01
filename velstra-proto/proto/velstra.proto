@@ -762,6 +762,9 @@ message Policy {
   bool stateful = 8;
   SourceValidation source_validation = 9;
   bool egress_default_drop = 10;
+  // Stable semantic scope for compiler-assigned routing ordinals. Empty uses
+  // the native numeric policy identity; name remains a display label.
+  string state_scope = 11;
 }
 
 // Maps an interface to a policy id and (optionally) an overlay segment (VNI).

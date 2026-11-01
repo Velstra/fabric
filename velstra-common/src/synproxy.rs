@@ -88,9 +88,9 @@ pub const MSS_TABLE: [u16; 8] = [1460, 1440, 1400, 1360, 1300, 1220, 1100, 536];
 
 /// The index of the largest [`MSS_TABLE`] entry that fits in `mss`.
 ///
-/// A client advertising less than the smallest entry gets the smallest entry;
-/// 536 is the IPv4 minimum every implementation must accept, so there is no
-/// case below it worth encoding.
+/// Values below the smallest entry cannot be represented without exceeding
+/// that value. The packet caller must reject them before minting a cookie;
+/// 536 is the IPv4 default MSS, not a minimum advertised MSS.
 #[inline(always)]
 pub fn mss_index(mss: u16) -> u8 {
     let mut i = 0;
@@ -556,11 +556,31 @@ impl SynFlow {
         self.flags & Self::SPLICED != 0
     }
 
-    /// Record the server's initial sequence number, completing the splice.
+    /// Validate the server's SYN-ACK before committing its sequence space.
+    ///
+    /// It must acknowledge the SYN we actually sent. Otherwise an unrelated
+    /// answer can poison the delta and the ACK synthesised on the client's
+    /// behalf. A retransmission must repeat the original server ISN as well.
+    /// Neither leg negotiated ECN, so no other flags belong on this answer.
+    /// The caller must persist the returned value before acknowledging it.
     #[inline]
-    pub fn splice(&mut self, server_isn: u32) {
-        self.delta = seq_delta(server_isn, self.cookie);
-        self.flags |= Self::SPLICED;
+    pub const fn server_syn_ack(self, server_isn: u32, ack: u32, flags: u8) -> Option<Self> {
+        if flags != (crate::tcp_flags::SYN | crate::tcp_flags::ACK)
+            || ack != self.client_isn.wrapping_add(1)
+        {
+            return None;
+        }
+        if self.is_spliced() {
+            if server_isn != self.cookie.wrapping_add(self.delta) {
+                return None;
+            }
+            return Some(self);
+        }
+        Some(Self {
+            delta: seq_delta(server_isn, self.cookie),
+            flags: self.flags | Self::SPLICED,
+            ..self
+        })
     }
 }
 
@@ -785,7 +805,13 @@ mod tests {
         assert!(!flow.is_spliced(), "a pending flow must not translate yet");
 
         let server_isn = 0x9999_0000;
-        flow.splice(server_isn);
+        flow = flow
+            .server_syn_ack(
+                server_isn,
+                0x1111_2223,
+                crate::tcp_flags::SYN | crate::tcp_flags::ACK,
+            )
+            .unwrap();
         assert!(flow.is_spliced());
 
         // The client acknowledges in cookie space; the server must see its own.
@@ -840,6 +866,56 @@ mod tests {
         assert_eq!(core::mem::size_of::<SynFlow>(), 16);
     }
 
+    #[test]
+    fn server_answer_must_acknowledge_the_exact_syn_including_sequence_wrap() {
+        use crate::tcp_flags::{ACK, SYN};
+        for client_isn in [0, 23, u32::MAX] {
+            let pending = SynFlow::pending(771, client_isn);
+            let ack = client_isn.wrapping_add(1);
+            assert!(pending.server_syn_ack(993, ack, SYN | ACK).is_some());
+            for wrong in [
+                ack.wrapping_sub(1),
+                ack.wrapping_add(1),
+                ack.wrapping_add(0x8000_0000),
+            ] {
+                assert_eq!(pending.server_syn_ack(993, wrong, SYN | ACK), None);
+            }
+            for flags in 0..=u8::MAX {
+                assert_eq!(
+                    pending.server_syn_ack(993, ack, flags).is_some(),
+                    flags == SYN | ACK
+                );
+            }
+            assert_eq!(pending, SynFlow::pending(771, client_isn));
+        }
+    }
+
+    #[test]
+    fn only_the_same_server_answer_is_an_idempotent_retransmission() {
+        use crate::tcp_flags::{ACK, SYN};
+        for (cookie, server_isn, client_isn) in
+            [(0, u32::MAX, u32::MAX), (u32::MAX, 0, 22), (771, 993, 0)]
+        {
+            let pending = SynFlow::pending(cookie, client_isn);
+            let ack = client_isn.wrapping_add(1);
+            let spliced = pending.server_syn_ack(server_isn, ack, SYN | ACK).unwrap();
+            assert!(spliced.is_spliced());
+            assert_eq!(
+                spliced.server_syn_ack(server_isn, ack, SYN | ACK),
+                Some(spliced)
+            );
+            assert_eq!(
+                spliced.server_syn_ack(server_isn.wrapping_add(1), ack, SYN | ACK),
+                None
+            );
+            assert_eq!(
+                spliced.server_syn_ack(server_isn, ack.wrapping_add(1), SYN | ACK),
+                None
+            );
+            assert_eq!(translate_to_client(server_isn, spliced.delta), cookie);
+        }
+    }
+
     /// Different connections must not collide into the same cookie, or one
     /// client's handshake would admit another's forgery.
     #[test]
@@ -849,5 +925,163 @@ mod tests {
             let c = make_cookie(SECRET, CLIENT, SERVER, port, 443, 4, 1460);
             assert!(seen.insert(c), "two source ports minted the same cookie");
         }
+    }
+}
+
+/// Bounded MSS option reader for the stateless SYN-cookie path. Options may
+/// start at any byte, and absence means the IPv4 default, not the appliance's
+/// advertised receive MSS. A malformed or duplicate MSS cannot choose a cookie.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SynMssParser {
+    position: u8,
+    header_len: u8,
+    remaining: u8,
+    kind: u8,
+    mss: u16,
+    seen: bool,
+    done: bool,
+    failed: bool,
+}
+impl SynMssParser {
+    #[inline(always)]
+    pub fn new(header_len: u8) -> Option<Self> {
+        if !(20..=60).contains(&header_len) || header_len & 3 != 0 {
+            return None;
+        }
+        Some(Self {
+            position: 20,
+            header_len,
+            remaining: 0,
+            kind: 0,
+            mss: 536,
+            seen: false,
+            done: false,
+            failed: false,
+        })
+    }
+
+    /// Each call consumes at most one option byte. The callback receives only
+    /// TCP-header offsets; callers must bounds-check reads against this packet.
+    #[inline(always)]
+    pub fn step(&mut self, mut byte: impl FnMut(usize) -> Option<u8>) -> bool {
+        if self.done || self.failed {
+            return false;
+        }
+        let offset = self.position as usize;
+        if offset >= self.header_len as usize {
+            self.done = true;
+            return false;
+        }
+        self.position += 1;
+        if self.remaining == 255 {
+            let Some(length) = byte(offset) else {
+                self.failed = true;
+                return false;
+            };
+            if length < 2
+                || offset - 1 + length as usize > self.header_len as usize
+                || self.kind == 2 && (length != 4 || self.seen)
+            {
+                self.failed = true;
+                return false;
+            }
+            self.remaining = length - 2;
+            if self.kind == 2 {
+                self.seen = true;
+                self.mss = 0;
+            }
+        } else if self.remaining != 0 {
+            if self.kind == 2 {
+                let Some(value) = byte(offset) else {
+                    self.failed = true;
+                    return false;
+                };
+                self.mss = (self.mss << 8) | u16::from(value);
+            }
+            self.remaining -= 1;
+        } else {
+            let Some(kind) = byte(offset) else {
+                self.failed = true;
+                return false;
+            };
+            match kind {
+                0 => {
+                    self.done = true;
+                    return false;
+                }
+                1 => {}
+                _ => {
+                    self.kind = kind;
+                    self.remaining = 255;
+                }
+            }
+        }
+        true
+    }
+
+    #[inline(always)]
+    pub fn finish(self) -> Option<u16> {
+        (!self.failed
+            && (self.done || self.position == self.header_len)
+            && self.remaining == 0
+            && self.mss != 0)
+            .then_some(self.mss)
+    }
+}
+
+#[cfg(test)]
+mod mss_reader_tests {
+    use super::*;
+
+    fn read(options: &[u8]) -> Option<u16> {
+        let mut parser = SynMssParser::new((20 + options.len()) as u8)?;
+        for _ in 0..40 {
+            if !parser.step(|offset| options.get(offset - 20).copied()) {
+                break;
+            }
+        }
+        parser.finish()
+    }
+
+    #[test]
+    fn absent_and_end_of_options_use_ipv4_default() {
+        assert_eq!(read(&[]), Some(536));
+        assert_eq!(read(&[1, 1, 1, 1]), Some(536));
+        assert_eq!(read(&[0, 2, 4, 1]), Some(536));
+    }
+
+    #[test]
+    fn mss_need_not_be_the_first_or_aligned_option() {
+        assert_eq!(read(&[2, 4, 5, 180]), Some(1460));
+        assert_eq!(read(&[1, 2, 4, 3, 132, 0, 0, 0]), Some(900));
+        assert_eq!(read(&[30, 3, 99, 2, 4, 2, 24, 0]), Some(536));
+        let mut maximum = [1u8; 40];
+        maximum[36..].copy_from_slice(&[2, 4, 0xff, 0xff]);
+        assert_eq!(read(&maximum), Some(u16::MAX));
+    }
+
+    #[test]
+    fn incomplete_duplicate_zero_and_invalid_options_are_rejected() {
+        for options in [
+            &[2, 3, 5, 0][..],
+            &[2, 4, 0, 0],
+            &[2, 4, 5, 180, 2, 4, 5, 180],
+            &[30, 0, 1, 1],
+            &[30, 1, 1, 1],
+            &[1, 1, 1, 2],
+            &[1, 2, 4, 5],
+        ] {
+            assert_eq!(read(options), None, "{options:?}");
+        }
+        for length in [0, 19, 21, 61, 64, 255] {
+            assert!(SynMssParser::new(length).is_none());
+        }
+        let mut parser = SynMssParser::new(24).unwrap();
+        assert!(!parser.step(|_| None));
+        assert_eq!(parser.finish(), None);
+        let mut parser = SynMssParser::new(24).unwrap();
+        assert!(parser.step(|_| Some(2)));
+        assert_eq!(parser.finish(), None);
     }
 }

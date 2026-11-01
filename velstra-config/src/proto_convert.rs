@@ -180,6 +180,7 @@ pub fn file_config_to_proto(cfg: &FileConfig, version: u64) -> proto::NodeConfig
             .map(|p| proto::Policy {
                 id: p.id,
                 name: p.name.clone().unwrap_or_default(),
+                state_scope: p.state_scope.clone().unwrap_or_default(),
                 default_action: action_to_proto(p.default_action) as i32,
                 egress_default_drop: p.egress_default_drop,
                 drop_icmp: p.drop_icmp,
@@ -392,6 +393,11 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
                     None
                 } else {
                     Some(p.name.clone())
+                },
+                state_scope: if p.state_scope.is_empty() {
+                    None
+                } else {
+                    Some(p.state_scope.clone())
                 },
                 default_action: action_from_proto(p.default_action()),
                 egress_default_drop: p.egress_default_drop,
@@ -632,6 +638,27 @@ pub fn runtime_from_proto(cfg: &proto::NodeConfig) -> Result<RuntimeConfig> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn semantic_scope_survives_wire_without_repurposing_display_names() {
+        let cfg: crate::FileConfig = toml::from_str(
+            r#"[[policy]]
+            id = 7
+            name = "display label"
+            state_scope = "zone/wan"
+            stateful = true
+        "#,
+        )
+        .unwrap();
+        let message = super::file_config_to_proto(&cfg, 1);
+        let back = super::file_config_from_proto(&message);
+        assert_eq!(back.policies[0].state_scope.as_deref(), Some("zone/wan"));
+        assert_eq!(back.policies[0].name.as_deref(), Some("display label"));
+        assert_eq!(
+            back.resolve().unwrap().policies[1].state_scope.as_deref(),
+            Some("zone/wan")
+        );
+    }
+
     use super::*;
 
     #[test]

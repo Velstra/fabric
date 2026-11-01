@@ -49,7 +49,7 @@ provide the [`aya::Pod`] marker impls the user-space map API needs.
 A single XDP program. It parses each frame on raw, bounds-checked packet
 pointers (the verifier forbids slices), looks the packet up against the maps,
 and calls the shared `decide()`. It is built **only** for the BPF target, by the
-control plane's build script via `aya-build`; it is never compiled for the host.
+control plane's build script using the checked-in atomic BPF target; it is never compiled for the host.
 
 ### `velstra-app`
 
@@ -232,10 +232,14 @@ of network namespaces, see [TESTING.md](TESTING.md).
   classifier `velstra_egress` — shares the maps and `decide()` with the XDP hook
   but runs at **egress** (`--egress`). It filters leaving traffic by destination
   (blocklist + port rules + ICMP + default, scoped by egress ifindex) and, on a
-  stateful policy, records the flow so the reply is allowed at ingress — covering
-  host-originated connections and the receive side of a tenant tap (the inner
-  firewall after overlay decap). IPv4 only; IPv6/overlay-aware egress are
-  follow-ups. Counters `tx_packets` / `egress_dropped`.
+  stateful IPv4 policy, records the flow so the reply is allowed at ingress —
+  covering host-originated connections and the receive side of a tenant tap.
+  IPv6 applies family/direction-scoped rules, source or destination CIDRs,
+  destination blocklists and bounded extension-header parsing before NPTv6.
+  IPv6 TCP, UDP and echo tracking is shared between ingress, TC and scoped
+  guest delivery. Explicit denials precede return admission, and shared rule
+  budgets cover the supported family/direction contexts. Counters
+  `tx_packets` / `egress_dropped`.
 * **Orchestration (Track C)** — *done.* `velstra-orchestrator` is a pure model
   of the virtual fabric (hosts/networks/ports) with IPAM and a **deriver**: given
   the topology it computes each host's `FileConfig` — local tap bindings plus a

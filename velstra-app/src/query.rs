@@ -12,7 +12,9 @@
 //!
 //! ```text
 //! status            → readiness and the last configuration error
+//! interface <name>  → actual per-interface enforcement acknowledgement (JSON)
 //! stats             → the per-CPU counter table, summed
+//! state-gc          → coherent state maintenance progress and errors (JSON)
 //! flows [limit]     → the live NAT flow table (0 = all; default 100)
 //! top [limit]       → hosts ranked by the traffic volume attributed to them
 //! cgnat <ip>        → the WAN port block an internal address holds
@@ -135,10 +137,28 @@ async fn respond(line: &str, firewall: &Arc<Mutex<Firewall>>) -> String {
     let args: Vec<&str> = tokens.collect();
     let limit = parse_limit(args.first().copied());
     match verb {
+        "state-gc" => {
+            if !args.is_empty() {
+                return "error: usage: state-gc\n".into();
+            }
+            match firewall.lock().await.gc_status() {
+                Ok(status) => status,
+                Err(error) => format!("error: reading firewall maintenance status: {error:#}\n"),
+            }
+        }
         "status" => match firewall.lock().await.configuration_status() {
             Ok(status) => status,
             Err(error) => format!("error: reading configuration state: {error:#}\n"),
         },
+        "interface" => {
+            let [name] = args.as_slice() else {
+                return "error: usage: interface <name>\n".to_string();
+            };
+            match firewall.lock().await.interface_status(name) {
+                Ok(status) => status,
+                Err(error) => format!("error: interface is not protected: {error:#}\n"),
+            }
+        }
         "stats" => {
             let fw = firewall.lock().await;
             match fw.read_stats() {

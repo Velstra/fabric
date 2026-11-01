@@ -62,6 +62,8 @@ use log::{info, warn};
 use tokio::{net::UdpSocket, sync::Mutex};
 use velstra_common::{FlowKey, FlowState};
 
+use crate::firewall::FirewallFlowHandle;
+
 /// Datagram magic + version tag (`VCS1` = Velstra Conntrack Sync v1).
 const MAGIC: [u8; 4] = *b"VCS1";
 /// Header `kind` for a CONNTRACK batch (key + value). Value 0 keeps the frame
@@ -254,7 +256,7 @@ fn read_fw_flows(map: &HashMap<MapData, FlowKey, u8>) -> Vec<FlowKey> {
     map.keys().flatten().collect()
 }
 
-/// Long-lived task: own the `CONNTRACK` and `FW_FLOWS` handles and a bound UDP
+/// Long-lived task: share the `CONNTRACK` and `FW_FLOWS` handles and a bound UDP
 /// socket, and every `interval` **push** both full tables to each peer while
 /// continuously **applying** any datagrams peers push to us.
 ///
@@ -264,7 +266,7 @@ fn read_fw_flows(map: &HashMap<MapData, FlowKey, u8>) -> Vec<FlowKey> {
 /// loop can panic the agent.
 pub async fn run(
     conntrack: Arc<Mutex<HashMap<MapData, FlowKey, FlowState>>>,
-    mut fw_flows: HashMap<MapData, FlowKey, u8>,
+    fw_flows: FirewallFlowHandle,
     listen: SocketAddr,
     peers: Vec<SocketAddr>,
     interval_secs: u64,
@@ -292,7 +294,12 @@ pub async fn run(
                     continue;
                 }
                 let ct = read_conntrack(&*conntrack.lock().await);
-                let fw = read_fw_flows(&fw_flows);
+                // Snapshot before socket awaits; never hold a blocking userspace
+                // mutex while yielding. The controller retains this same handle.
+                let fw = match fw_flows.lock() {
+                    Ok(map) => read_fw_flows(&map),
+                    Err(_) => { warn!("conntrack-sync: firewall flow handle lock poisoned; skipping push"); continue; }
+                };
                 if ct.is_empty() && fw.is_empty() {
                     continue;
                 }
@@ -343,9 +350,13 @@ pub async fn run(
                         }
                     }
                     Some(Datagram::FwFlows(keys)) => {
+                        let mut map = match fw_flows.lock() {
+                            Ok(map) => map,
+                            Err(_) => { warn!("conntrack-sync: firewall flow handle lock poisoned; skipping import"); continue; }
+                        };
                         let mut applied = 0usize;
                         for k in &keys {
-                            match fw_flows.insert(k, 1u8, 0) {
+                            match map.insert(k, 1u8, 0) {
                                 Ok(()) => applied += 1,
                                 Err(e) => warn!("conntrack-sync: apply fw-flow entry from {from} failed: {e}"),
                             }

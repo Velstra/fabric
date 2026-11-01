@@ -14,9 +14,11 @@
 
 mod conntrack_sync;
 mod controller_client;
+mod datapath_pins;
 mod firewall;
 mod flows;
 mod flowspec;
+mod hook_status;
 mod ipfix;
 mod mapping;
 mod portal;
@@ -54,6 +56,12 @@ enum Command {
     Run(RunArgs),
     /// Parse a config file and print the resolved ruleset. No privileges needed.
     Validate(ValidateArgs),
+    /// Explicitly remove owned persistent firewall hooks (allows unfiltered traffic).
+    /// Stop the owning agent first; a running agent holds the directory lock.
+    Detach {
+        #[arg(long)]
+        datapath_state_dir: PathBuf,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -163,6 +171,12 @@ struct RunArgs {
     #[arg(long, default_value_t = false)]
     egress: bool,
 
+    /// Private bpffs directory retaining enforcement across process exits.
+    /// Restarts atomically replace owned links under a shared closed apply gate.
+    /// Requires root and pinnable XDP/TCX links; no silent ephemeral fallback.
+    #[arg(long)]
+    datapath_state_dir: Option<PathBuf>,
+
     /// Seconds between live statistics dumps. `0` disables periodic dumps.
     #[arg(long, default_value_t = 5)]
     stats_interval: u64,
@@ -243,6 +257,9 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Validate(args) => validate(args),
         Command::Run(args) => run(args).await,
+        Command::Detach { datapath_state_dir } => {
+            datapath_pins::DatapathPins::open(&datapath_state_dir)?.detach()
+        }
     }
 }
 
@@ -315,11 +332,26 @@ async fn run(args: RunArgs) -> Result<()> {
         args.xdp_mode,
         &initial,
         args.egress,
+        args.datapath_state_dir.as_deref(),
     )?));
     for (iface, mode) in &firewall.lock().await.attached {
         info!("attached to {iface} in {mode:?} mode");
     }
-    info!("Velstra is live. Press Ctrl-C to detach.");
+    {
+        let store = firewall.lock().await.flow_store_handle();
+        let capacity = store
+            .lock()
+            .map_err(|_| anyhow!("firewall state control lock poisoned"))?
+            .capacity();
+        info!("coherent firewall state control ready ({} slots)", capacity);
+        let health = firewall.lock().await.gc_status_handle();
+        tokio::spawn(velstra::flow_gc::run(store, health));
+    }
+    if args.datapath_state_dir.is_some() {
+        info!("Velstra is live. Kernel enforcement persists when this process exits.");
+    } else {
+        info!("Velstra is live. Press Ctrl-C to detach.");
+    }
 
     // Read-only diagnostics socket (C23): the agent owns the maps, so it is the
     // only process that can answer what the data plane is currently doing.
@@ -489,12 +521,12 @@ async fn run(args: RunArgs) -> Result<()> {
     }
 
     if let Some(cts) = initial.conntrack_sync.clone() {
-        // Take both flow tables the datapath keys on: CONNTRACK (NAT) and FW_FLOWS
+        // Share both flow tables the datapath keys on: CONNTRACK (NAT) and FW_FLOWS
         // (stateful-firewall replies). Both must cross to the backup or a failover
         // drops established connections.
         let handles = {
             let mut fw = firewall.lock().await;
-            match (fw.conntrack_handle(), fw.take_fw_flows()) {
+            match (fw.conntrack_handle(), fw.fw_flows_handle()) {
                 (Ok(ct), Ok(ff)) => Ok((ct, ff)),
                 (Err(e), _) | (_, Err(e)) => Err(e),
             }
@@ -536,7 +568,11 @@ async fn run(args: RunArgs) -> Result<()> {
         }
         Err(error) => warn!("could not read final statistics: {error:#}"),
     }
-    info!("Detaching XDP program and exiting.");
+    if args.datapath_state_dir.is_some() {
+        info!("Exiting; persistent kernel enforcement remains attached.");
+    } else {
+        info!("Detaching XDP program and exiting.");
+    }
     Ok(())
 }
 

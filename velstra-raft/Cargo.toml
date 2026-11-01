@@ -30,5 +30,8 @@ tonic-build = { workspace = true }
 # A vendored protoc so downstream crates need no system protoc to build.
 protoc-bin-vendored = "3"
 
+[dev-dependencies]
+tokio-stream = { workspace = true, features = ["net"] }
+
 [lints.clippy]
 result_large_err = "allow"

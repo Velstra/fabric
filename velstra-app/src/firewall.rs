@@ -5,13 +5,14 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
-    sync::Arc,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use aya::{
-    Ebpf,
+    Ebpf, EbpfLoader,
     maps::{
         Array, DevMap, HashMap, MapData, PerCpuArray, ProgramArray,
         lpm_trie::{Key, LpmTrie},
@@ -25,6 +26,10 @@ use aya::{
 use clap::ValueEnum;
 use log::warn;
 use tokio::sync::Mutex;
+use velstra::{
+    flow_scopes::{self, ScopeCatalogue, ScopePlan},
+    flow_store::{FlowStore, SharedFlowStore},
+};
 use velstra_common::{
     Action, ArpEntry, ArpKey, Backend, CONFIG_FAILED, CONFIG_READY, CONFIG_UPDATING, CgnatLayout,
     Cidr4, Cidr6, ConfigFlags, Counter, FloodSet, FlowKey, FlowState, GlobalConfig, IrbEndpoint,
@@ -42,6 +47,13 @@ use velstra_config::{
     ResolvedRoute, ResolvedService, ResolvedSrv6, ResolvedSrv6Flood, ResolvedSrv6IrbRoute,
     ResolvedSrv6LocalSid, ResolvedSrv6Route, ResolvedSynProxy, ResolvedTunnel, RuntimeConfig,
 };
+
+use crate::datapath_pins::DatapathPins;
+
+/// Shared userspace ownership only. This lock serializes controller/sync map
+/// operations; it does not lock kernel packet writers or make protocol records
+/// coherent. The legacy presence value itself is a single byte.
+pub type FirewallFlowHandle = Arc<StdMutex<HashMap<MapData, FlowKey, u8>>>;
 
 /// How to attach the XDP program to the interface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -74,6 +86,7 @@ impl AttachMode {
 struct InterfaceLink<L> {
     ifindex: u32,
     _link: L,
+    pin: Option<PathBuf>,
 }
 
 impl<L> InterfaceLink<L> {
@@ -84,6 +97,7 @@ impl<L> InterfaceLink<L> {
         Ok(Self {
             ifindex,
             _link: link,
+            pin: None,
         })
     }
 
@@ -105,15 +119,64 @@ impl<L> InterfaceLink<L> {
             }
         }
     }
+
+    fn with_pin(mut self, path: Option<PathBuf>) -> Self {
+        self.pin = path;
+        self
+    }
+
+    fn retire(&mut self) -> Result<()> {
+        if let Some(path) = &self.pin {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("retiring pinned datapath link"),
+            }
+        }
+        self.pin = None;
+        Ok(())
+    }
+
+    fn retain_current(&mut self, iface: &str) -> bool {
+        if self.is_current(iface) {
+            return true;
+        }
+        match self.retire() {
+            Ok(()) => false,
+            Err(error) => {
+                warn!("retiring stale datapath interface {iface} failed; retrying: {error:#}");
+                true
+            }
+        }
+    }
+}
+
+fn retire_links<L>(
+    links: &mut BTreeMap<String, InterfaceLink<L>>,
+    wanted: &HashSet<String>,
+) -> Result<()> {
+    let obsolete: Vec<_> = links
+        .iter()
+        .filter(|(name, link)| !wanted.contains(*name) || !link.is_current(name))
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in obsolete {
+        if let Some(link) = links.get_mut(&name) {
+            link.retire()?;
+        }
+        links.remove(&name);
+    }
+    Ok(())
 }
 
 /// A loaded-and-attached Velstra firewall.
 ///
-/// Owns the [`Ebpf`] object and its interface links; dropping the firewall
-/// detaches the programs and frees the maps. The XDP program therefore stays attached exactly as long as this value
-/// (and hence the daemon) lives.
+/// Owns the [`Ebpf`] object and its interface links. Ephemeral links detach when
+/// this value drops. Appliance-owned pinned links retain their programs/maps
+/// across process exits and are retired explicitly by reconciliation.
 pub struct Firewall {
     ebpf: Ebpf,
+    pins: Option<DatapathPins>,
     /// The interfaces the program is attached to and the [`XdpMode`] each
     /// attach succeeded with. Attaching to several interfaces from one process
     /// shares the maps (notably `CONNTRACK`) across them, which is what makes
@@ -157,6 +220,9 @@ pub struct Firewall {
     egress_attached: BTreeMap<String, InterfaceLink<SchedClassifierLink>>,
     /// Explicit --egress coverage survives interface disappearance/recreation.
     explicit_egress_ifaces: Vec<String>,
+    /// CLI/automatic ingress bindings also need bidirectional observation;
+    /// candidate config assignments override these fallback policy IDs.
+    ingress_bindings: BTreeMap<String, PolicyId>,
     /// Interfaces attached dynamically by auto-attach, tracked separately so they
     /// can be dropped again when the interface disappears (a VM tap going away).
     auto_attached: HashSet<String>,
@@ -171,6 +237,14 @@ pub struct Firewall {
     /// query path read it. Keeping it here is what stops enabling HA from taking
     /// the flow table away from every other reader.
     conntrack: Option<Arc<Mutex<HashMap<MapData, FlowKey, FlowState>>>>,
+    /// Sync and security revocation must keep access to the same kernel map.
+    fw_flows: Option<FirewallFlowHandle>,
+    /// The syscall-only coherent state controller retains a program FD; its
+    /// maps stay in Ebpf, rather than being surrendered to the first consumer.
+    flow_store: SharedFlowStore,
+    gc_status: velstra::flow_gc::SharedGcStatus,
+    scope_catalogue: ScopeCatalogue,
+    applied_scopes: ScopePlan,
     /// Sources blocked at **run time** rather than by configuration, each with the
     /// moment it stops being blocked (roadmap C11: a detector acting on what it
     /// saw).
@@ -218,6 +292,58 @@ type MappingValue = ([u8; 4], u16, Instant);
 /// filling the map and leaving no room for a forward somebody configured.
 const MAX_RUNTIME_MAPPINGS: usize = 256;
 
+/// Verify candidate code while inherited hooks still enforce their committed
+/// policy. Loading an unattached program must not publish maps or tail targets.
+fn preload_datapath_programs(ebpf: &mut Ebpf) -> Result<()> {
+    for name in [
+        "velstra",
+        "velstra_main",
+        "velstra_forward",
+        "velstra_guest_delivery",
+        "velstra_ipv6",
+        "velstra_guest_ipv6",
+        "velstra_state_v6",
+        "fw_flow_control",
+    ] {
+        let _: &Xdp = ebpf
+            .program(name)
+            .with_context(|| format!("candidate XDP entry {name} missing"))?
+            .try_into()?;
+    }
+    for name in ["velstra_egress", "velstra_bum", "velstra_state_tc6"] {
+        let _: &SchedClassifier = ebpf
+            .program(name)
+            .with_context(|| format!("candidate TC entry {name} missing"))?
+            .try_into()?;
+    }
+    if ebpf.map("VELSTRA_TC4").is_some() {
+        let _: &SchedClassifier = ebpf
+            .program("velstra_nat4")
+            .context("candidate TC IPv4 NAT entry missing")?
+            .try_into()?;
+    }
+    for (name, program) in ebpf.programs_mut() {
+        match program {
+            aya::programs::Program::Xdp(program) => {
+                if program.fd().is_err() {
+                    program
+                        .load()
+                        .with_context(|| format!("verifying candidate XDP program {name}"))?;
+                }
+            }
+            aya::programs::Program::SchedClassifier(program) => {
+                if program.fd().is_err() {
+                    program
+                        .load()
+                        .with_context(|| format!("verifying candidate TC program {name}"))?;
+                }
+            }
+            _ => bail!("unsupported candidate datapath program {name}"),
+        }
+    }
+    Ok(())
+}
+
 impl Firewall {
     /// Load the embedded eBPF object, program the maps from `cfg`, and attach
     /// to every interface in `ifaces`.
@@ -233,17 +359,58 @@ impl Firewall {
         mode: AttachMode,
         cfg: &RuntimeConfig,
         egress: bool,
+        pin_directory: Option<&Path>,
     ) -> Result<Self> {
+        // Hardware offload can fall back to a legacy netlink attachment which
+        // has no pinnable link descriptor. Refuse before any kernel mutation.
+        anyhow::ensure!(
+            pin_directory.is_none() || mode != AttachMode::Hw,
+            "persistent enforcement supports driver and skb XDP modes; hardware offload has no pinnable link"
+        );
         ensure_reader_barrier_supported()?;
         bump_memlock_rlimit();
 
         // The eBPF object is embedded at compile time by the build script.
-        let mut ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
-            env!("OUT_DIR"),
-            "/velstra"
-        )))
-        .context("loading embedded eBPF object")?;
+        let pins = pin_directory.map(DatapathPins::open).transpose()?;
+        let inherited_gate = pins
+            .as_ref()
+            .map(|pins| pins.gate().try_exists())
+            .transpose()?
+            .unwrap_or(false);
+        let mut loader = EbpfLoader::new();
+        if let Some(pins) = &pins {
+            loader.map_pin_path("APPLY_STATE", pins.gate());
+            loader.map_pin_path("VELSTRA_PROGS", pins.programs());
+            loader.map_pin_path("VELSTRA_V6", pins.ipv6_programs());
+            loader.map_pin_path("VELSTRA_TC6", pins.ipv6_tc_programs());
+            for &(map, _) in crate::datapath_pins::FLOW_STATE_PINS {
+                loader.map_pin_path(map, pins.flow_map_path(map)?);
+            }
+        }
+        let mut ebpf = loader
+            .load(aya::include_bytes_aligned!(concat!(
+                env!("OUT_DIR"),
+                "/velstra"
+            )))
+            .context("loading embedded eBPF object")?;
 
+        if !inherited_gate {
+            // A fresh generation has no committed enforcement to preserve.
+            // Its readiness metadata must start closed, including on failure.
+            let mut state: Array<_, u32> = Array::try_from(
+                ebpf.map_mut("APPLY_STATE")
+                    .context("APPLY_STATE map missing")?,
+            )?;
+            state
+                .set(0, CONFIG_UPDATING, 0)
+                .context("closing the fresh datapath gate")?;
+        }
+        // Program verification can be expensive or fail. Keep the inherited
+        // Ready gate and targets untouched until every candidate has passed.
+        preload_datapath_programs(&mut ebpf)?;
+        let prepared = prepare_host_config(cfg)?;
+        let flow_store =
+            FlowStore::shared(&mut ebpf).context("initializing coherent firewall state control")?;
         spawn_log_forwarder(&mut ebpf);
         {
             let mut state: Array<_, u32> =
@@ -254,23 +421,31 @@ impl Firewall {
                 .set(0, CONFIG_UPDATING, 0)
                 .context("closing the initial datapath gate")?;
         }
-        let prepared = prepare_host_config(cfg)?;
+        if pins.is_some() {
+            // Inherited programs share the tail-call table. Drain packets that
+            // passed their gate before replacing any target, so old scratch
+            // state can never be consumed by a new forwarding program.
+            synchronize_packet_readers().context("draining inherited datapath readers")?;
+        }
+        let mut scope_catalogue = ScopeCatalogue::open(&mut ebpf)?;
+        let scopes = scope_catalogue.prepare(&cfg.policies)?;
         apply_config(&mut ebpf, cfg, None, &prepared)?;
+        flow_scopes::install_views(&mut ebpf, &scopes)?;
+        // Reconcile shared state only while inherited packet readers are drained.
+        {
+            let mut store = flow_store
+                .lock()
+                .map_err(|_| anyhow!("firewall state control lock poisoned"))?;
+            flow_scopes::reconcile_store(&mut store, &scopes)?;
+        }
+        scope_catalogue.commit(&scopes)?;
 
-        // Load the tail-call target (`velstra_forward`) and register it in the
+        // Register the verified tail-call target (`velstra_forward`) in the
         // `VELSTRA_PROGS` program array, so the main program's
         // `tail_call(PROG_FORWARD)` resolves. It is loaded but never attached to
         // an interface — it only ever runs via the tail call out of `velstra`.
         // Done before the `velstra` mutable borrow below so the borrows don't
         // overlap, and before attach so the first packet already tail-calls.
-        {
-            let flow: &mut Xdp = ebpf
-                .program_mut("velstra_forward")
-                .ok_or_else(|| anyhow!("eBPF object has no `velstra_forward` program"))?
-                .try_into()?;
-            flow.load()
-                .context("loading XDP forward program into the kernel")?;
-        }
         // Clone the program fd to an owned handle so the immutable borrow on
         // `ebpf` ends before the map is borrowed mutably below.
         let flow_fd = {
@@ -280,19 +455,11 @@ impl Firewall {
                 .try_into()?;
             flow.fd()?.try_clone()?
         };
-        // Same again for `velstra_main`, the datapath itself. Only the small
+        // Likewise for verified `velstra_main`, the datapath itself. Only the small
         // port-security gate (`velstra`) is attached to an interface; it tail-
         // calls straight into this one. The split exists because a call chain's
         // stack frames are summed against a single 512-byte limit and the two
         // together came to 528 — a tail call starts a fresh frame.
-        {
-            let main: &mut Xdp = ebpf
-                .program_mut("velstra_main")
-                .ok_or_else(|| anyhow!("eBPF object has no `velstra_main` program"))?
-                .try_into()?;
-            main.load()
-                .context("loading XDP datapath program into the kernel")?;
-        }
         let main_fd = {
             let main: &Xdp = ebpf
                 .program("velstra_main")
@@ -300,15 +467,6 @@ impl Firewall {
                 .try_into()?;
             main.fd()?.try_clone()?
         };
-        {
-            let delivery: &mut Xdp = ebpf
-                .program_mut("velstra_guest_delivery")
-                .ok_or_else(|| anyhow!("eBPF object has no `velstra_guest_delivery` program"))?
-                .try_into()?;
-            delivery
-                .load()
-                .context("loading XDP guest delivery program into the kernel")?;
-        }
         let delivery_fd = {
             let delivery: &Xdp = ebpf
                 .program("velstra_guest_delivery")
@@ -316,6 +474,23 @@ impl Firewall {
                 .try_into()?;
             delivery.fd()?.try_clone()?
         };
+        for (index, name) in [
+            (0, "velstra_ipv6"),
+            (1, "velstra_guest_ipv6"),
+            (2, "velstra_state_v6"),
+        ] {
+            let ipv6: &Xdp = ebpf
+                .program(name)
+                .context("missing IPv6 datapath stage")?
+                .try_into()?;
+            let fd = ipv6.fd()?.try_clone()?;
+            ProgramArray::try_from(
+                ebpf.map_mut("VELSTRA_V6")
+                    .context("missing IPv6 jump table")?,
+            )?
+            .set(index, &fd, 0)
+            .context("registering IPv6 datapath stage")?;
+        }
         {
             let mut prog_array = ProgramArray::try_from(
                 ebpf.map_mut("VELSTRA_PROGS")
@@ -334,21 +509,24 @@ impl Firewall {
                 .context("registering guest delivery in VELSTRA_PROGS")?;
         }
 
-        let program: &mut Xdp = ebpf
-            .program_mut("velstra")
-            .ok_or_else(|| anyhow!("eBPF object has no `velstra` program"))?
-            .try_into()?;
-        program
-            .load()
-            .context("loading XDP program into the kernel")?;
-
         let mut attached = Vec::with_capacity(ifaces.len());
         let mut xdp_links = BTreeMap::new();
-        for iface in ifaces {
+        let mut startup_ifaces = ifaces.to_vec();
+        if pins.is_some() {
+            // Adopt already-present declared ports before reopening the shared
+            // gate. Their old hooks cannot be retired before a poll attaches
+            // replacements two seconds later.
+            for iface in &cfg.interfaces {
+                if !startup_ifaces.contains(&iface.name) && if_nametoindex(&iface.name).is_ok() {
+                    startup_ifaces.push(iface.name.clone());
+                }
+            }
+        }
+        for iface in &startup_ifaces {
             if xdp_links.contains_key(iface) {
                 continue;
             }
-            let (chosen, link) = attach_with_fallback(program, iface, mode)?;
+            let (chosen, link) = attach_with_fallback(&mut ebpf, iface, mode, pins.as_ref())?;
             xdp_links.insert(iface.clone(), link);
             attached.push((iface.clone(), chosen));
         }
@@ -363,7 +541,7 @@ impl Firewall {
         let egress_attached = if egress_ifaces.is_empty() {
             BTreeMap::new()
         } else {
-            attach_egress(&mut ebpf, &egress_ifaces)?
+            attach_egress(&mut ebpf, &egress_ifaces, pins.as_ref())?
         };
 
         let config_attached = cfg
@@ -378,6 +556,7 @@ impl Firewall {
             .collect();
         let mut fw = Self {
             ebpf,
+            pins,
             attached,
             xdp_links,
             applied: cfg.clone(),
@@ -393,21 +572,33 @@ impl Firewall {
             bum_attached: BTreeMap::new(),
             egress_attached,
             explicit_egress_ifaces: if egress { ifaces.to_vec() } else { Vec::new() },
+            ingress_bindings: ifaces.iter().cloned().map(|name| (name, 0)).collect(),
             conntrack: None,
+            fw_flows: None,
+            flow_store,
+            gc_status: Default::default(),
+            scope_catalogue,
+            applied_scopes: scopes,
             runtime_blocks: BTreeMap::new(),
             portal_sessions: BTreeMap::new(),
             runtime_mappings: BTreeMap::new(),
         };
-        fw.sync_bum_attachments(cfg);
-        fw.reopen_configuration()?;
+        // A declared device can appear while programs are being loaded. The
+        // initial map pass may have skipped it, even though startup just attached
+        // its hook. Resolve/program host identity again before publishing Ready;
+        // attachment alone does not mean that its policy/addresses are installed.
+        fw.reprogram()
+            .context("finalizing startup interface policy")?;
         Ok(fw)
     }
 
     fn prune_stale_links(&mut self) {
-        self.xdp_links.retain(|name, link| link.is_current(name));
-        self.bum_attached.retain(|name, link| link.is_current(name));
+        self.xdp_links
+            .retain(|name, link| link.retain_current(name));
+        self.bum_attached
+            .retain(|name, link| link.retain_current(name));
         self.egress_attached
-            .retain(|name, link| link.is_current(name));
+            .retain(|name, link| link.retain_current(name));
         self.attached
             .retain(|(name, _)| self.xdp_links.contains_key(name));
     }
@@ -429,15 +620,24 @@ impl Firewall {
     /// so a tenant cannot ARP or get a DHCP lease, which reads like a tenant
     /// problem rather than an agent one.
     ///
-    /// Best-effort by design: a load or attach failure costs replication and
-    /// nothing else, where taking the agent down would cost the firewall.
-    fn sync_bum_attachments(&mut self, cfg: &RuntimeConfig) {
+    /// Persistent appliances keep the apply gate closed on a hook failure. An
+    /// ephemeral fabric agent retains the existing best-effort attach behavior.
+    fn sync_bum_attachments(&mut self, cfg: &RuntimeConfig) -> Result<()> {
         // Either overlay: `velstra_bum` dispatches on whichever is enabled, and
         // gating the attach on the VXLAN one alone left an SRv6 host without a
         // classifier at all.
-        if cfg.overlay.is_none() && cfg.srv6.is_none() {
-            self.bum_attached.clear();
-            return;
+        let desired = if cfg.overlay.is_some() || cfg.srv6.is_some() {
+            cfg.interfaces
+                .iter()
+                .filter(|iface| iface.vni != 0)
+                .map(|iface| iface.name.clone())
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        retire_links(&mut self.bum_attached, &desired)?;
+        if desired.is_empty() {
+            return Ok(());
         }
         // Forget taps whose netdev has gone (the TC classifier detached with it).
         // Without this, a VM restart that brings the tap back under the same name
@@ -445,7 +645,6 @@ impl Firewall {
         // and it never gets a classifier again — `bum_replicated`/`srv6_bum_replicated`
         // stall until the agent restarts. Mirrors how `reconcile_auto_attach` and
         // `reconcile_config_interfaces` prune their attach sets.
-        self.bum_attached.retain(|name, link| link.is_current(name));
         let wanted: Vec<(String, u32)> = cfg
             .interfaces
             .iter()
@@ -457,7 +656,7 @@ impl Firewall {
             })
             .collect();
         if wanted.is_empty() {
-            return;
+            return Ok(());
         }
         match attach_bum_ingress(
             &mut self.ebpf,
@@ -465,10 +664,15 @@ impl Firewall {
                 .iter()
                 .map(|(name, _)| name.clone())
                 .collect::<Vec<_>>(),
+            self.pins.as_ref(),
         ) {
             Ok(links) => self.bum_attached.extend(links),
+            Err(e) if self.pins.is_some() => {
+                return Err(e).context("attaching persistent BUM enforcement");
+            }
             Err(e) => warn!("BUM replication attach failed: {e:#}"),
         }
+        Ok(())
     }
 
     /// A newly declared tenant tap needs the egress classifier before its
@@ -477,12 +681,13 @@ impl Firewall {
     fn sync_egress_attachments(&mut self, cfg: &RuntimeConfig) -> Result<()> {
         // A tap can disappear and return under the same name between two
         // config updates. Its old classifier vanished with the old ifindex.
-        let desired = egress_interfaces(cfg, &self.explicit_egress_ifaces, true);
+        let desired =
+            egress_for_bindings(cfg, &self.explicit_egress_ifaces, &self.ingress_bindings);
         // Keep every old hook until either the complete candidate or the old
         // configuration has been installed. Detaching a removed tenant's TC
         // hook here bypasses its closed gate during a failed update.
         self.egress_attached
-            .retain(|name, link| link.is_current(name));
+            .retain(|name, link| link.retain_current(name));
         let wanted: Vec<(String, u32)> = desired
             .into_iter()
             .filter(|name| !self.egress_attached.contains_key(name))
@@ -495,6 +700,7 @@ impl Firewall {
                     .iter()
                     .map(|(name, _)| name.clone())
                     .collect::<Vec<_>>(),
+                self.pins.as_ref(),
             )?;
             self.egress_attached.extend(links);
         }
@@ -502,10 +708,10 @@ impl Firewall {
     }
 
     /// Retire obsolete hooks only after map application or rollback succeeds.
-    fn retire_egress_attachments(&mut self, cfg: &RuntimeConfig) {
-        let desired = egress_interfaces(cfg, &self.explicit_egress_ifaces, true);
-        self.egress_attached
-            .retain(|name, link| desired.contains(name) && link.is_current(name));
+    fn retire_egress_attachments(&mut self, cfg: &RuntimeConfig) -> Result<()> {
+        let desired =
+            egress_for_bindings(cfg, &self.explicit_egress_ifaces, &self.ingress_bindings);
+        retire_links(&mut self.egress_attached, &desired.into_iter().collect())
     }
 
     /// Attach the (already-loaded) program to one more interface and assign it a
@@ -527,14 +733,20 @@ impl Firewall {
                 .insert(ifindex, policy_id, 0)
                 .with_context(|| format!("assigning {iface} to policy {policy_id}"))?;
         }
-        let program: &mut Xdp = self
-            .ebpf
-            .program_mut("velstra")
-            .ok_or_else(|| anyhow!("eBPF object has no `velstra` program"))?
-            .try_into()?;
-        let (chosen, link) = attach_with_fallback(program, iface, mode)?;
+        let mut candidate = self.ingress_bindings.clone();
+        candidate.insert(iface.to_owned(), policy_id);
+        let needs_egress =
+            egress_for_bindings(&self.applied, &self.explicit_egress_ifaces, &candidate)
+                .iter()
+                .any(|name| name == iface);
+        if needs_egress && !self.egress_attached.contains_key(iface) {
+            let links = attach_egress(&mut self.ebpf, &[iface.to_owned()], self.pins.as_ref())?;
+            self.egress_attached.extend(links);
+        }
+        let (chosen, link) = attach_with_fallback(&mut self.ebpf, iface, mode, self.pins.as_ref())?;
         self.xdp_links.insert(iface.to_owned(), link);
         self.attached.push((iface.to_string(), chosen));
+        self.ingress_bindings = candidate;
         Ok(chosen)
     }
 
@@ -572,6 +784,7 @@ impl Firewall {
             match self.attach_iface(&name, mode, policy) {
                 Ok(chosen) => {
                     self.auto_attached.insert(name.clone());
+                    self.ingress_bindings.insert(name.clone(), default_policy);
                     log::info!("auto-attached {name} -> policy {policy} ({chosen:?})");
                 }
                 Err(e) => warn!("auto-attach {name} failed: {e:#}"),
@@ -589,6 +802,7 @@ impl Firewall {
             .collect();
         for name in gone {
             self.auto_attached.remove(&name);
+            self.ingress_bindings.remove(&name);
             self.attached.retain(|(n, _)| n != &name);
             log::info!("auto-detached {name} (interface gone)");
         }
@@ -647,15 +861,38 @@ impl Firewall {
                     .with_context(|| format!("registering local redirect device {iface}"))?;
             }
         }
-        let program: &mut Xdp = self
-            .ebpf
-            .program_mut("velstra")
-            .ok_or_else(|| anyhow!("eBPF object has no `velstra` program"))?
-            .try_into()?;
-        let (chosen, link) = attach_with_fallback(program, iface, mode)?;
+        let (chosen, link) = attach_with_fallback(&mut self.ebpf, iface, mode, self.pins.as_ref())?;
         self.xdp_links.insert(iface.to_owned(), link);
         self.attached.push((iface.to_string(), chosen));
         Ok(chosen)
+    }
+
+    /// An attachment and its name cache are not evidence that the current
+    /// ifindex has its declared map rows. Repair deferred startup assignments
+    /// and actual map drift through the same closed-gate reconciliation path.
+    fn interface_maps_current(&self) -> Result<bool> {
+        let policies: HashMap<_, u32, PolicyId> = HashMap::try_from(
+            self.ebpf
+                .map("IFACE_POLICY")
+                .context("IFACE_POLICY map missing")?,
+        )?;
+        let vnis: HashMap<_, u32, u32> = HashMap::try_from(
+            self.ebpf
+                .map("IFACE_VNI")
+                .context("IFACE_VNI map missing")?,
+        )?;
+        for iface in &self.applied.interfaces {
+            if !self.xdp_links.contains_key(&iface.name) {
+                continue;
+            }
+            let index = if_nametoindex(&iface.name)?;
+            if policies.get(&index, 0).ok() != Some(iface.policy)
+                || vnis.get(&index, 0).ok() != Some(iface.vni)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Reconcile the **config-named** interfaces against `present`: attach (and
@@ -693,7 +930,9 @@ impl Firewall {
         if recovery_required {
             log::info!("retrying configuration recovery while traffic remains blocked");
         }
-        let mut changed = !stale.is_empty() || route_devices_changed || recovery_required;
+        let assignments_changed = !self.interface_maps_current().unwrap_or(false);
+        let mut changed =
+            !stale.is_empty() || route_devices_changed || recovery_required || assignments_changed;
         for name in stale {
             self.config_attached.remove(&name);
             self.attached.retain(|(attached, _)| attached != &name);
@@ -778,9 +1017,9 @@ impl Firewall {
         // the stateful fast path for as long as its entry lives, which is
         // exactly the traffic somebody advertised the rule to stop.
         //
-        // Best-effort on purpose. The entries are an optimisation, so failing to
-        // clear one costs that flow its mitigation and nothing else — where
-        // refusing to program the rules over it would cost every flow theirs.
+        // Best-effort cleanup only: the packet path evaluates explicit denials
+        // before established-flow admission. A retained or replicated entry
+        // therefore cannot bypass the newly installed mitigation.
         if let Err(e) = self.purge_discarded_flows() {
             log::warn!("flowspec: could not clear the flows it discards ({e:#})");
         }
@@ -811,11 +1050,8 @@ impl Firewall {
         (&self.flowspec, &self.flowspec_refused)
     }
 
-    /// Remove the `FW_FLOWS` entries the advertised discards match.
-    ///
-    /// Narrow by construction — see `crate::flowspec::flow_is_discarded`. The map
-    /// may have been taken by the C9 sync task, in which case there is nothing
-    /// here to clear and that is not an error.
+    /// Remove matching firewall grants even after HA sync has obtained a handle.
+    /// Explicit packet denials remain authoritative during and after the purge.
     fn purge_discarded_flows(&mut self) -> Result<()> {
         let drops: Vec<_> = self
             .flowspec
@@ -826,12 +1062,10 @@ impl Firewall {
         if drops.is_empty() {
             return Ok(());
         }
-        let Some(map) = self.ebpf.map_mut("FW_FLOWS") else {
-            return Ok(());
-        };
-        // An LRU hash map is read and written through the same userspace handle
-        // as an ordinary one; the eviction policy is the kernel's business.
-        let mut flows: HashMap<_, FlowKey, u8> = HashMap::try_from(map)?;
+        let handle = self.fw_flows_handle()?;
+        let mut flows = handle
+            .lock()
+            .map_err(|_| anyhow!("firewall flow handle lock poisoned"))?;
         // Collected first: deleting while iterating a BPF map is how a scan
         // silently skips entries.
         let doomed: Vec<FlowKey> = flows
@@ -880,9 +1114,17 @@ impl Firewall {
         merged.validate_firewall_capacity()?;
         // Resolve fallible host identity before changing any active hooks/maps.
         let prepared = prepare_host_config(&merged)?;
+        let scopes = self.scope_catalogue.prepare(&merged.policies)?;
         let previous = self.applied.clone();
         let previous_host = self.applied_host.clone();
+        let previous_scopes = self.applied_scopes.clone();
         let forwards = self.port_forward_snapshot()?;
+        // Control writers share this lock; kernel writers are separately
+        // excluded by closing and draining the packet-reader gate below.
+        let control = self.flow_store.clone();
+        let mut store = control
+            .lock()
+            .map_err(|_| anyhow!("firewall state control lock poisoned"))?;
         self.set_configuration_state(CONFIG_UPDATING)?;
         if let Err(error) = synchronize_packet_readers() {
             let _ = self.set_configuration_state(CONFIG_FAILED);
@@ -892,7 +1134,15 @@ impl Firewall {
         let update = (|| -> Result<HashSet<MappingKey>> {
             self.sync_egress_attachments(&merged)?;
             apply_config(&mut self.ebpf, &merged, Some(&previous), &prepared)?;
-            self.reapply_runtime_mappings(&merged)
+            flow_scopes::install_views(&mut self.ebpf, &scopes)?;
+            if scopes.timeouts != previous_scopes.timeouts {
+                flow_scopes::reconcile_store(&mut store, &scopes)?;
+            }
+            self.sync_bum_attachments(&merged)?;
+            self.retire_egress_attachments(&merged)?;
+            let retained = self.reapply_runtime_mappings(&merged)?;
+            self.scope_catalogue.commit(&scopes)?;
+            Ok(retained)
         })();
         let retained_mappings = match update {
             Ok(retained) => retained,
@@ -900,6 +1150,8 @@ impl Firewall {
                 let rollback = (|| -> Result<()> {
                     self.sync_egress_attachments(&previous)?;
                     apply_config(&mut self.ebpf, &previous, Some(&merged), &previous_host)?;
+                    flow_scopes::install_views(&mut self.ebpf, &previous_scopes)?;
+                    self.scope_catalogue.restore(&previous_scopes)?;
                     self.restore_port_forward_snapshot(&forwards)?;
                     let blocks: Vec<String> = self
                         .runtime_blocks
@@ -910,8 +1162,8 @@ impl Firewall {
                     for cidr in blocks {
                         self.write_block(&cidr, true)?;
                     }
-                    self.sync_bum_attachments(&previous);
-                    self.retire_egress_attachments(&previous);
+                    self.sync_bum_attachments(&previous)?;
+                    self.retire_egress_attachments(&previous)?;
                     Ok(())
                 })();
                 match rollback {
@@ -934,9 +1186,8 @@ impl Firewall {
         };
         self.runtime_mappings
             .retain(|key, _| retained_mappings.contains(key));
-        self.sync_bum_attachments(&merged);
-        self.retire_egress_attachments(&merged);
         self.applied = merged;
+        self.applied_scopes = scopes;
         self.route_ifindices = prepared.route_ifindices.clone();
         self.applied_host = prepared;
         self.reopen_configuration()?;
@@ -963,6 +1214,32 @@ impl Firewall {
     }
 
     fn reopen_configuration(&mut self) -> Result<()> {
+        // Temporary ingress handoff guards stay pinned through crashes and
+        // partial startup. Retire them only once all replacement hooks/maps
+        // exist, immediately before reopening the shared gate.
+        if let Some(pins) = &self.pins {
+            let wanted = self
+                .xdp_links
+                .values()
+                .filter_map(|link| link.pin.clone())
+                .chain(
+                    self.egress_attached
+                        .values()
+                        .filter_map(|link| link.pin.clone()),
+                )
+                .chain(
+                    self.bum_attached
+                        .values()
+                        .filter_map(|link| link.pin.clone()),
+                )
+                .collect();
+            if let Err(error) = pins.retire_unused(&wanted) {
+                self.last_apply_error = Some(format!("could not retire datapath hooks: {error:#}"));
+                let _ = self.set_configuration_state(CONFIG_FAILED);
+                return Err(error)
+                    .context("datapath hook retirement failed; firewall remains closed");
+            }
+        }
         if let Err(error) = self.set_configuration_state(CONFIG_READY) {
             self.last_apply_error = Some(format!("could not reopen the datapath: {error:#}"));
             let _ = self.set_configuration_state(CONFIG_FAILED);
@@ -982,6 +1259,88 @@ impl Firewall {
             output.push_str(&format!("Last update: {error}\n"));
         }
         Ok(output)
+    }
+
+    /// An activation acknowledgement for a declaratively protected interface.
+    /// Check kernel attachment and policy identity under the same agent lock;
+    /// a global Ready gate alone says nothing about a newly created ifindex.
+    pub fn interface_status(&self, name: &str) -> Result<String> {
+        anyhow::ensure!(
+            self.configuration_state()? == CONFIG_READY,
+            "configuration is not Ready"
+        );
+        let desired = self
+            .applied
+            .interfaces
+            .iter()
+            .find(|iface| iface.name == name)
+            .with_context(|| format!("interface {name:?} is not in the applied configuration"))?;
+        let index = if_nametoindex(name)?;
+        let link = self
+            .xdp_links
+            .get(name)
+            .context("interface has no owned XDP attachment")?;
+        anyhow::ensure!(
+            link.ifindex == index,
+            "interface was recreated; attachment has not converged"
+        );
+        let mode = self
+            .attached
+            .iter()
+            .find(|(iface, _)| iface == name)
+            .map(|(_, mode)| *mode)
+            .context("interface has no applied XDP mode")?;
+        let pins = self
+            .pins
+            .as_ref()
+            .context("kernel attachment acknowledgement requires persistent links")?;
+        let xdp = self
+            .ebpf
+            .program("velstra")
+            .context("XDP program is missing")?;
+        crate::hook_status::verify_xdp(&pins.xdp_path(index, mode), index, xdp.info()?.id())?;
+        let policies: HashMap<_, u32, PolicyId> = HashMap::try_from(
+            self.ebpf
+                .map("IFACE_POLICY")
+                .context("IFACE_POLICY map is missing")?,
+        )?;
+        anyhow::ensure!(
+            policies.get(&index, 0)? == desired.policy,
+            "interface policy has not converged"
+        );
+        let needs_egress = egress_for_bindings(
+            &self.applied,
+            &self.explicit_egress_ifaces,
+            &self.ingress_bindings,
+        )
+        .iter()
+        .any(|iface| iface == name);
+        if needs_egress {
+            let expected = self
+                .ebpf
+                .program("velstra_egress")
+                .context("egress program is missing")?
+                .info()?
+                .id();
+            let (_, attached) = SchedClassifier::query_tcx(name, TcAttachType::Egress)?;
+            anyhow::ensure!(
+                attached.iter().any(|program| program.id() == expected),
+                "required egress enforcement is not attached"
+            );
+        }
+        // Close a name/ifindex race during the observations above. The consumer
+        // also receives this index, so it can reject a subsequent replacement.
+        anyhow::ensure!(
+            if_nametoindex(name)? == index,
+            "interface changed during readiness query"
+        );
+        Ok(format!(
+            "{}\n",
+            serde_json::json!({
+                "ready": true, "interface": name, "ifindex": index,
+                "policy": desired.policy, "egress": needs_egress,
+            })
+        ))
     }
 
     /// Keep unexpired temporary grants across a successful policy refresh,
@@ -1582,22 +1941,37 @@ impl Firewall {
         Ok(out)
     }
 
-    /// Take ownership of the `FW_FLOWS` map handle for the same C9 conntrack-sync
-    /// task. `FW_FLOWS` is the stateful-firewall reply table (`FlowKey → present`,
-    /// value a mere presence flag); replicating it alongside `CONNTRACK` is what
-    /// lets an established but *non-NAT'd* stateful flow's reply survive a VRRP
-    /// failover — without it the reply misses `FW_FLOWS` on the new master and the
-    /// deny-by-default zone drops it. Same take-out rationale as [`take_conntrack`]:
-    /// the XDP map reference is already resolved, the kernel map lives on, and
-    /// nothing else in the control plane touches `FW_FLOWS`.
-    ///
-    /// [`take_conntrack`]: Firewall::take_conntrack
-    pub fn take_fw_flows(&mut self) -> Result<HashMap<MapData, FlowKey, u8>> {
+    /// Return shared ownership of firewall grants. Moving the map out of Ebpf
+    /// must not surrender the controller's revocation access to the sync task.
+    pub fn fw_flows_handle(&mut self) -> Result<FirewallFlowHandle> {
+        if let Some(handle) = &self.fw_flows {
+            return Ok(handle.clone());
+        }
         let map = self
             .ebpf
             .take_map("FW_FLOWS")
             .ok_or_else(|| anyhow!("FW_FLOWS map missing"))?;
-        HashMap::try_from(map).context("FW_FLOWS as a HashMap")
+        let handle = Arc::new(StdMutex::new(
+            HashMap::try_from(map).context("FW_FLOWS as a HashMap")?,
+        ));
+        self.fw_flows = Some(handle.clone());
+        Ok(handle)
+    }
+
+    pub fn flow_store_handle(&self) -> SharedFlowStore {
+        self.flow_store.clone()
+    }
+
+    pub fn gc_status_handle(&self) -> velstra::flow_gc::SharedGcStatus {
+        self.gc_status.clone()
+    }
+
+    pub fn gc_status(&self) -> Result<String> {
+        Ok(self
+            .gc_status
+            .lock()
+            .map_err(|_| anyhow!("firewall maintenance status lock poisoned"))?
+            .render())
     }
 }
 
@@ -1779,22 +2153,25 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
                 .iter()
                 .filter(|r| r.dst.is_none() && r.src6.is_none() && r.dst6.is_none())
             {
-                let (prefix, addr) = port_rule_src_lpm(&rule.src);
-                let _ = rules.remove(&Key::new(
-                    prefix,
-                    ScopedSrcPortKey::with_ifindex(
-                        policy.id,
-                        rule.key.proto,
-                        rule.icmp_type,
-                        if rule.icmp_type == 0 {
-                            rule.key.port
-                        } else {
-                            0
-                        },
-                        stale_ifindex(&rule.in_interface),
-                        addr,
-                    ),
-                ));
+                for context in velstra_config::firewall_rule_contexts(rule) {
+                    let (prefix, addr) = port_rule_src_lpm(&rule.src);
+                    let _ = rules.remove(&Key::new(
+                        prefix,
+                        ScopedSrcPortKey::with_ifindex(
+                            policy.id,
+                            rule.key.proto,
+                            rule.icmp_type,
+                            if rule.icmp_type == 0 {
+                                rule.key.port
+                            } else {
+                                0
+                            },
+                            stale_ifindex(&rule.in_interface),
+                            addr,
+                        )
+                        .in_context(context),
+                    ));
+                }
             }
         }
     }
@@ -1808,22 +2185,25 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
         )?;
         for policy in &old.policies {
             for rule in policy.port_rules.iter().filter(|r| r.src6.is_some()) {
-                let (prefix, addr) = port_rule_src6_lpm(&rule.src6);
-                let _ = rules.remove(&Key::new(
-                    prefix,
-                    ScopedSrcPortKey6::with_ifindex(
-                        policy.id,
-                        rule.key.proto,
-                        rule.icmp_type,
-                        if rule.icmp_type == 0 {
-                            rule.key.port
-                        } else {
-                            0
-                        },
-                        stale_ifindex(&rule.in_interface),
-                        addr,
-                    ),
-                ));
+                for context in velstra_config::firewall_rule_contexts(rule) {
+                    let (prefix, addr) = port_rule_src6_lpm(&rule.src6);
+                    let _ = rules.remove(&Key::new(
+                        prefix,
+                        ScopedSrcPortKey6::with_ifindex(
+                            policy.id,
+                            rule.key.proto,
+                            rule.icmp_type,
+                            if rule.icmp_type == 0 {
+                                rule.key.port
+                            } else {
+                                0
+                            },
+                            stale_ifindex(&rule.in_interface),
+                            addr,
+                        )
+                        .in_context(context),
+                    ));
+                }
             }
         }
     }
@@ -1834,22 +2214,25 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
         )?;
         for policy in &old.policies {
             for rule in policy.port_rules.iter().filter(|r| r.dst6.is_some()) {
-                let (prefix, addr) = port_rule_dst6_lpm(&rule.dst6);
-                let _ = rules.remove(&Key::new(
-                    prefix,
-                    ScopedDstPortKey6::with_ifindex(
-                        policy.id,
-                        rule.key.proto,
-                        rule.icmp_type,
-                        if rule.icmp_type == 0 {
-                            rule.key.port
-                        } else {
-                            0
-                        },
-                        stale_ifindex(&rule.in_interface),
-                        addr,
-                    ),
-                ));
+                for context in velstra_config::firewall_rule_contexts(rule) {
+                    let (prefix, addr) = port_rule_dst6_lpm(&rule.dst6);
+                    let _ = rules.remove(&Key::new(
+                        prefix,
+                        ScopedDstPortKey6::with_ifindex(
+                            policy.id,
+                            rule.key.proto,
+                            rule.icmp_type,
+                            if rule.icmp_type == 0 {
+                                rule.key.port
+                            } else {
+                                0
+                            },
+                            stale_ifindex(&rule.in_interface),
+                            addr,
+                        )
+                        .in_context(context),
+                    ));
+                }
             }
         }
     }
@@ -1860,22 +2243,25 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
         )?;
         for policy in &old.policies {
             for rule in policy.port_rules.iter().filter(|r| r.dst.is_some()) {
-                let (prefix, addr) = port_rule_dst_lpm(&rule.dst);
-                let _ = rules.remove(&Key::new(
-                    prefix,
-                    ScopedDstPortKey::with_ifindex(
-                        policy.id,
-                        rule.key.proto,
-                        rule.icmp_type,
-                        if rule.icmp_type == 0 {
-                            rule.key.port
-                        } else {
-                            0
-                        },
-                        stale_ifindex(&rule.in_interface),
-                        addr,
-                    ),
-                ));
+                for context in velstra_config::firewall_rule_contexts(rule) {
+                    let (prefix, addr) = port_rule_dst_lpm(&rule.dst);
+                    let _ = rules.remove(&Key::new(
+                        prefix,
+                        ScopedDstPortKey::with_ifindex(
+                            policy.id,
+                            rule.key.proto,
+                            rule.icmp_type,
+                            if rule.icmp_type == 0 {
+                                rule.key.port
+                            } else {
+                                0
+                            },
+                            stale_ifindex(&rule.in_interface),
+                            addr,
+                        )
+                        .in_context(context),
+                    ));
+                }
             }
         }
     }
@@ -2338,33 +2724,36 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
                 .enumerate()
                 .filter(|(_, r)| r.dst.is_none() && r.src6.is_none() && r.dst6.is_none())
             {
-                let (prefix, addr) = port_rule_src_lpm(&rule.src);
-                let slot = limit_slots.get(&(policy.id, index)).copied().unwrap_or(0);
-                rules
-                    .insert(
-                        &Key::new(
-                            prefix,
-                            ScopedSrcPortKey::with_ifindex(
-                                policy.id,
-                                rule.key.proto,
-                                rule.icmp_type,
-                                if rule.icmp_type == 0 {
-                                    rule.key.port
-                                } else {
-                                    0
-                                },
-                                rule_ifindex(&rule.in_interface)?,
-                                addr,
+                for context in velstra_config::firewall_rule_contexts(rule) {
+                    let (prefix, addr) = port_rule_src_lpm(&rule.src);
+                    let slot = limit_slots.get(&(policy.id, index)).copied().unwrap_or(0);
+                    rules
+                        .insert(
+                            &Key::new(
+                                prefix,
+                                ScopedSrcPortKey::with_ifindex(
+                                    policy.id,
+                                    rule.key.proto,
+                                    rule.icmp_type,
+                                    if rule.icmp_type == 0 {
+                                        rule.key.port
+                                    } else {
+                                        0
+                                    },
+                                    rule_ifindex(&rule.in_interface)?,
+                                    addr,
+                                )
+                                .in_context(context),
                             ),
-                        ),
-                        port_rule_with_limit(
-                            port_rule_value(rule.action, rule.log, cidr_bits(&rule.src))
-                                | rule.scope,
-                            slot,
-                        ),
-                        0,
-                    )
-                    .context("inserting port rule")?;
+                            port_rule_with_limit(
+                                port_rule_value(rule.action, rule.log, cidr_bits(&rule.src))
+                                    | rule.scope,
+                                slot,
+                            ),
+                            0,
+                        )
+                        .context("inserting port rule")?;
+                }
             }
         }
     }
@@ -2383,33 +2772,36 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
                 .enumerate()
                 .filter(|(_, r)| r.src6.is_some())
             {
-                let (prefix, addr) = port_rule_src6_lpm(&rule.src6);
-                let slot = limit_slots.get(&(policy.id, index)).copied().unwrap_or(0);
-                rules
-                    .insert(
-                        &Key::new(
-                            prefix,
-                            ScopedSrcPortKey6::with_ifindex(
-                                policy.id,
-                                rule.key.proto,
-                                rule.icmp_type,
-                                if rule.icmp_type == 0 {
-                                    rule.key.port
-                                } else {
-                                    0
-                                },
-                                rule_ifindex(&rule.in_interface)?,
-                                addr,
+                for context in velstra_config::firewall_rule_contexts(rule) {
+                    let (prefix, addr) = port_rule_src6_lpm(&rule.src6);
+                    let slot = limit_slots.get(&(policy.id, index)).copied().unwrap_or(0);
+                    rules
+                        .insert(
+                            &Key::new(
+                                prefix,
+                                ScopedSrcPortKey6::with_ifindex(
+                                    policy.id,
+                                    rule.key.proto,
+                                    rule.icmp_type,
+                                    if rule.icmp_type == 0 {
+                                        rule.key.port
+                                    } else {
+                                        0
+                                    },
+                                    rule_ifindex(&rule.in_interface)?,
+                                    addr,
+                                )
+                                .in_context(context),
                             ),
-                        ),
-                        port_rule_with_limit(
-                            port_rule_value(rule.action, rule.log, cidr6_bits(&rule.src6))
-                                | rule.scope,
-                            slot,
-                        ),
-                        0,
-                    )
-                    .context("inserting IPv6 port rule")?;
+                            port_rule_with_limit(
+                                port_rule_value(rule.action, rule.log, cidr6_bits(&rule.src6))
+                                    | rule.scope,
+                                slot,
+                            ),
+                            0,
+                        )
+                        .context("inserting IPv6 port rule")?;
+                }
             }
         }
     }
@@ -2426,33 +2818,36 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
                 .enumerate()
                 .filter(|(_, r)| r.dst6.is_some())
             {
-                let (prefix, addr) = port_rule_dst6_lpm(&rule.dst6);
-                let slot = limit_slots.get(&(policy.id, index)).copied().unwrap_or(0);
-                rules
-                    .insert(
-                        &Key::new(
-                            prefix,
-                            ScopedDstPortKey6::with_ifindex(
-                                policy.id,
-                                rule.key.proto,
-                                rule.icmp_type,
-                                if rule.icmp_type == 0 {
-                                    rule.key.port
-                                } else {
-                                    0
-                                },
-                                rule_ifindex(&rule.in_interface)?,
-                                addr,
+                for context in velstra_config::firewall_rule_contexts(rule) {
+                    let (prefix, addr) = port_rule_dst6_lpm(&rule.dst6);
+                    let slot = limit_slots.get(&(policy.id, index)).copied().unwrap_or(0);
+                    rules
+                        .insert(
+                            &Key::new(
+                                prefix,
+                                ScopedDstPortKey6::with_ifindex(
+                                    policy.id,
+                                    rule.key.proto,
+                                    rule.icmp_type,
+                                    if rule.icmp_type == 0 {
+                                        rule.key.port
+                                    } else {
+                                        0
+                                    },
+                                    rule_ifindex(&rule.in_interface)?,
+                                    addr,
+                                )
+                                .in_context(context),
                             ),
-                        ),
-                        port_rule_with_limit(
-                            port_rule_value(rule.action, rule.log, cidr6_bits(&rule.dst6))
-                                | rule.scope,
-                            slot,
-                        ),
-                        0,
-                    )
-                    .context("inserting IPv6 destination rule")?;
+                            port_rule_with_limit(
+                                port_rule_value(rule.action, rule.log, cidr6_bits(&rule.dst6))
+                                    | rule.scope,
+                                slot,
+                            ),
+                            0,
+                        )
+                        .context("inserting IPv6 destination rule")?;
+                }
             }
         }
     }
@@ -2470,33 +2865,36 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
                 .enumerate()
                 .filter(|(_, r)| r.dst.is_some())
             {
-                let (prefix, addr) = port_rule_dst_lpm(&rule.dst);
-                let slot = limit_slots.get(&(policy.id, index)).copied().unwrap_or(0);
-                rules
-                    .insert(
-                        &Key::new(
-                            prefix,
-                            ScopedDstPortKey::with_ifindex(
-                                policy.id,
-                                rule.key.proto,
-                                rule.icmp_type,
-                                if rule.icmp_type == 0 {
-                                    rule.key.port
-                                } else {
-                                    0
-                                },
-                                rule_ifindex(&rule.in_interface)?,
-                                addr,
+                for context in velstra_config::firewall_rule_contexts(rule) {
+                    let (prefix, addr) = port_rule_dst_lpm(&rule.dst);
+                    let slot = limit_slots.get(&(policy.id, index)).copied().unwrap_or(0);
+                    rules
+                        .insert(
+                            &Key::new(
+                                prefix,
+                                ScopedDstPortKey::with_ifindex(
+                                    policy.id,
+                                    rule.key.proto,
+                                    rule.icmp_type,
+                                    if rule.icmp_type == 0 {
+                                        rule.key.port
+                                    } else {
+                                        0
+                                    },
+                                    rule_ifindex(&rule.in_interface)?,
+                                    addr,
+                                )
+                                .in_context(context),
                             ),
-                        ),
-                        port_rule_with_limit(
-                            port_rule_value(rule.action, rule.log, cidr_bits(&rule.dst))
-                                | rule.scope,
-                            slot,
-                        ),
-                        0,
-                    )
-                    .context("inserting destination rule")?;
+                            port_rule_with_limit(
+                                port_rule_value(rule.action, rule.log, cidr_bits(&rule.dst))
+                                    | rule.scope,
+                                slot,
+                            ),
+                            0,
+                        )
+                        .context("inserting destination rule")?;
+                }
             }
         }
     }
@@ -3981,13 +4379,11 @@ fn read_iface_mac(iface: &str) -> Result<[u8; 6]> {
 /// * a policy with **egress default drop**. On a guest tap this hook sees
 ///   packets entering the guest, so omitting it makes a cloud security group
 ///   look active while every inbound packet passes;
-/// * a **stateful** policy that does not pass by default. The ingress hook
-///   records a flow when it admits one, so a reply to something that *arrived*
-///   is covered — but a connection the box itself starts never crosses that hook
-///   on the way out, so nothing vouches for its reply and the default action
-///   drops it. That is the whole of DNS, NTP, ACME, the update channel, dyndns,
-///   alert webhooks and config-sync: on real hardware the box could send and
-///   never hear an answer, while `stateful = true` said otherwise;
+/// * every **stateful** policy. Native protocol tracking must observe both
+///   directions of the handshake, even when the base policy passes by default.
+///   Otherwise an ingress SYN followed by an unobserved egress SYN-ACK leaves
+///   the next ingress ACK invalid. Host-originated flows likewise need their
+///   outgoing opener observed before a deny-by-default ingress admits replies;
 /// * an NPTv6 boundary interface (C16), where the source prefix is translated.
 ///
 /// Names may repeat across the reasons; the result is deduplicated and keeps the
@@ -4017,10 +4413,7 @@ fn egress_interfaces(cfg: &RuntimeConfig, ifaces: &[String], egress: bool) -> Ve
     let needs_reply_state: Vec<PolicyId> = cfg
         .policies
         .iter()
-        .filter(|p| {
-            p.global.has_flag(ConfigFlags::STATEFUL)
-                && p.global.default_action != Action::Pass as u32
-        })
+        .filter(|p| p.global.has_flag(ConfigFlags::STATEFUL))
         .map(|p| p.id)
         .collect();
     for i in &cfg.interfaces {
@@ -4035,7 +4428,48 @@ fn egress_interfaces(cfg: &RuntimeConfig, ifaces: &[String], egress: bool) -> Ve
     for r in &cfg.npt66 {
         push(&r.interface, &mut out);
     }
+    for name in ifaces {
+        let policy = cfg
+            .interfaces
+            .iter()
+            .find(|i| &i.name == name)
+            .map_or(0, |i| i.policy);
+        if policy_needs_egress(cfg, policy) {
+            push(name, &mut out);
+        }
+    }
     out
+}
+
+fn policy_needs_egress(cfg: &RuntimeConfig, id: PolicyId) -> bool {
+    cfg.policies.iter().any(|policy| {
+        policy.id == id
+            && ((policy.global.has_flag(ConfigFlags::STATEFUL)
+                || policy.global.has_flag(ConfigFlags::EGRESS_DEFAULT_DROP))
+                || policy
+                    .port_rules
+                    .iter()
+                    .any(|rule| rule.scope & PORT_RULE_OUT_ONLY != 0))
+    })
+}
+
+fn egress_for_bindings(
+    cfg: &RuntimeConfig,
+    explicit: &[String],
+    bindings: &BTreeMap<String, PolicyId>,
+) -> Vec<String> {
+    let mut desired = egress_interfaces(cfg, explicit, true);
+    for (name, fallback) in bindings {
+        let policy = cfg
+            .interfaces
+            .iter()
+            .find(|iface| &iface.name == name)
+            .map_or(*fallback, |iface| iface.policy);
+        if policy_needs_egress(cfg, policy) && !desired.contains(name) {
+            desired.push(name.clone());
+        }
+    }
+    desired
 }
 
 /// Load the `velstra_egress` TC classifier and attach it at **egress** on each
@@ -4044,7 +4478,24 @@ fn egress_interfaces(cfg: &RuntimeConfig, ifaces: &[String], egress: bool) -> Ve
 fn attach_egress(
     ebpf: &mut Ebpf,
     ifaces: &[String],
+    pins: Option<&DatapathPins>,
 ) -> Result<BTreeMap<String, InterfaceLink<SchedClassifierLink>>> {
+    {
+        let state: &mut SchedClassifier = ebpf
+            .program_mut("velstra_state_tc6")
+            .context("missing TC IPv6 state stage")?
+            .try_into()?;
+        match state.load() {
+            Ok(()) | Err(aya::programs::ProgramError::AlreadyLoaded) => {}
+            Err(error) => return Err(error).context("loading TC IPv6 state stage"),
+        }
+        let fd = state.fd()?.try_clone()?;
+        ProgramArray::try_from(
+            ebpf.map_mut("VELSTRA_TC6")
+                .context("missing TC IPv6 jump table")?,
+        )?
+        .set(0, &fd, 0)?;
+    }
     let program: &mut SchedClassifier = ebpf
         .program_mut("velstra_egress")
         .ok_or_else(|| anyhow!("eBPF object has no `velstra_egress` program"))?
@@ -4058,13 +4509,27 @@ fn attach_egress(
         let ifindex = if_nametoindex(iface)?;
         // Idempotent: a pre-existing clsact qdisc is fine.
         let _ = qdisc_add_clsact(iface);
-        let id = program
-            .attach(iface, TcAttachType::Egress)
-            .with_context(|| format!("attaching TC egress program to {iface}"))?;
-        let link = program
+        let inherited = pins
+            .map(|pins| pins.inherited_tc(ifindex, false))
+            .transpose()?
+            .flatten();
+        let replacing = inherited.is_some();
+        let id = match inherited {
+            Some(link) => program.attach_to_link(link),
+            None => program.attach(iface, TcAttachType::Egress),
+        }
+        .with_context(|| format!("attaching TC egress program to {iface}"))?;
+        let mut link = program
             .take_link(id)
             .context("owning TC egress attachment")?;
-        links.insert(iface.clone(), InterfaceLink::new(iface, ifindex, link)?);
+        let path = pins.map(|pins| pins.tc_path(ifindex, false));
+        if let (Some(pins), Some(path), false) = (pins, path.as_ref(), replacing) {
+            link = pins.pin_new(path, link)?;
+        }
+        links.insert(
+            iface.clone(),
+            InterfaceLink::new(iface, ifindex, link)?.with_pin(path),
+        );
         log::info!("attached egress firewall to {iface}");
     }
     // On a partial failure, the links collected so far drop and detach too.
@@ -4082,6 +4547,16 @@ fn attach_egress(
 fn attach_bum_ingress(
     ebpf: &mut Ebpf,
     ifaces: &[String],
+    pins: Option<&DatapathPins>,
+) -> Result<BTreeMap<String, InterfaceLink<SchedClassifierLink>>> {
+    attach_ingress(ebpf, ifaces, pins, false)
+}
+
+fn attach_ingress(
+    ebpf: &mut Ebpf,
+    ifaces: &[String],
+    pins: Option<&DatapathPins>,
+    handoff: bool,
 ) -> Result<BTreeMap<String, InterfaceLink<SchedClassifierLink>>> {
     let program: &mut SchedClassifier = ebpf
         .program_mut("velstra_bum")
@@ -4106,11 +4581,37 @@ fn attach_bum_ingress(
         let ifindex = if_nametoindex(iface)?;
         // Idempotent: a pre-existing clsact qdisc is fine.
         let _ = qdisc_add_clsact(iface);
-        let id = program
-            .attach(iface, TcAttachType::Ingress)
-            .with_context(|| format!("attaching TC BUM-replication program to {iface}"))?;
-        let link = program.take_link(id).context("owning TC BUM attachment")?;
-        links.insert(iface.clone(), InterfaceLink::new(iface, ifindex, link)?);
+        let inherited = pins
+            .map(|pins| {
+                if handoff {
+                    pins.inherited_handoff(ifindex)
+                } else {
+                    pins.inherited_tc(ifindex, true)
+                }
+            })
+            .transpose()?
+            .flatten();
+        let replacing = inherited.is_some();
+        let id = match inherited {
+            Some(link) => program.attach_to_link(link),
+            None => program.attach(iface, TcAttachType::Ingress),
+        }
+        .with_context(|| format!("attaching TC BUM-replication program to {iface}"))?;
+        let mut link = program.take_link(id).context("owning TC BUM attachment")?;
+        let path = pins.map(|pins| {
+            if handoff {
+                pins.handoff_path(ifindex)
+            } else {
+                pins.tc_path(ifindex, true)
+            }
+        });
+        if let (Some(pins), Some(path), false) = (pins, path.as_ref(), replacing) {
+            link = pins.pin_new(path, link)?;
+        }
+        links.insert(
+            iface.clone(),
+            InterfaceLink::new(iface, ifindex, link)?.with_pin(path),
+        );
         log::info!("attached BUM head-end replication (ingress) to {iface}");
     }
     Ok(links)
@@ -4118,17 +4619,83 @@ fn attach_bum_ingress(
 
 /// Attach `program`, walking the candidate modes for `mode` until one succeeds.
 fn attach_with_fallback(
-    program: &mut Xdp,
+    ebpf: &mut Ebpf,
     iface: &str,
     mode: AttachMode,
+    pins: Option<&DatapathPins>,
 ) -> Result<(XdpMode, InterfaceLink<XdpLink>)> {
     let ifindex = if_nametoindex(iface)?;
+    let inherited = match pins {
+        Some(pins) => pins
+            .inherited_xdp(ifindex)?
+            .map(|(mode, link)| (pins, mode, link)),
+        None => None,
+    };
+    if let Some((pins, chosen, link)) = inherited {
+        anyhow::ensure!(
+            mode.candidates().contains(&chosen),
+            "{iface} already has a persistent {chosen:?} hook; requested mode {mode:?} is incompatible"
+        );
+        let replacement = {
+            let program: &mut Xdp = ebpf
+                .program_mut("velstra")
+                .context("XDP program is missing")?
+                .try_into()?;
+            program
+                .attach_to_link(link)
+                .and_then(|id| program.take_link(id))
+        };
+        match replacement {
+            Ok(link) => {
+                return Ok((
+                    chosen,
+                    InterfaceLink::new(iface, ifindex, link)?
+                        .with_pin(Some(pins.xdp_path(ifindex, chosen))),
+                ));
+            }
+            Err(error) => {
+                if mode != AttachMode::Auto || chosen != XdpMode::Driver {
+                    return Err(error).context("replacing persistent XDP program");
+                }
+                // Native replacement can become unsupported after a NIC/MTU
+                // change. Never detach the old hook into an unfiltered gap.
+                // Pin a TCX ingress guard sharing the CLOSED apply gate first.
+                let mut gate: Array<_, u32> = Array::try_from(
+                    ebpf.map_mut("APPLY_STATE")
+                        .context("APPLY_STATE map missing")?,
+                )?;
+                gate.set(0, CONFIG_UPDATING, 0)?;
+                synchronize_packet_readers().context("draining native XDP before mode handoff")?;
+                let guards = attach_ingress(ebpf, &[iface.to_owned()], Some(pins), true)
+                    .context("protecting native-to-generic XDP handoff")?;
+                std::fs::remove_file(pins.xdp_path(ifindex, chosen))
+                    .context("retiring unsupported native XDP hook under ingress guard")?;
+                // The pin retains the guard even if a later SKB attachment or
+                // startup fails. Full apply removes it before CONFIG_READY.
+                drop(guards);
+                warn!(
+                    "native XDP replacement on {iface} failed: {error}; retrying under a persistent ingress guard"
+                );
+            }
+        }
+    }
+    let program: &mut Xdp = ebpf
+        .program_mut("velstra")
+        .context("XDP program is missing")?
+        .try_into()?;
     let mut last_err = None;
     for candidate in mode.candidates() {
         match program.attach(iface, *candidate) {
             Ok(id) => {
-                let link = program.take_link(id).context("owning XDP attachment")?;
-                return Ok((*candidate, InterfaceLink::new(iface, ifindex, link)?));
+                let mut link = program.take_link(id).context("owning XDP attachment")?;
+                let path = pins.map(|pins| pins.xdp_path(ifindex, *candidate));
+                if let (Some(pins), Some(path)) = (pins, path.as_ref()) {
+                    link = pins.pin_new(path, link)?;
+                }
+                return Ok((
+                    *candidate,
+                    InterfaceLink::new(iface, ifindex, link)?.with_pin(path),
+                ));
             }
             Err(e) => {
                 warn!("attach to {iface} in {candidate:?} mode failed: {e}");
@@ -4286,7 +4853,7 @@ mod tests {
     /// channel, webhooks and config-sync all failing while `stateful = true`
     /// claimed otherwise, and nothing in the configuration hinted at why.
     #[test]
-    fn a_stateful_deny_by_default_policy_brings_the_egress_hook() {
+    fn every_stateful_policy_brings_the_egress_hook() {
         let iface = |name: &str, policy: PolicyId| ResolvedInterface {
             name: name.into(),
             policy,
@@ -4298,6 +4865,7 @@ mod tests {
             rate_limit_mbit: None,
         };
         let policy = |id: PolicyId, action: Action, stateful: bool| PolicyConfig {
+            state_scope: None,
             mac_rules: Vec::new(),
             id,
             global: GlobalConfig::new(action, if stateful { ConfigFlags::STATEFUL } else { 0 }),
@@ -4327,10 +4895,41 @@ mod tests {
         cfg.policies = vec![policy(1, Action::Drop, false)];
         assert!(egress_interfaces(&cfg, &[], false).is_empty());
 
-        // Stateful but passing by default: the reply gets through on its own, and
-        // a hook that is not needed is a verdict stage nobody asked for.
+        // Native protocol state must see the complete handshake even under
+        // default allow. Otherwise forwarding/NPT observes SYN but not SYNACK,
+        // then rejects the initiator's final ACK or its first payload.
         cfg.policies = vec![policy(1, Action::Pass, true)];
+        assert_eq!(egress_interfaces(&cfg, &[], false), ["eth0"]);
+        cfg.interfaces.push(iface("eth1", 1));
+        assert_eq!(egress_interfaces(&cfg, &[], false), ["eth0", "eth1"]);
+        cfg.interfaces.pop();
+        cfg.policies = vec![policy(1, Action::Pass, false)];
         assert!(egress_interfaces(&cfg, &[], false).is_empty());
+
+        // CLI and automatic links are not necessarily declared interfaces.
+        // Desired policy overrides fallback assignments, and live removal of
+        // stateful mode retires only automatically required TC hooks.
+        cfg.policies = vec![
+            policy(0, Action::Pass, true),
+            policy(1, Action::Pass, false),
+        ];
+        assert_eq!(egress_interfaces(&cfg, &["cli0".into()], false), ["cli0"]);
+        let bindings = BTreeMap::from([("cli0".into(), 0), ("auto1".into(), 1)]);
+        assert_eq!(egress_for_bindings(&cfg, &[], &bindings), ["cli0"]);
+        cfg.policies[1] = policy(1, Action::Pass, true);
+        assert_eq!(
+            egress_for_bindings(&cfg, &[], &bindings),
+            ["eth0", "auto1", "cli0"]
+        );
+        cfg.policies = vec![
+            policy(0, Action::Pass, false),
+            policy(1, Action::Pass, false),
+        ];
+        assert!(egress_for_bindings(&cfg, &[], &bindings).is_empty());
+        assert_eq!(
+            egress_for_bindings(&cfg, &["cli0".into()], &bindings),
+            ["cli0"]
+        );
 
         // The other reasons still hold, and a name is listed once however many
         // reasons name it.

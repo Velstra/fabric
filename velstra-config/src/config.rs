@@ -693,6 +693,11 @@ pub struct PolicyFile {
     /// Optional human-readable name (for logs only).
     #[serde(default)]
     pub name: Option<String>,
+    /// Stable semantic identity for compiler-assigned routing ordinals.
+    /// Absent uses the explicit numeric policy ID. No lifecycle IDs belong in
+    /// desired configuration; those are allocated by the agent.
+    #[serde(default)]
+    pub state_scope: Option<String>,
     #[serde(default)]
     pub default_action: ActionName,
     #[serde(default)]
@@ -1141,6 +1146,9 @@ pub struct ResolvedPortForward {
 pub struct PolicyConfig {
     /// Policy id (`0` is the default).
     pub id: PolicyId,
+    /// Stable semantic identity when a compiler assigns transient routing IDs.
+    /// Unnamed native policies retain their explicit numeric resource identity.
+    pub state_scope: Option<String>,
     /// The `CONFIG` map entry for this policy.
     pub global: GlobalConfig,
     /// Normalised IPv4 CIDR blocks for this policy's `BLOCKLIST` entries.
@@ -1512,10 +1520,42 @@ pub struct RuntimeConfig {
     pub fail_closed: bool,
 }
 
+// An explicit address constraint always fixes its wire family, including
+// IPv4 /0. Only an absent address constraint applies across both families.
+fn rule_map_scope(rule: &ResolvedRule) -> u32 {
+    let family = if rule.src6.is_some() || rule.dst6.is_some() {
+        PORT_RULE_V6_ONLY
+    } else if rule.src.is_some() || rule.dst.is_some() {
+        PORT_RULE_V4_ONLY
+    } else {
+        0
+    };
+    rule.scope | family
+}
+
+/// The four exact wire contexts a resolved rule applies to. Kept shared by
+/// capacity validation and the map writer so expansion cannot escape limits.
+pub fn firewall_rule_contexts(rule: &ResolvedRule) -> impl Iterator<Item = u32> {
+    let scope = rule_map_scope(rule);
+    (0..4).filter(move |context| {
+        let excluded = if context & 2 == 0 {
+            PORT_RULE_V6_ONLY
+        } else {
+            PORT_RULE_V4_ONLY
+        } | if context & 1 == 0 {
+            PORT_RULE_OUT_ONLY
+        } else {
+            PORT_RULE_IN_ONLY
+        };
+        scope & excluded == 0
+    })
+}
+
 impl RuntimeConfig {
     /// Refuse configurations that cannot be represented by the shared firewall
     /// maps, before a live update removes or replaces any existing rules.
     pub fn validate_firewall_capacity(&self) -> Result<()> {
+        self.validate_firewall_rule_scopes()?;
         for (family, count) in [
             (
                 "IPv4",
@@ -1554,6 +1594,47 @@ impl RuntimeConfig {
         Ok(())
     }
 
+    /// Family and direction are exact key components. Reject impossible wire
+    /// constraints, and count expanded entries before any live map is changed.
+    fn validate_firewall_rule_scopes(&self) -> Result<()> {
+        let mut entries = [0usize; 4];
+        for policy in &self.policies {
+            for (index, rule) in policy.port_rules.iter().enumerate() {
+                let has_v4 = rule.src.is_some() || rule.dst.is_some();
+                let has_v6 = rule.src6.is_some() || rule.dst6.is_some();
+                if has_v4 && rule.scope & PORT_RULE_V6_ONLY != 0
+                    || has_v6 && rule.scope & PORT_RULE_V4_ONLY != 0
+                    || rule.scope & (PORT_RULE_V4_ONLY | PORT_RULE_V6_ONLY)
+                        == (PORT_RULE_V4_ONLY | PORT_RULE_V6_ONLY)
+                    || rule.scope & (PORT_RULE_IN_ONLY | PORT_RULE_OUT_ONLY)
+                        == (PORT_RULE_IN_ONLY | PORT_RULE_OUT_ONLY)
+                {
+                    bail!(
+                        "policy {}: firewall rule {} has contradictory wire constraints",
+                        policy.id,
+                        index + 1
+                    );
+                }
+                let trie = if rule.src6.is_some() {
+                    2
+                } else if rule.dst6.is_some() {
+                    3
+                } else if rule.dst.is_some() {
+                    1
+                } else {
+                    0
+                };
+                entries[trie] += firewall_rule_contexts(rule).count();
+            }
+        }
+        for (trie, count) in entries.into_iter().enumerate() {
+            if count > 8192 {
+                bail!("firewall trie {trie}: {count} expanded rules exceeds the data plane's 8192");
+            }
+        }
+        Ok(())
+    }
+
     /// A do-nothing, fail-open config (pass everything). Used when `run` is
     /// invoked without a `--config` file.
     pub fn passthrough() -> Self {
@@ -1562,6 +1643,7 @@ impl RuntimeConfig {
             // passed too, matching this config's whole premise.
             fail_closed: false,
             policies: vec![PolicyConfig {
+                state_scope: None,
                 mac_rules: Vec::new(),
                 id: 0,
                 global: GlobalConfig::new(Action::Pass, 0),
@@ -1791,14 +1873,6 @@ fn resolve_firewall(
             Some("out") => scope |= PORT_RULE_OUT_ONLY,
             Some(other) => bail!("policy {id}: direction {other:?} is not in or out"),
         }
-        // The egress hook is IPv4 only, so an IPv6 rule scoped to `out` would be
-        // written and never consulted. Refusing beats enforcing nothing quietly.
-        if scope & PORT_RULE_V6_ONLY != 0 && scope & PORT_RULE_OUT_ONLY != 0 {
-            bail!(
-                "policy {id}: direction \"out\" is IPv4 only — an ipv6 rule on the \
-                 egress hook would never be consulted"
-            );
-        }
         rules.push(ResolvedRule {
             key: PortKey::new(rule.proto.number(), rule.port),
             icmp_type: velstra_common::icmp_type_key(rule.icmp_type),
@@ -1816,6 +1890,7 @@ fn resolve_firewall(
 
     Ok(PolicyConfig {
         id,
+        state_scope: None,
         global,
         blocklist: cidrs,
         blocklist6: cidrs6,
@@ -1865,6 +1940,21 @@ impl FileConfig {
     /// Fails if a CIDR is malformed, a port-less protocol carries a port, or two
     /// policies share an id.
     pub fn resolve(&self) -> Result<RuntimeConfig> {
+        if self.policies.len() >= velstra_common::FLOW_POLICY_CAPACITY as usize {
+            bail!(
+                "too many policies: at most 1023 additional policies plus the global policy are supported"
+            );
+        }
+        let mut semantic_scopes = std::collections::BTreeSet::new();
+        for policy in &self.policies {
+            if policy.stateful {
+                let label = velstra_common::FlowScopeLabel::policy(policy.id, policy.state_scope.as_deref())
+                    .with_context(|| format!("policy {}: state_scope must contain 1–128 UTF-8 bytes without control characters",policy.id))?;
+                if !semantic_scopes.insert(label) {
+                    bail!("duplicate state_scope on stateful policies");
+                }
+            }
+        }
         // Policy 0 is the top-level config; `[[policy]]` blocks add tenants.
         let mut policies = vec![resolve_firewall(
             0,
@@ -1885,7 +1975,7 @@ impl FileConfig {
             if policies.iter().any(|p| p.id == policy.id) {
                 bail!("duplicate policy id {}", policy.id);
             }
-            policies.push(resolve_firewall(
+            let mut resolved = resolve_firewall(
                 policy.id,
                 policy.default_action,
                 policy.egress_default_drop,
@@ -1896,7 +1986,9 @@ impl FileConfig {
                 &policy.blocklist,
                 &policy.port_rules,
                 policy.portal.as_ref(),
-            )?);
+            )?;
+            resolved.state_scope = policy.state_scope.clone();
+            policies.push(resolved);
         }
 
         // "This box encapsulates" — true for either wire family. It gates the
@@ -3183,6 +3275,40 @@ mod tests {
     }
 
     #[test]
+    fn state_scopes_validate_semantic_identity_without_changing_display_labels() {
+        let make = |scope: &str| {
+            let mut config: FileConfig = toml::from_str(
+                "[[policy]]\nid=1\nname='display only'\nstateful=true\n\
+                 [[policy]]\nid=2\nname='display only'\nstateful=true\nstate_scope='zone/other'",
+            )
+            .unwrap();
+            config.policies[0].state_scope = Some(scope.to_owned());
+            config
+        };
+        for scope in [
+            "".to_owned(),
+            "a".repeat(129),
+            "bad\nname".to_owned(),
+            "é".repeat(65),
+            "zone/other".to_owned(),
+        ] {
+            assert!(
+                make(&scope).resolve().is_err(),
+                "accepted invalid scope {scope:?}"
+            );
+        }
+        let valid = "a".repeat(128);
+        let resolved = make(&valid).resolve().unwrap();
+        assert_eq!(
+            resolved.policies[1].state_scope.as_deref(),
+            Some(valid.as_str())
+        );
+        let native: FileConfig = toml::from_str("[[policy]]\nid=1\nname='same label'\nstateful=true\n[[policy]]\nid=2\nname='same label'\nstateful=true").unwrap();
+        let resolved = native.resolve().unwrap();
+        assert!(resolved.policies.iter().all(|p| p.state_scope.is_none()));
+    }
+
+    #[test]
     fn stateful_flag_sets_per_policy() {
         let toml = r#"
             default_action = "drop"
@@ -4359,21 +4485,118 @@ mod rule_limit_tests {
         assert!(policy_with("action = \"drop\"\nlimit = 0\n").is_ok());
     }
 
-    /// If this fails, an `ipv6` rule scoped to `direction = "out"` is written
-    /// into the maps and never consulted — the egress hook is IPv4 only. An
-    /// operator blocking outbound IPv6 to a destination would believe it was
-    /// blocked while every packet went out.
+    /// The TC path supports both families; preserve the exact family/direction
+    /// scope in the resolved rule instead of refusing a supported combination.
     #[test]
-    fn an_ipv6_rule_on_the_egress_hook_is_refused_because_nothing_would_consult_it() {
-        let err = policy_with("action = \"pass\"\nfamily = \"ipv6\"\ndirection = \"out\"\n")
-            .expect_err("an ipv6 egress rule was accepted");
-        assert!(
-            err.to_string().contains("IPv4 only"),
-            "the refusal does not say what is wrong: {err}"
+    fn ipv6_egress_rules_preserve_both_scope_constraints() {
+        let cfg = policy_with("action = \"drop\"\nfamily = \"ipv6\"\ndirection = \"out\"\n")
+            .expect("IPv6 egress is supported");
+        assert_eq!(
+            only_rule(&cfg).scope,
+            PORT_RULE_V6_ONLY | PORT_RULE_OUT_ONLY
         );
-        // The three neighbouring combinations stay legal.
         assert!(policy_with("action = \"pass\"\nfamily = \"ipv6\"\ndirection = \"in\"\n").is_ok());
         assert!(policy_with("action = \"pass\"\nfamily = \"ipv4\"\ndirection = \"out\"\n").is_ok());
         assert!(policy_with("action = \"pass\"\ndirection = \"out\"\n").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod rule_key_validation_tests {
+    use super::*;
+    fn resolve(rules: &str) -> Result<RuntimeConfig> {
+        toml::from_str::<FileConfig>(rules)?.resolve()
+    }
+    #[test]
+    fn independent_family_and_direction_rules_are_representable() {
+        let config = resolve("[[port_rule]]\nproto='tcp'\nport=443\naction='drop'\nfamily='ipv4'\ndirection='in'\n[[port_rule]]\nproto='tcp'\nport=443\naction='pass'\nfamily='ipv6'\ndirection='out'").unwrap();
+        assert_eq!(
+            firewall_rule_contexts(&config.policies[0].port_rules[0]).collect::<Vec<_>>(),
+            vec![0]
+        );
+        assert_eq!(
+            firewall_rule_contexts(&config.policies[0].port_rules[1]).collect::<Vec<_>>(),
+            vec![3]
+        );
+    }
+    #[test]
+    fn explicit_zero_networks_remain_ipv4_only() {
+        for network in ["0.0.0.0/0", "0.0.0.0/1", "0.0.0.0/32"] {
+            for field in ["src", "dst"] {
+                let config = resolve(&format!(
+                    "[[port_rule]]\nproto='tcp'\nport=443\naction='drop'\n{field}='{network}'"
+                ))
+                .unwrap();
+                assert_eq!(
+                    firewall_rule_contexts(&config.policies[0].port_rules[0]).collect::<Vec<_>>(),
+                    vec![0, 1]
+                );
+            }
+        }
+    }
+    #[test]
+    fn unqualified_rules_expand_into_all_wire_contexts() {
+        let config = resolve("[[port_rule]]\nproto='tcp'\nport=443\naction='drop'").unwrap();
+        assert_eq!(
+            firewall_rule_contexts(&config.policies[0].port_rules[0]).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+    }
+    #[test]
+    fn expansion_is_included_in_capacity_limits() {
+        let mut config = RuntimeConfig::passthrough();
+        let rule = resolve("[[port_rule]]\nproto='tcp'\nport=443\naction='drop'")
+            .unwrap()
+            .policies
+            .remove(0)
+            .port_rules
+            .remove(0);
+        config.policies[0].port_rules = vec![rule; 2048];
+        config.validate_firewall_capacity().unwrap();
+        let extra = config.policies[0].port_rules[0].clone();
+        config.policies[0].port_rules.push(extra);
+        assert!(
+            config
+                .validate_firewall_capacity()
+                .unwrap_err()
+                .to_string()
+                .contains("expanded rules")
+        );
+    }
+    #[test]
+    fn impossible_family_address_combinations_are_rejected() {
+        for (family, source) in [("ipv4", "2001:db8::/64"), ("ipv6", "192.0.2.0/24")] {
+            let rules = format!(
+                "[[port_rule]]\nproto='tcp'\nport=443\naction='drop'\nfamily='{family}'\nsrc='{source}'\n"
+            );
+            assert!(resolve(&rules).is_err(), "{rules}");
+        }
+    }
+    #[test]
+    fn controller_wire_updates_preserve_independent_contexts() {
+        let cfg: FileConfig = toml::from_str("[[port_rule]]\nproto='udp'\nport=18091\naction='drop'\nfamily='ipv4'\n[[port_rule]]\nproto='udp'\nport=18091\naction='pass'\nfamily='ipv6'").unwrap();
+        let wire = crate::file_config_to_proto(&cfg, 1);
+        assert!(crate::runtime_from_proto(&wire).is_ok());
+    }
+    #[test]
+    fn implicit_family_in_a_physical_key_preserves_ordered_overrides() {
+        for (address, family) in [("192.0.2.0/24", "ipv4"), ("2001:db8::/64", "ipv6")] {
+            let cfg = format!(
+                "[[port_rule]]\nproto='tcp'\nport=443\nsrc='{address}'\naction='pass'\nfamily='{family}'\n[[port_rule]]\nproto='tcp'\nport=443\nsrc='{address}'\naction='drop'\n"
+            );
+            resolve(&cfg).unwrap();
+        }
+        resolve("[[port_rule]]\nproto='tcp'\nport=443\naction='pass'\n[[port_rule]]\nproto='tcp'\nport=443\naction='drop'").unwrap();
+    }
+    #[test]
+    fn independent_tries_policies_ports_and_identical_rules_remain_valid() {
+        for rules in [
+            "[[port_rule]]\nproto='tcp'\nport=443\naction='pass'\n[[port_rule]]\nproto='tcp'\nport=443\naction='pass'",
+            "[[port_rule]]\nproto='tcp'\nport=443\naction='drop'\nsrc='192.0.2.0/24'\n[[port_rule]]\nproto='tcp'\nport=443\naction='pass'\ndst='192.0.2.0/24'",
+            "[[port_rule]]\nproto='tcp'\nport=443\naction='drop'\n[[policy]]\nid=7\n[[policy.port_rule]]\nproto='tcp'\nport=443\naction='pass'",
+            "[[port_rule]]\nproto='tcp'\nport=443\naction='drop'\n[[port_rule]]\nproto='tcp'\nport=444\naction='pass'",
+        ] {
+            resolve(rules).unwrap_or_else(|e| panic!("{rules}: {e:#}"));
+        }
     }
 }

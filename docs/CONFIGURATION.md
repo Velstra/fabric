@@ -336,6 +336,23 @@ A load balancer appears once per policy id in play on its segment, not once per
 network: the datapath looks a service up under the **ingress port's** policy id,
 which equals the VNI only for ports with no security group.
 
+### Stateful policy identity
+
+`policy.name` is a display label. A compiler that assigns policy IDs by ordering
+should additionally set `state_scope` to a stable semantic name, such as
+`zone/wan`. Names must be unique among stateful policies and contain 1–128 UTF-8
+bytes without control characters. Without `state_scope`, identity follows the
+explicit numeric policy ID. The global policy has its own reserved identity.
+
+The agent derives and persists lifecycle IDs with its pinned state maps. Moving
+an unchanged `state_scope` to another policy ID preserves its identity. Removing
+the scope or disabling stateful operation revokes its state; creating it again
+allocates a fresh identity. Failed reservations are never reused. With
+`--datapath-state-dir`, compatible maps and their catalogue survive agent
+restarts. Removing that directory requires explicit datapath detachment. These
+local IDs are operational metadata, not configuration fields or an HA wire
+format.
+
 ---
 
 ## See also

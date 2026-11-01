@@ -5,7 +5,11 @@ edition.workspace = true
 
 license.workspace = true
 
+[package.metadata.velstra]
+persistent-datapath = true
+
 [dependencies]
+serde_json = { workspace = true }
 velstra-common = { path = "../velstra-common", features = ["user"] }
 velstra-config = { path = "../velstra-config" }
 velstra-proto = { path = "../velstra-proto" }
@@ -33,12 +37,10 @@ velstra-common = { path = "../velstra-common", features = ["user"] }
 
 [build-dependencies]
 anyhow = { workspace = true }
-aya-build = { workspace = true }
 cargo_metadata = { workspace = true }
-# TODO(https://github.com/rust-lang/cargo/issues/12375): this should be an artifact dependency, but
-# it's not possible to tell cargo to use `-Z build-std` to build it. We cargo-in-cargo in the build
-# script to build this, but we want to teach cargo about the dependency so that cache invalidation
-# works properly.
+# Keep the library dependency for Cargo invalidation while build.rs compiles
+# the binary using the checked-in atomic BPF target and pinned nightly. Artifact
+# dependencies cannot yet express its build-std requirement on stable Cargo.
 #
 # Note also that https://github.com/rust-lang/cargo/issues/10593 occurs when `target = ...` is added
 # to an artifact dependency; it seems possible to work around that by setting `resolver = "1"` in

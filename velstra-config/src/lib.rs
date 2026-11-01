@@ -18,6 +18,6 @@ pub use config::{
     ResolvedService, ResolvedSrv6, ResolvedSrv6Flood, ResolvedSrv6IrbRoute, ResolvedSrv6LocalSid,
     ResolvedSrv6Route, ResolvedSynProxy, ResolvedTunnel, RouteCfg, RuntimeConfig, ServiceCfg,
     SourceValidationName, Srv6Cfg, Srv6FloodCfg, Srv6IrbRouteCfg, Srv6LocalSidCfg, Srv6RouteCfg,
-    TunnelCfg, load_file,
+    TunnelCfg, firewall_rule_contexts, load_file,
 };
 pub use proto_convert::{file_config_from_proto, file_config_to_proto, runtime_from_proto};

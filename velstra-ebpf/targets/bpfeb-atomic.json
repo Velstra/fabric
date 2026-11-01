@@ -1,0 +1,27 @@
+{
+  "arch": "bpf",
+  "atomic-cas": true,
+  "crt-objects-fallback": "false",
+  "data-layout": "E-m:e-p:64:64-i64:64-i128:128-n32:64-S128",
+  "dynamic-linking": true,
+  "linker-flavor": "bpf",
+  "linker-is-gnu": false,
+  "llvm-target": "bpfeb",
+  "max-atomic-width": 64,
+  "merge-functions": "disabled",
+  "metadata": {
+    "description": "BPF (big endian) with 32/64-bit atomics",
+    "host_tools": false,
+    "std": false,
+    "tier": 3
+  },
+  "min-atomic-width": 32,
+  "no-builtins": true,
+  "obj-is-bitcode": true,
+  "panic-strategy": "abort",
+  "position-independent-executables": true,
+  "singlethread": false,
+  "target-endian": "big",
+  "target-pointer-width": 64,
+  "cpu": "v3"
+}

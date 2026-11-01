@@ -258,6 +258,8 @@ unsafe impl aya::Pod for ScopedPortKey {}
 pub struct ScopedSrcPortKey {
     /// Policy id, matched exactly.
     pub policy_id: PolicyId,
+    /// Exact wire context: 0/1 for IPv4 ingress/egress, 2/3 for IPv6.
+    pub context: u32,
     /// IP protocol number.
     pub proto: u8,
     /// The ICMP type this rule matches, or `0` for "any type" — and for every
@@ -336,14 +338,15 @@ pub const fn icmp_reply_probe(probe: u8) -> u8 {
 
 impl ScopedSrcPortKey {
     /// Prefix bits covering the exactly-matched head (`policy_id` + `proto` +
-    /// `_pad` + `port` = 32 + 8 + 8 + 16).
-    pub const FIXED_BITS: u32 = 96;
+    /// `context` + `icmp_type` + `port` + `ifindex`).
+    pub const FIXED_BITS: u32 = 128;
 
     /// Build a scoped source/port key.
     #[inline]
     pub const fn new(policy_id: PolicyId, proto: u8, port: u16, src: u32) -> Self {
         Self {
             policy_id,
+            context: 0,
             proto,
             icmp_type: 0,
             ifindex: 0,
@@ -359,6 +362,7 @@ impl ScopedSrcPortKey {
     pub const fn with_icmp_type(policy_id: PolicyId, proto: u8, icmp_type: u8, src: u32) -> Self {
         Self {
             policy_id,
+            context: 0,
             proto,
             icmp_type,
             ifindex: 0,
@@ -381,6 +385,7 @@ impl ScopedSrcPortKey {
     ) -> Self {
         Self {
             policy_id,
+            context: 0,
             proto,
             icmp_type,
             ifindex,
@@ -398,6 +403,13 @@ impl ScopedSrcPortKey {
 
     /// The LPM prefix length for a lookup (all source bits known).
     pub const FULL_PREFIX: u32 = Self::FIXED_BITS + 32;
+    /// Select one exact address-family/direction context. The loader expands
+    /// rules that apply to more than one context; packet lookups never wildcard it.
+    #[inline(always)]
+    pub const fn in_context(mut self, context: u32) -> Self {
+        self.context = context;
+        self
+    }
 }
 
 // SAFETY: `#[repr(C)]`, integer fields, padding zeroed — POD.
@@ -418,6 +430,8 @@ unsafe impl aya::Pod for ScopedSrcPortKey {}
 pub struct ScopedSrcPortKey6 {
     /// Policy id, matched exactly.
     pub policy_id: PolicyId,
+    /// Exact wire context: 0/1 for IPv4 ingress/egress, 2/3 for IPv6.
+    pub context: u32,
     /// IP protocol number (the upper-layer one, after the extension chain).
     pub proto: u8,
     /// The ICMP type this rule matches, or `0` for "any type" — and for every
@@ -446,13 +460,14 @@ pub struct ScopedSrcPortKey6 {
 
 impl ScopedSrcPortKey6 {
     /// Prefix bits covering the exactly-matched head, as for the v4 key.
-    pub const FIXED_BITS: u32 = 96;
+    pub const FIXED_BITS: u32 = 128;
 
     /// Build a scoped IPv6 source/port key.
     #[inline]
     pub const fn new(policy_id: PolicyId, proto: u8, port: u16, src: [u8; 16]) -> Self {
         Self {
             policy_id,
+            context: 2,
             proto,
             icmp_type: 0,
             ifindex: 0,
@@ -473,6 +488,7 @@ impl ScopedSrcPortKey6 {
     ) -> Self {
         Self {
             policy_id,
+            context: 2,
             proto,
             icmp_type,
             ifindex: 0,
@@ -495,6 +511,7 @@ impl ScopedSrcPortKey6 {
     ) -> Self {
         Self {
             policy_id,
+            context: 2,
             proto,
             icmp_type,
             ifindex,
@@ -512,6 +529,13 @@ impl ScopedSrcPortKey6 {
 
     /// The LPM prefix length for a lookup (every source bit known).
     pub const FULL_PREFIX: u32 = Self::FIXED_BITS + 128;
+    /// Select one exact address-family/direction context. The loader expands
+    /// rules that apply to more than one context; packet lookups never wildcard it.
+    #[inline(always)]
+    pub const fn in_context(mut self, context: u32) -> Self {
+        self.context = context;
+        self
+    }
 }
 
 // SAFETY: `#[repr(C)]`, integer fields, padding zeroed — POD.
@@ -525,6 +549,8 @@ unsafe impl aya::Pod for ScopedSrcPortKey6 {}
 pub struct ScopedDstPortKey6 {
     /// Policy id, matched exactly.
     pub policy_id: PolicyId,
+    /// Exact wire context: 0/1 for IPv4 ingress/egress, 2/3 for IPv6.
+    pub context: u32,
     /// IP protocol number.
     pub proto: u8,
     /// The ICMP type this rule matches, or `0` for "any type" — and for every
@@ -553,13 +579,14 @@ pub struct ScopedDstPortKey6 {
 
 impl ScopedDstPortKey6 {
     /// Prefix bits covering the exactly-matched head.
-    pub const FIXED_BITS: u32 = 96;
+    pub const FIXED_BITS: u32 = 128;
 
     /// Build a scoped IPv6 destination/port key.
     #[inline]
     pub const fn new(policy_id: PolicyId, proto: u8, port: u16, dst: [u8; 16]) -> Self {
         Self {
             policy_id,
+            context: 2,
             proto,
             icmp_type: 0,
             ifindex: 0,
@@ -580,6 +607,7 @@ impl ScopedDstPortKey6 {
     ) -> Self {
         Self {
             policy_id,
+            context: 2,
             proto,
             icmp_type,
             ifindex: 0,
@@ -602,6 +630,7 @@ impl ScopedDstPortKey6 {
     ) -> Self {
         Self {
             policy_id,
+            context: 2,
             proto,
             icmp_type,
             ifindex,
@@ -618,6 +647,13 @@ impl ScopedDstPortKey6 {
 
     /// The LPM prefix length for a lookup.
     pub const FULL_PREFIX: u32 = Self::FIXED_BITS + 128;
+    /// Select one exact address-family/direction context. The loader expands
+    /// rules that apply to more than one context; packet lookups never wildcard it.
+    #[inline(always)]
+    pub const fn in_context(mut self, context: u32) -> Self {
+        self.context = context;
+        self
+    }
 }
 
 // SAFETY: `#[repr(C)]`, integer fields, padding zeroed — POD.
@@ -639,6 +675,8 @@ unsafe impl aya::Pod for ScopedDstPortKey6 {}
 pub struct ScopedDstPortKey {
     /// Policy id, matched exactly.
     pub policy_id: PolicyId,
+    /// Exact wire context: 0/1 for IPv4 ingress/egress, 2/3 for IPv6.
+    pub context: u32,
     /// IP protocol number.
     pub proto: u8,
     /// The ICMP type this rule matches, or `0` for "any type" — and for every
@@ -667,14 +705,15 @@ pub struct ScopedDstPortKey {
 
 impl ScopedDstPortKey {
     /// Prefix bits covering the exactly-matched head (`policy_id` + `proto` +
-    /// `_pad` + `port` = 32 + 8 + 8 + 16).
-    pub const FIXED_BITS: u32 = 96;
+    /// `context` + `icmp_type` + `port` + `ifindex`).
+    pub const FIXED_BITS: u32 = 128;
 
     /// Build a scoped destination/port key.
     #[inline]
     pub const fn new(policy_id: PolicyId, proto: u8, port: u16, dst: u32) -> Self {
         Self {
             policy_id,
+            context: 0,
             proto,
             icmp_type: 0,
             ifindex: 0,
@@ -690,6 +729,7 @@ impl ScopedDstPortKey {
     pub const fn with_icmp_type(policy_id: PolicyId, proto: u8, icmp_type: u8, dst: u32) -> Self {
         Self {
             policy_id,
+            context: 0,
             proto,
             icmp_type,
             ifindex: 0,
@@ -712,6 +752,7 @@ impl ScopedDstPortKey {
     ) -> Self {
         Self {
             policy_id,
+            context: 0,
             proto,
             icmp_type,
             ifindex,
@@ -728,6 +769,13 @@ impl ScopedDstPortKey {
 
     /// The LPM prefix length for a lookup (all destination bits known).
     pub const FULL_PREFIX: u32 = Self::FIXED_BITS + 32;
+    /// Select one exact address-family/direction context. The loader expands
+    /// rules that apply to more than one context; packet lookups never wildcard it.
+    #[inline(always)]
+    pub const fn in_context(mut self, context: u32) -> Self {
+        self.context = context;
+        self
+    }
 }
 
 // SAFETY: `#[repr(C)]`, integer fields, padding zeroed — POD.
@@ -1054,5 +1102,32 @@ mod tests {
         let m = PacketMeta::new([192, 168, 1, 9], [10, 0, 0, 1], ip_proto::UDP, 5353, 53, 48);
         assert_eq!(m.port_key(), PortKey::new(ip_proto::UDP, 53));
         assert_eq!(m.blocklist_key(), lpm_key_addr([192, 168, 1, 9]));
+    }
+}
+
+#[cfg(test)]
+mod firewall_context_tests {
+    use super::*;
+    #[test]
+    fn wire_context_precedes_the_lpm_address_and_has_no_padding() {
+        assert_eq!(core::mem::size_of::<ScopedSrcPortKey>(), 20);
+        assert_eq!(core::mem::size_of::<ScopedDstPortKey>(), 20);
+        assert_eq!(core::mem::size_of::<ScopedSrcPortKey6>(), 32);
+        assert_eq!(core::mem::size_of::<ScopedDstPortKey6>(), 32);
+        assert_eq!(core::mem::offset_of!(ScopedSrcPortKey, src), 16);
+        assert_eq!(core::mem::offset_of!(ScopedDstPortKey, dst), 16);
+        assert_eq!(core::mem::offset_of!(ScopedSrcPortKey6, src), 16);
+        assert_eq!(core::mem::offset_of!(ScopedDstPortKey6, dst), 16);
+        let key = ScopedSrcPortKey::new(7, 17, 443, 0);
+        for first in 0..4 {
+            for second in 0..4 {
+                assert_eq!(
+                    key.in_context(first) == key.in_context(second),
+                    first == second
+                );
+            }
+        }
+        assert_eq!(ScopedSrcPortKey::FULL_PREFIX, 160);
+        assert_eq!(ScopedSrcPortKey6::FULL_PREFIX, 256);
     }
 }

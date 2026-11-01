@@ -53,15 +53,18 @@ async fn rest_gateway_crud_authz_and_audit() {
     let topology = dir.join("topology.toml");
     std::fs::write(&topology, "").unwrap();
 
-    let [agent_port, admin_port, rest_port] = support::free_ports();
-    let rest = format!("http://127.0.0.1:{rest_port}");
-
     // Bind the webhook sink first so the controller can be pointed at it.
     let sink = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind webhook sink");
     let webhook_url = format!("http://{}/hook", sink.local_addr().unwrap());
     let sink = tokio::spawn(webhook_sink(sink));
+
+    // Keep every in-process listener bound before selecting the child ports.
+    // Otherwise the sink can reuse one of the just-released reservations and
+    // make the controller fail with EADDRINUSE before the REST test starts.
+    let [agent_port, admin_port, rest_port] = support::free_ports();
+    let rest = format!("http://127.0.0.1:{rest_port}");
 
     let _controller = Controller(
         Command::new(env!("CARGO_BIN_EXE_velstra-controller"))

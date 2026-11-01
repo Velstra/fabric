@@ -118,10 +118,19 @@ The build defaults to the same verified toolchain as CI because newer rolling
 nightlies can emit an invalid eBPF register. Set `VELSTRA_EBPF_TOOLCHAIN`
 only when validating another compiler and kernel combination.
 
+The datapath uses the versioned `velstra-ebpf/targets/bpfel-atomic.json`
+(or big-endian `bpfeb-atomic.json`) target. It enables BPF v3 and 32/64-bit
+compare-and-swap for shared state. The Cargo build and appliance build use the
+same target; compiler and linker warnings fail the datapath build. A custom
+linker can be selected with `CARGO_TARGET_BPFEL_ATOMIC_LINKER` (or its `BPFEB`
+equivalent); the previous `BPFEL_UNKNOWN_NONE`/`BPFEB_UNKNOWN_NONE` linker
+variables remain supported.
+
 ### Build, test, validate
 
 ```shell
-cargo test -p velstra-common   # fast: pure logic, no root, no eBPF toolchain
+cargo test -p velstra-common    # fast: pure logic, no root, no eBPF toolchain
+cargo test --workspace --locked # all host tests; requires the BPF build tools
 cargo build --release           # builds the eBPF object + the daemon
 
 # Check a policy without touching the kernel:
@@ -142,12 +151,42 @@ Useful flags:
 | `--config <path>`  | TOML policy file. Omitted ⇒ fail-open (pass everything).      |
 | `--xdp-mode <m>`   | `auto` (default), `driver`, `skb`, or `hw`. `auto` tries native driver mode then falls back to generic SKB. |
 | `--stats-interval` | Seconds between live stats dumps (`0` to disable).            |
+| `--datapath-state-dir <path>` | Private bpffs directory retaining owned XDP/TCX hooks across process exits. |
 
 Verify it works (in another shell, after attaching with `drop_icmp = true`):
 
 ```shell
 ping -c3 <host>     # 100% packet loss — dropped at the NIC by XDP
 ```
+
+### Retain enforcement across process exits
+
+Appliances can retain their last applied policy and live kernel tables while the
+management process is unavailable. Use a private directory on an existing bpffs
+mount:
+
+```shell
+mountpoint -q /sys/fs/bpf || sudo mount -t bpf -o mode=0700 bpffs /sys/fs/bpf
+sudo ./target/release/velstra run --iface eth0 --config examples/rules.toml \
+  --datapath-state-dir /sys/fs/bpf/velstra
+```
+
+The directory has one writer. Restarting adopts its owned links atomically, with
+both inherited and replacement programs blocked by the same apply gate until the
+complete configuration is installed. A failed replacement remains blocked and
+can be retried. Interfaces and hooks removed from the configuration lose their
+owned pins. This requires pinnable XDP/TCX links; unsupported attachment modes
+fail explicitly. HA state replication remains a separate mechanism.
+
+Stopping the process retains enforcement. To remove it during maintenance, stop
+the owning process and explicitly detach its hooks. This permits unfiltered
+traffic on the affected interfaces:
+
+```shell
+sudo ./target/release/velstra detach --datapath-state-dir /sys/fs/bpf/velstra
+```
+
+Cleanup refuses a live writer or unexpected objects in the private directory.
 
 ## Configuration
 
@@ -176,7 +215,9 @@ while an update is installed. If a map write fails, the previous configuration
 and temporary port mappings are restored before traffic is admitted again.
 If restoration fails, the gate stays closed and reconciliation retries; the
 query socket's `status` command reports `Failed (traffic blocked)` and the last
-error. Obsolete TC egress hooks are retired only after a complete apply or
+error. Hook-retirement failures are reported the same way, and reconciliation
+retries after the fault is removed without requiring a service restart.
+Obsolete TC egress hooks are retired only after a complete apply or
 successful rollback. Configured port forwards take precedence over temporary
 grants on the same policy, protocol and port.
 
@@ -190,9 +231,32 @@ do not rewrite the packet maps.
 
 This update barrier requires Linux `MEMBARRIER_CMD_GLOBAL` support, as provided
 by the appliance's Linux 6.12 kernel; `nohz_full` must be disabled. The agent
-refuses startup when this barrier is unavailable. This protects updates within
-the running agent; it does not provide persistent firewall attachment across
-agent termination.
+refuses startup when this barrier is unavailable.
+
+For an appliance, add `--datapath-state-dir /sys/fs/bpf/velstra`. A private,
+root-owned bpffs directory retains the XDP/TCX links, shared gate and tail-call
+table across process termination. A single writer lock prevents competing
+agents; restart adopts and replaces the retained hooks while traffic is blocked.
+Service stop preserves enforcement. Explicit maintenance cleanup uses
+`velstra detach --datapath-state-dir /sys/fs/bpf/velstra` after stopping the agent.
+Persistent hardware offload is rejected; use driver or generic/SKB attachment.
+Omitting this option retains process-scoped attachment.
+
+In `auto` mode, if a retained native hook cannot be replaced after a NIC or MTU
+change, a pinned TCX ingress guard closes the transition to generic XDP. The
+guard shares the apply gate and survives process death. It is retired only
+after all replacement hooks and maps are installed; failed startup remains
+closed until recovery. Explicit driver mode still reports an error instead of
+silently changing the requested attachment mode.
+
+With persistent links, the root-only query socket also accepts
+`interface <name>` for a declared interface. Its JSON acknowledgement includes
+the current kernel `ifindex`, applied policy and whether egress enforcement is
+required. It checks the actual attached XDP program, policy map and required
+TCX egress program; a global `Ready` response, detached pinned link or cached
+interface name is insufficient. Errors return `error:` rather than an
+acknowledgement. Consumers activating a protected link must validate the returned
+index against the device they are about to activate.
 
 ### Dual-stack (IPv6)
 
@@ -210,7 +274,7 @@ allowed IPv6 traffic is passed to the kernel stack.
 > are IPv4, so there is no IPv6 FIB or VIP6 in the data path yet (issue #1).
 > Fine for a host firewall; a tenant gateway routing IPv6 takes the slow path.
 
-### Stateful firewall
+### IPv4 stateful firewall
 
 Set `stateful = true` on a policy to track TCP/UDP connections and allow
 **established flows in either direction** — replies are permitted even under a
@@ -218,6 +282,9 @@ deny-by-default policy (the blocklist still wins). This is the classic stateful
 *gateway* firewall: attach to both zones (e.g. LAN and WAN), a connection
 allowed out from the LAN is recorded, and the matching reply ingressing the WAN
 is allowed automatically. Counter: `established_allowed`.
+
+Connection-state reply exceptions currently apply to IPv4. IPv6 filtering is
+stateless; enabling `stateful` does not grant IPv6 return-traffic exceptions.
 
 > Because XDP runs on **ingress**, this covers *forwarded* traffic (a firewall
 > appliance between zones). Replies to connections the host itself originates are
@@ -229,10 +296,16 @@ Pass `--egress` to also attach a TC `clsact` hook at **egress** on each
 `--iface`. XDP only sees traffic *arriving*; the egress hook filters traffic
 *leaving* — host-originated packets, and the receive side of a tenant tap. It
 reuses the same `decide()` and per-policy maps (selected by the **egress**
-interface), but matches the blocklist and port rules on the **destination**
-("don't talk to these") rather than the source. On a `stateful` policy it records
-each allowed flow so the **reply** (arriving at the XDP ingress hook) is
-permitted — closing the host-originated-connection gap. Counters: `tx_packets`,
+interface). The blocklist matches the **destination** ("don't talk to these");
+port rules retain both source and destination constraints, direction and family.
+Both IPv4 and IPv6 are filtered. Family and direction are exact trie-key
+components: the same protocol, port and prefix can have independent actions in
+each context. An explicit IPv4 prefix, including `0.0.0.0/0`, stays IPv4.
+IPv6 extension headers are walked before L4 matching, and truncated or unresolved
+chains are dropped. IPv6 TCP, UDP and echo reply admission uses incarnation-bound
+protocol state at both hooks; explicit prohibitions remain authoritative. On a `stateful` IPv4
+policy it records each allowed flow so the **reply** (arriving at the XDP ingress
+hook) is permitted — closing the host-originated-connection gap. Counters: `tx_packets`,
 `egress_dropped`.
 
 ```shell
@@ -240,7 +313,8 @@ sudo -E ./target/release/velstra run --iface eth0 --egress --config rules.toml
 ```
 
 It's opt-in because an egress filter can drop traffic the ingress side never
-sees. *(The egress hook is IPv4-only and not overlay-aware.)*
+sees. The hook filters both IP families; overlay-aware egress remains separate.
+IPv6 stateful reply tracking and per-rule egress rate limits are not yet implemented.
 
 ### Multi-tenant policy (per interface)
 

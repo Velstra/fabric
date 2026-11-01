@@ -98,8 +98,16 @@ jobs:
         run: cargo clippy -p velstra --all-targets --locked -- -D warnings
       - name: Build (release, embeds the eBPF object)
         run: cargo build --release --locked
-      - name: Test control plane
-        run: cargo test -p velstra --locked
+      - name: Build big-endian atomic datapath
+        env:
+          RUSTFLAGS: '--cfg=bpf_target_arch="x86_64" -Cdebuginfo=2 -Clinker=bpf-linker -Clink-arg=--btf -Dwarnings -Dlinker-messages'
+        run: >-
+          rustup run "$VELSTRA_EBPF_TOOLCHAIN" cargo build
+          -p velstra-ebpf --bin velstra --release --locked
+          -Z json-target-spec -Z build-std=core
+          --target velstra-ebpf/targets/bpfeb-atomic.json
+      - name: Test workspace
+        run: cargo test --workspace --locked
       - name: Smoke-test the agent CLI (no root needed)
         run: |
           # Agent-side policy files only; topology.toml is a controller file.
@@ -109,7 +117,7 @@ jobs:
           done
       # NOTE: the `cargo build --release` step above is what gates the eBPF data
       # plane — velstra-app's build.rs cross-compiles `velstra-ebpf` for the BPF
-      # target via aya-build, so a data-plane compile error fails this job (on
+      # target using its atomic target profile, so a compile error fails this job (on
       # PRs too). What it does not prove is that the loaded programs *do*
       # anything: that is the `datapath` job at the bottom of this file, which
       # needs root and therefore runs nightly rather than here.
@@ -165,6 +173,14 @@ jobs:
           grep -E "^BPF|BPF_SYSCALL|^CONFIG_XDP" /boot/config-"$(uname -r)" 2>/dev/null || true
       - name: Build the agent (release, embeds the eBPF object via build.rs)
         run: cargo build --release --locked -p velstra
+      - name: Prepare native firewall state checks (without root)
+        run: python3 tests/e2e/flow-store.py --prepare target/native-flow-store.json
+      - name: Verify native firewall state, map ABI and scope lifecycle (root)
+        run: |
+          if ! mountpoint -q /sys/fs/bpf; then
+            sudo mount -t bpf bpf /sys/fs/bpf
+          fi
+          sudo -E python3 tests/e2e/flow-store.py --run target/native-flow-store.json
       - name: Load-check (root) — the verifier must accept the datapath
         # `-E` keeps the invoking env (PATH, CARGO_*); the script finds the tree
         # from its own path, so it needs no VELSTRA_ROOT here.

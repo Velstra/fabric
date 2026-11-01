@@ -391,11 +391,17 @@ pub enum Counter {
     /// once: a host has one overlay format, so which of the pair moves says which
     /// wire format is actually carrying the fabric's broadcast traffic.
     Srv6BumReplicated = 44,
+    /// A bounded shared-bucket lock could not be acquired. The packet's drop
+    /// is also counted by its rule or port gate.
+    RateLimitContention = 45,
+    /// A nested/preempting packet could not acquire validation scratch. This
+    /// fails closed without misreporting a malformed wire packet.
+    PacketValidationContention = 46,
 }
 
 impl Counter {
     /// Number of distinct counters — the `max_entries` of the `STATS` map.
-    pub const COUNT: u32 = 45;
+    pub const COUNT: u32 = 47;
 
     /// The array index of this counter.
     #[inline]
@@ -452,6 +458,8 @@ impl Counter {
             39 => Counter::SynproxySpliced,
             40 => Counter::DroppedPortal,
             41 => Counter::MssClamped,
+            45 => Counter::RateLimitContention,
+            46 => Counter::PacketValidationContention,
             _ => return None,
         };
         Some(counter)
@@ -513,6 +521,8 @@ impl Counter {
             Counter::SynproxySpliced => "synproxy_spliced",
             Counter::MssClamped => "mss_clamped",
             Counter::DroppedPortal => "dropped_portal",
+            Counter::RateLimitContention => "rate_limit_contention",
+            Counter::PacketValidationContention => "packet_validation_contention",
         }
     }
 }
@@ -647,9 +657,92 @@ pub fn admit_established_egress_reply(verdict: Verdict, established: bool) -> bo
     verdict.action == Action::Pass || (established && verdict.counter == Counter::DroppedDefault)
 }
 
+/// Apply stateful and port-forward admission to the ingress policy verdict.
+/// Neither a remembered flow nor a DNAT listener grants an exception to an
+/// explicit deny, the blocklist or the ICMP prohibition. In particular, state
+/// replicated by an HA peer cannot undo a newly installed FlowSpec discard.
+/// The rule is needed to distinguish an explicit reject from default reject;
+/// both have the same accounting counter.
+#[inline]
+pub fn stateful_ingress_verdict(
+    verdict: Verdict,
+    rule: Option<Action>,
+    established: bool,
+    port_forward: bool,
+) -> Verdict {
+    let default_denial = verdict.counter == Counter::DroppedDefault
+        || (verdict.counter == Counter::Rejected && rule.is_none());
+    if verdict.action == Action::Pass || default_denial {
+        if established {
+            return Verdict::new(Action::Pass, Counter::EstablishedAllowed);
+        }
+        if port_forward {
+            return Verdict::new(Action::Pass, Counter::PassedRule);
+        }
+    }
+    verdict
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn established_ingress_and_dnat_never_override_explicit_denials() {
+        let packet = PacketMeta::new([192, 0, 2, 1], [192, 0, 2, 2], ip_proto::TCP, 4000, 443, 40);
+        for default in [Action::Pass, Action::Drop, Action::Reject] {
+            let cfg = GlobalConfig::new(default, ConfigFlags::STATEFUL);
+            for denial in [Action::Drop, Action::Reject] {
+                let verdict = decide(&packet, &cfg, false, Some(denial));
+                for established in [false, true] {
+                    for forward in [false, true] {
+                        let actual =
+                            stateful_ingress_verdict(verdict, Some(denial), established, forward);
+                        assert_eq!(actual.action, denial);
+                        assert_eq!(actual.counter, verdict.counter);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stateful_ingress_preserves_default_deny_reply_and_forward_exceptions() {
+        let packet = PacketMeta::new([192, 0, 2, 1], [192, 0, 2, 2], ip_proto::TCP, 4000, 443, 40);
+        for default in [Action::Drop, Action::Reject] {
+            let cfg = GlobalConfig::new(default, ConfigFlags::STATEFUL);
+            let verdict = decide(&packet, &cfg, false, None);
+            assert_eq!(
+                stateful_ingress_verdict(verdict, None, false, false).action,
+                default
+            );
+            let reply = stateful_ingress_verdict(verdict, None, true, false);
+            assert_eq!(reply.action, Action::Pass);
+            assert_eq!(reply.counter, Counter::EstablishedAllowed);
+            let forward = stateful_ingress_verdict(verdict, None, false, true);
+            assert_eq!(forward.action, Action::Pass);
+            assert_eq!(forward.counter, Counter::PassedRule);
+        }
+    }
+
+    #[test]
+    fn stateful_ingress_keeps_blocklist_and_protocol_prohibitions() {
+        let packet = PacketMeta::new([192, 0, 2, 1], [192, 0, 2, 2], ip_proto::ICMP, 0, 0, 40);
+        let cfg = GlobalConfig::new(Action::Pass, ConfigFlags::STATEFUL | ConfigFlags::DROP_ICMP);
+        for blocked in [false, true] {
+            let verdict = decide(&packet, &cfg, blocked, Some(Action::Pass));
+            let actual = stateful_ingress_verdict(verdict, Some(Action::Pass), true, true);
+            assert_eq!(actual.action, Action::Drop);
+            assert_eq!(
+                actual.counter,
+                if blocked {
+                    Counter::DroppedBlocklist
+                } else {
+                    Counter::DroppedIcmp
+                }
+            );
+        }
+    }
 
     /// Deny-by-default is a statement about what the box accepts, not a gag
     /// order. A packet leaving with no egress rule to its name has to pass, or

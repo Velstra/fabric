@@ -33,9 +33,14 @@
 mod cgnat;
 mod cidr;
 mod config;
+mod firewall_flow;
+mod firewall_key;
+mod firewall_packet;
+mod firewall_scope;
 mod forward;
 mod lb;
 mod mac;
+mod napt;
 mod npt;
 mod overlay;
 mod packet;
@@ -50,6 +55,15 @@ mod synproxy;
 pub use cgnat::CgnatLayout;
 pub use cidr::{Cidr4, Cidr6, CidrError, mask_v4, mask_v6, parse_cidr_v4, parse_cidr_v6};
 pub use config::{ConfigFlags, GlobalConfig, SourceValidation};
+pub use firewall_flow::{
+    FirewallFlow, FirewallFlowTransfer, FlowDirection, FlowObservation, FlowPacket, FlowTimeouts,
+    MAX_FLOW_TIMEOUT_MS, MAX_TCP_SEGMENT_LEN, TCP_NO_WINDOW_SCALE, TcpHeaderParser, TcpSegment,
+};
+pub use firewall_key::{FirewallFlowAlias, FirewallFlowKey, FlowScope};
+pub use firewall_packet::{
+    FirewallPacketFlow, FirewallPacketReader, firewall_packet_flow_v6, firewall_packet_valid,
+};
+pub use firewall_scope::{FLOW_LABEL_MAX, FLOW_POLICY_CAPACITY, FlowScopeLabel, FlowScopeMetadata};
 pub use forward::{
     ForwardOutcome, Rewrite, RouteEntry, csum_replace_u16, decrement_ttl, ipv4_checksum,
     plan_forward,
@@ -59,6 +73,7 @@ pub use lb::{
     select_backend, session_hash,
 };
 pub use mac::{MacError, parse_mac};
+pub use napt::{NAPT_PROBES, napt_candidate, napt_seed};
 pub use npt::{Npt66, npt66_rewrite, oc_add};
 pub use overlay::{
     ARP_REPLY, ARP_REQUEST, ArpEntry, ArpKey, ArpReply, ETHERTYPE_ARP, Encap, FloodSet,
@@ -82,6 +97,7 @@ pub use policy::{
     PORT_RULE_V6_ONLY, Verdict, admit_established_egress_reply, decide, decide_egress,
     port_rule_action, port_rule_bits, port_rule_excluded, port_rule_limit, port_rule_logs,
     port_rule_present, port_rule_value, port_rule_winner, port_rule_with_limit,
+    stateful_ingress_verdict,
 };
 pub use portal::{
     PortalClientKey, PortalGate, PortalSeenKey, gate_admits_unauthenticated, v6_source_is_v4_mapped,
@@ -97,7 +113,19 @@ pub use srv6::{
     plan_srv6_irb, write_srv6_encap,
 };
 pub use synproxy::{
-    EPOCH_SHIFT, MSS_TABLE, SYNTH_WINDOW, SynFlow, SynProxyCfg, SynProxyKey, TcpSynth,
-    check_cookie, csum_replace_u32, epoch_of, make_cookie, mss_index, plan_server_ack,
+    EPOCH_SHIFT, MSS_TABLE, SYNTH_WINDOW, SynFlow, SynMssParser, SynProxyCfg, SynProxyKey,
+    TcpSynth, check_cookie, csum_replace_u32, epoch_of, make_cookie, mss_index, plan_server_ack,
     plan_server_syn, plan_syn_ack, seq_delta, translate_to_client, translate_to_server,
+};
+
+pub mod firewall_table;
+pub use firewall_table::{
+    FirewallFlowAllocator, FirewallFlowRef, FirewallFlowSlot, FirewallFlowStorage,
+    FirewallFlowTable, FlowLookup, FlowTableError,
+};
+
+pub mod firewall_control;
+pub use firewall_control::{
+    FirewallFlowRecord, FlowControlMessage, FlowControlOp, FlowControlStatus, FlowRecordKind,
+    FlowVersion,
 };

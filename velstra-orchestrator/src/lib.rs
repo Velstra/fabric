@@ -1721,6 +1721,7 @@ impl Topology {
                 continue;
             };
             cfg.policies.push(PolicyFile {
+                state_scope: None,
                 id: *vni,
                 name: Some(net.name.clone()),
                 default_action: net.default_action,
@@ -1787,6 +1788,7 @@ impl Topology {
         for pid in sg_pids {
             if let Some(sg) = self.security_groups.values().find(|g| g.policy_id() == pid) {
                 cfg.policies.push(PolicyFile {
+                    state_scope: None,
                     id: pid,
                     name: Some(sg.name.clone()),
                     default_action: sg.default_action,

@@ -19,3 +19,7 @@ which = { workspace = true }
 [[bin]]
 name = "velstra"
 path = "src/main.rs"
+# This is a kernel entry point, not a host executable or libtest harness.
+# Its packet/verifier tests run through the actual Linux BPF VM checks.
+test = false
+bench = false

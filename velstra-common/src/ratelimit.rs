@@ -6,6 +6,8 @@
 //! in a packet capture and shows up months later as a rule that throttles traffic
 //! it was never meant to touch.
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 /// Nanoseconds in a second. The kernel clock is nanoseconds; a rate is per second.
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 
@@ -18,6 +20,11 @@ const NANOS_PER_SEC: u64 = 1_000_000_000;
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RateBucket {
+    // Zero when idle. Runtime callers must use `take_shared`; configuration
+    // writers may replace a bucket only while packet readers are quiescent.
+    busy: u32,
+    // Explicit padding keeps the timestamp and token fields naturally aligned.
+    _pad: u32,
     /// Sustained rate, packets per second. `0` disables the bucket (always allow),
     /// which is what an unprogrammed slot reads as.
     pub rate: u32,
@@ -35,11 +42,73 @@ impl RateBucket {
     #[inline]
     pub const fn new(rate: u32, burst: u32) -> Self {
         Self {
+            busy: 0,
+            _pad: 0,
             rate,
             burst,
             tokens: (burst as u64) * NANOS_PER_SEC,
             last_ns: 0,
         }
+    }
+
+    /// Spend from a map value shared by multiple packet-processing CPUs.
+    ///
+    /// Returns `None` if another CPU holds the bucket throughout the bounded
+    /// retry window. The caller must drop and count that packet. It must never
+    /// reinterpret contention as permission or multiply a limit per CPU.
+    ///
+    /// # Safety
+    /// `bucket` must be a valid, naturally aligned map value for this call.
+    /// Every concurrent runtime access must use this method; configuration
+    /// replacement requires quiescing all readers first. No helper call or
+    /// fallible operation runs while the lock is held. Only the lock word is
+    /// accessed atomically; mutable references to the shared value are never
+    /// constructed, including while another CPU is waiting for the lock.
+    #[inline(always)]
+    pub unsafe fn take_shared(bucket: *mut Self, now_ns: u64, n: u32) -> Option<bool> {
+        // Rate/burst are immutable during packet processing. An unlimited
+        // bucket needs no mutable state and must not drop due to contention.
+        if unsafe { core::ptr::addr_of!((*bucket).rate).read() } == 0 {
+            return Some(true);
+        }
+        // SAFETY: the caller guarantees a live aligned value; the first field
+        // has AtomicU32's layout and all runtime accesses to it are atomic.
+        let lock = unsafe { &*core::ptr::addr_of!((*bucket).busy).cast::<AtomicU32>() };
+        let mut acquired = false;
+        for _ in 0..8 {
+            if lock
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                acquired = true;
+                break;
+            }
+        }
+        if !acquired {
+            return None;
+        }
+        // SAFETY: no other runtime caller accesses these fields until release.
+        // Work on an owned copy so no reference aliases the shared lock word.
+        let mut local = unsafe {
+            Self {
+                busy: 0,
+                _pad: 0,
+                rate: core::ptr::addr_of!((*bucket).rate).read(),
+                burst: core::ptr::addr_of!((*bucket).burst).read(),
+                tokens: core::ptr::addr_of!((*bucket).tokens).read(),
+                last_ns: core::ptr::addr_of!((*bucket).last_ns).read(),
+            }
+        };
+        let allowed = local.take_n(now_ns, n);
+        // SAFETY: this invocation owns the lock and releases on its only exit.
+        unsafe {
+            core::ptr::addr_of_mut!((*bucket).tokens).write(local.tokens);
+            core::ptr::addr_of_mut!((*bucket).last_ns).write(local.last_ns);
+        }
+        // Use an RMW rather than an atomic store: BPF supports exchange, while
+        // not all compiler/kernel combinations support atomic load/store IR.
+        lock.swap(0, Ordering::Release);
+        Some(allowed)
     }
 
     /// The bucket's ceiling in scaled tokens. At most `u32::MAX × 1e9`, which is
@@ -85,9 +154,9 @@ impl RateBucket {
             // longer gap is capped away in the next step anyway, and a checked
             // multiply here needs a 128-bit product, which the BPF target has no
             // `__multi3` for — the kernel build fails outright. Clamped, the
-            // product is at most `cap` and the sum at most `2 × cap`, both well
-            // inside u64.
-            let full_ns = cap / (self.rate as u64);
+            // product is at most `cap + rate - 1`; even adding a full bucket
+            // stays inside u64 at u32::MAX rate and burst.
+            let full_ns = cap.div_ceil(self.rate as u64);
             let elapsed = now_ns - self.last_ns;
             let elapsed = if elapsed > full_ns { full_ns } else { elapsed };
             // elapsed ns × rate/s = scaled tokens, already in the same units.
@@ -192,6 +261,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fractional_full_refill_reaches_the_capacity() {
+        let mut bucket = RateBucket::new(3, 1);
+        assert!(bucket.take(1_000_000_000));
+        assert!(!bucket.take(1_000_000_000));
+        assert!(bucket.take(2_000_000_000));
+        assert!(!bucket.take(2_000_000_000));
+    }
+
     /// An unprogrammed slot reads as all-zero. Blocking on it would turn a
     /// half-applied config into a black hole, so a zero rate allows.
     #[test]
@@ -285,5 +363,107 @@ mod byte_tests {
         // An unprogrammed slot must never silently black-hole a port.
         let mut b = RateBucket::new(0, 0);
         assert!(b.take_n(1_000, 9_000));
+    }
+}
+
+#[cfg(test)]
+mod concurrent_tests {
+    use std::{
+        cell::UnsafeCell,
+        sync::{Arc, Barrier},
+        thread,
+    };
+
+    use super::*;
+
+    struct Shared(UnsafeCell<RateBucket>);
+    // SAFETY: tests access the value exclusively through take_shared, or after
+    // joining all writers. It has the same ownership contract as a live map.
+    unsafe impl Sync for Shared {}
+
+    #[test]
+    fn competing_cpus_cannot_spend_the_same_credit() {
+        let bucket = Arc::new(Shared(UnsafeCell::new(RateBucket::new(1, 127))));
+        let barrier = Arc::new(Barrier::new(16));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let bucket = bucket.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    let mut accepted = 0;
+                    for _ in 0..10_000 {
+                        // SAFETY: all writers follow the shared map protocol.
+                        if unsafe { RateBucket::take_shared(bucket.0.get(), 1_000_000_000, 1) }
+                            == Some(true)
+                        {
+                            accepted += 1;
+                        }
+                    }
+                    accepted
+                })
+            })
+            .collect();
+        let accepted: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(accepted, 127);
+        // SAFETY: every writer is joined.
+        let final_bucket = unsafe { *bucket.0.get() };
+        assert_eq!(final_bucket.tokens, 0);
+        assert_eq!(final_bucket.busy, 0);
+        assert_eq!(final_bucket.last_ns, 1_000_000_000);
+    }
+
+    #[test]
+    fn contention_rejects_without_corrupting_the_owner() {
+        let mut bucket = RateBucket::new(1, 3);
+        bucket.busy = 1;
+        let before = bucket;
+        // SAFETY: exclusive access supplies a live aligned value.
+        assert_eq!(
+            unsafe { RateBucket::take_shared(&mut bucket, 123, 1) },
+            None
+        );
+        assert_eq!(bucket, before);
+    }
+
+    #[test]
+    fn an_unlimited_bucket_does_not_contend() {
+        let mut bucket = RateBucket::new(0, 0);
+        bucket.busy = 1;
+        // SAFETY: exclusive access supplies a live aligned value.
+        assert_eq!(
+            unsafe { RateBucket::take_shared(&mut bucket, 123, u32::MAX) },
+            Some(true)
+        );
+        assert_eq!(bucket.busy, 1);
+    }
+
+    #[test]
+    fn layout_keeps_atomic_and_timestamp_fields_aligned() {
+        assert_eq!(core::mem::size_of::<RateBucket>(), 32);
+        assert_eq!(core::mem::align_of::<RateBucket>(), 8);
+        assert_eq!(core::mem::offset_of!(RateBucket, busy), 0);
+        assert_eq!(core::mem::offset_of!(RateBucket, rate), 8);
+        assert_eq!(core::mem::offset_of!(RateBucket, tokens), 16);
+        assert_eq!(core::mem::offset_of!(RateBucket, last_ns), 24);
+    }
+
+    #[test]
+    fn shared_packet_and_byte_budgets_match_the_reference() {
+        for (rate, burst) in [(0, 0), (1, 3), (125_000, 3_000), (u32::MAX, u32::MAX)] {
+            let mut reference = RateBucket::new(rate, burst);
+            let mut shared = reference;
+            for now in [0, 1, 2, 1, 1_000_000_000, u64::MAX] {
+                for cost in [0, 1, 900, 1_500, u32::MAX] {
+                    let expected = reference.take_n(now, cost);
+                    // SAFETY: exclusive access supplies a live aligned value.
+                    assert_eq!(
+                        unsafe { RateBucket::take_shared(&mut shared, now, cost) },
+                        Some(expected)
+                    );
+                    assert_eq!(shared, reference);
+                }
+            }
+        }
     }
 }
