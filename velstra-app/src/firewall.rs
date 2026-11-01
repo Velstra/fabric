@@ -189,6 +189,9 @@ pub struct Firewall {
     /// advertised and is doing nothing" is the question somebody asks during an
     /// attack, and a journal that has rotated cannot answer it.
     flowspec_refused: Vec<(String, String)>,
+    /// Packet events drained from the consume-once kernel ring, kept so every
+    /// reader pages through them with its own cursor (see `packet_events`).
+    packet_log: crate::packet_events::PacketEventLog,
     /// Tenant taps already carrying the TC BUM-replication classifier. Tracked
     /// because the attach is now re-tried on every reprogram — a tap that appears
     /// after startup has to be picked up — and attaching twice would put two
@@ -519,6 +522,13 @@ impl Firewall {
             flowspec: Vec::new(),
             dynamic_routes: Vec::new(),
             flowspec_refused: Vec::new(),
+            // The run's start time: distinct across restarts, which is all a
+            // reader needs to know its cursor belongs to a previous run.
+            packet_log: crate::packet_events::PacketEventLog::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_nanos() as u64),
+            ),
             auto_attached: HashSet::new(),
             config_attached,
             route_ifindices: prepared.route_ifindices,
@@ -1828,9 +1838,9 @@ impl Firewall {
         })
     }
 
-    /// Drain a bounded batch from the kernel ring. Consumption is explicit;
-    /// counters above remain available even if a slow reader loses events.
-    pub fn read_packet_events(&mut self, limit: usize) -> Result<Vec<serde_json::Value>> {
+    /// Move what the kernel ring holds into the agent's event log. Only the
+    /// agent consumes the ring; readers page through the log (`packet_log`).
+    fn drain_packet_ring(&mut self) -> Result<()> {
         let names: BTreeMap<(u32, u32), String> = self
             .applied
             .policies
@@ -1846,8 +1856,9 @@ impl Firewall {
                 .map_mut("PACKET_EVENTS")
                 .ok_or_else(|| anyhow!("PACKET_EVENTS map missing"))?,
         )?;
-        let mut rows = Vec::new();
-        for _ in 0..limit.clamp(1, 4096) {
+        // Bounded per call: a ring refilled as fast as it is read must not hold
+        // the firewall lock forever. One log's worth is all a reader could see.
+        for _ in 0..crate::packet_events::CAPACITY {
             let Some(item) = ring.next() else {
                 break;
             };
@@ -1870,7 +1881,7 @@ impl Firewall {
                     std::net::IpAddr::V6(std::net::Ipv6Addr::from(bytes)).to_string()
                 }
             };
-            rows.push(serde_json::json!({"timestamp_ns": event.timestamp_ns,
+            self.packet_log.push(serde_json::json!({"timestamp_ns": event.timestamp_ns,
                 "policy": event.policy, "rule_id": event.rule_id,
                 "rule": names.get(&(event.policy,event.rule_id)), "interface": event.ifindex,
                 "length": event.length, "family": event.family, "src": address(event.src), "dst": address(event.dst),
@@ -1878,7 +1889,39 @@ impl Firewall {
                 "action": match event.action { 0 => "accept", 1 => "drop", _ => "reject" },
                 "direction": if event.direction == 0 { "in" } else { "out" }, "reason": event.reason}));
         }
-        Ok(rows)
+        Ok(())
+    }
+
+    /// `packet-events [limit]`, the pre-cursor request: each event once across
+    /// every client still using it, as the ring used to behave for them.
+    pub fn read_packet_events(&mut self, limit: usize) -> Result<Vec<serde_json::Value>> {
+        self.drain_packet_ring()?;
+        Ok(self.packet_log.legacy(limit.clamp(1, 4096)))
+    }
+
+    /// `packet-events-since <id> [limit]`: a page of the log after a reader's
+    /// cursor, plus the kernel's own overflow count — events the ring dropped
+    /// before the agent could drain them, which no cursor can recover.
+    pub fn packet_events_since(&mut self, cursor: u64, limit: usize) -> Result<serde_json::Value> {
+        self.drain_packet_ring()?;
+        let mut page = self.packet_log.since(cursor, limit.clamp(1, 4096));
+        let lost: PerCpuArray<_, u64> = PerCpuArray::try_from(
+            self.ebpf
+                .map("PACKET_EVENTS_LOST")
+                .ok_or_else(|| anyhow!("PACKET_EVENTS_LOST map missing"))?,
+        )?;
+        page["ring_lost"] = serde_json::json!(lost.get(&0, 0)?.iter().copied().sum::<u64>());
+        Ok(page)
+    }
+
+    /// `packet-events-tail [limit]`: the newest events, consuming nothing.
+    pub fn packet_events_tail(&mut self, limit: usize) -> Result<Vec<serde_json::Value>> {
+        self.drain_packet_ring()?;
+        Ok(self
+            .packet_log
+            .tail(limit.clamp(1, 4096))
+            .cloned()
+            .collect())
     }
 
     pub fn read_stats(&self) -> Result<Stats> {
