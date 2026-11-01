@@ -34,7 +34,6 @@ pub const DEADLINE_PIN: &str = "/sys/fs/bpf/velstra-ha/deadline";
 pub const OWNER_PIN: &str = "/sys/fs/bpf/velstra-ha/owner";
 const EXIT_PIN: &str = "/sys/fs/bpf/velstra-ha/exit";
 const GUARD_PIN: &str = "/sys/fs/bpf/velstra-ha/guard";
-const FRESH_NS: u64 = 100_000_000;
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Authority {
@@ -81,6 +80,10 @@ pub struct State {
     cold: bool,
     pub active_term: u64,
     agent_boot: [u8; 16],
+    /// Why this member could not take over right now, refreshed every poll.
+    /// A standby that is merely "Backup" while the witness would refuse it is
+    /// the failure an operator otherwise discovers during the outage.
+    not_ready: Option<&'static str>,
 }
 pub type Shared = Arc<Mutex<State>>;
 impl State {
@@ -99,6 +102,7 @@ impl State {
             cold: true,
             active_term: 0,
             agent_boot: boot,
+            not_ready: Some("fresh agent has no state snapshot yet"),
         })))
     }
     /// Local forwarding authority and replica freshness, never inferred from
@@ -108,7 +112,7 @@ impl State {
         let Some(config) = self.config.as_ref().filter(|config| config.enabled) else {
             return serde_json::json!({"role":"standalone","sync_age_ms":null});
         };
-        let fresh_role = fresh(self.role.updated_ns, now);
+        let fresh_role = role_fresh(config, self.role.updated_ns, now);
         let master = fresh_role
             && self.active_term > 0
             && self.role.authority.owner == config.node
@@ -118,8 +122,38 @@ impl State {
             "owner":self.role.authority.owner,"lease_remaining_ms":self.role.deadline_ns.saturating_sub(now)/1_000_000,
             "vips_ready":self.role.vips_ready,"vpn_ready":self.role.vpn_ready,
             "replica_ready":self.ready_term>0,
+            "ready":master || self.not_ready.is_none(),
+            "not_ready":if master {None} else {self.not_ready},
             "sync_age_ms":if !master && self.ready_at>0 {Some(now.saturating_sub(self.ready_at)/1_000_000)}else{None},
             "sync_age_scope":"local standby: time since the latest complete authenticated state update"})
+    }
+    /// Records the first reason, in the order an operator can act on, that
+    /// the witness would refuse this member authority.
+    pub fn observe(
+        &mut self,
+        config: &HaConfig,
+        policy: [u8; 32],
+        links_ready: bool,
+        role_fresh: bool,
+        now: u64,
+    ) {
+        self.not_ready = if !role_fresh {
+            Some("coordinator is not reporting")
+        } else if !links_ready {
+            Some("data links are not ready")
+        } else if self.role.authority.term > 0 && self.role.authority.policy != policy {
+            // A commit on the owner changes its fingerprint at once; this
+            // member stays ineligible until configuration sync delivers it.
+            Some("policy differs from the owner's; awaiting configuration sync")
+        } else if self.ready_term == 0 && self.cold {
+            Some("fresh agent has no state snapshot yet")
+        } else if self.ready_term == 0 {
+            Some("no complete state snapshot from the owner")
+        } else if !self.is_ready(config, policy, now) {
+            Some("state snapshot is stale")
+        } else {
+            None
+        };
     }
     fn is_ready(&self, config: &HaConfig, policy: [u8; 32], now: u64) -> bool {
         self.ready_term > 0
@@ -190,7 +224,7 @@ impl State {
                         && a.owner == 3 - config.node
                         && *a == self.role.authority
                         && a.policy == policy
-                        && fresh(self.role.updated_ns, now_ns()),
+                        && role_fresh(config, self.role.updated_ns, now_ns()),
                     "state sender is not the current witness authority"
                 );
                 Ok(())
@@ -231,8 +265,8 @@ pub fn now_ns() -> u64 {
         .saturating_mul(1_000_000_000)
         .saturating_add(time.tv_nsec as u64)
 }
-fn fresh(updated: u64, now: u64) -> bool {
-    updated <= now && now - updated <= FRESH_NS
+fn role_fresh(config: &HaConfig, updated: u64, now: u64) -> bool {
+    updated <= now && now - updated <= config.role_fresh_ms.saturating_mul(1_000_000)
 }
 fn read_role() -> Result<Role> {
     let file = OpenOptions::new()
@@ -472,6 +506,23 @@ pub fn register_agent(enabled: bool) -> Result<Option<AgentLifetime>> {
     owner.set(0, pid, 0)?;
     Ok(Some(AgentLifetime { owner, pid }))
 }
+/// The WireGuard listen ports the kernel map must gain and lose to match the
+/// configuration exactly.
+fn wireguard_port_changes(present: &BTreeSet<u16>, wanted: &[u16]) -> (Vec<u16>, Vec<u16>) {
+    let add = wanted
+        .iter()
+        .copied()
+        .filter(|port| !present.contains(port))
+        .collect();
+    // A port that stays in the map after its tunnel is gone keeps being
+    // treated as HA WireGuard traffic on a port that may now mean anything.
+    let remove = present
+        .iter()
+        .copied()
+        .filter(|port| !wanted.contains(port))
+        .collect();
+    (add, remove)
+}
 /// Called under the firewall configuration lock before admitting a new lease.
 pub fn reconcile_interfaces(
     ebpf: &mut aya::Ebpf,
@@ -483,8 +534,15 @@ pub fn reconcile_interfaces(
             ebpf.map_mut("HA_WG_PORTS")
                 .context("HA WireGuard port map")?,
         )?;
-        for port in &config.wireguard_ports {
-            ports.insert(*port, 1, 0)?;
+        let present = ports
+            .keys()
+            .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+        let (add, remove) = wireguard_port_changes(&present, &config.wireguard_ports);
+        for port in add {
+            ports.insert(port, 1, 0)?;
+        }
+        for port in remove {
+            ports.remove(&port)?;
         }
     }
     let mut complete = true;
@@ -606,8 +664,11 @@ pub async fn monitor(firewall: Arc<Mutex<Firewall>>, shared: Shared, config: HaC
             }
         };
         let role = read_role().ok().filter(|r| {
-            r.cluster == config.cluster && r.node == config.node && fresh(r.updated_ns, now_ns())
+            r.cluster == config.cluster
+                && r.node == config.node
+                && role_fresh(&config, r.updated_ns, now_ns())
         });
+        let coordinator_live = role.is_some();
         let mut state = shared.lock().await;
         if let Some(role) = role {
             state.role = role;
@@ -626,6 +687,7 @@ pub async fn monitor(firewall: Arc<Mutex<Firewall>>, shared: Shared, config: HaC
         }
         let ready = state.is_ready(&config, policy, now);
         let active = state.forwarding_allowed(&config, policy, links_ready, now);
+        state.observe(&config, policy, links_ready, coordinator_live, now);
         // A genuinely cold election has a complete empty baseline. Publish
         // that fact before acknowledging forwarding: Wren may already have
         // renewed the initial claim by the time its VPN task starts. Warm
@@ -705,6 +767,7 @@ mod tests {
             cluster: "test-cluster-0123456789".into(),
             node: 1,
             interfaces: vec!["wan".into()],
+            role_fresh_ms: 100,
         }
     }
     #[tokio::test]
@@ -726,6 +789,92 @@ mod tests {
         assert_eq!(state.telemetry(now + 200_000_000)["role"], "Fenced");
         state.config = None;
         assert_eq!(state.telemetry(now)["role"], "standalone");
+    }
+    #[tokio::test]
+    async fn a_standby_reports_why_it_cannot_take_over() {
+        let cfg = config();
+        let shared = State::new(Some(cfg.clone())).unwrap();
+        let mut state = shared.lock().await;
+        let now = now_ns();
+        state.role = Role {
+            cluster: cfg.cluster.clone(),
+            node: 1,
+            authority: Authority {
+                term: 4,
+                owner: 2,
+                boot: [2; 16],
+                policy: [8; 32],
+            },
+            updated_ns: now,
+            ..Role::default()
+        };
+        let authority = state.role.authority.clone();
+        state.snapshot_ready(&authority);
+        state.observe(&cfg, [8; 32], true, true, now);
+        assert_eq!(state.telemetry(now)["role"], "Backup");
+        assert_eq!(state.telemetry(now)["ready"], true);
+        assert!(state.telemetry(now)["not_ready"].is_null());
+        // The owner committed a policy this standby has not received yet.
+        state.observe(&cfg, [9; 32], true, true, now);
+        assert_eq!(state.telemetry(now)["ready"], false);
+        assert_eq!(
+            state.telemetry(now)["not_ready"],
+            "policy differs from the owner's; awaiting configuration sync"
+        );
+        state.observe(&cfg, [8; 32], false, true, now);
+        assert_eq!(
+            state.telemetry(now)["not_ready"],
+            "data links are not ready"
+        );
+        state.observe(&cfg, [8; 32], true, true, now + 2_000_000_000);
+        assert_eq!(state.telemetry(now)["not_ready"], "state snapshot is stale");
+        state.begin_install();
+        state.observe(&cfg, [8; 32], true, true, now);
+        assert_eq!(
+            state.telemetry(now)["not_ready"],
+            "no complete state snapshot from the owner"
+        );
+        let fresh_agent = State::new(Some(cfg.clone())).unwrap();
+        let mut fresh_agent = fresh_agent.lock().await;
+        fresh_agent.role = state.role.clone();
+        fresh_agent.observe(&cfg, [8; 32], true, true, now);
+        assert_eq!(
+            fresh_agent.telemetry(now)["not_ready"],
+            "fresh agent has no state snapshot yet"
+        );
+        state.observe(&cfg, [8; 32], true, false, now);
+        assert_eq!(
+            state.telemetry(now)["not_ready"],
+            "coordinator is not reporting"
+        );
+    }
+    #[test]
+    fn role_freshness_follows_the_configured_witness_budget() {
+        let mut cfg = config();
+        let now = 10_000_000_000;
+        assert!(role_fresh(&cfg, now - 100_000_000, now));
+        assert!(!role_fresh(&cfg, now - 101_000_000, now));
+        cfg.role_fresh_ms = 330;
+        assert!(role_fresh(&cfg, now - 300_000_000, now));
+        assert!(!role_fresh(&cfg, now - 331_000_000, now));
+        assert!(
+            !role_fresh(&cfg, now + 1, now),
+            "a role from the future is not fresh"
+        );
+    }
+    #[test]
+    fn removed_wireguard_ports_leave_the_kernel_map() {
+        let present: BTreeSet<u16> = [51820, 51821].into_iter().collect();
+        let (add, remove) = wireguard_port_changes(&present, &[51821, 51822]);
+        assert_eq!(add, vec![51822]);
+        assert_eq!(
+            remove,
+            vec![51820],
+            "a port no longer configured must stop being treated as HA WireGuard"
+        );
+        let (add, remove) = wireguard_port_changes(&present, &[]);
+        assert!(add.is_empty());
+        assert_eq!(remove, vec![51820, 51821]);
     }
     #[test]
     fn guard_scope_cleanup_requires_reserved_coordinates_and_verified_kernel_owner() {

@@ -1559,6 +1559,15 @@ pub struct HaConfig {
     pub cluster: String,
     pub node: u8,
     pub interfaces: Vec<String>,
+    /// How old the coordinator's role file may be and still count as a live
+    /// coordinator. It is rewritten once per witness exchange, so it has to
+    /// cover the configured witness I/O budget plus the coordinator's poll;
+    /// the lease deadline inside it, not this, is what fences forwarding.
+    #[serde(default = "default_role_fresh_ms")]
+    pub role_fresh_ms: u64,
+}
+fn default_role_fresh_ms() -> u64 {
+    100
 }
 
 /// Fully-resolved, validated configuration ready to be written into BPF maps.
@@ -1639,6 +1648,10 @@ impl RuntimeConfig {
             anyhow::ensure!(
                 ha.wireguard_ports.iter().all(|p| *p > 0),
                 "HA WireGuard ports must be nonzero"
+            );
+            anyhow::ensure!(
+                (100..=10_000).contains(&ha.role_fresh_ms),
+                "HA role freshness must be 100..=10000 ms"
             );
             anyhow::ensure!(
                 ha.disabled.iter().all(|n| ha.interfaces.contains(n)),
@@ -4640,5 +4653,25 @@ mod rule_limit_tests {
             policy_with("action = \"pass\"\nfamily = \"ipv6\"\ndirection = \"out\"\n").unwrap();
         let rule = only_rule(&cfg);
         assert_eq!(rule.scope, PORT_RULE_V6_ONLY | PORT_RULE_OUT_ONLY);
+    }
+}
+
+#[cfg(test)]
+mod ha_config_tests {
+    use super::HaConfig;
+
+    /// A runtime file written before the witness budget was configurable keeps
+    /// the role freshness it always had.
+    #[test]
+    fn role_freshness_defaults_for_existing_runtime_files() {
+        let ha: HaConfig =
+            toml::from_str("enabled = true\ncluster = \"c\"\nnode = 1\ninterfaces = [\"eth1\"]\n")
+                .unwrap();
+        assert_eq!(ha.role_fresh_ms, 100);
+        let ha: HaConfig = toml::from_str(
+            "enabled = true\ncluster = \"c\"\nnode = 1\ninterfaces = [\"eth1\"]\nrole_fresh_ms = 330\n",
+        )
+        .unwrap();
+        assert_eq!(ha.role_fresh_ms, 330);
     }
 }
