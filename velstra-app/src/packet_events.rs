@@ -66,9 +66,15 @@ impl PacketEventLog {
     /// pass next, and how many events left the window before it asked.
     ///
     /// A cursor this run never issued (from a previous agent run) starts over
-    /// rather than waiting for the new ids to catch up with it.
-    pub fn since(&self, cursor: u64, limit: usize) -> Value {
-        let restarted = cursor >= self.next_id;
+    /// rather than waiting for the new ids to catch up with it. `epoch` is the
+    /// run the reader's cursor came from, when it says: ids restart at 1 every
+    /// run, so a cursor from an older run that is *behind* this run's ids looks
+    /// like one of ours, and only the epoch tells them apart. Without it the
+    /// reader would page on from the middle of a run it never saw the start of.
+    /// A reader that does not send one (it predates epochs) is judged by the id
+    /// alone, which catches only the cursor that ran past this run's ids.
+    pub fn since(&self, cursor: u64, epoch: Option<u64>, limit: usize) -> Value {
+        let restarted = epoch.is_some_and(|epoch| epoch != self.epoch) || cursor >= self.next_id;
         let cursor = if restarted { 0 } else { cursor };
         let oldest = self.oldest_id();
         // Ids in (cursor, oldest) were evicted before this reader saw them.
@@ -96,7 +102,7 @@ impl PacketEventLog {
     /// client that still speaks it, exactly as the ring behaved for them — but
     /// no longer at the expense of a cursor reader.
     pub fn legacy(&mut self, limit: usize) -> Vec<Value> {
-        let page = self.since(self.legacy_cursor, limit);
+        let page = self.since(self.legacy_cursor, Some(self.epoch), limit);
         self.legacy_cursor = page["cursor"].as_u64().unwrap_or(self.legacy_cursor);
         match page {
             Value::Object(mut page) => match page.remove("events") {
@@ -131,15 +137,15 @@ mod tests {
     #[test]
     fn readers_with_their_own_cursors_never_take_each_others_events() {
         let mut log = log_of(5, 16);
-        let console = log.since(0, 100);
+        let console = log.since(0, None, 100);
         assert_eq!(ids(&console), [1, 2, 3, 4, 5]);
         // A second reader — and the legacy one — still see every event.
-        assert_eq!(ids(&log.since(0, 100)), [1, 2, 3, 4, 5]);
+        assert_eq!(ids(&log.since(0, None, 100)), [1, 2, 3, 4, 5]);
         assert_eq!(log.legacy(100).len(), 5);
-        assert_eq!(ids(&log.since(0, 100)), [1, 2, 3, 4, 5]);
+        assert_eq!(ids(&log.since(0, None, 100)), [1, 2, 3, 4, 5]);
         // Paging forward from the returned cursor yields only what is new.
         log.push(json!({"n":5}));
-        let next = log.since(console["cursor"].as_u64().unwrap(), 100);
+        let next = log.since(console["cursor"].as_u64().unwrap(), Some(7), 100);
         assert_eq!(ids(&next), [6]);
         assert_eq!(next["missed"], 0);
         assert_eq!(next["epoch"], 7);
@@ -151,21 +157,21 @@ mod tests {
     #[test]
     fn a_reader_that_fell_out_of_the_window_is_told_how_many_it_missed() {
         let log = log_of(10, 4);
-        let page = log.since(2, 100);
+        let page = log.since(2, None, 100);
         assert_eq!(ids(&page), [7, 8, 9, 10]);
         assert_eq!(page["missed"], 4, "ids 3..=6 were evicted unseen");
         assert_eq!(page["oldest_event_id"], 7);
         assert_eq!(page["next_event_id"], 11);
         // A limited page keeps its place and reports no gap on the next one.
-        let first = log.since(6, 2);
+        let first = log.since(6, None, 2);
         assert_eq!(ids(&first), [7, 8]);
-        let second = log.since(first["cursor"].as_u64().unwrap(), 2);
+        let second = log.since(first["cursor"].as_u64().unwrap(), None, 2);
         assert_eq!(
             (ids(&second), second["missed"].clone()),
             (vec![9, 10], json!(0))
         );
         // Nothing new: the cursor stays where it was.
-        let idle = log.since(10, 100);
+        let idle = log.since(10, None, 100);
         assert!(ids(&idle).is_empty());
         assert_eq!(idle["cursor"], 10);
     }
@@ -173,12 +179,27 @@ mod tests {
     #[test]
     fn a_cursor_from_a_previous_agent_run_starts_over() {
         let log = log_of(3, 16);
-        let page = log.since(900, 100);
+        let page = log.since(900, None, 100);
         assert_eq!(page["restarted"], true);
         assert_eq!(ids(&page), [1, 2, 3]);
-        let empty = PacketEventLog::with_capacity(1, 4).since(0, 10);
+        let empty = PacketEventLog::with_capacity(1, 4).since(0, None, 10);
         assert_eq!(empty["cursor"], 0);
         assert_eq!(empty["oldest_event_id"], Value::Null);
+    }
+
+    /// A cursor from the previous run that is still behind this run's ids:
+    /// the id alone cannot tell it from one of ours, so without the epoch the
+    /// reader silently skipped the new run's first events.
+    #[test]
+    fn an_older_cursor_from_a_previous_run_starts_over_by_its_epoch() {
+        let log = log_of(10, 16);
+        let page = log.since(4, Some(6), 100);
+        assert_eq!(page["restarted"], true);
+        assert_eq!(ids(&page), (1..=10).collect::<Vec<_>>());
+        assert_eq!(page["missed"], 0, "nothing of this run was lost to it");
+        let ours = log.since(4, Some(7), 100);
+        assert_eq!(ours["restarted"], false);
+        assert_eq!(ids(&ours), [5, 6, 7, 8, 9, 10]);
     }
 
     #[test]
@@ -186,6 +207,6 @@ mod tests {
         let log = log_of(6, 16);
         let tail: Vec<_> = log.tail(2).map(|e| e["id"].as_u64().unwrap()).collect();
         assert_eq!(tail, [5, 6]);
-        assert_eq!(ids(&log.since(0, 100)).len(), 6);
+        assert_eq!(ids(&log.since(0, None, 100)).len(), 6);
     }
 }

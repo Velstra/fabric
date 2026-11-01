@@ -523,11 +523,24 @@ fn wireguard_port_changes(present: &BTreeSet<u16>, wanted: &[u16]) -> (Vec<u16>,
         .collect();
     (add, remove)
 }
+/// Whether the HA guard itself brings `name` up once the guard is on it.
+///
+/// Not a link the firewall holds (`held`): that one must carry the firewall's
+/// own hooks under a policy in force as well, and the guard is installed long
+/// before either — at load, before the first XDP attach, and on a recreated
+/// link within one 20 ms poll. Raising it here would let it forward unfiltered
+/// until the firewall's next pass, so the firewall raises it instead, once
+/// both are in place (`Firewall::activate_held_links`). One owner per link.
+fn guard_raises_link(config: &HaConfig, name: &str, held: impl Fn(&str) -> bool) -> bool {
+    !config.disabled.iter().any(|n| n == name) && !held(name)
+}
 /// Called under the firewall configuration lock before admitting a new lease.
+/// `held` names the links the firewall raises itself (see `guard_raises_link`).
 pub fn reconcile_interfaces(
     ebpf: &mut aya::Ebpf,
     config: &HaConfig,
     seen: &mut BTreeMap<String, u32>,
+    held: impl Fn(&str) -> bool,
 ) -> Result<bool> {
     {
         let mut ports = HashMap::<_, u16, u8>::try_from(
@@ -577,7 +590,7 @@ pub fn reconcile_interfaces(
             // ActivationPolicy=manual keeps recreated links down until this
             // persistent guard is installed. Standby links can then resolve the
             // shared address only after a valid lease opens the kernel gate.
-            if !config.disabled.contains(name) {
+            if guard_raises_link(config, name, &held) {
                 tool("ip", &["link", "set", "dev", name, "up"])?;
             }
             seen.insert(name.clone(), index);
@@ -643,7 +656,6 @@ pub fn control_addresses(config: &HaConfig) -> Result<BTreeSet<IpAddr>> {
     Ok(result)
 }
 pub async fn monitor(firewall: Arc<Mutex<Firewall>>, shared: Shared, config: HaConfig) {
-    let mut links = BTreeMap::new();
     let mut poll = tokio::time::interval(Duration::from_millis(20));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -656,7 +668,7 @@ pub async fn monitor(firewall: Arc<Mutex<Firewall>>, shared: Shared, config: HaC
                 continue;
             }
         };
-        let links_ready = match fw.ha_interfaces(&config, &mut links) {
+        let links_ready = match fw.ha_interfaces(&config) {
             Ok(value) => value,
             Err(error) => {
                 log::warn!("HA guard reconcile failed: {error:#}");
@@ -860,6 +872,29 @@ mod tests {
         assert!(
             !role_fresh(&cfg, now + 1, now),
             "a role from the future is not fresh"
+        );
+    }
+    /// The guard goes on long before the firewall's hooks (at load, before the
+    /// first XDP attach; on a recreated link within one poll). A link the
+    /// firewall holds must therefore never be raised by the guard: it would
+    /// forward unfiltered until the firewall's next pass found it.
+    #[test]
+    fn the_guard_never_raises_a_link_the_firewall_holds() {
+        let mut cfg = config();
+        cfg.interfaces = vec!["wan".into(), "lan".into(), "sync".into()];
+        cfg.disabled = vec!["sync".into()];
+        let held = |name: &str| name == "lan";
+        assert!(
+            guard_raises_link(&cfg, "wan", held),
+            "not held: the guard raises it"
+        );
+        assert!(
+            !guard_raises_link(&cfg, "lan", held),
+            "held: only the firewall may raise it, hooks and guard both in place"
+        );
+        assert!(
+            !guard_raises_link(&cfg, "sync", held),
+            "disabled stays down"
         );
     }
     #[test]
