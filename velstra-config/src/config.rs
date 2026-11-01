@@ -812,6 +812,15 @@ pub struct InterfaceFile {
     /// Ports per internal address. See `cgnat_base_port`.
     #[serde(default)]
     pub cgnat_block_size: u16,
+    /// The link's owner keeps it administratively down until this agent has
+    /// attached its hooks and put the policy in force; the agent then brings it
+    /// up. An appliance sets this on every link it holds (networkd
+    /// `ActivationPolicy=manual`), so a link that is new or was recreated never
+    /// forwards before the firewall sees it — the hold is what closes the gap a
+    /// polled attach leaves. A file-mode setting: a controller's ports are
+    /// created by whoever plugs a guest in, and nothing holds them.
+    #[serde(default)]
+    pub activate: bool,
 }
 
 /// Stateful-firewall idle timeouts, in seconds. Zero and values over seven
@@ -1362,6 +1371,8 @@ pub struct ResolvedInterface {
     pub rate_limit_mbit: Option<u32>,
     /// Deterministic CGNAT port-block layout for this egress, or a disabled layout.
     pub cgnat: CgnatLayout,
+    /// Bring the link up once its hooks are attached. See [`InterfaceFile::activate`].
+    pub activate: bool,
 }
 
 /// A resolved overlay forwarding entry: the tenant segment, the inner-destination
@@ -2159,6 +2170,7 @@ impl FileConfig {
                 cgnat: CgnatLayout::new(iface.cgnat_base_port, iface.cgnat_block_size),
                 binding: resolve_binding(iface)?,
                 rate_limit_mbit: iface.rate_limit_mbit.filter(|m| *m > 0),
+                activate: iface.activate,
             });
         }
 
@@ -3529,6 +3541,7 @@ mod tests {
                     cgnat: CgnatLayout::default(),
                     binding: None,
                     rate_limit_mbit: None,
+                    activate: false,
                 },
                 ResolvedInterface {
                     name: "tap1".into(),
@@ -3540,6 +3553,7 @@ mod tests {
                     cgnat: CgnatLayout::default(),
                     binding: None,
                     rate_limit_mbit: None,
+                    activate: false,
                 },
             ]
         );
@@ -4640,5 +4654,33 @@ mod rule_limit_tests {
             policy_with("action = \"pass\"\nfamily = \"ipv6\"\ndirection = \"out\"\n").unwrap();
         let rule = only_rule(&cfg);
         assert_eq!(rule.scope, PORT_RULE_V6_ONLY | PORT_RULE_OUT_ONLY);
+    }
+}
+
+#[cfg(test)]
+mod activation_tests {
+    use super::*;
+
+    /// An appliance holds a zoned link down until the agent has attached its
+    /// hooks, and says so per interface. The flag has to survive resolution, or
+    /// the agent attaches and leaves the link down for good.
+    #[test]
+    fn a_held_link_is_resolved_as_one_to_bring_up() {
+        let cfg = toml::from_str::<FileConfig>(
+            r#"
+            [[interface]]
+            name = "lan0"
+            policy = 0
+            activate = true
+            [[interface]]
+            name = "tap0"
+            policy = 0
+            "#,
+        )
+        .unwrap()
+        .resolve()
+        .unwrap();
+        assert!(cfg.interfaces[0].activate);
+        assert!(!cfg.interfaces[1].activate, "only a held link is activated");
     }
 }

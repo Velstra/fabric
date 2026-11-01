@@ -208,6 +208,10 @@ pub struct Firewall {
     config_attached: BTreeMap<String, u32>,
     /// Route egress devices can appear without being declared as firewall ports.
     route_ifindices: BTreeMap<String, u32>,
+    /// Links their owner holds down until this agent has hooked them (see
+    /// `ResolvedInterface::activate`), attached since they were last brought
+    /// up. Drained by [`Self::activate_held_links`] once the policy is in force.
+    held_links: BTreeSet<String>,
     /// The `CONNTRACK` handle once it has been moved out of [`Self::ebpf`],
     /// **shared** rather than given away: both the C9 sync task and the flow
     /// query path read it. Keeping it here is what stops enabling HA from taking
@@ -506,7 +510,17 @@ impl Firewall {
                     .map(|index| (i.name.clone(), index))
             })
             .collect();
+        // Everything attached here was attached by this process: a held link
+        // among them is down (boot) or up from a previous agent, and either
+        // way is brought up once the policy is in force.
+        let held_links = cfg
+            .interfaces
+            .iter()
+            .filter(|i| i.activate && attached.iter().any(|(name, _)| name == &i.name))
+            .map(|i| i.name.clone())
+            .collect();
         let mut fw = Self {
+            held_links,
             ebpf,
             attached,
             xdp_links,
@@ -880,19 +894,22 @@ impl Firewall {
         }
 
         // Attach config interfaces that are present but not yet attached.
-        let todo: Vec<(String, PolicyId, u32)> = self
+        let todo: Vec<(String, PolicyId, u32, bool)> = self
             .applied
             .interfaces
             .iter()
             .filter(|i| present_set.contains(i.name.as_str()))
             .filter(|i| !self.attached.iter().any(|(n, _)| n == &i.name))
-            .map(|i| (i.name.clone(), i.policy, i.vni))
+            .map(|i| (i.name.clone(), i.policy, i.vni, i.activate))
             .collect();
-        for (name, policy, vni) in todo {
+        for (name, policy, vni, activate) in todo {
             match self.attach_config_iface(&name, mode, policy, vni) {
                 Ok(chosen) => {
                     if let Ok(index) = if_nametoindex(&name) {
                         self.config_attached.insert(name.clone(), index);
+                    }
+                    if activate {
+                        self.held_links.insert(name.clone());
                     }
                     changed = true;
                     log::info!(
@@ -917,6 +934,72 @@ impl Firewall {
             // just because Linux gave a recreated TAP a new interface ID.
             if let Err(error) = self.reprogram() {
                 warn!("reprogramming recreated interfaces failed: {error:#}");
+            }
+        }
+        self.activate_held_links();
+    }
+
+    /// The check a commit waits on: every held link that exists is up. A link
+    /// that could not be hooked stays down — the fail-closed half — and this is
+    /// the loud half, so the commit says which link and does not report success
+    /// over a segment that is silently dark.
+    pub fn ensure_held_links_up(&mut self) -> Result<()> {
+        self.activate_held_links();
+        let dark: Vec<&str> = self
+            .applied
+            .interfaces
+            .iter()
+            .filter(|i| i.activate)
+            .map(|i| i.name.as_str())
+            .filter(|name| {
+                std::fs::read_to_string(format!("/sys/class/net/{name}/flags"))
+                    .ok()
+                    .and_then(|flags| {
+                        u32::from_str_radix(flags.trim().trim_start_matches("0x"), 16).ok()
+                    })
+                    .is_some_and(|flags| flags & libc::IFF_UP as u32 == 0)
+            })
+            .collect();
+        anyhow::ensure!(
+            dark.is_empty(),
+            "held down because their packet hooks are not in place: {}",
+            dark.join(", ")
+        );
+        Ok(())
+    }
+
+    /// Bring up the held links that now carry their hooks under a policy in
+    /// force. A link that cannot come up yet stays held and is retried on the
+    /// next reconcile; one no longer declared as held is forgotten.
+    fn activate_held_links(&mut self) {
+        let declared = &self.applied.interfaces;
+        self.held_links
+            .retain(|name| declared.iter().any(|i| i.activate && &i.name == name));
+        if self.held_links.is_empty() {
+            return;
+        }
+        let in_force = self
+            .configuration_state()
+            .is_ok_and(|state| state == CONFIG_READY);
+        let needs_egress =
+            egress_interfaces(&self.applied, &self.egress_candidates(&self.applied), true);
+        let ready = links_to_activate(
+            &self.held_links,
+            &self.applied.interfaces,
+            |name| {
+                self.xdp_links.contains_key(name)
+                    && (!needs_egress.iter().any(|n| n == name)
+                        || self.egress_attached.contains_key(name))
+            },
+            in_force,
+        );
+        for name in ready {
+            match set_link_up(&name) {
+                Ok(()) => {
+                    self.held_links.remove(&name);
+                    log::info!("{name}: hooks attached and policy in force; link brought up");
+                }
+                Err(error) => warn!("bringing held link {name} up failed: {error:#}"),
             }
         }
     }
@@ -3320,10 +3403,50 @@ fn masquerade_targets(
         .filter(|i| i.masquerade)
         .filter_map(|i| {
             let ifindex = index(&i.name).ok()?;
-            let ip = i.snat_address.or_else(|| address(&i.name).ok())?;
+            // A present uplink with no address keeps its entry, unaddressed:
+            // deleting it would hand the uplink to the plain egress policy and
+            // let LAN traffic leave with its private source address.
+            let ip = i
+                .snat_address
+                .or_else(|| address(&i.name).ok())
+                .unwrap_or(velstra_common::UNADDRESSED);
             Some((ifindex, ip))
         })
         .collect()
+}
+
+/// The held links that may come up now: still declared as held, carrying every
+/// hook they need (`attached`), and only while the configuration is in force.
+fn links_to_activate(
+    held: &BTreeSet<String>,
+    interfaces: &[ResolvedInterface],
+    attached: impl Fn(&str) -> bool,
+    in_force: bool,
+) -> Vec<String> {
+    if !in_force {
+        return Vec::new();
+    }
+    held.iter()
+        .filter(|name| interfaces.iter().any(|i| i.activate && &i.name == *name))
+        .filter(|name| attached(name))
+        .cloned()
+        .collect()
+}
+
+/// `ip link set dev <name> up`, through the pinned iproute2 the appliance hands
+/// the agent.
+fn set_link_up(name: &str) -> Result<()> {
+    let ip = std::env::var("VELSTRA_IP_BIN").unwrap_or_else(|_| "ip".into());
+    let output = std::process::Command::new(ip)
+        .args(["link", "set", "dev", name, "up"])
+        .output()
+        .context("running ip link set up")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "ip link set dev {name} up: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
 }
 
 /// Reconcile egress ifindex → public IPv4 without clearing conntrack. This is
@@ -4781,9 +4904,11 @@ mod tests {
         .unwrap();
         let indices = |name: &str| Ok(if name == "wan0" { 10 } else { 11 });
         let absent = |_: &str| Err(anyhow!("no lease yet"));
+        // No lease: the entry stays, unaddressed, so the data plane drops what
+        // would otherwise leave un-translated (see `velstra_common::UNADDRESSED`).
         assert_eq!(
             masquerade_targets(&cfg.interfaces, indices, absent),
-            BTreeMap::from([(11, [203, 0, 113, 100])])
+            BTreeMap::from([(10, velstra_common::UNADDRESSED), (11, [203, 0, 113, 100])])
         );
         for ip in [[198, 51, 100, 2], [198, 51, 100, 9]] {
             assert_eq!(
@@ -4793,6 +4918,44 @@ mod tests {
         }
         assert!(
             masquerade_targets(&cfg.interfaces, |_| Err(anyhow!("removed")), absent).is_empty()
+        );
+    }
+
+    /// A held link comes up only once it carries its hooks and the policy is in
+    /// force: bringing it up any earlier is the unfiltered window the hold
+    /// exists to close.
+    #[test]
+    fn a_held_link_comes_up_only_attached_and_programmed() {
+        let iface = |name: &str, activate: bool| ResolvedInterface {
+            name: name.into(),
+            policy: 0,
+            vni: 0,
+            masquerade: false,
+            snat_address: None,
+            mss: 0,
+            cgnat: CgnatLayout::default(),
+            binding: None,
+            rate_limit_mbit: None,
+            activate,
+        };
+        let interfaces = [
+            iface("lan0", true),
+            iface("wan0", true),
+            iface("tap0", false),
+        ];
+        let pending: BTreeSet<String> = ["lan0", "wan0", "tap0", "gone0"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let attached = |name: &str| name != "wan0";
+        assert_eq!(
+            links_to_activate(&pending, &interfaces, attached, true),
+            vec!["lan0".to_string()],
+            "wan0 has no hook yet; tap0 is not held; gone0 is no longer declared"
+        );
+        assert!(
+            links_to_activate(&pending, &interfaces, attached, false).is_empty(),
+            "a configuration that is not in force must not open a link"
         );
     }
 
@@ -4848,6 +5011,7 @@ mod tests {
             cgnat: CgnatLayout::default(),
             binding: None,
             rate_limit_mbit: None,
+            activate: false,
         });
         // An uplink with no tenant segment must not register VNI 0.
         cfg.interfaces.push(ResolvedInterface {
@@ -4860,6 +5024,7 @@ mod tests {
             cgnat: CgnatLayout::default(),
             binding: None,
             rate_limit_mbit: None,
+            activate: false,
         });
         cfg.irb_routes.push(ResolvedIrbRoute {
             vni: 100,
@@ -4899,6 +5064,7 @@ mod tests {
             cgnat: CgnatLayout::default(),
             binding: None,
             rate_limit_mbit: None,
+            activate: false,
         };
         let policy = |id: PolicyId, action: Action, stateful: bool| PolicyConfig {
             mac_rules: Vec::new(),

@@ -176,10 +176,16 @@ async fn respond(
                 }
             }
         }
-        "reconcile-links" => match firewall.lock().await.reconcile_links() {
-            Ok(()) => "ok\n".into(),
-            Err(e) => format!("error: reconciling packet hooks: {e:#}\n"),
-        },
+        "reconcile-links" => {
+            let mut fw = firewall.lock().await;
+            match fw
+                .reconcile_links()
+                .and_then(|()| fw.ensure_held_links_up())
+            {
+                Ok(()) => "ok\n".into(),
+                Err(e) => format!("error: reconciling packet hooks: {e:#}\n"),
+            }
+        }
         "status" => match firewall.lock().await.configuration_status() {
             Ok(status) => status,
             Err(error) => format!("error: reading configuration state: {error:#}\n"),
