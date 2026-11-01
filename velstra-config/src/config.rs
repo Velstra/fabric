@@ -812,6 +812,15 @@ pub struct InterfaceFile {
     /// Ports per internal address. See `cgnat_base_port`.
     #[serde(default)]
     pub cgnat_block_size: u16,
+    /// The link's owner keeps it administratively down until this agent has
+    /// attached its hooks and put the policy in force; the agent then brings it
+    /// up. An appliance sets this on every link it holds (networkd
+    /// `ActivationPolicy=manual`), so a link that is new or was recreated never
+    /// forwards before the firewall sees it — the hold is what closes the gap a
+    /// polled attach leaves. A file-mode setting: a controller's ports are
+    /// created by whoever plugs a guest in, and nothing holds them.
+    #[serde(default)]
+    pub activate: bool,
 }
 
 /// Stateful-firewall idle timeouts, in seconds. Zero and values over seven
@@ -1362,6 +1371,8 @@ pub struct ResolvedInterface {
     pub rate_limit_mbit: Option<u32>,
     /// Deterministic CGNAT port-block layout for this egress, or a disabled layout.
     pub cgnat: CgnatLayout,
+    /// Bring the link up once its hooks are attached. See [`InterfaceFile::activate`].
+    pub activate: bool,
 }
 
 /// A resolved overlay forwarding entry: the tenant segment, the inner-destination
@@ -1559,6 +1570,15 @@ pub struct HaConfig {
     pub cluster: String,
     pub node: u8,
     pub interfaces: Vec<String>,
+    /// How old the coordinator's role file may be and still count as a live
+    /// coordinator. It is rewritten once per witness exchange, so it has to
+    /// cover the configured witness I/O budget plus the coordinator's poll;
+    /// the lease deadline inside it, not this, is what fences forwarding.
+    #[serde(default = "default_role_fresh_ms")]
+    pub role_fresh_ms: u64,
+}
+fn default_role_fresh_ms() -> u64 {
+    100
 }
 
 /// Fully-resolved, validated configuration ready to be written into BPF maps.
@@ -1639,6 +1659,10 @@ impl RuntimeConfig {
             anyhow::ensure!(
                 ha.wireguard_ports.iter().all(|p| *p > 0),
                 "HA WireGuard ports must be nonzero"
+            );
+            anyhow::ensure!(
+                (100..=10_000).contains(&ha.role_fresh_ms),
+                "HA role freshness must be 100..=10000 ms"
             );
             anyhow::ensure!(
                 ha.disabled.iter().all(|n| ha.interfaces.contains(n)),
@@ -2159,6 +2183,7 @@ impl FileConfig {
                 cgnat: CgnatLayout::new(iface.cgnat_base_port, iface.cgnat_block_size),
                 binding: resolve_binding(iface)?,
                 rate_limit_mbit: iface.rate_limit_mbit.filter(|m| *m > 0),
+                activate: iface.activate,
             });
         }
 
@@ -3529,6 +3554,7 @@ mod tests {
                     cgnat: CgnatLayout::default(),
                     binding: None,
                     rate_limit_mbit: None,
+                    activate: false,
                 },
                 ResolvedInterface {
                     name: "tap1".into(),
@@ -3540,6 +3566,7 @@ mod tests {
                     cgnat: CgnatLayout::default(),
                     binding: None,
                     rate_limit_mbit: None,
+                    activate: false,
                 },
             ]
         );
@@ -4640,5 +4667,53 @@ mod rule_limit_tests {
             policy_with("action = \"pass\"\nfamily = \"ipv6\"\ndirection = \"out\"\n").unwrap();
         let rule = only_rule(&cfg);
         assert_eq!(rule.scope, PORT_RULE_V6_ONLY | PORT_RULE_OUT_ONLY);
+    }
+}
+
+#[cfg(test)]
+mod ha_config_tests {
+    use super::HaConfig;
+
+    /// A runtime file written before the witness budget was configurable keeps
+    /// the role freshness it always had.
+    #[test]
+    fn role_freshness_defaults_for_existing_runtime_files() {
+        let ha: HaConfig =
+            toml::from_str("enabled = true\ncluster = \"c\"\nnode = 1\ninterfaces = [\"eth1\"]\n")
+                .unwrap();
+        assert_eq!(ha.role_fresh_ms, 100);
+        let ha: HaConfig = toml::from_str(
+            "enabled = true\ncluster = \"c\"\nnode = 1\ninterfaces = [\"eth1\"]\nrole_fresh_ms = 330\n",
+        )
+        .unwrap();
+        assert_eq!(ha.role_fresh_ms, 330);
+    }
+}
+
+#[cfg(test)]
+mod activation_tests {
+    use super::*;
+
+    /// An appliance holds a zoned link down until the agent has attached its
+    /// hooks, and says so per interface. The flag has to survive resolution, or
+    /// the agent attaches and leaves the link down for good.
+    #[test]
+    fn a_held_link_is_resolved_as_one_to_bring_up() {
+        let cfg = toml::from_str::<FileConfig>(
+            r#"
+            [[interface]]
+            name = "lan0"
+            policy = 0
+            activate = true
+            [[interface]]
+            name = "tap0"
+            policy = 0
+            "#,
+        )
+        .unwrap()
+        .resolve()
+        .unwrap();
+        assert!(cfg.interfaces[0].activate);
+        assert!(!cfg.interfaces[1].activate, "only a held link is activated");
     }
 }
