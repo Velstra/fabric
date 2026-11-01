@@ -3420,6 +3420,15 @@ fn try_velstra_v6_state(ctx: &XdpContext) -> Result<u32, ()> {
     let proto = fwkey.proto;
     let dst_port = fwkey.dst_port;
     ct_key6(fwkey, ctx.data(), ctx.data_end(), off);
+    // The connection is tracked under the INTERNAL address on both hooks: the
+    // egress hook records a flow before NPTv6 rewrites its source, so a reply
+    // must be looked up (and recorded) by the address it is about to be
+    // translated back to — not the external one it arrived with, which no flow
+    // carries and which left every TCP reply "new" and the next segment out
+    // invalid.
+    if stateful {
+        npt66_ct_internal_dst(fwkey, ifindex);
+    }
     let control = ct_control(ctx.data(), ctx.data_end(), off, proto);
     let ct = if stateful {
         ct_classify(fwkey, control)
@@ -3618,6 +3627,20 @@ fn npt66_ingress_v6(ctx: &XdpContext, ifindex: u32) -> Result<(), ()> {
         *((data + off) as *mut [u8; 16]) = new_dst;
     }
     Ok(())
+}
+
+/// Rewrite a conntrack key's destination from the external to the internal
+/// NPTv6 prefix when `ifindex` carries a rule and the destination matches — the
+/// key-side twin of [`npt66_ingress_v6`]. Out of line for the same stack reason;
+/// the key is the per-CPU scratch slot, changed in place.
+#[inline(never)]
+fn npt66_ct_internal_dst(key: &mut FirewallKey, ifindex: u32) {
+    let Some(rule) = (unsafe { NPTV6.get(&ifindex) }) else {
+        return;
+    };
+    if rule.matches_external(&key.dst) {
+        key.dst = rule.translate_in(key.dst);
+    }
 }
 
 /// `family` values for [`bpf_fib_lookup`] (`AF_INET` / `AF_INET6` — the kernel's
