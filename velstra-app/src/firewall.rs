@@ -1371,9 +1371,7 @@ impl Firewall {
             self.configuration_state()? == CONFIG_READY,
             "firewall is not ready for state replication"
         );
-        Ok(crate::conntrack_sync::secure::policy_fingerprint(
-            &self.applied,
-        ))
+        crate::conntrack_sync::secure::policy_fingerprint(&self.applied)
     }
 
     /// Keep unexpired temporary grants across a successful policy refresh,
