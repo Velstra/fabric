@@ -779,6 +779,7 @@ mod tests {
             cluster: "test-cluster-0123456789".into(),
             node: 1,
             interfaces: vec!["wan".into()],
+            control_interfaces: vec![],
             role_fresh_ms: 100,
         }
     }
