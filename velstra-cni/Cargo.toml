@@ -17,6 +17,7 @@ serde = { workspace = true, features = ["std"] }
 serde_json = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
+libc = { workspace = true }
 # The CNI is a short-lived sync process; it drives the gRPC calls on a
 # current-thread runtime built for the duration of one ADD/DEL.
 tonic = { workspace = true }

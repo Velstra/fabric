@@ -7,7 +7,7 @@
 use std::{
     collections::BTreeMap,
     fmt::Debug,
-    io::{Cursor, Write},
+    io::Cursor,
     net::IpAddr,
     ops::RangeBounds,
     path::{Path, PathBuf},
@@ -757,18 +757,7 @@ impl LogStore {
             return Ok(());
         };
         let bytes = serde_json::to_vec(inner).map_err(io_err)?;
-        let path = dir.join(LOG_FILE);
-        let tmp = dir.join(format!("{LOG_FILE}.tmp"));
-        let mut f = std::fs::File::create(&tmp).map_err(io_err)?;
-        f.write_all(&bytes).map_err(io_err)?;
-        f.sync_all().map_err(io_err)?;
-        drop(f);
-        std::fs::rename(&tmp, &path).map_err(io_err)?;
-        // fsync the directory so the rename itself is durable across a power loss.
-        if let Ok(d) = std::fs::File::open(dir.as_path()) {
-            let _ = d.sync_all();
-        }
-        Ok(())
+        crate::durable::replace(&dir.join(LOG_FILE), &bytes).map_err(io_err)
     }
 }
 
@@ -984,7 +973,8 @@ impl StateMachineStore {
     }
 
     /// Atomically persist `snap` to the snapshot directory, if one is configured.
-    /// Writes to a temp file and renames, so readers never see a partial file.
+    /// Syncs the complete file, renames it and syncs its directory before Raft
+    /// may publish the snapshot or purge the covered log entries.
     fn persist(&self, snap: &StoredSnapshot) -> Result<(), StorageError<NodeId>> {
         let Some(dir) = &self.dir else {
             return Ok(());
@@ -994,12 +984,7 @@ impl StateMachineStore {
             data: snap.data.clone(),
         };
         let bytes = serde_json::to_vec(&payload).map_err(io_err)?;
-        let path = dir.join(SNAPSHOT_FILE);
-        let tmp = dir.join(format!("{SNAPSHOT_FILE}.tmp"));
-        std::fs::write(&tmp, &bytes)
-            .and_then(|()| std::fs::rename(&tmp, &path))
-            .map_err(io_err)?;
-        Ok(())
+        crate::durable::replace(&dir.join(SNAPSHOT_FILE), &bytes).map_err(io_err)
     }
 
     /// A clone of the current applied topology (for deriving per-host configs).
@@ -1893,5 +1878,61 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn durable_snapshot_restores_topology_after_log_purge_and_restart() {
+        use openraft::CommittedLeaderId;
+        let dir =
+            std::env::temp_dir().join(format!("velstra-snapshot-restart-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let entry = Entry {
+            log_id: LogId::new(CommittedLeaderId::new(3, 1), 7),
+            payload: EntryPayload::Normal(TopoRequest::AddHost(host_spec("h1", "10.0.0.1"))),
+        };
+        {
+            let mut state = StateMachineStore::new(Some(dir.clone()), None).unwrap();
+            assert!(state.apply([entry.clone()]).await.unwrap()[0].ok);
+            let snapshot = state.build_snapshot().await.unwrap();
+            assert_eq!(snapshot.meta.last_log_id, Some(entry.log_id));
+            let mut log = LogStore::new(Some(dir.clone()), None).unwrap();
+            {
+                let mut inner = log.inner.lock().await;
+                inner.log.insert(7, entry.clone());
+                log.persist(&inner).unwrap();
+            }
+            log.purge(entry.log_id).await.unwrap();
+        }
+        let snapshot = load_snapshot(&dir).unwrap().unwrap();
+        let mut state = StateMachineStore::new(Some(dir.clone()), Some(snapshot)).unwrap();
+        assert_eq!(state.applied_state().await.unwrap().0, Some(entry.log_id));
+        assert_eq!(state.topology().await.hosts().count(), 1);
+        let mut log = LogStore::new(Some(dir.clone()), None).unwrap();
+        assert!(
+            log.try_get_log_entries(0..u64::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            log.get_log_state().await.unwrap().last_purged_log_id,
+            Some(entry.log_id)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_snapshot_persistence_is_not_published_or_acknowledged() {
+        let missing = std::env::temp_dir()
+            .join(format!(
+                "velstra-missing-raft-parent-{}",
+                std::process::id()
+            ))
+            .join("missing");
+        let mut state = StateMachineStore::new(Some(missing.clone()), None).unwrap();
+        assert!(state.build_snapshot().await.is_err());
+        assert!(state.get_current_snapshot().await.unwrap().is_none());
+        let mut log = LogStore::new(Some(missing), None).unwrap();
+        assert!(log.save_vote(&Vote::new_committed(3, 1)).await.is_err());
     }
 }
