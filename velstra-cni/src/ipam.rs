@@ -6,7 +6,7 @@ use std::{
     net::Ipv4Addr,
     path::{Path, PathBuf},
     thread::sleep,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -79,8 +79,13 @@ impl Ipam {
             let ip = Ipv4Addr::from(host);
             let path = self.dir.join(ip.to_string());
             // create_new is the atomic "claim this address" operation.
-            if let Ok(()) = fs::write_new(&path, container_id) {
-                return Ok((ip, self.prefix, Ipv4Addr::from(gateway)));
+            match fs::write_new(&path, container_id) {
+                Ok(()) => return Ok((ip, self.prefix, Ipv4Addr::from(gateway))),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("creating IPAM lease {}", path.display()));
+                }
             }
         }
         bail!("no free addresses left in the subnet");
@@ -91,55 +96,196 @@ impl Ipam {
         let _lock = self.lock()?;
         for entry in fs::read_dir(&self.dir)? {
             let path = entry?.path();
-            if path.file_name().and_then(|n| n.to_str()) == Some(".lock") {
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| name.starts_with('.'))
+            {
                 continue;
             }
-            if fs::read_to_string(&path).ok().as_deref() == Some(container_id) {
-                let _ = fs::remove_file(&path);
+            if fs::read_to_string(&path)
+                .with_context(|| format!("reading IPAM lease {}", path.display()))?
+                == container_id
+            {
+                fs::remove_file(&path)
+                    .with_context(|| format!("removing IPAM lease {}", path.display()))?;
             }
         }
+        fs::File::open(&self.dir)?
+            .sync_all()
+            .context("syncing released IPAM leases")?;
         Ok(())
     }
 
-    /// Acquire the coarse per-network lock (best effort; proceeds after a
-    /// timeout rather than failing the whole CNI call).
-    fn lock(&self) -> Result<LockGuard> {
+    /// The kernel owns lock lifetime. A busy owner is never declared stale by
+    /// elapsed time, and the shared lock inode is never removed or replaced.
+    fn lock(&self) -> Result<fs::File> {
+        use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
         let path = self.dir.join(".lock");
-        for _ in 0..200 {
-            if fs::write_new(&path, "").is_ok() {
-                return Ok(LockGuard(path));
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+            .context("opening IPAM lock")?;
+        if !file.metadata()?.is_file() {
+            bail!("IPAM lock is not a regular file");
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            // SAFETY: file owns a live descriptor; flock neither borrows nor
+            // takes ownership of any Rust memory. Drop closes/unlocks it.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(file);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::WouldBlock
+                && error.kind() != std::io::ErrorKind::Interrupted
+            {
+                return Err(error).context("acquiring IPAM lock");
+            }
+            if Instant::now() >= deadline {
+                bail!("IPAM lock is busy; retry the CNI operation (live owner was not displaced)");
             }
             sleep(Duration::from_millis(10));
         }
-        // Stale lock: take it over rather than wedging forever.
-        let _ = fs::write(&path, "");
-        Ok(LockGuard(path))
-    }
-}
-
-/// Removes the lock file when dropped.
-struct LockGuard(PathBuf);
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
     }
 }
 
 /// Small `fs` helpers local to this module.
 mod fs {
     pub use std::fs::*;
-    use std::{io::Write, path::Path};
+    use std::{
+        io::Write,
+        os::unix::fs::OpenOptionsExt,
+        path::Path,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
 
     /// Create a file only if it does not exist, writing `contents`.
     pub fn write_new(path: &Path, contents: &str) -> std::io::Result<()> {
-        let mut f = OpenOptions::new().write(true).create_new(true).open(path)?;
-        f.write_all(contents.as_bytes())
+        write_new_with(path, contents, |file, contents| {
+            file.write_all(contents.as_bytes())?;
+            file.sync_all()
+        })
+    }
+
+    pub(super) fn write_new_with(
+        path: &Path,
+        contents: &str,
+        write: impl FnOnce(&mut File, &str) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("lease has no parent"))?;
+        let (temporary, mut file) = loop {
+            let temporary = parent.join(format!(
+                ".lease-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&temporary)
+            {
+                Ok(file) => break (temporary, file),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        };
+        let mut published = false;
+        let result = (|| {
+            write(&mut file, contents)?;
+            hard_link(&temporary, path)?;
+            published = true;
+            File::open(parent)?.sync_all()
+        })();
+        if result.is_err() && published {
+            let _ = remove_file(path);
+        }
+        let cleaned = remove_file(temporary);
+        result.and(cleaned)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_lock_owner_is_not_stolen_after_two_seconds() {
+        use std::os::unix::fs::MetadataExt;
+        let root = temp_root();
+        let ipam = Ipam::open("net", "10.0.0.0/29", &root).unwrap();
+        let owner = ipam.lock().unwrap();
+        let inode = std::fs::metadata(ipam.dir.join(".lock")).unwrap().ino();
+        let contender = Ipam::open("net", "10.0.0.0/29", &root).unwrap();
+        let thread = std::thread::spawn(move || contender.allocate("contender", None));
+        std::thread::sleep(Duration::from_millis(2200));
+        let error = thread.join().unwrap().unwrap_err();
+        assert!(error.to_string().contains("live owner was not displaced"));
+        assert_eq!(
+            std::fs::metadata(ipam.dir.join(".lock")).unwrap().ino(),
+            inode
+        );
+        assert!(!ipam.dir.join("10.0.0.2").exists());
+        drop(owner); // Closing the descriptor is also the kernel's crash-recovery mechanism.
+        assert_eq!(
+            ipam.allocate("recovered", None).unwrap().0,
+            Ipv4Addr::new(10, 0, 0, 2)
+        );
+        assert_eq!(
+            std::fs::metadata(ipam.dir.join(".lock")).unwrap().ino(),
+            inode
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_owner_write_never_publishes_or_leaves_an_ownerless_lease() {
+        use std::io::Write;
+        let root = temp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("10.0.0.2");
+        let error = fs::write_new_with(&path, "container", |file, _| {
+            file.write_all(b"partial")?;
+            Err(std::io::Error::from_raw_os_error(libc::ENOSPC))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        fs::write_new(&path, "container").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "container");
+        assert_eq!(
+            fs::write_new(&path, "other").unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "container");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn release_reports_unreadable_lease_instead_of_claiming_success() {
+        let root = temp_root();
+        let ipam = Ipam::open("net", "10.0.0.0/29", &root).unwrap();
+        std::fs::create_dir(ipam.dir.join("10.0.0.2")).unwrap();
+        assert!(
+            ipam.release("container")
+                .unwrap_err()
+                .to_string()
+                .contains("reading IPAM lease")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn temp_root() -> PathBuf {
         let p = std::env::temp_dir().join(format!(

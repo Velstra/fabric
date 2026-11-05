@@ -26,6 +26,7 @@ use tokio::sync::watch;
 use tonic::transport::ClientTlsConfig;
 use velstra_orchestrator::Topology;
 
+mod durable;
 pub mod network;
 pub mod store;
 
