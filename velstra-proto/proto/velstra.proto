@@ -801,6 +801,8 @@ message InterfaceAssignment {
   // Source-NAT traffic leaving this interface to its own public address.
   bool masquerade = 8;
   optional string snat_address = 11;
+  // Admit validated local DHCPv4 replies only on an explicitly declared client.
+  bool dhcp_client = 12;
   // Deterministic CGNAT: the first WAN port handed out, and how many each
   // internal address gets. Both zero = plain hash-spread NAPT.
   uint32 cgnat_base_port = 9;

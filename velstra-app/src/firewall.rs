@@ -3515,7 +3515,7 @@ fn local_egress_addresses(
 ) -> HashSet<[u8; 8]> {
     interfaces
         .iter()
-        .filter(|i| i.masquerade)
+        .filter(|i| i.masquerade || i.dhcp_client)
         .flat_map(|i| {
             let Ok(ifindex) = index(&i.name) else {
                 return Vec::new();
@@ -3593,6 +3593,28 @@ fn set_link_up(name: &str) -> Result<()> {
 /// called on policy changes AND ordinary link polling: leases can arrive well
 /// after apply and can change while the desired configuration stays identical.
 fn program_masquerade(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Result<()> {
+    let clients: BTreeMap<_, _> = interfaces
+        .iter()
+        .filter(|i| i.dhcp_client)
+        .filter_map(|i| {
+            let index = if_nametoindex(&i.name).ok()?;
+            let mac = read_iface_mac(&i.name).ok()?;
+            Some((
+                index,
+                [mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 0, 0],
+            ))
+        })
+        .collect();
+    {
+        let mut map: HashMap<_, u32, [u8; 8]> = HashMap::try_from(
+            ebpf.map_mut("DHCP_CLIENTS")
+                .ok_or_else(|| anyhow!("DHCP_CLIENTS map missing"))?,
+        )?;
+        drop_unlisted(&mut map, &clients.keys().copied().collect())?;
+        for (index, mac) in clients {
+            map.insert(index, mac, 0)?;
+        }
+    }
     let prepared = masquerade_targets(interfaces, if_nametoindex, read_iface_ipv4);
     let local = local_egress_addresses(interfaces, if_nametoindex, read_iface_ipv4_all);
     {
@@ -5091,6 +5113,7 @@ mod tests {
         let iface = |name: &str, activate: bool| ResolvedInterface {
             name: name.into(),
             policy: 0,
+            dhcp_client: false,
             vni: 0,
             masquerade: false,
             snat_address: None,
@@ -5141,6 +5164,7 @@ mod tests {
         let iface = |name: &str| ResolvedInterface {
             name: name.into(),
             policy: 0,
+            dhcp_client: false,
             vni: 0,
             masquerade: false,
             snat_address: None,
@@ -5175,6 +5199,7 @@ mod tests {
         let lan = ResolvedInterface {
             name: "lan0".into(),
             policy: 0,
+            dhcp_client: false,
             vni: 0,
             masquerade: false,
             snat_address: None,
@@ -5188,6 +5213,26 @@ mod tests {
             links_to_activate(&[lan], |_| true, |_| true, |_| true, true),
             vec!["lan0".to_string()]
         );
+    }
+
+    #[test]
+    fn local_dhcp_addresses_are_scoped_to_the_actual_client_interface() {
+        let cfg = serde_json::from_value::<velstra_config::FileConfig>(serde_json::json!({
+            "interface": [{"name":"wan0", "policy":0, "dhcp_client":true},
+                          {"name":"lan0", "policy":0}]
+        }))
+        .unwrap()
+        .resolve()
+        .unwrap();
+        let keys = local_egress_addresses(
+            &cfg.interfaces,
+            |name| Ok(if name == "wan0" { 10 } else { 11 }),
+            |_| Ok(vec![[198, 18, 88, 100]]),
+        );
+        assert_eq!(keys.len(), 1);
+        assert!(keys.contains(&local_egress_address_key(10, [198, 18, 88, 100])));
+        assert!(!keys.contains(&local_egress_address_key(11, [198, 18, 88, 100])));
+        assert!(local_egress_addresses(&cfg.interfaces, |_| Ok(10), |_| Ok(vec![])).is_empty());
     }
 
     #[test]
@@ -5255,6 +5300,7 @@ mod tests {
         cfg.interfaces.push(ResolvedInterface {
             name: "tap0".into(),
             policy: 100,
+            dhcp_client: false,
             vni: 100,
             masquerade: false,
             snat_address: None,
@@ -5268,6 +5314,7 @@ mod tests {
         cfg.interfaces.push(ResolvedInterface {
             name: "eth0".into(),
             policy: 0,
+            dhcp_client: false,
             vni: 0,
             masquerade: true,
             snat_address: None,
@@ -5308,6 +5355,7 @@ mod tests {
         let iface = |name: &str, policy: PolicyId| ResolvedInterface {
             name: name.into(),
             policy,
+            dhcp_client: false,
             vni: 0,
             masquerade: false,
             snat_address: None,

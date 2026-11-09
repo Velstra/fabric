@@ -50,7 +50,8 @@
 use aya_ebpf::{
     bindings::{
         BPF_F_PSEUDO_HDR, BPF_FIB_LKUP_RET_FWD_DISABLED, BPF_FIB_LKUP_RET_NO_NEIGH,
-        BPF_FIB_LKUP_RET_SUCCESS, TC_ACT_OK, TC_ACT_SHOT, bpf_fib_lookup, xdp_action,
+        BPF_FIB_LKUP_RET_NOT_FWDED, BPF_FIB_LKUP_RET_SUCCESS, TC_ACT_OK, TC_ACT_SHOT,
+        bpf_fib_lookup, xdp_action,
     },
     helpers::{
         bpf_fib_lookup as fib_lookup, bpf_get_current_pid_tgid, bpf_ktime_get_boot_ns,
@@ -68,7 +69,8 @@ mod link_layer;
 mod telemetry;
 use aya_log_ebpf::info;
 use conntrack::{
-    ct_classify, ct_control, ct_cookie_admitted, ct_key4, ct_key6, ct_record, ct_seed_reply,
+    ct_classify, ct_control, ct_cookie_admitted, ct_is_routed_reply, ct_key4, ct_key6, ct_record,
+    ct_seed_reply,
 };
 use network_types::{
     eth::EthHdr,
@@ -94,7 +96,8 @@ use velstra_common::{
     TcpSynth, TunnelEndpoint, TunnelKey, admit_established_egress_reply, build_encap,
     build_srv6_encap, check_cookie, csum_replace_u32, decide, decide_egress, decode_vni, epoch_of,
     gate_admits_unauthenticated, icmp, icmp_checksum, icmp_type_probe, ip_proto, ipv6_ext_len,
-    is_ipv6_ext, is_overlay_dport, lpm_key_addr, make_cookie, plan_arp_reply, plan_forward,
+    is_ipv6_ext, is_overlay_dport, legacy_napt_seed, lpm_key_addr, make_cookie, masquerade_commit,
+    napt_binding_matches, napt_find_existing, napt_port, napt_seed, plan_arp_reply, plan_forward,
     plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_server_ack, plan_server_syn,
     plan_srv6_irb, plan_syn_ack, plan_tcp_rst, select_backend, session_hash, tcp_flags,
     translate_to_client, translate_to_server, unaddressed_uplink_drops, v6_source_is_v4_mapped,
@@ -167,6 +170,11 @@ pub fn velstra_ha_guard(_ctx: TcContext) -> i32 {
 /// policy `0` (the default), so a single-tenant deployment needs no entries.
 #[map]
 static IFACE_POLICY: HashMap<u32, PolicyId> = HashMap::with_max_entries(1024, 0);
+
+/// Only declared local DHCPv4 clients, with the NIC's actual Ethernet address.
+/// A UDP destination port alone is never a local-control admission criterion.
+#[map]
+static DHCP_CLIENTS: HashMap<u32, [u8; 8]> = HashMap::with_max_entries(1024, 0);
 
 /// Maps an ingress interface index to its overlay segment (VNI), independent of
 /// its firewall policy. Absent / `0` means the interface is local-only and its
@@ -1983,27 +1991,43 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
     Ok(TC_ACT_OK as i32)
 }
 
-/// How many ephemeral ports the masquerade NAPT probe tries before falling back
-/// to the client's own source port. Small and bounded to keep the egress path
-/// within the verifier's complexity budget.
+/// How many ephemeral ports the masquerade NAPT probe tries before refusing a
+/// new flow. Small and bounded to keep the egress path within the verifier's
+/// complexity budget. Candidate mixing is shared with the host regression tests.
 const NAPT_PROBES: u16 = 8;
 
-/// The base ephemeral port for a masquerade flow, mixed from its 4-tuple so
-/// distinct clients spread across the port range rather than clustering.
-#[inline(always)]
-fn napt_seed(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16) -> u32 {
-    let h = u32::from_ne_bytes(src)
-        ^ u32::from_ne_bytes(dst).rotate_left(16)
-        ^ ((sport as u32) << 16)
-        ^ (dport as u32);
-    // Knuth multiplicative hash — cheap, no map, and stable across a flow's packets.
-    h.wrapping_mul(2654435761)
-}
-
-/// The `i`-th NAPT candidate port, in the ephemeral range [32768, 65535]; never 0.
-#[inline(always)]
-fn napt_port(seed: u32, i: u16) -> u16 {
-    32768 + (seed.wrapping_add(i as u32) % 32768) as u16
+/// Search the whole candidate window for existing state BEFORE considering a
+/// free slot. Otherwise an expired earlier collision silently changes an
+/// established flow's public port. A second bounded compatibility search lets
+/// an upgraded owner use the actual port replicated by the deployed allocator.
+#[inline(never)]
+fn existing_napt_port(
+    flow: &FlowKey,
+    origin: [u8; 4],
+    wan_ip: [u8; 4],
+    layout: &CgnatLayout,
+    seed: u32,
+) -> u16 {
+    let now = unsafe { bpf_ktime_get_ns() };
+    let timeouts = conntrack::timeouts();
+    napt_find_existing(flow.src_ip, seed, layout, |candidate| {
+        let key = FlowKey::new(
+            flow.policy,
+            flow.dst_ip,
+            wan_ip,
+            flow.dst_port,
+            candidate,
+            flow.proto,
+        );
+        if let Some(state) = unsafe { CONNTRACK.get(&key) }.copied() {
+            if napt_binding_matches(&state, origin, flow.src_port)
+                && !state.expired(flow.proto, now, timeouts)
+            {
+                return true;
+            }
+        }
+        false
+    })
 }
 
 /// Phase 4b **masquerade** (source NAT + NAPT). A packet leaving a masquerade
@@ -2069,14 +2093,31 @@ fn masquerade_egress(
         return Ok(TC_ACT_OK as i32);
     }
 
+    // A plain routed reply is not a new inside-originated NAT connection. In
+    // particular, SNAT of its SYN/ACK changes both endpoint and port, provoking
+    // a peer RST. Keep intentional HA WireGuard VIP translation unchanged.
+    if !local_wg {
+        let key = ct_key4(
+            FlowKey::new(policy_id, src_addr, dst_addr, src_port, dst_port, proto),
+            ctx.data(),
+            ctx.data_end(),
+            EthHdr::LEN + ihl_bytes,
+        );
+        let control = ct_control(ctx.data(), ctx.data_end(), EthHdr::LEN + ihl_bytes, proto);
+        if ct_is_routed_reply(&key, control) {
+            ct_record(&key, control);
+            return Ok(TC_ACT_OK as i32);
+        }
+    }
+
     // NAPT (port address translation). Allocate a WAN source port unique to this
     // client flow so replies to (wan_ip, wan_port) demux back to the right client:
     // two internal hosts sending from the same source port to the same destination
     // would otherwise share one reverse conntrack key and misroute each other's
     // replies (pure SNAT without PAT). Probe a small window of ephemeral ports
-    // seeded by the flow hash — reuse the slot already recording THIS flow (a
-    // retransmit reuses the same port), take the first free slot, else fall back to
-    // the client's own port (the pre-NAPT behaviour) on exhaustion.
+    // seeded by the flow hash. Existing state wins over a free earlier candidate
+    // and over a new allocator's preferred port. Only a NEW flow takes a free
+    // slot; exhaustion drops rather than stealing another client's mapping.
     // `masquerade` rather than `forward`: the rewrite is identical (restore the
     // destination on the reply), but the entry additionally records that its NAT
     // target is the client that *originated* the connection — the only place that
@@ -2093,8 +2134,21 @@ fn masquerade_egress(
         Some(l) => *l,
         None => CgnatLayout::default(),
     };
-    let mut wan_port = 0;
+    let flow = FlowKey::new(policy_id, src_addr, dst_addr, src_port, dst_port, proto);
+    let mut wan_port = existing_napt_port(&flow, reply_target, wan_ip, &layout, seed);
+    if wan_port == 0 {
+        wan_port = existing_napt_port(
+            &flow,
+            reply_target,
+            wan_ip,
+            &layout,
+            legacy_napt_seed(src_addr, dst_addr, src_port, dst_port),
+        );
+    }
     for i in 0..NAPT_PROBES {
+        if wan_port != 0 {
+            break;
+        }
         let cand = match layout.candidate(src_addr, seed, i) {
             Some(p) => p,
             None => napt_port(seed, i),
@@ -2107,7 +2161,7 @@ fn masquerade_egress(
             }
             Some(s)
                 if s.expired(proto, unsafe { bpf_ktime_get_ns() }, conntrack::timeouts())
-                    || (s.nat_ip == reply_target && s.nat_port == src_port) =>
+                    || napt_binding_matches(&s, reply_target, src_port) =>
             {
                 wan_port = cand;
                 break;
@@ -2132,22 +2186,43 @@ fn masquerade_egress(
     // unconditional insert would have reset the counters on every packet, and a
     // lookup refreshes the LRU just as an insert did.
     let bytes = (ctx.data_end() - ctx.data()) as u64;
+    let mut existing = false;
+    let mut inserted = false;
     match CONNTRACK.get_ptr_mut(&rkey) {
         // SAFETY: as in `account_flow` — a pointer into this CPU's map value,
         // read and written before any other operation on the map.
-        Some(entry)
-            if unsafe { (*entry).nat_ip == reply_target && (*entry).nat_port == src_port } =>
-        unsafe {
+        Some(entry) if unsafe { napt_binding_matches(&*entry, reply_target, src_port) } => unsafe {
             (*entry).account(bytes);
             (*entry).last_seen_ns = bpf_ktime_get_ns();
             (*entry).age_ns = 0;
+            existing = true;
         },
-        // No entry, or a slot the port probe had to take from another flow on
-        // exhaustion: this flow starts the accounting over, as it must.
+        // A free or expired slot. Insert failure must not translate: the reply
+        // would have no reverse binding. Never replace a live foreign binding.
         _ => {
             let mut first = fwd;
             first.account(bytes);
-            let _ = insert_nat(&rkey, &first);
+            inserted = insert_nat(&rkey, &first);
+        }
+    }
+    let rewritten = if existing || inserted {
+        snat_tc(ctx, src_addr, wan_ip, src_port, wan_port, proto).is_ok()
+    } else {
+        false
+    };
+    // Translation and reverse state are published together. A failed rewrite
+    // must not leave a private source on the wire, and a new binding that
+    // never left the host must not DNAT a later unsolicited packet.
+    match masquerade_commit(existing, inserted, rewritten) {
+        velstra_common::MasqueradeCommit::Translated => {}
+        velstra_common::MasqueradeCommit::DropAndForget => {
+            let _ = CONNTRACK.remove(&rkey);
+            bump(Counter::EgressDropped);
+            return Ok(TC_ACT_SHOT as i32);
+        }
+        velstra_common::MasqueradeCommit::Drop => {
+            bump(Counter::EgressDropped);
+            return Ok(TC_ACT_SHOT as i32);
         }
     }
     // …and let that reply pass the WAN zone's deny-by-default stateful firewall.
@@ -2155,11 +2230,6 @@ fn masquerade_egress(
         &rkey,
         ct_control(ctx.data(), ctx.data_end(), EthHdr::LEN + ihl_bytes, proto),
     );
-
-    if snat_tc(ctx, src_addr, wan_ip, src_port, wan_port, proto).is_err() {
-        // Too short to rewrite — let it out un-NAT'd rather than black-hole it.
-        return Ok(TC_ACT_OK as i32);
-    }
     let public_key = ct_key4(
         FlowKey::new(policy_id, wan_ip, dst_addr, wan_port, dst_port, proto),
         ctx.data(),
@@ -2672,8 +2742,13 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     // Runs ahead of every other verdict: a packet whose source cannot be the
     // sender is not worth matching rules against, and the answer does not depend
     // on any of them.
+    let local_dhcp = proto == ip_proto::UDP
+        && src_port == 67
+        && dst_port == 68
+        && local_dhcp_reply(ctx, ifindex, ihl_bytes);
     let rpf = cfg.source_validation();
     if rpf != SourceValidation::Disabled
+        && !local_dhcp
         && source_is_spoofed(ctx, &meta, ifindex, rpf == SourceValidation::Strict)
     {
         bump(Counter::DroppedSpoofed);
@@ -2819,6 +2894,10 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
         || (cfg.has_flag(ConfigFlags::DROP_ICMP) && proto == ip_proto::ICMP)
     {
         (verdict.action, verdict.counter)
+    } else if local_dhcp {
+        // Explicit denies, blocklists and rate limits above still win. This is
+        // local bootstrap traffic, not a new forwarded or established flow.
+        (Action::Pass, Counter::PassedRule)
     } else if established {
         (Action::Pass, Counter::EstablishedAllowed)
     } else if has_port_forward {
@@ -2873,6 +2952,13 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
         return reject_packet(
             ctx, ihl_bytes, src_addr, dst_addr, src_port, dst_port, proto,
         );
+    }
+
+    if local_dhcp {
+        bump(fw_counter);
+        // No NAT/overlay forwarding or conntrack entry for the broadcast tuple.
+        // The persistent HA TC guard still fences the local stack when needed.
+        return Ok(xdp_action::XDP_PASS);
     }
 
     // Allowed. On a stateful policy, remember a new flow (and its reverse) so the
@@ -3671,6 +3757,75 @@ fn npt66_ct_internal_dst(key: &mut FirewallKey, ifindex: u32) {
 /// own numbers, which no header exports to a BPF program).
 const AF_INET: u8 = 2;
 const AF_INET6: u8 = 10;
+
+// `BPF_FIB_LKUP_RET_NOT_FWDED` is the only completed lookup that proves a
+// unicast DHCPv4 destination is local. Keep the shared classifier on that code.
+const _: () =
+    assert!(BPF_FIB_LKUP_RET_NOT_FWDED as u32 == velstra_common::DHCP_FIB_NOT_FORWARDED as u32);
+
+/// Narrow local-control admission, never a forwarding exception. Initial
+/// acquisition requests broadcast replies; renewals may address the NIC's
+/// already-owned IPv4. The FIB check prevents stale address metadata from
+/// admitting a datagram which has become routable through the appliance.
+#[inline(never)]
+fn local_dhcp_reply(ctx: &XdpContext, ifindex: u32, ihl: usize) -> bool {
+    let Some(mac) = (unsafe { DHCP_CLIENTS.get(&ifindex) }).copied() else {
+        return false;
+    };
+    let Ok(ip) = (unsafe { ptr_at::<[u8; 20]>(ctx, EthHdr::LEN) }) else {
+        return false;
+    };
+    let ip = unsafe { &*ip };
+    let length = u16::from_be_bytes([ip[2], ip[3]]) as usize;
+    let frame_len = ctx.data_end() - ctx.data();
+    if length + EthHdr::LEN > frame_len {
+        return false;
+    }
+    let Ok(udp) = (unsafe { ptr_at::<[u8; 8]>(ctx, EthHdr::LEN + ihl) }) else {
+        return false;
+    };
+    let Ok(bootp) = (unsafe { ptr_at::<[u8; 240]>(ctx, EthHdr::LEN + ihl + 8) }) else {
+        return false;
+    };
+    if !velstra_common::dhcpv4_reply_matches(ip, unsafe { &*udp }, unsafe { &*bootp }, &mac) {
+        return false;
+    }
+    let dst = [ip[16], ip[17], ip[18], ip[19]];
+    if dst == [255, 255, 255, 255] {
+        return true;
+    }
+    let index = ifindex.to_ne_bytes();
+    let key = [
+        index[0], index[1], index[2], index[3], dst[0], dst[1], dst[2], dst[3],
+    ];
+    if unsafe { LOCAL_EGRESS_ADDRS.get(&key) }.is_none() {
+        return false;
+    }
+    let Some(params) = fib_scratch() else {
+        return false;
+    };
+    unsafe {
+        (*params).family = AF_INET;
+        (*params).l4_protocol = ip_proto::UDP;
+        (*params).sport = 67u16.to_be();
+        (*params).dport = 68u16.to_be();
+        (*params).__bindgen_anon_1.tot_len = length as u16;
+        (*params).ifindex = ifindex;
+        (*params).__bindgen_anon_3.ipv4_src = u32::from_ne_bytes([ip[12], ip[13], ip[14], ip[15]]);
+        (*params).__bindgen_anon_4.ipv4_dst = u32::from_ne_bytes(dst);
+    }
+    let rc = unsafe {
+        fib_lookup(
+            ctx.ctx.cast(),
+            params,
+            core::mem::size_of::<bpf_fib_lookup>() as i32,
+            0,
+        )
+    };
+    // Only NOT_FWDED is a completed lookup of a non-unicast (local) route.
+    // FWD_DISABLED is returned before lookup when ingress forwarding is off.
+    velstra_common::dhcp_fib_is_local(rc)
+}
 
 /// Source-address validation (uRPF, RFC 3704) for IPv4. Returns `true` when the
 /// packet should be dropped as spoofed.

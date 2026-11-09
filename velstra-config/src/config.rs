@@ -745,6 +745,9 @@ pub struct InterfaceFile {
     /// Policy id this interface's traffic is evaluated against (its firewall
     /// ruleset).
     pub policy: PolicyId,
+    /// This NIC runs a local DHCPv4 client, not a forwarded DHCP service.
+    #[serde(default)]
+    pub dhcp_client: bool,
     /// Overlay segment (VXLAN Network Identifier) this interface belongs to.
     /// **Decoupled from `policy`**: many ports can share one ruleset on
     /// different segments, or one segment can host ports with different rules
@@ -1356,6 +1359,7 @@ pub struct ResolvedInterface {
     pub name: String,
     /// Firewall policy id (`IFACE_POLICY`).
     pub policy: PolicyId,
+    pub dhcp_client: bool,
     /// Overlay segment / VNI (`IFACE_VNI`). `0` means local-only (no overlay).
     pub vni: u32,
     /// Masquerade (source NAT) traffic leaving this interface (`MASQUERADE`).
@@ -2197,6 +2201,7 @@ impl FileConfig {
             interfaces.push(ResolvedInterface {
                 name: iface.name.clone(),
                 policy: iface.policy,
+                dhcp_client: iface.dhcp_client,
                 vni,
                 masquerade: iface.masquerade,
                 snat_address: iface
@@ -3596,6 +3601,7 @@ mod tests {
                 ResolvedInterface {
                     name: "tap0".into(),
                     policy: 7,
+                    dhcp_client: false,
                     vni: 7, // defaults to the policy id
                     masquerade: false,
                     snat_address: None,
@@ -3608,6 +3614,7 @@ mod tests {
                 ResolvedInterface {
                     name: "tap1".into(),
                     policy: 0,
+                    dhcp_client: false,
                     vni: 0,
                     masquerade: false,
                     snat_address: None,
