@@ -2267,6 +2267,7 @@ fn snat_tc(
 const O_ETH_DST: usize = 0; //                 Ethernet destination MAC
 const O_ETH_SRC: usize = 6; //                 Ethernet source MAC
 const O_IP: usize = EthHdr::LEN; //         14: IPv4 header start
+const O_IP_TOS: usize = O_IP + 1; //       15: DSCP + ECN
 const O_IP_TOTLEN: usize = O_IP + 2; //     16: IPv4 total length
 const O_IP_ID: usize = O_IP + 4; //         18: IPv4 identification
 const O_IP_FRAG: usize = O_IP + 6; //       20: IPv4 flags + fragment offset
@@ -5011,6 +5012,9 @@ fn write_synth(
         }
         *((data + O_IP_SRC) as *mut [u8; 4]) = new_src;
         *((data + O_IP_DST) as *mut [u8; 4]) = new_dst;
+        // The synthesized header's checksum covers TOS zero, not the incoming
+        // packet's DSCP/ECN. Leaving it in place makes the reply invalid.
+        *((data + O_IP_TOS) as *mut u8) = 0;
         *((data + O_IP_TOTLEN) as *mut [u8; 2]) = plan.total_len.to_be_bytes();
         *((data + O_IP_ID) as *mut [u8; 2]) = [0, 0];
         *((data + O_IP_FRAG) as *mut [u8; 2]) = [0, 0];
@@ -5323,6 +5327,9 @@ fn reject_packet(
         // IPv4: swap addresses, fix length/ttl/proto/checksum, clear id+frag.
         *((data + O_IP_SRC) as *mut [u8; 4]) = dst_addr;
         *((data + O_IP_DST) as *mut [u8; 4]) = src_addr;
+        // plan_tcp_rst computes a fresh TOS-zero IPv4 header. Do not retain the
+        // rejected SYN's DSCP/ECN under that checksum (OSQA-169).
+        *((data + O_IP_TOS) as *mut u8) = 0;
         *((data + O_IP_TOTLEN) as *mut [u8; 2]) = 40u16.to_be_bytes();
         *((data + O_IP_ID) as *mut [u8; 2]) = [0, 0];
         *((data + O_IP_FRAG) as *mut [u8; 2]) = [0, 0];
