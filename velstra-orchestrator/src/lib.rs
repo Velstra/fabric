@@ -1817,6 +1817,9 @@ impl Topology {
                     });
                 }
                 cfg.interfaces.push(InterfaceFile {
+                    // A tenant's DHCP traffic is forwarded; the tap is not
+                    // an appliance-local DHCP client admission boundary.
+                    dhcp_client: false,
                     snat_address: None,
                     mss: None,
                     // B13: the port's own send ceiling, carried straight
@@ -2935,6 +2938,7 @@ mod tests {
         let iface = rt.interfaces.iter().find(|i| i.name == "tapA").unwrap();
         assert_eq!(iface.policy, 5000);
         assert_eq!(iface.vni, 5000);
+        assert!(!iface.dhcp_client, "tenant taps are not local DHCP clients");
         // The remote port (pb on h2) is NOT a local interface here.
         assert!(!rt.interfaces.iter().any(|i| i.name == "tapB"));
 
