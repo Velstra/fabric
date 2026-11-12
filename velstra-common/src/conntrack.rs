@@ -208,6 +208,41 @@ impl FirewallState {
         })
     }
 
+    /// 0 needs normal new-flow policy, 1 is a valid tracked packet, 2 is invalid.
+    /// A fresh opener may reuse a closing tuple, but is NOT established traffic:
+    /// policy must admit it before ct_record replaces the old paired state.
+    #[inline(always)]
+    pub fn classify(&self, proto: u8, control: u8, now: u64, timeouts: ConntrackTimeouts) -> u8 {
+        if self.expired(proto, now, timeouts)
+            || (proto == ip_proto::TCP
+                && matches!(self.phase, Self::CLOSING | Self::RESET)
+                && Self::is_opener(proto, control))
+        {
+            0
+        } else if self.next_phase(proto, control).is_some() {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// Ordinary routed responder traffic must retain its original tuple even
+    /// when leaving a masquerading interface. Only live valid reply-direction
+    /// state establishes this exemption; an untracked/expired/invalid packet
+    /// cannot acquire it merely by looking like an ACK or UDP response.
+    #[inline(always)]
+    pub fn is_routed_reply(
+        &self,
+        proto: u8,
+        control: u8,
+        now: u64,
+        timeouts: ConntrackTimeouts,
+    ) -> bool {
+        matches!(proto, ip_proto::TCP | ip_proto::UDP)
+            && self.reply == 1
+            && self.classify(proto, control, now, timeouts) == 1
+    }
+
     /// Validate a protocol transition without materializing a second full
     /// state. eBPF uses this scalar result with map-backed working state.
     #[inline(always)]
@@ -385,5 +420,115 @@ mod tests {
         assert_ne!(a, FirewallKey { src_port: 124, ..a });
         assert_eq!(core::mem::size_of::<FirewallKey>(), 44);
         assert_eq!(core::mem::size_of::<FirewallState>(), 24);
+    }
+
+    fn closing() -> FirewallState {
+        FirewallState {
+            last_seen_ns: 1,
+            age_ns: 0,
+            phase: FirewallState::CLOSING,
+            reply: 0,
+        }
+    }
+
+    #[test]
+    fn a_closing_tuple_opener_needs_new_policy_not_established_admission() {
+        assert_eq!(closing().classify(6, tcp_flags::SYN, 2, T), 0);
+        assert!(closing().next_phase(6, tcp_flags::SYN).is_none());
+        assert_eq!(
+            FirewallState {
+                reply: 1,
+                ..closing()
+            }
+            .classify(6, tcp_flags::SYN, 2, T),
+            0
+        );
+        assert_eq!(closing().classify(6, tcp_flags::ACK, 2, T), 1);
+    }
+
+    #[test]
+    fn active_connections_do_not_accept_new_syn_as_established() {
+        for reply in [0, 1] {
+            let state = FirewallState {
+                phase: FirewallState::ESTABLISHED,
+                reply,
+                ..closing()
+            };
+            assert_eq!(state.classify(6, tcp_flags::SYN, 2, T), 2);
+        }
+    }
+
+    #[test]
+    fn malformed_syn_flags_cannot_reopen_closing_or_reset_state() {
+        for phase in [FirewallState::CLOSING, FirewallState::RESET] {
+            let state = FirewallState { phase, ..closing() };
+            for flags in [
+                tcp_flags::SYN | tcp_flags::FIN,
+                tcp_flags::SYN | tcp_flags::RST,
+                tcp_flags::SYN | tcp_flags::ACK,
+            ] {
+                assert_eq!(state.classify(6, flags, 2, T), 2);
+            }
+            assert_eq!(state.classify(6, tcp_flags::SYN, 2, T), 0);
+        }
+    }
+
+    #[test]
+    fn live_routed_tcp_responder_keeps_its_tuple_from_synack_to_close() {
+        let state = FirewallState {
+            phase: FirewallState::NEW,
+            reply: 1,
+            ..closing()
+        };
+        assert!(state.is_routed_reply(6, tcp_flags::SYN | tcp_flags::ACK, 2, T));
+        assert!(!FirewallState { reply: 0, ..state }.is_routed_reply(6, tcp_flags::SYN, 2, T));
+        for phase in [FirewallState::ESTABLISHED, FirewallState::CLOSING] {
+            let state = FirewallState { phase, ..state };
+            assert!(state.is_routed_reply(6, tcp_flags::ACK, 2, T));
+            assert!(!state.is_routed_reply(6, tcp_flags::SYN, 2, T));
+        }
+    }
+
+    #[test]
+    fn invalid_or_untracked_looking_response_does_not_gain_nat_exemption() {
+        let state = FirewallState {
+            phase: FirewallState::NEW,
+            reply: 1,
+            ..closing()
+        };
+        for flags in [
+            tcp_flags::ACK,
+            tcp_flags::SYN,
+            tcp_flags::SYN | tcp_flags::FIN,
+        ] {
+            assert!(!state.is_routed_reply(6, flags, 2, T));
+        }
+        assert!(!state.is_routed_reply(1, 0, 2, T));
+        assert!(!FirewallState { reply: 2, ..state }.is_routed_reply(17, 0, 2, T));
+    }
+
+    #[test]
+    fn reply_exemption_expires_and_rejects_other_clock_epochs() {
+        let state = FirewallState {
+            phase: FirewallState::ESTABLISHED,
+            reply: 1,
+            ..closing()
+        };
+        let deadline = 1 + T.tcp_established as u64 * 1_000_000_000;
+        assert!(state.is_routed_reply(6, tcp_flags::ACK, deadline - 1, T));
+        assert!(!state.is_routed_reply(6, tcp_flags::ACK, deadline, T));
+        assert!(!state.is_routed_reply(6, tcp_flags::ACK, 0, T));
+    }
+
+    #[test]
+    fn udp_response_metadata_is_directional_and_time_bounded() {
+        let state = FirewallState {
+            phase: FirewallState::NEW,
+            reply: 1,
+            ..closing()
+        };
+        assert!(state.is_routed_reply(17, 0, 2, T));
+        assert!(!FirewallState { reply: 0, ..state }.is_routed_reply(17, 0, 2, T));
+        assert!(!state.is_routed_reply(17, 0, 1 + T.udp as u64 * 1_000_000_000, T));
     }
 }

@@ -201,9 +201,12 @@ fn cmd_del(conf: &NetConf) -> Result<Option<CniResult>> {
     let _ = net::teardown(&net::veth_name(&container_id));
 
     if !conf.controllers.is_empty() {
-        if let Some(port_id) = take_port(Path::new(DEFAULT_STATE_ROOT), &container_id) {
-            let _ = controller::remove_port(&conf.controllers, &conf.tls_options(), &port_id);
-        }
+        // Keep the port record until the controller accepts deletion. Dropping
+        // it first makes a failed DEL unrecoverable: the retry no longer knows
+        // which port still holds the address.
+        release_recorded_port(Path::new(DEFAULT_STATE_ROOT), &container_id, |port_id| {
+            controller::remove_port(&conf.controllers, &conf.tls_options(), port_id)
+        })?;
         return Ok(None);
     }
 
@@ -295,11 +298,36 @@ fn record_port(state_root: &Path, container_id: &str, port_id: &str) -> Result<(
 }
 
 /// Read and delete the port id recorded for `container_id` (idempotent).
+#[cfg(test)]
 fn take_port(state_root: &Path, container_id: &str) -> Option<String> {
+    let id = read_port(state_root, container_id)?;
+    forget_port(state_root, container_id);
+    Some(id)
+}
+
+fn read_port(state_root: &Path, container_id: &str) -> Option<String> {
     let path = port_record_path(state_root, container_id);
     let id = std::fs::read_to_string(&path).ok()?.trim().to_string();
-    let _ = std::fs::remove_file(&path);
     (!id.is_empty()).then_some(id)
+}
+
+fn forget_port(state_root: &Path, container_id: &str) {
+    let _ = std::fs::remove_file(port_record_path(state_root, container_id));
+}
+
+/// Delete the controller port, then the local record. `remove` failing leaves
+/// the record in place so the next DEL can retry the same port id.
+fn release_recorded_port(
+    state_root: &Path,
+    container_id: &str,
+    mut remove: impl FnMut(&str) -> Result<()>,
+) -> Result<Option<String>> {
+    let Some(port_id) = read_port(state_root, container_id) else {
+        return Ok(None);
+    };
+    remove(&port_id)?;
+    forget_port(state_root, container_id);
+    Ok(Some(port_id))
 }
 
 #[cfg(test)]
@@ -333,6 +361,28 @@ mod tests {
         assert_eq!(take_port(&root, "container-xyz"), None);
         // Unknown container ids are simply absent.
         assert_eq!(take_port(&root, "never-seen"), None);
+
+        record_port(&root, "container-retry", "port-5001").unwrap();
+        let failure = release_recorded_port(&root, "container-retry", |_| {
+            bail!("controller unavailable")
+        });
+        assert!(failure.is_err());
+        assert_eq!(
+            read_port(&root, "container-retry").as_deref(),
+            Some("port-5001")
+        );
+        assert_eq!(
+            release_recorded_port(&root, "container-retry", |_| Ok(()))
+                .unwrap()
+                .as_deref(),
+            Some("port-5001")
+        );
+        assert_eq!(read_port(&root, "container-retry"), None);
+        assert_eq!(
+            release_recorded_port(&root, "container-retry", |_| bail!("must not be called"))
+                .unwrap(),
+            None
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

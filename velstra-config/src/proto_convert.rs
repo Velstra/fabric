@@ -206,6 +206,7 @@ pub fn file_config_to_proto(cfg: &FileConfig, version: u64) -> proto::NodeConfig
             .map(|i| proto::InterfaceAssignment {
                 name: i.name.clone(),
                 policy: i.policy,
+                dhcp_client: i.dhcp_client,
                 vni: i.vni,
                 mss: i.mss.map(u32::from),
                 bind_mac: i.bind_mac.clone(),
@@ -432,6 +433,7 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
             .iter()
             .map(|i| InterfaceFile {
                 mss: i.mss.map(|v| v as u16),
+                dhcp_client: i.dhcp_client,
                 // Port security, carried at last. This used to say the proto had
                 // no field for it — true, and its consequence was never written
                 // down beside it: the orchestrator derives a binding for every
@@ -949,6 +951,7 @@ mod every_field_survives {
         InterfaceFile {
             name: "tap0".into(),
             policy: 4711,
+            dhcp_client: true,
             vni: Some(5001),
             mss: Some(1400),
             bind_mac: Some("02:00:00:00:00:01".into()),
@@ -980,6 +983,7 @@ mod every_field_survives {
         let InterfaceFile {
             name,
             policy,
+            dhcp_client,
             vni,
             mss,
             bind_mac,
@@ -995,6 +999,7 @@ mod every_field_survives {
         } = after;
         assert_eq!(*name, before.name, "name");
         assert_eq!(*policy, before.policy, "policy");
+        assert_eq!(*dhcp_client, before.dhcp_client, "local DHCP client");
         assert_eq!(*vni, before.vni, "vni");
         assert_eq!(*mss, before.mss, "mss — TCP clamping is off on this node");
         assert_eq!(

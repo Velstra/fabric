@@ -24,6 +24,7 @@
 //! ```
 
 use std::{
+    collections::BTreeSet,
     fmt,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
@@ -744,6 +745,9 @@ pub struct InterfaceFile {
     /// Policy id this interface's traffic is evaluated against (its firewall
     /// ruleset).
     pub policy: PolicyId,
+    /// This NIC runs a local DHCPv4 client, not a forwarded DHCP service.
+    #[serde(default)]
+    pub dhcp_client: bool,
     /// Overlay segment (VXLAN Network Identifier) this interface belongs to.
     /// **Decoupled from `policy`**: many ports can share one ruleset on
     /// different segments, or one segment can host ports with different rules
@@ -1355,6 +1359,7 @@ pub struct ResolvedInterface {
     pub name: String,
     /// Firewall policy id (`IFACE_POLICY`).
     pub policy: PolicyId,
+    pub dhcp_client: bool,
     /// Overlay segment / VNI (`IFACE_VNI`). `0` means local-only (no overlay).
     pub vni: u32,
     /// Masquerade (source NAT) traffic leaving this interface (`MASQUERADE`).
@@ -1570,6 +1575,12 @@ pub struct HaConfig {
     pub cluster: String,
     pub node: u8,
     pub interfaces: Vec<String>,
+    /// Explicit dedicated control bindings. Omitted by legacy configurations:
+    /// no interface name is then normalized in the state-policy fingerprint.
+    /// The compiler must already have checked their L2 ancestry carries no
+    /// fenced data/VIPs. Only resolved bindings belong here, not unbound parents.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub control_interfaces: Vec<String>,
     /// How old the coordinator's role file may be and still count as a live
     /// coordinator. It is rewritten once per witness exchange, so it has to
     /// cover the configured witness I/O budget plus the coordinator's poll;
@@ -1579,6 +1590,47 @@ pub struct HaConfig {
 }
 fn default_role_fresh_ms() -> u64 {
     100
+}
+impl HaConfig {
+    /// Validate the exact partition of resolved interface bindings before any
+    /// member-local name can be normalized. Never infer control as the mere
+    /// complement of an operator-supplied (possibly incomplete) guard list.
+    pub fn validated_control_interfaces<'a>(
+        &'a self,
+        interfaces: &[ResolvedInterface],
+    ) -> Result<BTreeSet<&'a str>> {
+        let control: BTreeSet<_> = self.control_interfaces.iter().map(String::as_str).collect();
+        if control.is_empty() {
+            return Ok(control);
+        }
+        let guarded: BTreeSet<_> = self.interfaces.iter().map(String::as_str).collect();
+        let resolved: BTreeSet<_> = interfaces.iter().map(|i| i.name.as_str()).collect();
+        anyhow::ensure!(
+            self.enabled && control.len() <= 128 && control.len() == self.control_interfaces.len(),
+            "explicit HA control bindings need enabled HA and 1..128 unique names"
+        );
+        anyhow::ensure!(
+            control.iter().all(|name| !name.is_empty()
+                && name.len() < 16
+                && name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))),
+            "invalid HA control interface"
+        );
+        anyhow::ensure!(
+            guarded.len() == self.interfaces.len() && guarded.is_disjoint(&control),
+            "HA guard/control bindings must be unique and disjoint"
+        );
+        anyhow::ensure!(
+            resolved.len() == interfaces.len()
+                && control.is_subset(&resolved)
+                && resolved
+                    .iter()
+                    .all(|name| guarded.contains(name) || control.contains(name)),
+            "HA guard/control sets must cover every resolved binding and only name existing control bindings"
+        );
+        Ok(control)
+    }
 }
 
 /// Fully-resolved, validated configuration ready to be written into BPF maps.
@@ -1642,6 +1694,7 @@ impl RuntimeConfig {
     /// maps, before a live update removes or replaces any existing rules.
     pub fn validate_firewall_capacity(&self) -> Result<()> {
         if let Some(ha) = &self.ha {
+            ha.validated_control_interfaces(&self.interfaces)?;
             anyhow::ensure!(
                 (1..=2).contains(&ha.node)
                     && ((!ha.enabled && ha.cluster.is_empty())
@@ -2148,6 +2201,7 @@ impl FileConfig {
             interfaces.push(ResolvedInterface {
                 name: iface.name.clone(),
                 policy: iface.policy,
+                dhcp_client: iface.dhcp_client,
                 vni,
                 masquerade: iface.masquerade,
                 snat_address: iface
@@ -3547,6 +3601,7 @@ mod tests {
                 ResolvedInterface {
                     name: "tap0".into(),
                     policy: 7,
+                    dhcp_client: false,
                     vni: 7, // defaults to the policy id
                     masquerade: false,
                     snat_address: None,
@@ -3559,6 +3614,7 @@ mod tests {
                 ResolvedInterface {
                     name: "tap1".into(),
                     policy: 0,
+                    dhcp_client: false,
                     vni: 0,
                     masquerade: false,
                     snat_address: None,

@@ -173,11 +173,23 @@ pub(super) fn ct_classify(key: &FirewallKey, control: u8) -> u8 {
         let _ = unsafe { FW_FLOWS.remove(&(*scratch).reverse) };
         return 0;
     }
-    if state.next_phase(key.proto, control).is_some() {
-        1
-    } else {
-        2
-    }
+    state.classify(key.proto, control, now, timeouts)
+}
+
+/// Preserve an admitted WAN-initiated connection's routed response. This reads
+/// existing direction/phase/age metadata, never creates an exemption or changes
+/// map layout. The caller records activity only after receiving true.
+#[inline(never)]
+pub(super) fn ct_is_routed_reply(key: &FirewallKey, control: u8) -> bool {
+    let Some(state) = (unsafe { FW_FLOWS.get(key) }) else {
+        return false;
+    };
+    state.is_routed_reply(
+        key.proto,
+        control,
+        unsafe { bpf_ktime_get_ns() },
+        timeouts(),
+    )
 }
 
 #[inline(never)]

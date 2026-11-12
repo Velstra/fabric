@@ -25,7 +25,9 @@
 //!
 //! ## What is exported, and what is not
 //!
-//! Only what the data plane actually knows: the five-tuple and the two counters.
+//! Only what the data plane actually knows: policy identity, the five-tuple and
+//! the two counters. Each configured policy is a logical Observation Point;
+//! IANA observationPointId (138, unsigned64) carries its exact numeric policy ID.
 //! There are no timestamps, because the map holds none — inventing "first seen"
 //! from when the exporter noticed a flow would put a plausible, wrong number in
 //! a record an operator later reasons about. Only NAT'd connections appear at
@@ -34,7 +36,7 @@
 //! The encoder is pure and unit-tested; only [`run`] needs a socket.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -51,22 +53,23 @@ const VERSION: u16 = 10;
 /// Set ID reserved for a template set (RFC 7011 §3.3.2).
 const SET_TEMPLATE: u16 = 2;
 /// The template this exporter defines. Anything from 256 up is ours to choose.
-const TEMPLATE_ID: u16 = 256;
+const TEMPLATE_ID: u16 = 257;
 /// Message header: version, length, export time, sequence, domain.
 const HEADER_LEN: usize = 16;
-/// One data record: the five-tuple plus the two counters.
-const RECORD_LEN: usize = 4 + 4 + 2 + 2 + 1 + 8 + 8;
+/// One data record: policy observation point, five-tuple and two counters.
+const RECORD_LEN: usize = 8 + 4 + 4 + 2 + 2 + 1 + 8 + 8;
 
 /// The information elements a record carries, as `(id, length)` — IANA IPFIX
 /// element IDs, so a collector needs nothing from us to read them.
-const FIELDS: [(u16, u16); 7] = [
-    (8, 4),  // sourceIPv4Address
-    (12, 4), // destinationIPv4Address
-    (7, 2),  // sourceTransportPort
-    (11, 2), // destinationTransportPort
-    (4, 1),  // protocolIdentifier
-    (1, 8),  // octetDeltaCount
-    (2, 8),  // packetDeltaCount
+const FIELDS: [(u16, u16); 8] = [
+    (138, 8), // observationPointId: configured firewall policy ID
+    (8, 4),   // sourceIPv4Address
+    (12, 4),  // destinationIPv4Address
+    (7, 2),   // sourceTransportPort
+    (11, 2),  // destinationTransportPort
+    (4, 1),   // protocolIdentifier
+    (1, 8),   // octetDeltaCount
+    (2, 8),   // packetDeltaCount
 ];
 
 /// How many records fit in one datagram without relying on IP fragmentation.
@@ -171,6 +174,7 @@ pub fn encode_message(
         buf.extend_from_slice(&TEMPLATE_ID.to_be_bytes());
         buf.extend_from_slice(&(data_len as u16).to_be_bytes());
         for r in records {
+            buf.extend_from_slice(&u64::from(r.key.policy).to_be_bytes());
             buf.extend_from_slice(&r.key.src_ip);
             buf.extend_from_slice(&r.key.dst_ip);
             buf.extend_from_slice(&r.key.src_port.to_be_bytes());
@@ -196,7 +200,7 @@ pub async fn run(
     domain: u32,
     interval_secs: u64,
 ) {
-    let socket = match UdpSocket::bind(("0.0.0.0", 0)).await {
+    let socket = match collector_socket(collector).await {
         Ok(s) => s,
         Err(e) => {
             warn!("ipfix: cannot open a socket: {e}");
@@ -207,16 +211,21 @@ pub async fn run(
 
     let mut seen: HashMap<FlowKey, Sent> = HashMap::new();
     let mut sequence: u32 = 0;
+    // At most one map snapshot is pending. Keep locally unsent records even if
+    // their flow disappears before recovery; never replace them with idle deltas.
+    let mut pending = VecDeque::new();
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
     loop {
         ticker.tick().await;
 
-        let flows: Vec<(FlowKey, FlowState)> = {
-            let map = conntrack.lock().await;
-            map.iter().filter_map(|e| e.ok()).collect()
-        };
-        let records = deltas(&flows, &mut seen);
-        if records.is_empty() {
+        if pending.is_empty() {
+            let flows: Vec<(FlowKey, FlowState)> = {
+                let map = conntrack.lock().await;
+                map.iter().filter_map(|e| e.ok()).collect()
+            };
+            pending = deltas(&flows, &mut seen).into();
+        }
+        if pending.is_empty() {
             continue;
         }
 
@@ -224,18 +233,62 @@ pub async fn run(
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as u32)
             .unwrap_or(0);
-        for chunk in records.chunks(MAX_RECORDS) {
-            let msg = encode_message(domain, now, sequence, chunk);
-            if let Err(e) = socket.send_to(&msg, collector).await {
-                warn!("ipfix: send to {collector} failed: {e}");
-                break; // the collector is unreachable; try again next interval
-            }
-            sequence = sequence.wrapping_add(chunk.len() as u32);
+        if let Err(e) = flush_pending(&mut pending, &mut sequence, domain, now, |message| {
+            let socket = &socket;
+            async move { socket.send(&message).await }
+        })
+        .await
+        {
+            warn!(
+                "ipfix: send to {collector} failed: {e}; {} unsent records retained",
+                pending.len()
+            );
         }
     }
 }
 
-/// Resolve a `host:port` collector address.
+async fn collector_socket(collector: SocketAddr) -> std::io::Result<UdpSocket> {
+    let bind = if collector.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let socket = UdpSocket::bind(bind).await?;
+    socket.connect(collector).await?;
+    Ok(socket)
+}
+
+/// A successful local datagram submission commits only that chunk. UDP delivery
+/// beyond the local host remains unacknowledged, as required by the transport.
+async fn flush_pending<F, Fut>(
+    pending: &mut VecDeque<FlowDelta>,
+    sequence: &mut u32,
+    domain: u32,
+    now: u32,
+    mut send: F,
+) -> std::io::Result<()>
+where
+    F: FnMut(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<usize>>,
+{
+    while !pending.is_empty() {
+        let chunk: Vec<_> = pending.iter().take(MAX_RECORDS).copied().collect();
+        let message = encode_message(domain, now, *sequence, &chunk);
+        let expected = message.len();
+        if send(message).await? != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "partial IPFIX datagram submission",
+            ));
+        }
+        pending.drain(..chunk.len());
+        *sequence = sequence.wrapping_add(chunk.len() as u32);
+    }
+    Ok(())
+}
+
+/// Resolve a `host:port` collector address. Use the resolver's first result,
+/// matching its IPv4/IPv6 family at bind time; no silent family downgrade.
 pub fn parse_collector(spec: &str) -> Result<SocketAddr> {
     use std::net::ToSocketAddrs;
     spec.to_socket_addrs()
@@ -247,6 +300,139 @@ pub fn parse_collector(spec: &str) -> Result<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decode by the wire template, without the encoder's FIELDS/RECORD_LEN.
+    fn decode(message: &[u8]) -> Vec<HashMap<u16, Vec<u8>>> {
+        let u16_at = |offset| u16::from_be_bytes([message[offset], message[offset + 1]]) as usize;
+        let template_bytes = u16_at(18);
+        let fields: Vec<_> = (0..u16_at(22))
+            .map(|i| (u16_at(24 + i * 4) as u16, u16_at(26 + i * 4)))
+            .collect();
+        let record_bytes: usize = fields.iter().map(|(_, len)| len).sum();
+        let start = 16 + template_bytes;
+        let end = start + u16_at(start + 2);
+        message[start + 4..end]
+            .chunks_exact(record_bytes)
+            .map(|record| {
+                let mut offset = 0;
+                fields
+                    .iter()
+                    .map(|(id, len)| {
+                        let field = (*id, record[offset..offset + len].to_vec());
+                        offset += len;
+                        field
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn identical_five_tuples_in_distinct_policies_remain_distinguishable_on_wire() {
+        let mut first = key([10, 0, 0, 1], 40000);
+        first.policy = 100;
+        let mut second = first;
+        second.policy = 200;
+        let records: Vec<_> = [first, second]
+            .into_iter()
+            .map(|key| FlowDelta {
+                key,
+                bytes: 1000,
+                packets: 10,
+            })
+            .collect();
+        let wire = encode_message(7, 0, 0, &records);
+        let decoded = decode(&wire);
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0][&138], 100u64.to_be_bytes());
+        assert_eq!(decoded[1][&138], 200u64.to_be_bytes());
+        for field in [8, 12, 7, 11, 4, 1, 2] {
+            assert_eq!(decoded[0][&field], decoded[1][&field]);
+        }
+    }
+
+    #[tokio::test]
+    async fn ipv4_and_ipv6_collectors_receive_decodable_datagrams() {
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            let collector = UdpSocket::bind(address).await.unwrap();
+            let address = collector.local_addr().unwrap();
+            assert_eq!(parse_collector(&address.to_string()).unwrap(), address);
+            let socket = collector_socket(address).await.unwrap();
+            assert_eq!(socket.local_addr().unwrap().is_ipv6(), address.is_ipv6());
+            let message = encode_message(
+                7,
+                0,
+                0,
+                &[FlowDelta {
+                    key: key([10, 0, 0, 1], 40000),
+                    bytes: 42,
+                    packets: 1,
+                }],
+            );
+            socket.send(&message).await.unwrap();
+            let mut received = [0; 1500];
+            let (length, _) =
+                tokio::time::timeout(Duration::from_secs(1), collector.recv_from(&mut received))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(&received[..length], &message);
+            assert_eq!(decode(&received[..length]).len(), 1);
+        }
+        use std::net::ToSocketAddrs;
+        let expected = "localhost:4739".to_socket_addrs().unwrap().next().unwrap();
+        assert_eq!(parse_collector("localhost:4739").unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn unsent_chunks_survive_failure_without_repeating_successful_chunks() {
+        let flows: Vec<_> = (0..(MAX_RECORDS * 2 + 1))
+            .map(|i| (key([10, 0, 0, 1], 10000 + i as u16), state(10, 1000)))
+            .collect();
+        let mut seen = HashMap::new();
+        let mut pending = VecDeque::from(deltas(&flows, &mut seen));
+        let mut sequence = 0;
+        let mut messages = Vec::new();
+        let failed = flush_pending(&mut pending, &mut sequence, 7, 0, |message| {
+            if messages.is_empty() {
+                let length = message.len();
+                messages.push(message);
+                std::future::ready(Ok(length))
+            } else {
+                std::future::ready(Err(std::io::Error::other("injected local send failure")))
+            }
+        })
+        .await;
+        assert!(failed.is_err());
+        assert_eq!(sequence, MAX_RECORDS as u32);
+        assert_eq!(pending.len(), MAX_RECORDS + 1);
+        flush_pending(&mut pending, &mut sequence, 7, 1, |message| {
+            let length = message.len();
+            messages.push(message);
+            std::future::ready(Ok(length))
+        })
+        .await
+        .unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(sequence as usize, flows.len());
+        let ports: Vec<_> = messages
+            .iter()
+            .flat_map(|m| decode(m))
+            .map(|r| r[&7].clone())
+            .collect();
+        assert_eq!(ports.len(), flows.len());
+        assert_eq!(
+            ports
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            flows.len()
+        );
+        assert!(
+            deltas(&flows, &mut seen).is_empty(),
+            "idle counters must not duplicate a recovered batch"
+        );
+    }
 
     fn key(src: [u8; 4], sport: u16) -> FlowKey {
         FlowKey::new(0, src, [203, 0, 113, 5], sport, 443, 6)

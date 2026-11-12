@@ -34,6 +34,7 @@ mod cgnat;
 mod cidr;
 mod config;
 mod conntrack;
+mod dhcp;
 mod forward;
 mod lb;
 mod mac;
@@ -54,6 +55,7 @@ pub use cgnat::CgnatLayout;
 pub use cidr::{Cidr4, Cidr6, CidrError, mask_v4, mask_v6, parse_cidr_v4, parse_cidr_v6};
 pub use config::{ConfigFlags, GlobalConfig, SourceValidation};
 pub use conntrack::{ConntrackTimeouts, FirewallKey, FirewallState};
+pub use dhcp::{DHCP_FIB_NOT_FORWARDED, dhcp_fib_is_local, dhcpv4_reply_matches};
 pub use forward::{
     ForwardOutcome, Rewrite, RouteEntry, csum_replace_u16, decrement_ttl, ipv4_checksum,
     plan_forward,
@@ -63,7 +65,10 @@ pub use lb::{
     plan_icmp_echo_nat, plan_nat, select_backend, session_hash,
 };
 pub use mac::{MacError, parse_mac};
-pub use masquerade::{UNADDRESSED, unaddressed_uplink_drops};
+pub use masquerade::{
+    MasqueradeCommit, UNADDRESSED, legacy_napt_seed, masquerade_commit, napt_binding_matches,
+    napt_find_existing, napt_port, napt_seed, unaddressed_uplink_drops,
+};
 pub use npt::{Npt66, npt66_rewrite, oc_add};
 pub use overlay::{
     ARP_REPLY, ARP_REQUEST, ArpEntry, ArpKey, ArpReply, ETHERTYPE_ARP, Encap, FloodSet,

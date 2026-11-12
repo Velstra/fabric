@@ -1045,8 +1045,12 @@ pub async fn run(
 /// Canonical, versioned JSON of the shared dataplane policy. Local addresses,
 /// MACs, routes and sync endpoints are excluded; policy IDs, interface bindings,
 /// state lifetimes, filtering and NAT semantics must agree before state applies.
-pub(crate) fn policy_fingerprint(cfg: &RuntimeConfig) -> [u8; 32] {
+pub(crate) fn policy_fingerprint(cfg: &RuntimeConfig) -> Result<[u8; 32]> {
     use serde_json::json;
+    let control = match cfg.ha.as_ref() {
+        Some(ha) => ha.validated_control_interfaces(&cfg.interfaces)?,
+        None => BTreeSet::new(),
+    };
     let policies: Vec<_> = cfg.policies.iter().map(|p| json!({
         "id":p.id, "global":[p.global.default_action,p.global.flags],
         "block4":p.blocklist.iter().map(|c| (c.octets,c.prefix)).collect::<Vec<_>>(),
@@ -1056,12 +1060,18 @@ pub(crate) fn policy_fingerprint(cfg: &RuntimeConfig) -> [u8; 32] {
         "rules":p.port_rules.iter().map(|r| json!([r.name,r.key.proto,r.key.port,r.icmp_type,r.in_interface,r.scope,
             r.src.map(|c|(c.octets,c.prefix)),r.dst.map(|c|(c.octets,c.prefix)),r.src6.map(|c|(c.octets,c.prefix)),r.dst6.map(|c|(c.octets,c.prefix)),r.action.as_u32(),r.log,r.limit])).collect::<Vec<_>>()
     })).collect();
-    let interfaces: Vec<_> = cfg
+    let mut interfaces: Vec<_> = cfg
         .interfaces
         .iter()
         .map(|i| {
             json!([
-                i.name,
+                // A typed marker cannot collide with an ordinary interface
+                // name. Keep ALL remaining policy/tenant-security semantics.
+                if control.contains(i.name.as_str()) {
+                    json!({"ha_control_binding":true})
+                } else {
+                    json!(i.name)
+                },
                 i.policy,
                 i.vni,
                 i.masquerade,
@@ -1073,6 +1083,12 @@ pub(crate) fn policy_fingerprint(cfg: &RuntimeConfig) -> [u8; 32] {
             ])
         })
         .collect();
+    if !control.is_empty() {
+        // Member-local ancestry can occur at different document positions.
+        // A sorted multiset preserves every binding and its multiplicity; it
+        // never drops an unguarded or accidentally unlisted data interface.
+        interfaces.sort_by_cached_key(serde_json::Value::to_string);
+    }
     let forwards: Vec<_> = cfg
         .port_forwards
         .iter()
@@ -1109,13 +1125,13 @@ pub(crate) fn policy_fingerprint(cfg: &RuntimeConfig) -> [u8; 32] {
             ])
         })
         .collect();
-    let bytes = json!({"version":5,"ha":cfg.ha.as_ref().map(|h|json!([h.cluster,h.interfaces,h.wireguard_ports,h.wireguard,h.wireguard_policy])),"policies":policies,"interfaces":interfaces,"forwards":forwards,"services":services,
+    let bytes = json!({"version":if control.is_empty(){5}else{6},"ha":cfg.ha.as_ref().map(|h|json!([h.cluster,h.interfaces,h.wireguard_ports,h.wireguard,h.wireguard_policy])),"policies":policies,"interfaces":interfaces,"forwards":forwards,"services":services,
         "timeouts":[cfg.conntrack.tcp_syn,cfg.conntrack.tcp_established,cfg.conntrack.tcp_closing,cfg.conntrack.udp,cfg.conntrack.udp_stream,cfg.conntrack.icmp],
         "synproxy":cfg.synproxy.iter().map(|s|(s.port,s.mss)).collect::<Vec<_>>(),"fail_closed":cfg.fail_closed}).to_string();
-    digest::digest(&digest::SHA256, bytes.as_bytes())
+    Ok(digest::digest(&digest::SHA256, bytes.as_bytes())
         .as_ref()
         .try_into()
-        .expect("SHA256 length")
+        .expect("SHA256 length"))
 }
 
 #[cfg(test)]
@@ -1828,12 +1844,196 @@ mod tests {
     fn policy_fingerprint_fences_changed_filtering_without_node_local_routes() {
         let first = RuntimeConfig::passthrough();
         let mut second = first.clone();
-        assert_eq!(policy_fingerprint(&first), policy_fingerprint(&second));
+        assert_eq!(
+            policy_fingerprint(&first).unwrap(),
+            policy_fingerprint(&second).unwrap()
+        );
         second.policies[0].global.flags ^= velstra_common::ConfigFlags::STATEFUL;
-        assert_ne!(policy_fingerprint(&first), policy_fingerprint(&second));
+        assert_ne!(
+            policy_fingerprint(&first).unwrap(),
+            policy_fingerprint(&second).unwrap()
+        );
         second = first.clone();
         second.conntrack.tcp_established = 30;
-        assert_ne!(policy_fingerprint(&first), policy_fingerprint(&second));
+        assert_ne!(
+            policy_fingerprint(&first).unwrap(),
+            policy_fingerprint(&second).unwrap()
+        );
+    }
+    fn explicit_control_policy() -> RuntimeConfig {
+        serde_json::from_value::<velstra_config::FileConfig>(serde_json::json!({
+            "ha":{"enabled":true,"cluster":"test-cluster-0123456789","node":1,"interfaces":["data0"],"control_interfaces":["ctrl-a","sync-a"]},
+            "conntrack_sync":{"listen":"10.3.0.1:5429","peer":["10.3.0.2:5429"],"secret":"fixture-state-secret-at-least-32bytes"},
+            "interface":[{"name":"data0","policy":1,"vni":10},{"name":"ctrl-a","policy":2,"vni":0},{"name":"sync-a","policy":2,"vni":0}],
+            "policy":[{"id":1,"default_action":"pass"},{"id":2,"default_action":"pass","port_rule":[{"proto":"tcp","port":5441,"action":"pass"}]}]
+        })).unwrap().resolve().unwrap()
+    }
+
+    #[test]
+    fn policy_fingerprint_explicit_control_names_and_order_are_member_local() {
+        let first = explicit_control_policy();
+        let mut peer = first.clone();
+        let ha = peer.ha.as_mut().unwrap();
+        ha.node = 2;
+        ha.control_interfaces = vec!["ctrl-b".into(), "sync-b".into()];
+        peer.interfaces[1].name = "ctrl-b".into();
+        peer.interfaces[2].name = "sync-b".into();
+        peer.interfaces.swap(0, 2);
+        let sync = peer.conntrack_sync.as_mut().unwrap();
+        sync.listen = "10.3.0.2:5429".parse().unwrap();
+        sync.peers = vec!["10.3.0.1:5429".parse().unwrap()];
+        peer.validate_firewall_capacity().unwrap();
+        assert_eq!(
+            policy_fingerprint(&first).unwrap(),
+            policy_fingerprint(&peer).unwrap()
+        );
+        // Both control bindings remain in the multiset, not just one record
+        // per common policy: adding another identically configured link differs.
+        let mut extra = first.clone();
+        let mut link = extra.interfaces[1].clone();
+        link.name = "extra-control".into();
+        extra.interfaces.push(link);
+        extra
+            .ha
+            .as_mut()
+            .unwrap()
+            .control_interfaces
+            .push("extra-control".into());
+        extra.validate_firewall_capacity().unwrap();
+        assert_ne!(
+            policy_fingerprint(&first).unwrap(),
+            policy_fingerprint(&extra).unwrap()
+        );
+    }
+
+    #[test]
+    fn policy_fingerprint_retains_all_guarded_and_control_security_semantics() {
+        let first = explicit_control_policy();
+        let expected = policy_fingerprint(&first).unwrap();
+        let mut mutations = Vec::new();
+        for interface in 0..first.interfaces.len() {
+            for field in 0..8 {
+                let mut changed = first.clone();
+                let i = &mut changed.interfaces[interface];
+                match field {
+                    0 => i.policy = 0,
+                    1 => i.vni += 1,
+                    2 => i.masquerade = !i.masquerade,
+                    3 => i.snat_address = Some([192, 0, 2, 100]),
+                    4 => i.mss = 1400,
+                    5 => i.rate_limit_mbit = Some(100),
+                    6 => i.cgnat.base_port = 10000,
+                    _ => {
+                        i.binding = Some(velstra_config::PortIdentity {
+                            mac: Some([0, 1, 2, 3, 4, 5]),
+                            v4: vec!["192.0.2.4".parse().unwrap()],
+                            v6: Vec::new(),
+                        })
+                    }
+                }
+                mutations.push(changed);
+            }
+        }
+        let mut changed = first.clone();
+        changed
+            .policies
+            .iter_mut()
+            .find(|p| p.id == 2)
+            .unwrap()
+            .port_rules[0]
+            .key
+            .port = 5442;
+        mutations.push(changed);
+        let mut changed = first.clone();
+        changed
+            .policies
+            .iter_mut()
+            .find(|p| p.id == 1)
+            .unwrap()
+            .global
+            .flags ^= velstra_common::ConfigFlags::STATEFUL;
+        mutations.push(changed);
+        let mut changed = first.clone();
+        changed.conntrack.tcp_established = 30;
+        mutations.push(changed);
+        for (index, changed) in mutations.into_iter().enumerate() {
+            assert_ne!(
+                expected,
+                policy_fingerprint(&changed).unwrap(),
+                "mutation {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_fingerprint_rejects_incomplete_overlapping_or_disabled_control_claims() {
+        let first = explicit_control_policy();
+        let mut mutations = Vec::new();
+        let mut c = first.clone();
+        c.ha.as_mut().unwrap().interfaces.clear();
+        mutations.push(c);
+        let mut c = first.clone();
+        c.ha.as_mut()
+            .unwrap()
+            .control_interfaces
+            .push("data0".into());
+        mutations.push(c);
+        let mut c = first.clone();
+        c.ha.as_mut()
+            .unwrap()
+            .control_interfaces
+            .push("ctrl-a".into());
+        mutations.push(c);
+        let mut c = first.clone();
+        c.ha.as_mut().unwrap().control_interfaces = vec!["ctrl-a".into()];
+        mutations.push(c);
+        let mut c = first.clone();
+        c.ha.as_mut()
+            .unwrap()
+            .control_interfaces
+            .push("undeclared".into());
+        mutations.push(c);
+        let mut c = first.clone();
+        c.ha.as_mut().unwrap().enabled = false;
+        mutations.push(c);
+        let mut c = first.clone();
+        let mut link = c.interfaces[0].clone();
+        link.name = "unlisted-data".into();
+        c.interfaces.push(link);
+        mutations.push(c);
+        for c in mutations {
+            assert!(c.validate_firewall_capacity().is_err());
+            assert!(policy_fingerprint(&c).is_err());
+        }
+        // Legacy configurations still hash every unlisted interface by name.
+        let mut legacy = first.clone();
+        legacy.ha.as_mut().unwrap().control_interfaces.clear();
+        let mut other = legacy.clone();
+        other.interfaces[1].name = "other-control".into();
+        assert_ne!(
+            policy_fingerprint(&legacy).unwrap(),
+            policy_fingerprint(&other).unwrap()
+        );
+        legacy.ha.as_mut().unwrap().enabled = false;
+        other.ha.as_mut().unwrap().enabled = false;
+        assert_ne!(
+            policy_fingerprint(&legacy).unwrap(),
+            policy_fingerprint(&other).unwrap()
+        );
+    }
+
+    #[test]
+    fn policy_fingerprint_legacy_version_five_golden_digest() {
+        let legacy = RuntimeConfig::passthrough();
+        let hex = policy_fingerprint(&legacy)
+            .unwrap()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            hex,
+            "1b44c3c7fa77a9a3092934f444ae00c27033e48fd67bbb1fd12a938024d4d55f"
+        );
     }
     #[tokio::test]
     async fn tcp_handshake_and_frame_roundtrip_use_fresh_sessions() {

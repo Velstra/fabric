@@ -253,6 +253,16 @@ impl State {
         }
     }
 }
+/// Publish `deadline` into the kernel fence. A failed update attempts to clear
+/// it before returning the error. If the map refuses both writes, the old
+/// bounded lease can only expire; never report that a clear succeeded.
+fn publish_kernel_fence(mut write: impl FnMut(u64) -> Result<()>, deadline: u64) -> Result<()> {
+    if let Err(error) = write(deadline) {
+        let _ = write(0);
+        return Err(error);
+    }
+    Ok(())
+}
 pub fn now_ns() -> u64 {
     let mut time = libc::timespec {
         tv_sec: 0,
@@ -730,11 +740,16 @@ pub async fn monitor(firewall: Arc<Mutex<Firewall>>, shared: Shared, config: HaC
                 now.saturating_sub(state.role.updated_ns) / 1_000_000
             );
         }
-        if let Err(error) = fw.ha_deadline(deadline) {
-            log::error!("HA kernel fence update failed: {error:#}");
-            continue;
-        }
-        if active {
+        let fence_ok = match publish_kernel_fence(|value| fw.ha_deadline(value), deadline) {
+            Ok(()) => true,
+            Err(error) => {
+                log::error!(
+                    "HA kernel fence update failed; fence reset attempted and forwarding readiness withdrawn: {error:#}"
+                );
+                false
+            }
+        };
+        if fence_ok && active {
             state.cold = false;
             state.active_term = state.role.authority.term;
             state.ready_term = state.active_term;
@@ -769,6 +784,51 @@ pub async fn monitor(firewall: Arc<Mutex<Firewall>>, shared: Shared, config: HaC
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_fence_publication_clears_the_previous_lease() {
+        let mut writes = Vec::new();
+        let error = publish_kernel_fence(
+            |deadline| {
+                writes.push(deadline);
+                if deadline != 0 {
+                    anyhow::bail!("HA deadline map update rejected");
+                }
+                Ok(())
+            },
+            9_000_000_000,
+        );
+        assert!(error.is_err());
+        assert_eq!(writes, [9_000_000_000, 0]);
+    }
+
+    #[test]
+    fn fence_clear_is_attempted_when_every_map_write_fails() {
+        let mut writes = Vec::new();
+        let error = publish_kernel_fence(
+            |deadline| {
+                writes.push(deadline);
+                anyhow::bail!("HA deadline map unavailable");
+            },
+            0,
+        );
+        assert!(error.is_err());
+        assert_eq!(writes, [0, 0]);
+    }
+
+    #[test]
+    fn successful_fence_publication_does_not_clear() {
+        let mut writes = Vec::new();
+        publish_kernel_fence(
+            |deadline| {
+                writes.push(deadline);
+                Ok(())
+            },
+            4_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(writes, [4_000_000_000]);
+    }
+
     fn config() -> HaConfig {
         HaConfig {
             enabled: true,
@@ -779,6 +839,7 @@ mod tests {
             cluster: "test-cluster-0123456789".into(),
             node: 1,
             interfaces: vec!["wan".into()],
+            control_interfaces: vec![],
             role_fresh_ms: 100,
         }
     }
