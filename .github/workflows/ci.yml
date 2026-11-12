@@ -114,9 +114,9 @@ jobs:
       # anything: that is the `datapath` job at the bottom of this file, which
       # needs root and therefore runs nightly rather than here.
       # Hand the freshly-built binaries to the `images` job so it doesn't repeat
-      # the (slow) eBPF release build. Only on push — PRs don't publish.
+      # the (slow) eBPF release build. Only version tags publish artifacts.
       - name: Upload release binaries
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v7
         with:
           name: velstra-binaries
@@ -171,13 +171,13 @@ jobs:
         run: sudo -E ./tests/e2e/loadcheck.sh
 
   # Build the three container images from the binaries the `build` job produced
-  # and push them to GHCR. Runs only on a push to the default branch or a version
-  # tag — never on pull requests (which can't access the registry token anyway).
+  # and push them to GHCR. A main-branch integration is NOT a release. Only a
+  # deliberate version tag may publish, after every verification lane succeeds.
   images:
     name: container images — build & push
     runs-on: ubuntu-latest
-    needs: build
-    if: github.event_name == 'push'
+    needs: [logic, build, loadcheck, datapath]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read
       packages: write
@@ -200,18 +200,14 @@ jobs:
       - name: Build and push (controller, agent, cni)
         run: |
           set -eu
-          # GHCR requires a lowercase owner; the SHA is always a tag, plus
-          # `latest` on the default branch and the tag name on a version tag.
+          # Never move latest from an unqualified main push. Publish the exact
+          # version and its full commit identity only; promotion is deliberate.
           REGISTRY="ghcr.io/$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
-          SHA_TAG="${GITHUB_SHA:0:7}"
+          SHA_TAG="${GITHUB_SHA}"
           for c in controller agent cni; do
-            TAGS="-t ${REGISTRY}/${c}:${SHA_TAG}"
-            case "$GITHUB_REF" in
-              refs/heads/main|refs/heads/master) TAGS="${TAGS} -t ${REGISTRY}/${c}:latest" ;;
-              refs/tags/*)                       TAGS="${TAGS} -t ${REGISTRY}/${c}:${GITHUB_REF_NAME}" ;;
-            esac
-            echo "building ${c}: ${TAGS}"
-            docker buildx build --push -f "deploy/docker/Dockerfile.${c}" ${TAGS} .
+            TAGS=(-t "${REGISTRY}/${c}:${SHA_TAG}" -t "${REGISTRY}/${c}:${GITHUB_REF_NAME}")
+            echo "building ${c}: ${TAGS[*]}"
+            docker buildx build --push -f "deploy/docker/Dockerfile.${c}" "${TAGS[@]}" .
           done
 
   # The datapath itself: `tests/e2e/run.sh` loads the real XDP and TC programs
@@ -232,7 +228,7 @@ jobs:
   # ebpf]`, not deleting the job: the first nightly failure is information.
   datapath:
     name: e2e datapath (nightly, needs root)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -254,3 +250,32 @@ jobs:
         run: cargo build --release --locked
       - name: Run the end-to-end datapath suite
         run: sudo -E ./tests/e2e/run.sh
+
+  # Keep GitHub release creation in the same dependency graph as container
+  # publication. A separate tag workflow could publish before verification.
+  release:
+    name: verified version release
+    needs: [logic, build, loadcheck, datapath, images]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Extract release notes from CHANGELOG
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            $0 ~ ("^## \\[" v "\\]") { inblock = 1; next }
+            inblock && /^## \[/ { exit }
+            inblock { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          test -s RELEASE_NOTES.md
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file RELEASE_NOTES.md \
+            --verify-tag

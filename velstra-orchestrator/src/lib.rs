@@ -2023,17 +2023,15 @@ impl Topology {
             // the guest never sends the TCP/UDP packet to the datapath at all.
             // Use the router's anycast MAC on routed segments; a plain segment
             // gets a stable, locally administered MAC scoped by its VNI.
-            let service_mac = self.ip_vrf_of_network(lb.vni).map_or_else(
-                || {
-                    [
-                        0x02,
-                        0x56,
-                        0x00,
-                        (lb.vni >> 16) as u8,
-                        (lb.vni >> 8) as u8,
-                        lb.vni as u8,
-                    ]
-                },
+            let service_mac = self.ip_vrf_of_network(lb.vni).map_or(
+                [
+                    0x02,
+                    0x56,
+                    0x00,
+                    (lb.vni >> 16) as u8,
+                    (lb.vni >> 8) as u8,
+                    lb.vni as u8,
+                ],
                 |vrf| vrf.gateway_mac,
             );
             if !cfg
