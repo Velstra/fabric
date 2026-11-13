@@ -21,14 +21,12 @@ Full texts: [`LICENSE`](LICENSE) (AGPL-3.0), [`LICENSE-MIT`](LICENSE-MIT),
 
 ## Commercial / dual licensing
 
-The AGPL is deliberate: it keeps the project open and discourages closed forks
-and unshared SaaS. Organisations that cannot accept the AGPL's obligations (for
-example, embedding Velstra in a closed-source appliance) can obtain a separate
-**commercial license** — this is possible because contributors sign a CLA (see
-[`CONTRIBUTING.md`](CONTRIBUTING.md)) granting the maintainer the right to
-relicense. Contact the maintainer for commercial terms.
+Contact the maintainer to discuss commercial terms. Availability depends on the
+rights held for the relevant code and bundled dependencies. No project CLA is
+currently administered; do not assume that contributors have granted additional
+commercial relicensing rights. The licenses listed above remain authoritative.
 
 ## Contributions
 
-By contributing you agree to the Contributor License Agreement, which keeps
-dual-licensing possible. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+Contributions use their component's license. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md); a documentation statement is not a signed CLA.

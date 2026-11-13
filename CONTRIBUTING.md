@@ -2,26 +2,16 @@
 
 Contributions are welcome — bug reports, fixes, features, docs.
 
-## License & CLA
+## License
 
 Velstra is **AGPL-3.0-or-later** (the shared ABI libraries are MIT/Apache and
 the eBPF object is GPL/MIT — see [`LICENSING.md`](LICENSING.md)).
 
-To keep **dual-licensing** possible (so the project can fund itself by offering a
-commercial license to organisations that cannot use the AGPL), contributors must
-agree to a **Contributor License Agreement (CLA)** before their first
-contribution is merged. The CLA:
-
-- lets you keep the copyright to your contribution, **and**
-- grants the maintainer the right to license your contribution under the AGPL
-  *and* under separate commercial terms.
-
-Without this, the project could never be relicensed (it would need every past
-contributor's permission), and the open-core/commercial model would be
-impossible. This is the same approach used by Qt, Grafana, and many others.
-
-> The CLA is enforced via [CLA Assistant](https://github.com/cla-assistant/cla-assistant)
-> on pull requests. (Set this up on the GitHub repo before accepting external PRs.)
+Contributions use the license of the component they modify. There is currently
+no administered Contributor License Agreement (CLA) or configured CLA-enforcement
+process. A pull request is not evidence of consent to additional commercial
+relicensing rights. Any future CLA requires a separate, explicit process and
+review of existing contributions.
 
 ## Development
 
