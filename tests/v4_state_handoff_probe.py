@@ -221,7 +221,15 @@ def exercise(pid, interface):
             results.append(name)
             print("PASSED " + name, flush=True)
 
-        check("ordinary IPv4 packet passes unchanged", kernel.packet(ingress, packet, ifindex) == (2, packet))
+        ordinary = kernel.packet(ingress, packet, ifindex)
+        need(ordinary == (2, packet),
+             "ordinary IPv4 packet differs: " + json.dumps({
+                 "kernel": platform.release(), "action": ordinary[0],
+                 "input": packet.hex(), "output": ordinary[1].hex(),
+                 "ready": kernel.value(ready, 4).hex(),
+                 "epoch": kernel.value(epoch, 8).hex(),
+             }))
+        check("ordinary IPv4 packet passes unchanged", True)
         width = 72 * kernel.cpus
         original = kernel.value(scratch, width)
         start = kernel.cpu * 72
