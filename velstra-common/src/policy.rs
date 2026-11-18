@@ -391,11 +391,28 @@ pub enum Counter {
     /// once: a host has one overlay format, so which of the pair moves says which
     /// wire format is actually carrying the fabric's broadcast traffic.
     Srv6BumReplicated = 44,
+    /// Unsupported forwarded IPv4 fragment refused before masquerade. A reason
+    /// subset of EgressDropped, not an additional packet in aggregate totals.
+    EgressNatFragmentDropped = 45,
+    /// No reusable/claimable port or echo identifier in the bounded NAT
+    /// candidate window. This does NOT mean the state map is full. Packet
+    /// attempts (including retransmissions), not a count of rejected flows.
+    /// Reason subset of EgressDropped; never add it to aggregate drops again.
+    EgressNatNoCandidate = 46,
+    /// NAT NOEXIST insertion failed with an error other than a competing
+    /// claim (EEXIST). A map/helper failure, not proof of capacity exhaustion.
+    /// Reason subset of EgressDropped, counting packet attempts.
+    EgressNatClaimFailed = 47,
+    /// Packet refused after a required firewall-state write or scratch lookup
+    /// failed. Reason subset: TC also counts EgressDropped, ingress counts
+    /// DroppedRule (or SynproxyRejected for a cookie admission failure).
+    /// Not a flow count, capacity measurement or proof of paired atomicity.
+    FirewallStateWriteFailed = 48,
 }
 
 impl Counter {
     /// Number of distinct counters — the `max_entries` of the `STATS` map.
-    pub const COUNT: u32 = 45;
+    pub const COUNT: u32 = 49;
 
     /// The array index of this counter.
     #[inline]
@@ -446,6 +463,10 @@ impl Counter {
             42 => Counter::DroppedNotYours,
             43 => Counter::DroppedPortRate,
             44 => Counter::Srv6BumReplicated,
+            45 => Counter::EgressNatFragmentDropped,
+            46 => Counter::EgressNatNoCandidate,
+            47 => Counter::EgressNatClaimFailed,
+            48 => Counter::FirewallStateWriteFailed,
             36 => Counter::SynproxyChallenged,
             37 => Counter::SynproxyAdmitted,
             38 => Counter::SynproxyRejected,
@@ -507,6 +528,10 @@ impl Counter {
             Counter::DroppedNotYours => "dropped_not_yours",
             Counter::DroppedPortRate => "dropped_port_rate",
             Counter::Srv6BumReplicated => "srv6_bum_replicated",
+            Counter::EgressNatFragmentDropped => "egress_nat_fragment_dropped",
+            Counter::EgressNatNoCandidate => "egress_nat_no_candidate",
+            Counter::EgressNatClaimFailed => "egress_nat_claim_failed",
+            Counter::FirewallStateWriteFailed => "firewall_state_write_failed",
             Counter::SynproxyChallenged => "synproxy_challenged",
             Counter::SynproxyAdmitted => "synproxy_admitted",
             Counter::SynproxyRejected => "synproxy_rejected",
@@ -819,6 +844,29 @@ mod tests {
             assert!(!c.label().is_empty());
         }
         assert_eq!(Counter::from_u32(Counter::COUNT), None);
+    }
+
+    #[test]
+    fn nat_failure_reasons_append_without_renumbering_existing_counters() {
+        assert_eq!(Counter::EgressDropped.index(), 22);
+        assert_eq!(Counter::EgressMasqueraded.index(), 23);
+        assert_eq!(Counter::EgressNatFragmentDropped.index(), 45);
+        assert_eq!(Counter::EgressNatNoCandidate.index(), 46);
+        assert_eq!(Counter::EgressNatClaimFailed.index(), 47);
+        assert_eq!(
+            Counter::EgressNatNoCandidate.label(),
+            "egress_nat_no_candidate"
+        );
+        assert_eq!(
+            Counter::EgressNatClaimFailed.label(),
+            "egress_nat_claim_failed"
+        );
+        assert_eq!(Counter::FirewallStateWriteFailed.index(), 48);
+        assert_eq!(
+            Counter::FirewallStateWriteFailed.label(),
+            "firewall_state_write_failed"
+        );
+        assert_eq!(Counter::COUNT, 49);
     }
 
     #[test]

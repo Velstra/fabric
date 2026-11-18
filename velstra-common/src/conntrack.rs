@@ -153,10 +153,12 @@ impl FirewallState {
 
     #[inline(always)]
     pub fn idle_ns(&self, now: u64) -> u64 {
-        if now < self.last_seen_ns {
-            return u64::MAX;
-        }
-        (now - self.last_seen_ns).saturating_add(self.age_ns)
+        // A shared map can be refreshed on CPU B after CPU A sampled `now`.
+        // That is recent activity, NOT an invalid clock epoch. Expiring it here
+        // deletes live TCP state under load. Peer timestamps are never copied:
+        // conntrack sync imports a relative age rebased onto our local clock.
+        now.saturating_sub(self.last_seen_ns)
+            .saturating_add(self.age_ns)
     }
 
     /// `control` is TCP flags or the ICMP type. Unknown protocols are never
@@ -391,7 +393,7 @@ mod tests {
             let end = 100 + seconds * 1_000_000_000;
             assert!(!state.expired(proto, end - 1, custom));
             assert!(state.expired(proto, end, custom));
-            assert!(state.expired(proto, 99, custom));
+            assert!(!state.expired(proto, 99, custom));
         }
     }
 
@@ -508,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn reply_exemption_expires_and_rejects_other_clock_epochs() {
+    fn reply_exemption_expires_but_survives_a_concurrent_refresh() {
         let state = FirewallState {
             phase: FirewallState::ESTABLISHED,
             reply: 1,
@@ -517,7 +519,31 @@ mod tests {
         let deadline = 1 + T.tcp_established as u64 * 1_000_000_000;
         assert!(state.is_routed_reply(6, tcp_flags::ACK, deadline - 1, T));
         assert!(!state.is_routed_reply(6, tcp_flags::ACK, deadline, T));
-        assert!(!state.is_routed_reply(6, tcp_flags::ACK, 0, T));
+        assert!(state.is_routed_reply(6, tcp_flags::ACK, 0, T));
+    }
+
+    #[test]
+    fn a_newer_cpu_refresh_does_not_expire_a_live_connection() {
+        let state = FirewallState {
+            last_seen_ns: 1_000_000_001,
+            age_ns: 0,
+            phase: FirewallState::ESTABLISHED,
+            reply: 0,
+        };
+        // Deterministic interleaving: A reads the clock, B refreshes the map,
+        // then A reads the map. The old subtraction expired/deleted this flow.
+        let sampled_before_refresh = 1_000_000_000;
+        assert_eq!(state.idle_ns(sampled_before_refresh), 0);
+        assert_eq!(state.classify(6, ACK, sampled_before_refresh, T), 1);
+        assert!(state.observe(6, ACK, sampled_before_refresh, T).is_some());
+        // Carried peer age still applies, including at the timeout boundary.
+        assert!(
+            FirewallState {
+                age_ns: T.tcp_established as u64 * 1_000_000_000,
+                ..state
+            }
+            .expired(6, sampled_before_refresh, T)
+        );
     }
 
     #[test]

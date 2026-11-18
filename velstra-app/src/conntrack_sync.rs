@@ -13,13 +13,11 @@
 //!   after a failover the reply of an established *stateful-firewall* flow
 //!   (even one that is not NAT'd) hits the default-drop and is discarded.
 //!
-//! With a `secret`, [`secure`] uses authenticated TCP, policy fencing and
-//! batched map differences. Without it the compatibility task [`run`] binds a UDP
-//! socket and, each interval, **pushes** every live entry of *both* maps to the
-//! configured peer(s); symmetrically it **applies** entries received from a peer
-//! into its own maps. So the backup already holds the master's flow *and*
-//! firewall tables when the VIP lands on it, and established connections — NAT'd
-//! or merely stateful-firewalled — survive the failover.
+//! [`secure`] requires a shared credential and uses authenticated TCP, policy
+//! fencing and batched map differences. Unauthenticated UDP replication has
+//! been removed: legacy configurations are rejected before attaching the data
+//! plane. The codec here remains the record representation inside authenticated
+//! VCS2 frames; successful decoding alone never authorizes map updates.
 //!
 //! ## Wire format
 //!
@@ -45,24 +43,20 @@
 //!
 //! ## Trust model
 //!
-//! Like pfsync, the legacy UDP stream is **unauthenticated** and must run over a
-//! trusted link — a dedicated sync interface or a protected segment between the
-//! two appliances. A peer that can reach the `listen` socket can inject conntrack
-//! (hence NAT) and firewall state, so do not expose it to untrusted networks. (A
-//! configured `secret` selects the authenticated VCS2 transport instead.)
+//! VCS2 authenticates both peers and every sequenced frame. It does not encrypt
+//! flow metadata: use an isolated network or WireGuard for confidentiality.
+//! No UDP listener or automatic protocol downgrade is available.
 //!
 //! The codec ([`encode_conntrack_batch`] / [`encode_fwflows_batch`] /
 //! [`decode_datagram`]) is pure and allocation-only so it is unit-tested without
 //! a socket or a kernel map.
 
-use std::{net::SocketAddr, sync::Arc};
-
-use aya::maps::{HashMap, MapData};
-use log::{info, warn};
-use tokio::{net::UdpSocket, sync::Mutex};
 use velstra_common::{FirewallKey, FirewallState, FlowKey, FlowState};
 
 pub mod secure;
+/// Isolated versioned TCP codec; not accepted by the active VCS2 receiver yet.
+#[cfg(test)]
+pub mod tcp;
 
 /// Datagram magic + version tag (`VCS1` = Velstra Conntrack Sync v1).
 const MAGIC: [u8; 4] = *b"VCS1";
@@ -85,8 +79,6 @@ const HEADER_LEN: usize = 8;
 /// 1500-byte MTU without relying on IP fragmentation. A FW_FLOWS datagram uses
 /// the same cap and is smaller (20-byte records), so it also fits.
 const MAX_RECORDS: usize = 32;
-/// Receive buffer: one maximum-size (CONNTRACK) datagram.
-const RECV_BUF: usize = HEADER_LEN + 20 * 60;
 
 /// A decoded datagram: one map's worth of records, tagged by which map it came
 /// from so the receiver applies it to the right kernel table.
@@ -259,27 +251,6 @@ pub fn decode_datagram(buf: &[u8]) -> Option<Datagram> {
     }
 }
 
-/// Read every entry of the `CONNTRACK` LRU map into an owned vector. An empty map
-/// yields an empty vector; a per-entry read error is skipped rather than aborting
-/// the scan. Returning owned data ends the map borrow before the caller sends or
-/// (in the same task) inserts.
-fn read_conntrack(map: &HashMap<MapData, FlowKey, FlowState>) -> Vec<(FlowKey, FlowState)> {
-    let mut out = Vec::new();
-    for key in map.keys().flatten() {
-        if let Ok(val) = map.get(&key, 0) {
-            out.push((key, val));
-        }
-    }
-    out
-}
-
-/// Read state together with each key. A concurrently evicted key is skipped.
-fn read_fw_flows(
-    map: &HashMap<MapData, FirewallKey, FirewallState>,
-) -> Vec<(FirewallKey, FirewallState)> {
-    map.iter().filter_map(Result::ok).collect()
-}
-
 pub(crate) fn monotonic_ns() -> u64 {
     let mut time = libc::timespec {
         tv_sec: 0,
@@ -379,137 +350,6 @@ fn decode_firewall(buf: &[u8], count: usize) -> Option<Datagram> {
         records.push((k, state));
     }
     Some(Datagram::Firewall(records))
-}
-
-/// Long-lived task: own the `CONNTRACK` and `FW_FLOWS` handles and a bound UDP
-/// socket, and every `interval` **push** both full tables to each peer while
-/// continuously **applying** any datagrams peers push to us.
-///
-/// Best-effort throughout: a send error to one peer is logged and the others
-/// still get the push; a malformed inbound datagram is dropped; a per-entry map
-/// insert error is logged and the rest of the batch still applies. Nothing in the
-/// loop can panic the agent.
-pub async fn run(
-    conntrack: Arc<Mutex<HashMap<MapData, FlowKey, FlowState>>>,
-    mut fw_flows: HashMap<MapData, FirewallKey, FirewallState>,
-    listen: SocketAddr,
-    peers: Vec<SocketAddr>,
-    interval_secs: u64,
-) {
-    let socket = match UdpSocket::bind(listen).await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("conntrack-sync: bind {listen} failed, sync disabled: {e}");
-            return;
-        }
-    };
-    info!(
-        "conntrack-sync: listening on {listen}, pushing to {} peer(s) every {interval_secs}s",
-        peers.len()
-    );
-
-    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-    let mut rx = vec![0u8; RECV_BUF];
-
-    loop {
-        tokio::select! {
-            // Push our live conntrack + firewall tables to every peer.
-            _ = ticker.tick() => {
-                if peers.is_empty() {
-                    continue;
-                }
-                let ct = read_conntrack(&*conntrack.lock().await);
-                let fw = read_fw_flows(&fw_flows);
-                if ct.is_empty() && fw.is_empty() {
-                    continue;
-                }
-                let mut datagrams = encode_nat_batch(&ct, monotonic_ns());
-                datagrams.extend(encode_firewall_batch(&fw, monotonic_ns()));
-                for peer in &peers {
-                    for dg in &datagrams {
-                        if let Err(e) = socket.send_to(dg, peer).await {
-                            warn!("conntrack-sync: push to {peer} failed: {e}");
-                            break; // this peer is unreachable; try it again next tick
-                        }
-                    }
-                }
-                info!(
-                    "conntrack-sync: pushed {} conntrack + {} fw-flow entries to {} peer(s)",
-                    ct.len(), fw.len(), peers.len()
-                );
-            }
-
-            // Apply a peer's pushed state into our own tables.
-            res = socket.recv_from(&mut rx) => {
-                let (n, from) = match res {
-                    Ok(v) => v,
-                    Err(e) => { warn!("conntrack-sync: recv failed: {e}"); continue; }
-                };
-                let decoded = match decode_datagram(&rx[..n]) {
-                    Some(Datagram::Nat(mut entries)) => {
-                        let now = monotonic_ns();
-                        for (_, state) in &mut entries { state.last_seen_ns = now; }
-                        Some(Datagram::Nat(entries))
-                    }
-                    other => other,
-                };
-                match decoded {
-                    Some(Datagram::Conntrack(records)) | Some(Datagram::Nat(records)) => {
-                        let mut applied = 0usize;
-                        for (k, v) in &records {
-                            let mut map = conntrack.lock().await;
-                            // A peer's record carries no counters (see `encode_val`), so
-                            // applying it verbatim would zero this node's own accounting
-                            // for a flow it is actively forwarding. In an N-way mesh every
-                            // node pushes, so that would happen every interval — the
-                            // counters would never get past one tick's worth of traffic.
-                            let mut v = *v;
-                            if v.last_seen_ns == 0 { v.last_seen_ns = monotonic_ns(); }
-                            if let Ok(local) = map.get(k, 0) {
-                                if local.idle_ns(monotonic_ns()) < v.idle_ns(monotonic_ns()) { continue; }
-                                v.packets = local.packets;
-                                v.bytes = local.bytes;
-                            }
-                            match map.insert(k, v, 0) {
-                                Ok(()) => applied += 1,
-                                Err(e) => warn!("conntrack-sync: apply conntrack entry from {from} failed: {e}"),
-                            }
-                        }
-                        if applied > 0 {
-                            info!("conntrack-sync: applied {applied} conntrack entries from {from}");
-                        }
-                    }
-                    Some(Datagram::FwFlows(keys)) => {
-                        let mut applied = 0usize;
-                        for k in &keys {
-                            let k = FirewallKey::ipv4(*k);
-                            let state = FirewallState { last_seen_ns: monotonic_ns(), age_ns: 0, phase: FirewallState::ESTABLISHED, reply: 0 };
-                            match fw_flows.insert(k, state, 0) {
-                                Ok(()) => applied += 1,
-                                Err(e) => warn!("conntrack-sync: apply fw-flow entry from {from} failed: {e}"),
-                            }
-                        }
-                        if applied > 0 {
-                            info!("conntrack-sync: applied {applied} fw-flow entries from {from}");
-                        }
-                    }
-                    Some(Datagram::Firewall(records)) => {
-                        let now = monotonic_ns();
-                        for (key, age) in records {
-                            let state = FirewallState { last_seen_ns: now, ..age };
-                            // Do not replace state that has seen a more recent
-                            // packet locally with an older peer snapshot.
-                            if fw_flows.get(&key, 0).is_ok_and(|s| s.idle_ns(now) < state.idle_ns(now)) { continue; }
-                            if let Err(e) = fw_flows.insert(key, state, 0) {
-                                warn!("conntrack-sync: applying firewall state from {from} failed: {e}");
-                            }
-                        }
-                    }
-                    None => warn!("conntrack-sync: dropped malformed datagram from {from}"),
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]

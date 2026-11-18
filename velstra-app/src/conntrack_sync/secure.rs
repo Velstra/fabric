@@ -11,7 +11,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     io,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     os::fd::{AsFd, AsRawFd},
     sync::{
         Arc,
@@ -686,6 +686,22 @@ async fn send_records(
 }
 
 async fn push(
+    stream: TcpStream,
+    secret: Arc<String>,
+    snapshots: watch::Receiver<Option<Arc<Snapshot>>>,
+) -> Result<()> {
+    let mut unavailable = snapshots.clone();
+    // Retire even a stalled handshake/write when export authority is lost.
+    // Cancelling an in-progress frame is safe only because we drop this TCP
+    // session entirely; the next session always starts with a full snapshot.
+    tokio::select! {
+        biased;
+        _ = unavailable.wait_for(Option::is_none) => Ok(()),
+        result = push_available(stream, secret, snapshots) => result,
+    }
+}
+
+async fn push_available(
     mut stream: TcpStream,
     secret: Arc<String>,
     mut snapshots: watch::Receiver<Option<Arc<Snapshot>>>,
@@ -737,9 +753,49 @@ async fn push(
             write_frame(&mut stream, &mut session, next.policy, HEARTBEAT, &[]).await?;
             previous = Some(next);
         } else {
-            previous = None;
+            return Ok(());
         }
         snapshots.changed().await?;
+    }
+}
+
+async fn send_peer(
+    peer: SocketAddr,
+    secret: Arc<String>,
+    mut snapshots: watch::Receiver<Option<Arc<Snapshot>>>,
+) {
+    let mut retry = 50u64;
+    loop {
+        // Standbys must not authenticate idle sessions or consume receiver
+        // permits. Drop the watch borrow before connecting or awaiting I/O.
+        if snapshots.has_changed().is_err() || snapshots.wait_for(Option::is_some).await.is_err() {
+            return;
+        }
+        let mut unavailable = snapshots.clone();
+        let result = tokio::select! {
+            biased;
+            _ = unavailable.wait_for(Option::is_none) => {
+                retry = 50;
+                continue;
+            }
+            result = timeout(IO_TIMEOUT, TcpStream::connect(peer)) => result,
+        };
+        let result = match result {
+            Ok(Ok(stream)) => {
+                retry = 50;
+                push(stream, secret.clone(), snapshots.clone()).await
+            }
+            Ok(Err(error)) => Err(error.into()),
+            Err(error) => Err(error.into()),
+        };
+        log::debug!("conntrack-sync: peer {peer} disconnected: {result:?}");
+        tokio::select! {
+            biased;
+            _ = unavailable.wait_for(Option::is_none) => { retry = 50; }
+            _ = tokio::time::sleep(Duration::from_millis(retry)) => {
+                retry = (retry * 2).min(1000);
+            }
+        }
     }
 }
 
@@ -947,24 +1003,7 @@ pub async fn run(
     }));
     let (snapshots, receiver) = watch::channel(None);
     for peer in config.peers.iter().copied() {
-        let secret = secret.clone();
-        let receiver = receiver.clone();
-        tokio::spawn(async move {
-            let mut retry = 50u64;
-            loop {
-                let result = match timeout(IO_TIMEOUT, TcpStream::connect(peer)).await {
-                    Ok(Ok(stream)) => {
-                        retry = 50;
-                        push(stream, secret.clone(), receiver.clone()).await
-                    }
-                    Ok(Err(error)) => Err(error.into()),
-                    Err(error) => Err(error.into()),
-                };
-                log::debug!("conntrack-sync: peer {peer} disconnected: {result:?}");
-                tokio::time::sleep(Duration::from_millis(retry)).await;
-                retry = (retry * 2).min(1000);
-            }
-        });
+        tokio::spawn(send_peer(peer, secret.clone(), receiver.clone()));
     }
     let permits = Arc::new(Semaphore::new(config.peers.len().max(1) * 2));
     let generations: BTreeMap<_, _> = config
@@ -2035,6 +2074,171 @@ mod tests {
             "1b44c3c7fa77a9a3092934f444ae00c27033e48fd67bbb1fd12a938024d4d55f"
         );
     }
+    #[tokio::test]
+    async fn tcp_sender_retires_session_when_snapshot_becomes_unavailable() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let (snapshots, receiver) = watch::channel(Some(Arc::new(Snapshot {
+            authority: None,
+            policy: [7; 32],
+            entries: Entries::new(),
+        })));
+        let sender = tokio::spawn(push(stream, Arc::new("test secret".into()), receiver));
+        let key = timeout(IO_TIMEOUT, handshake(&mut peer, b"test secret", false))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut session = Session { key, sequence: 0 };
+        for expected in [BEGIN, END, HEARTBEAT] {
+            let bytes = timeout(IO_TIMEOUT, read_frame(&mut peer))
+                .await
+                .unwrap()
+                .unwrap();
+            let (policy, kind, _) = session.verify(&bytes).unwrap();
+            assert_eq!(policy, [7; 32]);
+            assert_eq!(kind, expected);
+        }
+        // The completed authenticated snapshot is the synchronization barrier:
+        // retiring export authority must close the session, not leave an idle
+        // socket until the receiver's three-second watchdog expires.
+        snapshots.send_replace(None);
+        let retired = timeout(Duration::from_secs(1), peer.read_u8()).await;
+        sender.abort();
+        assert!(
+            matches!(retired, Ok(Err(ref error)) if error.kind() == io::ErrorKind::UnexpectedEof),
+            "sender did not retire its unavailable snapshot session: {retired:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_sender_cancels_stalled_handshake_on_authority_loss() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let (snapshots, receiver) = watch::channel(Some(Arc::new(Snapshot {
+            authority: None,
+            policy: [7; 32],
+            entries: Entries::new(),
+        })));
+        let sender = tokio::spawn(push(stream, Arc::new("test secret".into()), receiver));
+        // Read the client's challenge but deliberately never answer it.
+        let mut challenge = [0; 36];
+        timeout(IO_TIMEOUT, peer.read_exact(&mut challenge))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&challenge[..4], b"VCS2");
+        snapshots.send_replace(None);
+        let retired = timeout(Duration::from_secs(1), peer.read_u8()).await;
+        sender.abort();
+        assert!(
+            matches!(retired, Ok(Err(ref error)) if error.kind() == io::ErrorKind::UnexpectedEof),
+            "stalled handshake retained export session: {retired:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_sender_waits_for_snapshot_and_reconnects_with_full_state() {
+        timeout(Duration::from_secs(5), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (snapshots, receiver) = watch::channel(None);
+            let sender = tokio::spawn(send_peer(
+                listener.local_addr().unwrap(),
+                Arc::new("test secret".into()),
+                receiver,
+            ));
+            // No exportable snapshot: not even a TCP connection may be made.
+            assert!(
+                timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+            for term in [1, 2] {
+                let authority = Some(Authority {
+                    term,
+                    owner: 1,
+                    boot: [3; 16],
+                    policy: [7; 32],
+                });
+                let record = Record::Wireguard(ha::wireguard::Endpoint {
+                    interface: *b"wg0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+                    public_key: [9; 32],
+                    ip: [10, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    port: 51820,
+                    family: 4,
+                });
+                let snapshot = Arc::new(Snapshot {
+                    authority: authority.clone(),
+                    policy: [7; 32],
+                    entries: [(record.key(), record)].into_iter().collect(),
+                });
+                snapshots.send_replace(Some(snapshot.clone()));
+                let (mut peer, _) = listener.accept().await.unwrap();
+                let key = handshake(&mut peer, b"test secret", false).await.unwrap();
+                let mut session = Session { key, sequence: 0 };
+                for expected in [BEGIN, UPSERT, END, HEARTBEAT] {
+                    let bytes = read_frame(&mut peer).await.unwrap();
+                    let (policy, kind, payload) = session.verify(&bytes).unwrap();
+                    assert_eq!((policy, kind), ([7; 32], expected));
+                    match kind {
+                        BEGIN => assert_eq!(decode_authority(payload, policy).unwrap(), authority),
+                        UPSERT => assert_eq!(unpack(payload).unwrap(), vec![record]),
+                        _ => assert!(payload.is_empty()),
+                    }
+                }
+                // Subsequent unchanged snapshots send only a heartbeat.
+                snapshots.send_replace(Some(snapshot));
+                let bytes = read_frame(&mut peer).await.unwrap();
+                assert_eq!(session.verify(&bytes).unwrap().1, HEARTBEAT);
+                snapshots.send_replace(None);
+                assert_eq!(
+                    peer.read_u8().await.unwrap_err().kind(),
+                    io::ErrorKind::UnexpectedEof
+                );
+                assert!(
+                    timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err()
+                );
+            }
+            drop(snapshots);
+            sender.await.unwrap();
+        })
+        .await
+        .expect("sender lifecycle did not finish");
+    }
+
+    #[tokio::test]
+    async fn tcp_sender_exits_when_snapshot_producer_closes_with_last_value_available() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (snapshots, receiver) = watch::channel(Some(Arc::new(Snapshot {
+            authority: None,
+            policy: [7; 32],
+            entries: Entries::new(),
+        })));
+        drop(snapshots);
+        timeout(
+            Duration::from_secs(1),
+            send_peer(
+                listener.local_addr().unwrap(),
+                Arc::new("test secret".into()),
+                receiver,
+            ),
+        )
+        .await
+        .expect("closed producer caused a reconnect loop");
+        assert!(
+            timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn tcp_handshake_and_frame_roundtrip_use_fresh_sessions() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

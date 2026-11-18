@@ -2,17 +2,19 @@
 //! processing within the kernel's per-call-chain stack limit.
 use aya_ebpf::{
     bindings::{TC_ACT_OK, TC_ACT_SHOT, xdp_action},
-    helpers::bpf_ktime_get_ns,
     macros::{classifier, xdp},
     programs::{TcContext, XdpContext},
 };
-use velstra_common::{Counter, FlowKey, FlowState, ip_proto, plan_icmp_echo_nat};
+use velstra_common::{
+    CgnatLayout, Counter, FlowKey, FlowState, NaptClaim, NaptSlot, ip_proto, napt_claim, napt_port,
+    napt_seed, napt_slot, plan_icmp_echo_nat,
+};
 
 use super::{
     CONNTRACK, IFACE_POLICY, MASQUERADE, O_IP_CSUM, O_IP_DST, O_IP_SRC, SCRATCH, VELSTRA_PROGS,
-    account_flow, bump,
-    conntrack::{ct_control, ct_key4, ct_record, timeouts},
-    epoch, insert_nat, link_layer, napt_port, napt_seed, ptr_at,
+    account_flow, account_masquerade_binding, bump, claim_masquerade_nat,
+    conntrack::{ct_control, ct_key4, ct_record},
+    epoch, existing_napt_port, link_layer, ptr_at,
 };
 
 const ICMP: usize = 34;
@@ -33,6 +35,19 @@ pub fn velstra_icmp_nat(ctx: XdpContext) -> u32 {
 #[inline(always)]
 fn reply(ctx: &XdpContext) -> Result<u32, ()> {
     let scratch = SCRATCH.get(0).ok_or(())?;
+    // RELATED admission occurred in the ordinary policy path. Recompute the
+    // binding here rather than trusting a stale scratch decision; do not
+    // account/refresh or insert any NAT/firewall state for an error message.
+    if super::icmp_related::error_probe(scratch.icmp_type) {
+        if super::icmp_related::classify_xdp(ctx, scratch.policy_id) {
+            super::icmp_related::translate_xdp(ctx, scratch.policy_id)?;
+            bump(Counter::EstablishedAllowed);
+            return Ok(xdp_action::XDP_PASS);
+        }
+        // Policy explicitly admitted an ordinary, unrelated/non-NAT error.
+        // Never give it a translation or create a reverse permission.
+        return forward(ctx);
+    }
     if scratch.ihl_bytes != 20 {
         return forward(ctx);
     }
@@ -85,7 +100,10 @@ fn forward(ctx: &XdpContext) -> Result<u32, ()> {
 #[classifier]
 pub fn velstra_egress_icmp(ctx: TcContext) -> i32 {
     let before = epoch::egress_snapshot();
-    let action = request(&ctx).unwrap_or(TC_ACT_SHOT as i32);
+    let action = request(&ctx).unwrap_or_else(|()| {
+        bump(Counter::EgressDropped);
+        TC_ACT_SHOT as i32
+    });
     if epoch::unchanged(before) {
         link_layer::finish_tc(&ctx, action)
     } else {
@@ -114,35 +132,58 @@ fn request(ctx: &TcContext) -> Result<i32, ()> {
     let original_id = u16::from_be_bytes([echo[4], echo[5]]);
     if source != public {
         let seed = napt_seed(source, remote, original_id, 0);
-        let mut mapped = 0;
+        let bytes = (ctx.data_end() - ctx.data()) as u64;
+        let flow = FlowKey::new(policy, source, remote, original_id, 0, ip_proto::ICMP);
+        // As with TCP/UDP, a live owned identifier later in the window wins
+        // over an earlier vacancy. This preserves the established public ID.
+        // ICMP keeps its existing candidate seed/range and has no CGNAT layout.
+        let mut mapped = existing_napt_port(&flow, source, public, &CgnatLayout::default(), seed);
+        if mapped != 0 {
+            let key = FlowKey::new(policy, remote, public, 0, mapped, ip_proto::ICMP);
+            if !account_masquerade_binding(&key, source, original_id, bytes) {
+                mapped = 0;
+            }
+        }
+        let state = FlowState::masquerade(source, original_id);
         for probe in 0..8 {
+            if mapped != 0 {
+                break;
+            }
             let candidate = napt_port(seed, probe);
             let key = FlowKey::new(policy, remote, public, 0, candidate, ip_proto::ICMP);
-            match unsafe { CONNTRACK.get(&key) } {
-                None => {
-                    mapped = candidate;
-                    break;
+            let observed = napt_slot(unsafe { CONNTRACK.get(&key) }, source, original_id);
+            match napt_claim(
+                observed,
+                || match claim_masquerade_nat(&key, &state, bytes) {
+                    0 => Ok(()),
+                    error => Err(error),
+                },
+                || {
+                    matches!(
+                        napt_slot(unsafe { CONNTRACK.get(&key) }, source, original_id),
+                        NaptSlot::Owned
+                    )
+                },
+            ) {
+                NaptClaim::Existing => {
+                    if account_masquerade_binding(&key, source, original_id, bytes) {
+                        mapped = candidate;
+                    }
                 }
-                Some(state)
-                    if state.expired(ip_proto::ICMP, unsafe { bpf_ktime_get_ns() }, timeouts())
-                        || (state.nat_ip == source && state.nat_port == original_id) =>
-                {
-                    mapped = candidate;
-                    break;
+                NaptClaim::Inserted => mapped = candidate,
+                NaptClaim::Busy => {
+                    // Foreign expiry is not atomic ownership permission. Do
+                    // not account it, delete it, or emit using its public ID.
                 }
-                _ => {}
+                NaptClaim::Failed => {
+                    bump(Counter::EgressNatClaimFailed);
+                    return Err(());
+                }
             }
         }
         if mapped == 0 {
+            bump(Counter::EgressNatNoCandidate);
             return Err(());
-        }
-        let key = FlowKey::new(policy, remote, public, 0, mapped, ip_proto::ICMP);
-        if account_flow(&key, (ctx.data_end() - ctx.data()) as u64).is_none() {
-            let mut state = FlowState::masquerade(source, original_id);
-            state.account((ctx.data_end() - ctx.data()) as u64);
-            if !insert_nat(&key, &state) {
-                return Err(());
-            }
         }
         let from = u32::from_ne_bytes(source) as u64;
         let to = u32::from_ne_bytes(public) as u64;
@@ -157,7 +198,6 @@ fn request(ctx: &TcContext) -> Result<i32, ()> {
         .map_err(|_| ())?;
         ctx.store(O_IP_SRC, &public, 0).map_err(|_| ())?;
         ctx.store(ID, &mapped.to_be_bytes(), 0).map_err(|_| ())?;
-        bump(Counter::EgressMasqueraded);
     }
     let key = ct_key4(
         FlowKey::new(policy, public, remote, 0, 0, ip_proto::ICMP),
@@ -165,9 +205,17 @@ fn request(ctx: &TcContext) -> Result<i32, ()> {
         ctx.data_end(),
         ICMP,
     );
-    ct_record(
+    if ct_record(
         &key,
         ct_control(ctx.data(), ctx.data_end(), ICMP, ip_proto::ICMP),
-    );
+    )
+    .failed()
+    {
+        bump(Counter::FirewallStateWriteFailed);
+        return Err(());
+    }
+    if source != public {
+        bump(Counter::EgressMasqueraded);
+    }
     Ok(TC_ACT_OK as i32)
 }

@@ -1042,9 +1042,9 @@ pub struct ResolvedFlowExport {
 }
 
 /// C9 stateful-HA conntrack-state sync (a pfsync-analog for the eBPF `CONNTRACK`
-/// map and `FW_FLOWS`). With `secret`, a mutually authenticated TCP stream sends
-/// an initial snapshot, deltas and deletions. Without it, the legacy UDP stream
-/// requires a trusted link. Endpoint, protocol and credential changes restart
+/// map and `FW_FLOWS`). A required `secret` authenticates the TCP stream carrying
+/// an initial snapshot, deltas and deletions. Legacy unauthenticated UDP is
+/// rejected; migrate both peers before upgrading. Endpoint and credential changes restart
 /// the agent; policy-only updates reconcile live and fence stale peer state.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -1057,8 +1057,8 @@ pub struct ConntrackSyncCfg {
     /// Seconds between pushes. Defaults to 1.
     #[serde(default = "default_ct_interval_secs")]
     pub interval_secs: u64,
-    /// Enables mutually authenticated TCP replication. Legacy UDP is used only
-    /// when absent and requires a protected network.
+    /// Required 32..1024-byte shared credential for authenticated TCP replication.
+    /// Kept optional in the wire schema only to diagnose legacy configurations.
     #[serde(default)]
     pub secret: Option<String>,
     /// Secure replication polling period (10..=3600000 ms; default 50 ms).
@@ -1076,7 +1076,7 @@ fn default_ct_interval_secs() -> u64 {
 /// runtime — the failure surfaces at config-load time instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedConntrackSync {
-    /// Local bind endpoint (TCP with a secret, otherwise UDP).
+    /// Local authenticated TCP bind endpoint.
     pub listen: SocketAddr,
     /// Peer endpoints pushed to each interval.
     pub peers: Vec<SocketAddr>,
@@ -1084,6 +1084,25 @@ pub struct ResolvedConntrackSync {
     pub interval_secs: u64,
     pub secret: Option<String>,
     pub interval_ms: u64,
+}
+
+impl ResolvedConntrackSync {
+    /// Also checked at agent startup: manually constructed runtime configs must
+    /// never bypass file validation and enable an unauthenticated receiver.
+    pub fn require_authenticated(&self) -> Result<()> {
+        let secret = self.secret.as_deref().ok_or_else(|| anyhow::anyhow!(
+            "legacy unauthenticated conntrack sync is disabled; configure the same 32..1024-byte random secret and explicit peers on both nodes, or remove [conntrack_sync] before upgrading"
+        ))?;
+        anyhow::ensure!(
+            (32..=1024).contains(&secret.len()),
+            "conntrack_sync.secret must contain 32..1024 bytes; migrate both peers to a strong shared random credential"
+        );
+        anyhow::ensure!(
+            !self.peers.is_empty(),
+            "authenticated conntrack_sync requires explicit peers; listen-only legacy replication is disabled"
+        );
+        Ok(())
+    }
 }
 
 /// A resolved load-balancer service: a service key and its (validated) backends.
@@ -1181,6 +1200,11 @@ pub struct PortForwardCfg {
     /// hijack internal-to-internal traffic to the same port.
     #[serde(default)]
     pub match_dst: Option<String>,
+    /// Restrict the implicit firewall admission to an address actually owned
+    /// by the receiving interface. Refreshed after DHCP/VIP address changes.
+    /// Explicit Fabric transit/NodePort rules retain their opt-in any-dst mode.
+    #[serde(default)]
+    pub local_destination: bool,
     /// Hairpin (NAT reflection): also SNAT the source to this address (the box's IP
     /// on the client's segment) so the internal server's reply routes back through
     /// the box. Unset ⇒ plain DNAT, no source rewrite.
@@ -1209,6 +1233,7 @@ pub struct ResolvedPortForward {
     pub dst_port: u16,
     /// Hairpin match guard (network-order octets); `[0; 4]` ⇒ match any.
     pub match_dst: [u8; 4],
+    pub local_destination: bool,
     /// Hairpin source-NAT address (network-order octets); `[0; 4]` ⇒ no SNAT.
     pub snat_ip: [u8; 4],
     /// Policy the internal host's reply arrives under; `0` ⇒ not derived.
@@ -1837,21 +1862,7 @@ impl RuntimeConfig {
 
 /// Parse and validate a `[conntrack_sync]` block into its resolved form.
 fn resolve_conntrack_sync(cfg: &ConntrackSyncCfg) -> Result<ResolvedConntrackSync> {
-    if let Some(secret) = &cfg.secret {
-        anyhow::ensure!(
-            secret.len() >= 32,
-            "conntrack_sync.secret must contain at least 32 bytes"
-        );
-        anyhow::ensure!(
-            !cfg.peer.is_empty(),
-            "authenticated conntrack_sync requires explicit peers"
-        );
-    }
     if let Some(interval) = cfg.interval_ms {
-        anyhow::ensure!(
-            cfg.secret.is_some(),
-            "conntrack_sync.interval_ms requires authenticated replication"
-        );
         anyhow::ensure!(
             (10..=3600000).contains(&interval),
             "conntrack_sync.interval_ms must be 10..=3600000"
@@ -1868,14 +1879,16 @@ fn resolve_conntrack_sync(cfg: &ConntrackSyncCfg) -> Result<ResolvedConntrackSyn
             .with_context(|| format!("conntrack_sync.peer `{p}` is not an ip:port"))?;
         peers.push(addr);
     }
-    Ok(ResolvedConntrackSync {
+    let resolved = ResolvedConntrackSync {
         listen,
         peers,
         // Never sleep zero seconds — a `0` in TOML would spin the push loop.
         interval_secs: cfg.interval_secs.max(1),
         secret: cfg.secret.clone(),
         interval_ms: cfg.interval_ms.unwrap_or(50),
-    })
+    };
+    resolved.require_authenticated()?;
+    Ok(resolved)
 }
 
 /// Resolve one policy's firewall fields into map contents.
@@ -2398,6 +2411,7 @@ impl FileConfig {
                 dst_ip: dst_ip.octets(),
                 dst_port: pf.dst_port,
                 match_dst,
+                local_destination: pf.local_destination,
                 snat_ip,
                 reply_policy: pf.reply_policy,
             });
@@ -3247,6 +3261,7 @@ mod tests {
             [conntrack_sync]
             listen = "0.0.0.0:5429"
             peer = ["10.0.0.2:5429", "10.0.0.3:5429"]
+            secret = "unit-test-credential-at-least-32-bytes"
             interval_secs = 2
         "#;
         let cfg = toml::from_str::<FileConfig>(toml)
@@ -3265,18 +3280,61 @@ mod tests {
         // No `interval_secs` → default 1; an explicit `0` is clamped up to 1 so
         // the push loop never busy-spins.
         let cfg = toml::from_str::<FileConfig>(
-            "[conntrack_sync]\nlisten = \"0.0.0.0:5429\"\ninterval_secs = 0\n",
+            "[conntrack_sync]\nlisten = \"0.0.0.0:5429\"\npeer = [\"10.0.0.2:5429\"]\nsecret = \"unit-test-credential-at-least-32-bytes\"\ninterval_secs = 0\n",
         )
         .unwrap()
         .resolve()
         .unwrap();
         assert_eq!(cfg.conntrack_sync.unwrap().interval_secs, 1);
 
-        let cfg = toml::from_str::<FileConfig>("[conntrack_sync]\nlisten = \"0.0.0.0:5429\"\n")
+        let cfg = toml::from_str::<FileConfig>("[conntrack_sync]\nlisten = \"0.0.0.0:5429\"\npeer = [\"10.0.0.2:5429\"]\nsecret = \"unit-test-credential-at-least-32-bytes\"\n")
             .unwrap()
             .resolve()
             .unwrap();
         assert_eq!(cfg.conntrack_sync.unwrap().interval_secs, 1);
+    }
+
+    #[test]
+    fn conntrack_sync_refuses_legacy_short_empty_oversized_or_listen_only_configuration() {
+        let base = "[conntrack_sync]\nlisten = \"0.0.0.0:5429\"\n";
+        for tail in [
+            String::new(),
+            "peer = [\"10.0.0.2:5429\"]\n".into(),
+            "peer = [\"10.0.0.2:5429\"]\nsecret = \"\"\n".into(),
+            "peer = [\"10.0.0.2:5429\"]\nsecret = \"too-short\"\n".into(),
+            format!(
+                "peer = [\"10.0.0.2:5429\"]\nsecret = \"{}\"\n",
+                "s".repeat(1025)
+            ),
+            "secret = \"unit-test-credential-at-least-32-bytes\"\n".into(),
+        ] {
+            assert!(
+                toml::from_str::<FileConfig>(&format!("{base}{tail}"))
+                    .unwrap()
+                    .resolve()
+                    .is_err()
+            );
+        }
+        let err = toml::from_str::<FileConfig>(base)
+            .unwrap()
+            .resolve()
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("legacy unauthenticated conntrack sync is disabled")
+        );
+        let mut runtime = ResolvedConntrackSync {
+            listen: "127.0.0.1:5429".parse().unwrap(),
+            peers: vec!["127.0.0.2:5429".parse().unwrap()],
+            interval_secs: 1,
+            interval_ms: 50,
+            secret: None,
+        };
+        assert!(runtime.require_authenticated().is_err());
+        runtime.secret = Some("s".repeat(32));
+        assert!(runtime.require_authenticated().is_ok());
+        runtime.peers.clear();
+        assert!(runtime.require_authenticated().is_err());
     }
 
     #[test]
