@@ -1,55 +1,27 @@
-# HA state replication
+# Replicate connection state
 
-Configure both nodes with the same strong random credential and explicit peers:
+A standby can receive NAT, firewall and SYN-proxy connection state from a peer. Configure both nodes with compatible Fabric builds and matching filtering policies. Provide a dedicated HA network or encrypted tunnel if the flow metadata needs confidentiality.
+
+## Configure peers
+
+Add this table to the first node's policy. The addresses are examples; provision the same high-entropy secret (32–1024 bytes) on both nodes through your secret-management process. Protect the policy file.
 
 ```toml
 [conntrack_sync]
-listen = "10.3.0.1:5429"
-peer = ["10.3.0.2:5429"]
-secret = "replace-with-at-least-32-random-bytes"
+listen = "192.0.2.10:5429"
+peer = ["192.0.2.11:5429"]
+secret = "REPLACE_WITH_A_RANDOM_SHARED_SECRET"
 interval_ms = 50
 ```
 
-Reverse the endpoints on the other member. `secret` selects TCP, with fresh
-mutual challenges and HMAC-SHA256 authenticated, sequenced frames. There is no
-automatic downgrade to UDP. Authentication does not encrypt flow metadata; use
-WireGuard or a private HA network for confidentiality. Without `secret`, existing
-configurations retain the original unauthenticated UDP protocol and second-based
-`interval_secs`. Do not expose that listener to an untrusted network.
+On the second node, swap the listen and peer addresses. Replication requires authenticated TCP and explicit peers. Missing or invalid secrets and listen-only configurations are rejected; legacy unauthenticated UDP is disabled. Before upgrading both peers, configure a valid shared secret and peer addresses, or remove `[conntrack_sync]` to disable replication.
 
-The producer uses `BPF_MAP_LOOKUP_BATCH` on the NAT, dual-stack firewall and SYN-proxy
-LRU maps. A new replication connection sends a full snapshot; subsequent frames carry changed
-records and deletions. Interrupted streams reconnect with a fresh session and
-snapshot. Relative idle ages cross the wire; a peer's monotonic clock and traffic
-counters never replace local clock values or accounting. Locally advanced state
-takes precedence over queued peer updates and deletions. Unchanged imported
-entries are not sent back to their source. A completed replacement snapshot
-removes stale imports belonging to that peer.
+## Verify a switchover
 
-Each frame names a SHA-256 fingerprint of shared filtering, NAT, policy IDs,
-interface bindings and state lifetimes. Applying a frame holds the same lock as
-live policy reconciliation. An incomplete/failed apply or a different fingerprint
-rejects the stream; reconnect retries after both nodes converge. Node-local
-routes, link addresses and sync endpoints are not part of the fingerprint.
+1. Check that the peer stream establishes and both nodes accept the policy fingerprint. Filter, NAT, policy IDs, interface bindings and timeouts must agree.
+2. Establish a test connection through the active node. Allow the initial snapshot and subsequent changes to reach the standby.
+3. During a planned failover exercise, check progress on that **same connection**. A new client connection only demonstrates that the service is reachable again.
 
-Replication is asynchronous: a failure before a new flow reaches the standby can
-lose that flow. Keep the default 50ms interval for fast failover. Larger explicit
-intervals increase the potential state loss window. Conntrack replication does
-not elect or fence a master. VIP election, NAT to a shared address, and protection
-against two simultaneously forwarding masters must be configured separately.
+Each new session starts with a snapshot, then sends changed records and deletions. Replication is asynchronous: a recent flow may still exist only on the failed node. Election, exclusive forwarding authority and ownership of a shared address must be provided separately.
 
-The Sentinel `ha-kernel` NixOS check exercises actual LRU maps, authenticated TCP,
-deltas, deletion, local ownership and rejection of obsolete policy state. The
-`ha-failover` check uses four VMs and an established TCP socket through shared
-SNAT while terminating the active VM without a graceful VRRP withdrawal.
-
-The authenticated transport also replicates `SYN_FLOWS`: admitted pending
-handshakes and completed sequence-number splices, including wrapping deltas.
-The legacy UDP protocol does not import these records. The policy fingerprint
-format is version 3; both members must run a compatible build. Local SYN-cookie
-secrets stay local: an already admitted flow carries its cookie and splice, but
-an unacknowledged cookie minted before failure can require a fresh handshake.
-The `ha-synproxy-failover` VM check keeps one real proxied TCP socket alive
-through an ungraceful master crash; successful traffic after the crash verifies
-sequence and checksum translation in both directions. This does not qualify
-cold-start readiness, partition fencing or failback authority handover.
+[Replication implementation and tests](https://github.com/Velstra/fabric/tree/main/velstra-app/src/conntrack_sync) · [Sentinel HA verification](https://github.com/Velstra/sentinel/blob/main/nix/ha-failover-test.nix)

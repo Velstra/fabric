@@ -5,66 +5,29 @@
   <img src=".github/brand/logo.svg" alt="Velstra Fabric" height="72">
 </picture>
 
-Rust networking stack: an eBPF/XDP firewall and NAT dataplane, a per-host agent,
-a controller and a Kubernetes CNI plugin.
-For the complete firewall appliance, use [Sentinel](https://github.com/Velstra/sentinel).
+An eBPF/XDP dataplane, per-host agent, topology controller and Kubernetes CNI for tenant networks on Linux. Use it to answer neighbor requests on the host, carry tenant Ethernet over SRv6, or apply per-port policy. For a complete firewall appliance, see [Velstra Sentinel](https://github.com/Velstra/sentinel).
 
-## Start with the host tests
+## Try it
 
-Install Rust through Rustup, then:
+Build the controller and inspect a two-host topology without root, virtual machines or an eBPF toolchain. The [local fabric quickstart](https://velstra.github.io/fabric/quickstart.html) includes the expected result.
 
 ```sh
 git clone https://github.com/Velstra/fabric.git
 cd fabric
 cargo test -p velstra-common --locked
-cargo test --workspace --exclude velstra --exclude velstra-ebpf --locked
+cargo build -p velstra-controller --locked
 ```
 
-These tests need neither root nor the eBPF compiler. The protobuf compiler is
-vendored; an explicit `PROTOC` overrides it.
+## Operator handbook
 
-## Build and run the agent
+- [Start a local fabric](docs/quickstart.md)
+- [Verify local neighbor discovery and Ethernet over SRv6](docs/overlay.md)
+- [Configure and operate the agent](docs/agent.md)
+- [Manage topology and workload ports](docs/CONFIGURATION.md)
+- [Deploy the Kubernetes CNI](docs/kubernetes.md)
+- [Build the agent](docs/development.md) and [verify the dataplane](docs/TESTING.md)
 
-The full build needs the pinned nightly toolchain and a matching
-`bpf-linker`/LLVM installation. Follow [toolchain setup](docs/development.md#toolchain),
-then:
-
-```sh
-cargo build --release --locked
-./target/release/velstra validate examples/rules.toml
-```
-
-To attach the firewall, replace `eth0` with an isolated lab interface.
-This changes real packet handling; do not use your only management link.
-
-```sh
-sudo ./target/release/velstra run --iface eth0 --config examples/rules.toml
-```
-
-Stop with Ctrl-C. Start with the [sample policies](examples/) before writing
-your own.
-
-## Test the dataplane
-
-Linux, root and XDP/TC kernel support are required:
-
-```sh
-sudo ./target/release/velstra verify-ebpf
-sudo ./tests/e2e/run.sh
-```
-
-[Development checks](docs/development.md#tests) ·
-[E2E scenarios](tests/e2e/README.md) ·
-[Manual traffic lab](docs/TESTING.md)
-
-## Documentation
-
-[Agent operation](docs/agent.md) ·
-[Configuration/API](docs/CONFIGURATION.md) ·
-[Architecture](docs/ARCHITECTURE.md) ·
-[HA replication](docs/ha-state-replication.md) ·
-[Kubernetes](deploy/k8s/README.md) ·
-[Release policy](docs/RELEASE-POLICY.md)
+[Browse the GitHub Pages handbook](https://velstra.github.io/fabric/) · [Source examples](examples/) · [Release qualification](docs/RELEASE-POLICY.md)
 
 ## License
 
