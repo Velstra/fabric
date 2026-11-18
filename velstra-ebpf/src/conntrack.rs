@@ -299,7 +299,15 @@ unsafe fn record_scratch(scratch: *mut Scratch, control: u8) -> StatePublication
         (*scratch).reverse = (*scratch).key.reverse();
         let proto = (*scratch).key.proto;
         let phase = if let Some(old) = FW_FLOWS.get(&(*scratch).key) {
-            (*scratch).state = *old;
+            // Keep this fixed-size map-to-scratch copy as scalar stores. The
+            // aggregate assignment becomes an overlap-checking byte loop with
+            // some BPF backends, multiplying verifier paths in this caller.
+            // Volatile stores constrain code generation, not synchronization:
+            // this is still the same non-atomic snapshot of the four fields.
+            core::ptr::write_volatile(&raw mut (*scratch).state.last_seen_ns, old.last_seen_ns);
+            core::ptr::write_volatile(&raw mut (*scratch).state.age_ns, old.age_ns);
+            core::ptr::write_volatile(&raw mut (*scratch).state.phase, old.phase);
+            core::ptr::write_volatile(&raw mut (*scratch).state.reply, old.reply);
             if !(*scratch).state.expired(proto, now, timeouts()) {
                 (*scratch).state.next_phase(proto, control)
             } else {

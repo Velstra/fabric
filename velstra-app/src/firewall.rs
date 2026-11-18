@@ -805,6 +805,7 @@ impl Firewall {
         for name in [
             "velstra",
             "velstra_main",
+            "velstra_v4_state",
             "velstra_guest_delivery",
             "velstra_forward",
             "velstra_v6",
@@ -1022,6 +1023,27 @@ impl Firewall {
                     .ok_or_else(|| anyhow!("VELSTRA_PROGS missing"))?,
             )?;
             programs.set(slot, &fd, 0)?;
+        }
+
+        // Register the state-admission continuation before attaching ingress.
+        // A missing stage is fatal: skipping it would bypass the final verdict
+        // and conntrack publication rather than merely an optional transform.
+        {
+            let fd = {
+                let program: &mut Xdp = ebpf
+                    .program_mut("velstra_v4_state")
+                    .ok_or_else(|| anyhow!("missing velstra_v4_state"))?
+                    .try_into()?;
+                program
+                    .load()
+                    .context("loading IPv4 state-admission stage")?;
+                program.fd()?.try_clone()?
+            };
+            let mut programs = ProgramArray::try_from(
+                ebpf.map_mut("V4_STATE_PROGS")
+                    .ok_or_else(|| anyhow!("V4_STATE_PROGS missing"))?,
+            )?;
+            programs.set(0, &fd, 0)?;
         }
 
         let program: &mut Xdp = ebpf

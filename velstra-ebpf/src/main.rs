@@ -559,10 +559,22 @@ fn claim_marked_masquerade_nat(key: &FlowKey, original: &FlowState, bytes: u64) 
         return -12;
     };
     unsafe {
-        *state = *original;
+        // Keep this fixed-size initialization in the caller. An aggregate
+        // copy can introduce a memset subprogram for the timestamp fields,
+        // overflowing the cumulative BPF stack in the allocator callback.
+        // Volatile stores constrain code generation, not synchronization:
+        // this remains CPU-local scratch, published only by BPF_NOEXIST.
+        core::ptr::write_volatile(&raw mut (*state).nat_ip, original.nat_ip);
+        core::ptr::write_volatile(&raw mut (*state).nat2_ip, original.nat2_ip);
+        core::ptr::write_volatile(&raw mut (*state).nat_port, original.nat_port);
+        core::ptr::write_volatile(&raw mut (*state).nat2_port, original.nat2_port);
+        core::ptr::write_volatile(&raw mut (*state).flags, original.flags);
+        core::ptr::write_volatile(&raw mut (*state)._pad, original._pad);
+        core::ptr::write_volatile(&raw mut (*state).packets, original.packets);
+        core::ptr::write_volatile(&raw mut (*state).bytes, original.bytes);
         (*state).account(bytes);
-        (*state).last_seen_ns = bpf_ktime_get_ns();
-        (*state).age_ns = 0;
+        core::ptr::write_volatile(&raw mut (*state).last_seen_ns, bpf_ktime_get_ns());
+        core::ptr::write_volatile(&raw mut (*state).age_ns, 0);
         match CONNTRACK.insert(key, &*state, BPF_NOEXIST as u64) {
             Ok(()) => 0,
             Err(error) => error,
@@ -1242,6 +1254,48 @@ struct ForwardScratch {
 #[map]
 static SCRATCH: PerCpuArray<ForwardScratch> = PerCpuArray::with_max_entries(1, 0);
 
+/// Kernel-produced IPv4 policy lookup result, consumed once by the state stage.
+/// No packet pointer or verifier range proof crosses this boundary.
+#[repr(C)]
+struct V4StateScratch {
+    epoch: u64,
+    rule: u64,
+    frame_len: u64,
+    ifindex: u32,
+    policy_id: PolicyId,
+    vni: u32,
+    cfg: GlobalConfig,
+    src_addr: [u8; 4],
+    dst_addr: [u8; 4],
+    checksum: u16,
+    src_port: u16,
+    dst_port: u16,
+    total_len: u16,
+    ihl_bytes: u16,
+    proto: u8,
+    ttl: u8,
+    icmp_type: u8,
+    blocklisted: u8,
+    local_dhcp: u8,
+    valid: u8,
+}
+
+#[map]
+static V4_STATE_SCRATCH: PerCpuArray<V4StateScratch> = PerCpuArray::with_max_entries(1, 0);
+
+/// Separate from the full eight-slot transform table; no flow-map limit changes.
+#[map]
+static V4_STATE_PROGS: ProgramArray = ProgramArray::with_max_entries(1, 0);
+
+#[inline(always)]
+fn reset_v4_state() {
+    if let Some(scratch) = V4_STATE_SCRATCH.get_ptr_mut(0) {
+        // SAFETY: the map owns this CPU's slot. Volatile fixes handoff ordering,
+        // not cross-CPU synchronization or a persistent session snapshot.
+        unsafe { core::ptr::write_volatile(&raw mut (*scratch).valid, 0) };
+    }
+}
+
 /// Destination tap selected by an overlay decapsulator. The guest policy runs
 /// in a tail-called program with a fresh verifier stack.
 #[map]
@@ -1380,6 +1434,7 @@ pub fn velstra_related(ctx: XdpContext) -> u32 {
 /// (fail-closed), per the host-wide [`FAIL_CLOSED`] flag, rather than aborting.
 #[xdp]
 pub fn velstra_main(ctx: XdpContext) -> u32 {
+    reset_v4_state();
     if !ha_permits(ctx.ingress_ifindex() as u32) {
         return xdp_action::XDP_DROP;
     }
@@ -1399,6 +1454,58 @@ pub fn velstra_main(ctx: XdpContext) -> u32 {
         // posture, drop it: a packet the filter cannot parse is precisely the one
         // it must not admit. The `Malformed` counter records the event either way,
         // so the flag alone says which of the two happened.
+        Err(()) => {
+            bump(Counter::Malformed);
+            if fail_closed() {
+                xdp_action::XDP_DROP
+            } else {
+                xdp_action::XDP_PASS
+            }
+        }
+    };
+    if epoch::unchanged(before) {
+        link_layer::finish_xdp(&ctx, action)
+    } else {
+        xdp_action::XDP_DROP
+    }
+}
+
+/// Stateful IPv4 verdict and publication, with an independent verifier budget.
+/// The main stage has already authenticated the source and selected the rule;
+/// this stage never admits a packet without that one-shot, same-epoch handoff.
+#[xdp]
+pub fn velstra_v4_state(ctx: XdpContext) -> u32 {
+    let Some(scratch) = V4_STATE_SCRATCH.get_ptr_mut(0) else {
+        return xdp_action::XDP_DROP;
+    };
+    // Consume before any verdict, accounting, packet write or state publication.
+    let valid = unsafe { core::ptr::read_volatile(&raw const (*scratch).valid) };
+    unsafe { core::ptr::write_volatile(&raw mut (*scratch).valid, 0) };
+    let s = unsafe { &*scratch };
+    let before = s.epoch;
+    // Re-prove the whole IPv4 header and declared datagram here. Truncated or
+    // internally inconsistent lengths fail closed even in permissive policy;
+    // valid options, fragments and trailing Ethernet padding remain allowed.
+    if valid != 1
+        || before != epoch::snapshot()
+        || !epoch::unchanged(before)
+        || !configuration_ready()
+        || !ha_permits(ctx.ingress_ifindex() as u32)
+        || s.ifindex != ctx.ingress_ifindex() as u32
+        || s.frame_len != (ctx.data_end() - ctx.data()) as u64
+        || !(Ipv4Hdr::LEN as u16..=60).contains(&s.ihl_bytes)
+        || s.ihl_bytes & 3 != 0
+        || s.blocklisted > 1
+        || s.local_dhcp > 1
+        || ctx.data() + EthHdr::LEN + Ipv4Hdr::LEN > ctx.data_end()
+        || ctx.data() + EthHdr::LEN + s.ihl_bytes as usize > ctx.data_end()
+        || s.total_len < s.ihl_bytes
+        || EthHdr::LEN as u64 + s.total_len as u64 > s.frame_len
+    {
+        return xdp_action::XDP_DROP;
+    }
+    let action = match try_velstra_v4_state(&ctx, s) {
+        Ok(action) => action,
         Err(()) => {
             bump(Counter::Malformed);
             if fail_closed() {
@@ -1792,6 +1899,11 @@ fn bum_vxlan(ctx: &TcContext, ocfg: &OverlayConfig, vni: u32, dst_mac: [u8; 6]) 
     // BEFORE any room grow. Drop-silently (leave for local delivery) if encap
     // would exceed the underlay MTU — mirrors the XDP encap MTU guard.
     let frame_len = ctx.len();
+    // Preserve the save helper's rejection before this length is spilled
+    // across map lookups: the skb copy helper cannot accept a zero length.
+    if frame_len < EthHdr::LEN as u32 {
+        return Err(());
+    }
     if frame_len > 16384 {
         return Ok(TC_ACT_OK as i32);
     }
@@ -1893,6 +2005,11 @@ fn bum_srv6(ctx: &TcContext, scfg: &Srv6Config, vni: u32, dst_mac: [u8; 6]) -> R
     // BEFORE any room grow. Leave for local delivery if encap would exceed the
     // underlay MTU — mirrors the XDP encap MTU guard.
     let frame_len = ctx.len();
+    // Keep the same lower bound at the caller and the copy helper so a
+    // spilled length retains its nonzero verifier range across map lookups.
+    if frame_len < EthHdr::LEN as u32 {
+        return Err(());
+    }
     if frame_len > 16384 {
         return Ok(TC_ACT_OK as i32);
     }
@@ -3140,11 +3257,66 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     } else {
         rule
     };
-    let rule_action = if port_rule_present(rule) {
-        Some(port_rule_action(rule))
-    } else {
-        None
+    let Some(scratch) = V4_STATE_SCRATCH.get_ptr_mut(0) else {
+        return Ok(xdp_action::XDP_DROP);
     };
+    let before = epoch::snapshot();
+    if !epoch::unchanged(before) {
+        reset_v4_state();
+        return Ok(xdp_action::XDP_DROP);
+    }
+    // Fixed scalar stores avoid an overlap-checking aggregate memcpy. Publish
+    // valid last; the target consumes it before using any field. The original
+    // packet and configuration epoch remain unchanged across this tail call.
+    unsafe {
+        core::ptr::write_volatile(&raw mut (*scratch).valid, 0);
+        core::ptr::write_volatile(&raw mut (*scratch).epoch, before);
+        core::ptr::write_volatile(&raw mut (*scratch).rule, rule);
+        core::ptr::write_volatile(&raw mut (*scratch).frame_len, frame_len);
+        core::ptr::write_volatile(&raw mut (*scratch).ifindex, ifindex);
+        core::ptr::write_volatile(&raw mut (*scratch).policy_id, policy_id);
+        core::ptr::write_volatile(&raw mut (*scratch).vni, vni);
+        core::ptr::write_volatile(&raw mut (*scratch).cfg.default_action, cfg.default_action);
+        core::ptr::write_volatile(&raw mut (*scratch).cfg.flags, cfg.flags);
+        core::ptr::write_volatile(&raw mut (*scratch).src_addr, src_addr);
+        core::ptr::write_volatile(&raw mut (*scratch).dst_addr, dst_addr);
+        core::ptr::write_volatile(&raw mut (*scratch).checksum, checksum);
+        core::ptr::write_volatile(&raw mut (*scratch).src_port, src_port);
+        core::ptr::write_volatile(&raw mut (*scratch).dst_port, dst_port);
+        core::ptr::write_volatile(&raw mut (*scratch).total_len, meta.total_len);
+        core::ptr::write_volatile(&raw mut (*scratch).ihl_bytes, ihl_bytes as u16);
+        core::ptr::write_volatile(&raw mut (*scratch).proto, proto);
+        core::ptr::write_volatile(&raw mut (*scratch).ttl, ttl);
+        core::ptr::write_volatile(&raw mut (*scratch).icmp_type, icmp_type);
+        core::ptr::write_volatile(&raw mut (*scratch).blocklisted, blocklisted as u8);
+        core::ptr::write_volatile(&raw mut (*scratch).local_dhcp, local_dhcp as u8);
+        core::ptr::write_volatile(&raw mut (*scratch).valid, 1);
+        V4_STATE_PROGS.tail_call(ctx, 0);
+    }
+    reset_v4_state();
+    bump(Counter::Malformed);
+    Ok(xdp_action::XDP_DROP)
+}
+
+#[inline(always)]
+fn try_velstra_v4_state(ctx: &XdpContext, s: &V4StateScratch) -> Result<u32, ()> {
+    let src_addr = s.src_addr;
+    let dst_addr = s.dst_addr;
+    let checksum = s.checksum;
+    let src_port = s.src_port;
+    let dst_port = s.dst_port;
+    let ihl_bytes = s.ihl_bytes as usize;
+    let proto = s.proto;
+    let ttl = s.ttl;
+    let icmp_type = s.icmp_type;
+    let ifindex = s.ifindex;
+    let policy_id = s.policy_id;
+    let vni = s.vni;
+    let cfg = s.cfg;
+    let blocklisted = s.blocklisted != 0;
+    let local_dhcp = s.local_dhcp != 0;
+    let rule = s.rule;
+    let total_len = s.total_len;
     // A configured port-forward for this destination port implicitly opens the
     // firewall (the DNAT + reply SNAT run in `velstra_forward` / the conntrack
     // path). The main program only needs to know one *exists* — a bare `bool`,
@@ -3157,13 +3329,6 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     // map-lookup discriminant, so no map-value pointer is ever live here;
     // `try_port_forward` re-looks-up the target with a fresh stack downstream.
     let has_port_forward = port_forward_exists(policy_id, proto, dst_port, dst_addr, ifindex);
-
-    let verdict = decide(&meta, &cfg, blocklisted, rule_action);
-    // Per-rule logging: this rule's own log bit, and the effective flag combining
-    // it with the policy-wide log. `rule_log` alone gates logging of *allowed*
-    // traffic so a globally-logging policy doesn't start logging every pass.
-    let rule_log = port_rule_logs(rule);
-    let want_log = cfg.has_flag(ConfigFlags::LOG) || rule_log;
 
     // Stateful firewall: track allowed TCP/UDP flows so replies are permitted in
     // either direction, even under deny-by-default. The blocklist still wins.
@@ -3197,6 +3362,23 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
         && proto == ip_proto::ICMP
         && icmp_related::error_probe(icmp_type)
         && icmp_related::take_xdp(ctx, epoch::snapshot());
+
+    // Decode the pure policy verdict after state classification. All operands
+    // were copied from this handoff before map reads; no packet/map/helper
+    // ordering changes. Keeping verdict branches out of ct_classify reduces
+    // the verifier's cross-product of policy and TCP-state paths.
+    let meta = PacketMeta::new(src_addr, dst_addr, proto, src_port, dst_port, total_len);
+    let rule_action = if port_rule_present(rule) {
+        Some(port_rule_action(rule))
+    } else {
+        None
+    };
+    let verdict = decide(&meta, &cfg, blocklisted, rule_action);
+    // Per-rule logging: this rule's own log bit, and the effective flag combining
+    // it with the policy-wide log. `rule_log` alone gates logging of *allowed*
+    // traffic so a globally-logging policy doesn't start logging every pass.
+    let rule_log = port_rule_logs(rule);
+    let want_log = cfg.has_flag(ConfigFlags::LOG) || rule_log;
 
     // Per-rule rate limit (C15). Consulted only for a rule that carries a slot and
     // only for a NEW flow: an established connection whose packets each cost a
