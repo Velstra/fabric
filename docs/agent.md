@@ -22,7 +22,7 @@ The agent reports its attachment and counters. Ctrl-C detaches it. Use `--iface`
 
 ## Live updates
 
-During reconciliation the agent holds packets while it replaces policy maps and drains kernel readers. If applying a replacement fails, it attempts to restore the previous state. A failed restoration keeps the gate closed. The update barrier requires Linux global membarrier support and a kernel without `nohz_full` isolation. This mechanism applies while the agent runs.
+During a full policy replacement, the agent closes the packet gate and drains existing kernel readers before changing maps. Arriving packets are dropped, not buffered. If applying a replacement fails, it attempts to restore the previous state. A failed restoration keeps the gate closed. The update barrier requires Linux global membarrier support and a kernel without `nohz_full` isolation. This mechanism applies while the agent runs.
 
 ## Routing, NAT and overlays
 

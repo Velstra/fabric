@@ -15,6 +15,7 @@ Build the controller and inspect a two-host topology without root, virtual machi
 git clone https://github.com/Velstra/fabric.git
 cd fabric
 cargo test -p velstra-common --locked
+cargo build -p velstra-controller --locked
 ```
 
 ## Operator handbook

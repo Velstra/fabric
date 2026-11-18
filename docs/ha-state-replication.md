@@ -4,7 +4,7 @@ A standby can receive NAT, firewall and SYN-proxy connection state from a peer. 
 
 ## Configure peers
 
-Add this table to the first node's policy. The addresses are examples; provision the same high-entropy secret (at least 32 bytes) on both nodes through your secret-management process. Protect the policy file.
+Add this table to the first node's policy. The addresses are examples; provision the same high-entropy secret (32–1024 bytes) on both nodes through your secret-management process. Protect the policy file.
 
 ```toml
 [conntrack_sync]
@@ -14,7 +14,7 @@ secret = "REPLACE_WITH_A_RANDOM_SHARED_SECRET"
 interval_ms = 50
 ```
 
-On the second node, swap the listen and peer addresses. The secret selects authenticated TCP. Omitting it selects the legacy unauthenticated UDP mode, which has different timing and state coverage.
+On the second node, swap the listen and peer addresses. Replication requires authenticated TCP and explicit peers. Missing or invalid secrets and listen-only configurations are rejected; legacy unauthenticated UDP is disabled. Before upgrading both peers, configure a valid shared secret and peer addresses, or remove `[conntrack_sync]` to disable replication.
 
 ## Verify a switchover
 
