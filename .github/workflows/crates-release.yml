@@ -1,0 +1,97 @@
+name: Public crate release
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Exact crate version from Cargo.toml, without v'
+        required: true
+        type: string
+      publish:
+        description: 'Publish the allowlisted library after independent approval'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: public-crate-release-${{ github.event_name == 'pull_request' && github.ref || 'release' }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 4
+  REQUESTED_VERSION: ${{ inputs.version }}
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      sha256: ${{ steps.archive.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install the reviewed publication toolchain
+        run: rustup toolchain install 1.100.0 --profile minimal
+      - name: Select toolchain without altering the checkout
+        run: echo 'RUSTUP_TOOLCHAIN=1.100.0' >> "$GITHUB_ENV"
+      - name: Test release guards and select only the standalone library
+        id: plan
+        run: |
+          python3 -B -m unittest discover -s tests -p 'test_crate_release.py' -v
+          python3 -B scripts/crate_release.py plan
+      - name: Test all library features and build the real registry package
+        env:
+          PACKAGE: ${{ steps.plan.outputs.package }}
+        run: |
+          cargo test --locked --package "$PACKAGE" --all-features
+          cargo publish --dry-run --locked --registry crates-io --package "$PACKAGE"
+      - name: Inspect packaged files and bind their exact hash to this source
+        id: archive
+        run: python3 -B scripts/crate_release.py archive
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main'
+    needs: check
+    environment: crates-io
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PUBLISH_REQUESTED: ${{ inputs.publish }}
+      TESTED_CRATE_SHA256: ${{ needs.check.outputs.sha256 }}
+      RUSTUP_TOOLCHAIN: 1.100.0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Require actual independent approval and successful exact-source main CI
+        run: |
+          python3 -B scripts/check_release_environment.py crates-io --approved
+          rustup toolchain install 1.100.0 --profile minimal
+          python3 -B scripts/crate_release.py guard
+      - name: Rebuild and verify the package before requesting credentials
+        id: plan
+        run: python3 -B scripts/crate_release.py plan
+      - env:
+          PACKAGE: ${{ steps.plan.outputs.package }}
+        run: cargo publish --dry-run --locked --registry crates-io --package "$PACKAGE"
+      - name: Obtain short-lived, repository-bound crates.io credentials
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - name: Publish once and verify the registry checksum
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: python3 -B scripts/crate_release.py publish
