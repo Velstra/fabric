@@ -35,7 +35,10 @@ mod cidr;
 mod config;
 mod conntrack;
 mod dhcp;
+mod firewall_session;
 mod forward;
+mod fragment_guard;
+mod icmp_related;
 mod lb;
 mod mac;
 mod masquerade;
@@ -48,7 +51,11 @@ mod portal;
 mod ratelimit;
 mod reject;
 pub mod srv6;
+mod state_publication;
 mod synproxy;
+mod tcp_key;
+mod tcp_packet;
+mod tcp_state;
 mod telemetry;
 
 pub use cgnat::CgnatLayout;
@@ -56,9 +63,15 @@ pub use cidr::{Cidr4, Cidr6, CidrError, mask_v4, mask_v6, parse_cidr_v4, parse_c
 pub use config::{ConfigFlags, GlobalConfig, SourceValidation};
 pub use conntrack::{ConntrackTimeouts, FirewallKey, FirewallState};
 pub use dhcp::{DHCP_FIB_NOT_FORWARDED, dhcp_fib_is_local, dhcpv4_reply_matches};
+pub use firewall_session::{FirewallSession, FirewallSessionKey, SessionDirection, SessionError};
 pub use forward::{
     ForwardOutcome, Rewrite, RouteEntry, csum_replace_u16, decrement_ttl, ipv4_checksum,
     plan_forward,
+};
+pub use fragment_guard::forwarded_masquerade_fragment_drops;
+pub use icmp_related::{
+    RelatedChecksums, related_checksum_copy_length, related_checksums,
+    related_hairpin_firewall_candidate, related_icmp_error,
 };
 pub use lb::{
     Backend, FlowKey, FlowState, Nat, PortFwd, ServiceKey, ServiceValue, plan_dnat,
@@ -66,8 +79,9 @@ pub use lb::{
 };
 pub use mac::{MacError, parse_mac};
 pub use masquerade::{
-    MasqueradeCommit, UNADDRESSED, legacy_napt_seed, masquerade_commit, napt_binding_matches,
-    napt_find_existing, napt_port, napt_seed, unaddressed_uplink_drops,
+    MasqueradeCommit, NaptClaim, NaptDomain, NaptSlot, UNADDRESSED, legacy_napt_seed,
+    masquerade_commit, napt_binding_matches, napt_claim, napt_find_existing, napt_port,
+    napt_search_count, napt_seed, napt_slot, unaddressed_uplink_drops,
 };
 pub use npt::{Npt66, npt66_rewrite, oc_add};
 pub use overlay::{
@@ -99,16 +113,23 @@ pub use portal::{
 pub use ratelimit::RateBucket;
 pub use reject::{
     ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, IcmpUnreach, TcpRst, icmp, icmp_checksum,
-    plan_icmp_unreachable, plan_tcp_rst, tcp_flags,
+    plan_icmp_unreachable, plan_tcp_rst, plan_tcp_rst_v6, tcp_flags,
 };
 pub use srv6::{
     SRV6_L2_OUTER_LEN, Srv6Config, Srv6Encap, Srv6Endpoint, Srv6FloodSet, Srv6IrbEndpoint,
     Srv6LocalSid, Srv6Sid, Srv6SidKey, build_service_sid, build_srv6_encap, decode_service_sid,
     plan_srv6_irb, write_srv6_encap,
 };
+pub use state_publication::{StatePublication, publish_state_pair};
 pub use synproxy::{
     EPOCH_SHIFT, MSS_TABLE, SYNTH_WINDOW, SynFlow, SynProxyCfg, SynProxyKey, TcpSynth,
     check_cookie, csum_replace_u32, epoch_of, make_cookie, mss_index, plan_server_ack,
     plan_server_syn, plan_syn_ack, seq_delta, translate_to_client, translate_to_server,
+};
+pub use tcp_key::TcpSessionKey;
+pub use tcp_packet::{TcpChecksumState, TcpPacket, TcpPacketError, parse_tcp_packet};
+pub use tcp_state::{
+    TCP_SCALE_ABSENT, TCP_SEGMENT_VALIDATED, TCP_STATE_ABI, TcpDecision, TcpDisposition, TcpPeer,
+    TcpReason, TcpSegment, TcpSession, TcpSnapshot,
 };
 pub use telemetry::{PacketEvent, RuleCounterKey, RuleCounters, tag_rule, winning_tagged_rule};

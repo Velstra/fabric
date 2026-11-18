@@ -67,6 +67,19 @@ jobs:
         run: cargo clippy --workspace --exclude velstra-ebpf --exclude velstra --all-targets --locked -- -D warnings
       - name: test (host crates)
         run: cargo test --workspace --exclude velstra-ebpf --exclude velstra --locked
+      - name: RELATED ICMP probe and endpoint error-queue contract
+        run: python3 -B tests/conformance/icmp-related-probe.py selftest
+      - name: TCP reset probe packet and endpoint contract
+        run: python3 -B tests/conformance/tcp-reset-probe.py selftest
+      - name: Firewall publication caller contract
+        run: python3 -B tests/test_state_publication.py
+      - name: NAT search-bound writer contract
+        run: python3 -B tests/test_napt_search_bound.py
+      - name: IPv4 handoff, BUM bounds, and NAT initialization contracts
+        run: |
+          python3 -B tests/test_v4_state_handoff.py
+          python3 -B tests/test_bum_frame_bounds.py
+          python3 -B tests/test_nat_claim_initialization.py
       # The end-to-end suite is shell, and shell fails at runtime or not at all.
       # `--severity=error` only: these scripts are clean at that level today.
       - name: shellcheck
@@ -143,7 +156,9 @@ jobs:
   loadcheck:
     name: ebpf verifier load-check (root)
     if: github.event_name != 'schedule'
-    runs-on: ubuntu-latest
+    # Match the explicit build/datapath baseline; do not migrate the tool
+    # packaging and verifier kernel implicitly when ubuntu-latest moves.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -153,9 +168,22 @@ jobs:
           # build.rs); no clippy needed here, the host lanes cover that.
           components: rust-src
       - uses: Swatinem/rust-cache@v2
-      - name: Install protoc and iproute2
-        # protoc: velstra-proto's build. iproute2: loadcheck.sh's `ip link`.
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler iproute2
+      - name: Install verifier and packet-probe tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler iproute2 python3 util-linux linux-tools-common linux-tools-generic
+          # The distro wrapper selects by uname, which need not match the
+          # installed generic tools on hosted kernels. Use the packaged binary
+          # directly; map/program inspection does not need a matching kernel.
+          for tool in /usr/lib/linux-tools/*/bpftool; do
+            if [ -x "$tool" ]; then
+              "$tool" version
+              dirname "$tool" >> "$GITHUB_PATH"
+              exit 0
+            fi
+          done
+          echo "No packaged bpftool executable found" >&2
+          exit 1
       - uses: ./.github/actions/bpf-linker
       - name: Say what kernel this is
         # The verifier's verdict depends on it, so a failure that does not name the
@@ -169,6 +197,10 @@ jobs:
         # `-E` keeps the invoking env (PATH, CARGO_*); the script finds the tree
         # from its own path, so it needs no VELSTRA_ROOT here.
         run: sudo -E ./tests/e2e/loadcheck.sh
+      - name: Verify every packet program (root)
+        run: sudo ./target/release/velstra verify-ebpf
+      - name: IPv4 handoff faults and stateful packet regression (root)
+        run: sudo env "PATH=$PATH" python3 -B tests/v4_state_handoff_probe.py --binary ./target/release/velstra
 
   # Build the three container images from the binaries the `build` job produced
   # and push them to GHCR. A main-branch integration is NOT a release. Only a

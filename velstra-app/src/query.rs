@@ -13,6 +13,7 @@
 //! ```text
 //! status            → readiness and the last configuration error
 //! stats             → the per-CPU counter table, summed
+//! capacity          → observed raw state-map occupancy and 80% pressure status (JSON)
 //! ha-status         → actual forwarding authority and standby replica freshness
 //! firewall-states   → complete active firewall-state table
 //! firewall-state-summary [limit] → active total and bounded state sample
@@ -30,6 +31,7 @@
 //! unblock <cidr>    → lift one early (`all` lifts every one)
 //! reload            → reconcile the validated local configuration in place
 //! reload-reset      → also invalidate the previous policy namespace's state
+//! expire-state <nat|firewall> <scan-limit> → bounded standalone expiry maintenance
 //! reconcile-links   → hook what appeared; `ok`, or `held-down: <link>…` naming
 //!                     the held links still down because their hooks are not
 //!                     in place (everything else reconciled)
@@ -164,6 +166,21 @@ async fn respond(
     let args: Vec<&str> = tokens.collect();
     let limit = parse_limit(args.first().copied());
     match verb {
+        "expire-state" => {
+            let Some((table, limit)) = expiry_request(&args) else {
+                return format!(
+                    "usage: expire-state <nat|firewall> <1..={}>\n",
+                    crate::expiry::MAX_SCAN
+                );
+            };
+            match firewall.lock().await.expire_state(table, limit) {
+                Ok(report) => format!(
+                    "{}\n",
+                    serde_json::to_string(&report).expect("expiry report is serializable")
+                ),
+                Err(error) => format!("error: expiry maintenance: {error:#}\n"),
+            }
+        }
         "reload" | "reload-reset" => {
             let Some(path) = config else {
                 return "error: node is controller-managed or has no config file\n".into();
@@ -200,6 +217,7 @@ async fn respond(
                 Err(e) => format!("error: reading statistics: {e:#}\n"),
             }
         }
+        "capacity" => format!("{}\n", crate::capacity::query(firewall.clone()).await),
         "firewall-states" => {
             let fw = firewall.lock().await;
             match fw.read_firewall_states() {
@@ -420,6 +438,16 @@ async fn respond(
     }
 }
 
+fn expiry_request<'a>(args: &[&'a str]) -> Option<(&'a str, usize)> {
+    let [table @ ("nat" | "firewall"), limit] = args else {
+        return None;
+    };
+    let limit = limit.parse::<usize>().ok()?;
+    (1..=crate::expiry::MAX_SCAN)
+        .contains(&limit)
+        .then_some((*table, limit))
+}
+
 /// Parse an optional limit argument. An unparseable one yields `None` (the
 /// default) rather than an error: a diagnostics command should answer with
 /// something useful instead of arguing about its arguments.
@@ -442,6 +470,28 @@ fn held_down_reply(dark: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn expiry_command_requires_an_explicit_bounded_table() {
+        assert_eq!(
+            super::expiry_request(&["nat", "65536"]),
+            Some(("nat", 65536))
+        );
+        assert_eq!(
+            super::expiry_request(&["firewall", "1"]),
+            Some(("firewall", 1))
+        );
+        for args in [
+            &[][..],
+            &["nat"][..],
+            &["all", "2"],
+            &["nat", "0"],
+            &["nat", "65537"],
+            &["nat", "oops"],
+            &["nat", "1", "extra"],
+        ] {
+            assert!(super::expiry_request(args).is_none());
+        }
+    }
     use super::*;
 
     #[test]

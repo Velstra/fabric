@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use velstra_config::{HaConfig, RuntimeConfig};
 
-use crate::firewall::Firewall;
+use crate::firewall::{Firewall, timing};
 
 pub const ROLE_PATH: &str = "/run/velstra/ha/role.json";
 pub const AGENT_PATH: &str = "/run/velstra/ha/agent.json";
@@ -105,6 +105,24 @@ impl State {
             not_ready: Some("fresh agent has no state snapshot yet"),
         })))
     }
+    /// Revalidate the captured report after acquiring the state lock. A valid
+    /// report can age out while the monitor waits; never refresh its timestamp
+    /// or replace it with an unrelated observation from another generation.
+    fn accept_role(&mut self, config: &HaConfig, role: Option<Role>, now: u64) -> bool {
+        if let Some(role) = role.filter(|role| {
+            role.cluster == config.cluster
+                && role.node == config.node
+                && role_fresh(config, role.updated_ns, now)
+        }) {
+            self.role = role;
+            true
+        } else {
+            self.role.deadline_ns = 0;
+            self.role.vips_ready = false;
+            self.role.updated_ns = 0;
+            false
+        }
+    }
     /// Local forwarding authority and replica freshness, never inferred from
     /// link presence. The active node cannot measure remote apply latency from
     /// the one-way VCS2 feed; report that measurement as unknown, not zero.
@@ -179,6 +197,7 @@ impl State {
     ) -> bool {
         let ready = self.is_ready(config, policy, now);
         config.enabled
+            && role_fresh(config, self.role.updated_ns, now)
             && links_ready
             && self.role.vips_ready
             && self.role.authority.owner == config.node
@@ -362,14 +381,31 @@ pub fn attach_guard(interface: &str) -> Result<()> {
 /// removed from declarative HA intent. New data links are fenced first.
 fn obsolete_guard_ids(filters: &[serde_json::Value], owned: &BTreeSet<u32>) -> bool {
     filters.iter().any(|filter| {
+        // iproute2's bpf_dump_prog_info opens an options.prog object. The
+        // textual `id N` is not a flat options.id JSON field. Do not guess an
+        // ownership ID from malformed or conflicting compatibility fields.
+        let options = &filter["options"];
+        let id = options["prog"]["id"]
+            .as_u64()
+            .and_then(|id| u32::try_from(id).ok())
+            .filter(|id| *id != 0);
+        let unambiguous = options
+            .get("id")
+            .is_none_or(|legacy| id.is_some_and(|id| legacy.as_u64() == Some(u64::from(id))));
         filter["kind"] == "bpf"
+            && filter["chain"] == 0
+            && filter["protocol"] == "all"
             && filter["pref"] == 1
-            && (filter["options"]["handle"] == "0x1" || filter["options"]["handle"] == 1)
-            && filter["options"]["id"]
-                .as_u64()
-                .and_then(|id| u32::try_from(id).ok())
-                .is_some_and(|id| owned.contains(&id))
+            && (options["handle"] == "0x1" || options["handle"] == 1)
+            && unambiguous
+            && id.is_some_and(|id| owned.contains(&id))
     })
+}
+fn guard_inventory_args<'a>(name: &'a str, direction: &'a str) -> [&'a str; 6] {
+    // tc omits JSON coordinates that already equal a show-command selector.
+    // Inventory the whole hook so ownership checks see explicit pref, protocol
+    // and chain instead of trusting a missing field to mean the requested one.
+    ["-j", "filter", "show", "dev", name, direction]
 }
 fn remove_obsolete_guards(desired: &[String]) -> Result<()> {
     let owned: BTreeSet<_> = aya::programs::loaded_programs()
@@ -395,7 +431,7 @@ fn remove_obsolete_guards(desired: &[String]) -> Result<()> {
         }
         for direction in ["ingress", "egress"] {
             let output = Command::new(&tc)
-                .args(["-j", "filter", "show", "dev", name, direction, "pref", "1"])
+                .args(guard_inventory_args(name, direction))
                 .output()?;
             if !output.status.success() && !entry.path().exists() {
                 break;
@@ -414,7 +450,8 @@ fn remove_obsolete_guards(desired: &[String]) -> Result<()> {
                 tool(
                     "tc",
                     &[
-                        "filter", "del", "dev", name, direction, "pref", "1", "handle", "1", "bpf",
+                        "filter", "del", "dev", name, direction, "chain", "0", "protocol", "all",
+                        "pref", "1", "handle", "1", "bpf",
                     ],
                 )?;
             }
@@ -668,38 +705,50 @@ pub fn control_addresses(config: &HaConfig) -> Result<BTreeSet<IpAddr>> {
 pub async fn monitor(firewall: Arc<Mutex<Firewall>>, shared: Shared, config: HaConfig) {
     let mut poll = tokio::time::interval(Duration::from_millis(20));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut heartbeat_timing = timing::Heartbeat::default();
     loop {
-        poll.tick().await;
+        let tick_wait_entry = now_ns();
+        let scheduled_tick = poll.tick().await;
+        let tick_observation = heartbeat_timing.tick(tick_wait_entry, scheduled_tick);
+        let wait = timing::Span::start(timing::Phase::HaLockWait);
         let mut fw = firewall.lock().await;
-        let policy = match fw.sync_policy() {
+        drop(wait);
+        let _hold = timing::Span::start(timing::Phase::HaLockHold);
+        let observed_policy = {
+            let _timing = timing::Span::start(timing::Phase::HaPolicy);
+            fw.sync_policy()
+        };
+        let policy = match observed_policy {
             Ok(p) => p,
             Err(_) => {
                 let _ = fw.ha_deadline(0);
                 continue;
             }
         };
-        let links_ready = match fw.ha_interfaces(&config) {
+        let observed_links = {
+            let _timing = timing::Span::start(timing::Phase::HaGuards);
+            fw.ha_interfaces(&config)
+        };
+        let links_ready = match observed_links {
             Ok(value) => value,
             Err(error) => {
                 log::warn!("HA guard reconcile failed: {error:#}");
                 false
             }
         };
-        let role = read_role().ok().filter(|r| {
-            r.cluster == config.cluster
-                && r.node == config.node
-                && role_fresh(&config, r.updated_ns, now_ns())
-        });
-        let coordinator_live = role.is_some();
+        let role = {
+            let _timing = timing::Span::start(timing::Phase::HaReadRole);
+            read_role().ok().filter(|r| {
+                r.cluster == config.cluster
+                    && r.node == config.node
+                    && role_fresh(&config, r.updated_ns, now_ns())
+            })
+        };
+        let wait = timing::Span::start(timing::Phase::HaStateLockWait);
         let mut state = shared.lock().await;
-        if let Some(role) = role {
-            state.role = role;
-        } else {
-            state.role.deadline_ns = 0;
-            state.role.vips_ready = false;
-            state.role.updated_ns = 0;
-        }
+        drop(wait);
         let now = now_ns();
+        let coordinator_live = state.accept_role(&config, role, now);
         if state.ready_policy != policy {
             if state.retained_owner == state.ready_term && state.ready_term > 0 {
                 state.ready_policy = policy;
@@ -773,10 +822,16 @@ pub async fn monitor(firewall: Arc<Mutex<Firewall>>, shared: Shared, config: HaC
             eligible: config.enabled && links_ready && (state.cold || ready || active),
             updated_ns: now,
         };
-        if let Err(error) = write_agent(&agent) {
+        let published = {
+            let _timing = timing::Span::start(timing::Phase::HaPublish);
+            write_agent(&agent)
+        };
+        if let Err(error) = published {
             let _ = fw.ha_deadline(0);
             state.active_term = 0;
             log::warn!("HA readiness publish failed: {error:#}");
+        } else {
+            heartbeat_timing.published(tick_observation, agent.updated_ns);
         }
     }
 }
@@ -973,22 +1028,153 @@ mod tests {
         assert_eq!(remove, vec![51820, 51821]);
     }
     #[test]
+    fn guard_inventory_does_not_hide_coordinates_with_tc_show_selectors() {
+        assert_eq!(
+            guard_inventory_args("dmz0", "ingress"),
+            ["-j", "filter", "show", "dev", "dmz0", "ingress"]
+        );
+        assert_eq!(
+            guard_inventory_args("eth2", "egress"),
+            ["-j", "filter", "show", "dev", "eth2", "egress"]
+        );
+    }
+    #[test]
     fn guard_scope_cleanup_requires_reserved_coordinates_and_verified_kernel_owner() {
         use serde_json::json;
         let owned = [17].into_iter().collect();
-        let filter = json!({"kind":"bpf","pref":1,"options":{"handle":"0x1","id":17}});
+        // Real iproute2 shape: tc/f_bpf.c calls lib/bpf_legacy.c's
+        // bpf_dump_prog_info, whose program metadata is nested under `prog`.
+        let filter = json!({"protocol":"all","kind":"bpf","pref":1,"chain":0,
+            "options":{"handle":"0x1","bpf_name":"guard:[*fsobj]",
+                "direct-action":true,"not_in_hw":true,
+                "prog":{"id":17,"name":"velstra_ha_guar","tag":"9ddbb820a1a8c749","jited":1}}});
         assert!(obsolete_guard_ids(std::slice::from_ref(&filter), &owned));
         for different in [
-            json!({"kind":"bpf","pref":2,"options":{"handle":"0x1","id":17}}),
-            json!({"kind":"bpf","pref":1,"options":{"handle":"0x2","id":17}}),
-            json!({"kind":"bpf","pref":1,"options":{"handle":"0x1","id":18}}),
-            json!({"kind":"bpf","pref":1}),
-            json!({"kind":"flower","pref":1,"options":{"handle":"0x1","id":17}}),
+            json!({"protocol":"all","chain":0,"kind":"bpf","pref":2,"options":{"handle":"0x1","prog":{"id":17}}}),
+            json!({"protocol":"all","chain":0,"kind":"bpf","pref":1,"options":{"handle":"0x2","prog":{"id":17}}}),
+            json!({"protocol":"all","chain":0,"kind":"bpf","pref":1,"options":{"handle":"0x1","prog":{"id":18}}}),
+            json!({"protocol":"all","chain":0,"kind":"bpf","pref":1}),
+            json!({"protocol":"all","chain":0,"kind":"flower","pref":1,"options":{"handle":"0x1","prog":{"id":17}}}),
+            // The previous synthetic flat fixture is not a verified kernel
+            // identity. Never treat it as a fallback for missing nested data.
+            json!({"protocol":"all","chain":0,"kind":"bpf","pref":1,"options":{"handle":"0x1","id":17}}),
         ] {
             assert!(
                 !obsolete_guard_ids(&[different], &owned),
                 "unrelated filters must survive HA scope changes"
             );
+        }
+    }
+    #[test]
+    fn guard_scope_cleanup_never_borrows_owner_from_other_chain_or_protocol() {
+        use serde_json::json;
+        let owned = [17].into_iter().collect();
+        let foreign = json!({"protocol":"all","chain":0,"kind":"bpf","pref":1,
+            "options":{"handle":"0x1","prog":{"id":18}}});
+        for (field, value) in [
+            ("chain", json!(1)),
+            ("chain", json!("0")),
+            ("chain", json!(null)),
+            ("protocol", json!("ip")),
+            ("protocol", json!(null)),
+        ] {
+            let mut other = foreign.clone();
+            other["options"]["prog"]["id"] = json!(17);
+            other[field] = value;
+            assert!(!obsolete_guard_ids(&[foreign.clone(), other], &owned));
+        }
+        for field in ["chain", "protocol"] {
+            let mut missing = foreign.clone();
+            missing["options"]["prog"]["id"] = json!(17);
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(!obsolete_guard_ids(&[foreign.clone(), missing], &owned));
+        }
+    }
+    #[test]
+    fn guard_scope_cleanup_rejects_malformed_and_conflicting_program_ids() {
+        use serde_json::json;
+        let owned = [17].into_iter().collect();
+        for id in [
+            json!(null),
+            json!(-1),
+            json!(0),
+            json!("17"),
+            json!(17.0),
+            json!(4_294_967_296u64),
+            json!({"id":17}),
+        ] {
+            let filter = json!({"protocol":"all","chain":0,"kind":"bpf","pref":1,
+                "options":{"handle":"0x1","id":17,"prog":{"id":id}}});
+            assert!(!obsolete_guard_ids(&[filter], &owned));
+        }
+        for legacy in [json!(18), json!(null), json!("17"), json!(-1)] {
+            let filter = json!({"protocol":"all","chain":0,"kind":"bpf","pref":1,
+                "options":{"handle":"0x1","id":legacy,"prog":{"id":17}}});
+            assert!(!obsolete_guard_ids(&[filter], &owned));
+        }
+        let same = json!({"protocol":"all","chain":0,"kind":"bpf","pref":1,
+            "options":{"handle":1,"id":17,"prog":{"id":17}}});
+        assert!(obsolete_guard_ids(&[same], &owned));
+    }
+    #[tokio::test]
+    async fn captured_role_must_remain_fresh_after_state_lock_wait() {
+        let cfg = config();
+        let shared = State::new(Some(cfg.clone())).unwrap();
+        let mut state = shared.lock().await;
+        let published = 1_000_000_000;
+        let role = Role {
+            cluster: cfg.cluster.clone(),
+            node: cfg.node,
+            coordinator_boot: [7; 16],
+            authority: Authority {
+                term: 5,
+                owner: cfg.node,
+                boot: [7; 16],
+                policy: [8; 32],
+            },
+            claimed_agent_boot: state.agent_boot,
+            deadline_ns: published + 1_000_000_000,
+            updated_ns: published,
+            vips_ready: true,
+            ..Role::default()
+        };
+        let boundary = published + cfg.role_fresh_ms * 1_000_000;
+        assert!(role_fresh(&cfg, role.updated_ns, published + 90_000_000));
+        assert!(state.accept_role(&cfg, Some(role.clone()), boundary));
+        assert_eq!(state.role.updated_ns, published);
+        assert!(state.forwarding_allowed(&cfg, [8; 32], true, boundary));
+        assert!(state.role.deadline_ns > boundary + 1);
+        assert!(!state.forwarding_allowed(&cfg, [8; 32], true, boundary + 1));
+        assert!(!state.accept_role(&cfg, Some(role.clone()), boundary + 1));
+        assert_eq!(state.role.deadline_ns, 0);
+        assert!(!state.role.vips_ready);
+        assert_eq!(state.role.updated_ns, 0);
+        assert_eq!(
+            state.role.authority.term, 5,
+            "retain generation, not authority"
+        );
+        state.observe(&cfg, [8; 32], true, false, boundary + 1);
+        assert_eq!(state.not_ready, Some("coordinator is not reporting"));
+
+        for candidate in [
+            None,
+            Some(Role {
+                updated_ns: boundary + 1,
+                ..role.clone()
+            }),
+            Some(Role {
+                node: 2,
+                ..role.clone()
+            }),
+            Some(Role {
+                cluster: "foreign-cluster".into(),
+                ..role.clone()
+            }),
+        ] {
+            assert!(state.accept_role(&cfg, Some(role.clone()), boundary));
+            assert!(!state.accept_role(&cfg, candidate, boundary));
+            assert_eq!(state.role.deadline_ns, 0);
+            assert!(!state.forwarding_allowed(&cfg, [8; 32], true, boundary));
         }
     }
     #[tokio::test]
@@ -1072,6 +1258,7 @@ mod tests {
             claimed_agent_boot: state.agent_boot,
             vips_ready: true,
             deadline_ns: now + 100_000_000,
+            updated_ns: now,
             ..Role::default()
         };
         assert!(
@@ -1121,6 +1308,7 @@ mod tests {
             claimed_agent_boot: state.agent_boot,
             vips_ready: true,
             deadline_ns: later + 100_000_000,
+            updated_ns: later,
             ..Role::default()
         };
         assert!(state.is_ready(&cfg, [3; 32], later));

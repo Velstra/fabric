@@ -15,6 +15,124 @@
 /// sends from before it has a lease, which is the traffic that must still leave.
 pub const UNADDRESSED: [u8; 4] = [0; 4];
 
+/// A complete finite port domain, visited once in cyclic seed order. Unlike
+/// wrapping the seed before modulo, this also covers non-power-of-two CGNAT
+/// blocks when the seed is close to u32::MAX. This is NOT the legacy allocator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NaptDomain {
+    pub first: u32,
+    pub count: u32,
+    pub offset: u32,
+}
+
+impl NaptDomain {
+    #[inline(always)]
+    pub fn new(src: [u8; 4], seed: u32, layout: &crate::CgnatLayout) -> Self {
+        let (first, last) = layout.range_of(src).unwrap_or((32768, 65535));
+        if first == 0 || last < first {
+            return Self {
+                first: 0,
+                count: 0,
+                offset: 0,
+            };
+        }
+        let count = last as u32 - first as u32 + 1;
+        Self {
+            first: first as u32,
+            count,
+            offset: seed % count,
+        }
+    }
+
+    #[inline(always)]
+    pub fn candidate(&self, index: u32) -> u16 {
+        // Keep division-by-zero panic paths out of the kernel object, even
+        // for a corrupted/disabled domain. Such a domain has no candidate.
+        if self.count == 0 || index >= self.count {
+            return 0;
+        }
+        (self.first + (self.offset + index) % self.count) as u16
+    }
+}
+
+/// Count for a monotonic displacement summary of the default domain. The
+/// summary is the atomic OR of indices published BEFORE reverse-map insertion.
+/// Missing/invalid metadata and other layouts always retain complete search.
+#[inline(always)]
+pub fn napt_search_count(domain: NaptDomain, summary: u64) -> u32 {
+    if domain.first != 32768 || domain.count != 32768 || summary >= 32768 {
+        domain.count
+    } else {
+        summary as u32 + 1
+    }
+}
+
+#[cfg(test)]
+mod search_bound_tests {
+    use super::*;
+
+    #[test]
+    fn every_published_displacement_is_inside_the_monotonic_search() {
+        let domain = NaptDomain::new([10, 0, 0, 1], 27, &crate::CgnatLayout::default());
+        let mut summary = 0;
+        // Visit all positions in non-monotonic order; OR never loses a bit.
+        for i in 0..32768u64 {
+            let index = (i * 7919) % 32768;
+            let previous = summary;
+            summary |= index;
+            assert!(summary >= previous);
+            assert!(napt_search_count(domain, summary) > index as u32);
+        }
+    }
+
+    #[test]
+    fn unknown_writer_or_layout_cannot_shorten_discovery() {
+        let domain = NaptDomain {
+            first: 32768,
+            count: 32768,
+            offset: 17,
+        };
+        for summary in [32768, 65535, u64::MAX] {
+            assert_eq!(napt_search_count(domain, summary), domain.count);
+        }
+        for domain in [
+            NaptDomain {
+                first: 1000,
+                count: 100,
+                offset: 4,
+            },
+            NaptDomain {
+                first: 32768,
+                count: 64,
+                offset: 0,
+            },
+            NaptDomain {
+                first: 0,
+                count: 0,
+                offset: 0,
+            },
+        ] {
+            assert_eq!(napt_search_count(domain, 0), domain.count);
+        }
+    }
+
+    #[test]
+    fn deletions_and_failed_claims_must_not_reduce_the_summary() {
+        let domain = NaptDomain {
+            first: 32768,
+            count: 32768,
+            offset: 0,
+        };
+        let summary = 8 | 2; // including a failed claim only overestimates
+        assert_eq!(napt_search_count(domain, summary), 11);
+        let owned_late = domain.candidate(8);
+        assert!(
+            (0..napt_search_count(domain, summary))
+                .any(|index| domain.candidate(index) == owned_late)
+        );
+    }
+}
+
 /// Whether an IPv4 packet with source `src` must be dropped leaving an uplink
 /// whose `MASQUERADE` entry is `nat_ip`.
 ///
@@ -75,6 +193,56 @@ pub fn napt_binding_matches(state: &crate::FlowState, origin: [u8; 4], port: u16
         && state.nat_port == port
         && state.nat2_ip == [0; 4]
         && state.nat2_port == 0
+}
+
+/// The observed owner of one reverse NAPT key. An expired foreign binding is
+/// still foreign: expiry is not an atomic compare-and-replace permission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NaptSlot {
+    Owned,
+    Vacant,
+    Foreign,
+}
+
+#[inline(always)]
+pub fn napt_slot(state: Option<&crate::FlowState>, origin: [u8; 4], port: u16) -> NaptSlot {
+    match state {
+        Some(state) if napt_binding_matches(state, origin, port) => NaptSlot::Owned,
+        Some(_) => NaptSlot::Foreign,
+        None => NaptSlot::Vacant,
+    }
+}
+
+/// Result of reserving a single candidate, not proof of global map capacity.
+/// LRU insertion can still evict an unrelated key; that is a separate limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NaptClaim {
+    Existing,
+    Inserted,
+    Busy,
+    Failed,
+}
+
+/// Resolve a vacancy/insert race without replacing another endpoint's state.
+/// `insert_noexist` MUST use BPF_NOEXIST, never BPF_ANY or delete-then-insert.
+/// Only EEXIST is a normal race: reread actual ownership, reusing the same flow
+/// or letting the caller try its next candidate. Other errors fail closed.
+#[inline(always)]
+pub fn napt_claim(
+    observed: NaptSlot,
+    insert_noexist: impl FnOnce() -> Result<(), i32>,
+    owned_after_race: impl FnOnce() -> bool,
+) -> NaptClaim {
+    match observed {
+        NaptSlot::Owned => NaptClaim::Existing,
+        NaptSlot::Foreign => NaptClaim::Busy,
+        NaptSlot::Vacant => match insert_noexist() {
+            Ok(()) => NaptClaim::Inserted,
+            Err(-17) if owned_after_race() => NaptClaim::Existing,
+            Err(-17) => NaptClaim::Busy,
+            Err(_) => NaptClaim::Failed,
+        },
+    }
 }
 
 /// Bounded existing-binding search shared with the real egress dataplane.
@@ -147,6 +315,201 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    #[test]
+    fn complete_domain_visits_every_ephemeral_port_once_even_at_seed_wrap() {
+        for seed in [0, 1, 32767, u32::MAX - 3, u32::MAX] {
+            let domain = NaptDomain::new([10, 0, 0, 1], seed, &crate::CgnatLayout::default());
+            let visited: BTreeSet<_> = (0..domain.count).map(|i| domain.candidate(i)).collect();
+            assert_eq!(visited, (32768..=65535).collect());
+        }
+    }
+
+    #[test]
+    fn complete_domain_covers_exact_cgnat_block_without_crossing_subscriber_boundary() {
+        for size in [1, 7, 9, 65, 511, 512, 65535] {
+            let layout = crate::CgnatLayout::new(1, size);
+            for src in [[10, 0, 0, 1], [10, 0, 0, 2]] {
+                let (first, last) = layout.range_of(src).unwrap();
+                for seed in [0, 1, u32::MAX - 3, u32::MAX] {
+                    let domain = NaptDomain::new(src, seed, &layout);
+                    let visited: BTreeSet<_> =
+                        (0..domain.count).map(|i| domain.candidate(i)).collect();
+                    assert_eq!(visited, (first..=last).collect());
+                    assert_eq!(domain.count, size as u32);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn complete_domain_is_not_an_eight_or_sixty_four_candidate_window() {
+        let domain = NaptDomain::new([10, 0, 0, 1], 0, &crate::CgnatLayout::default());
+        let mut occupied = BTreeSet::new();
+        for _ in 0..129 {
+            let port = (0..domain.count)
+                .map(|i| domain.candidate(i))
+                .find(|port| !occupied.contains(port))
+                .unwrap();
+            assert!(occupied.insert(port));
+        }
+        assert_eq!(occupied.len(), 129);
+        assert_eq!(occupied.last(), Some(&32896));
+    }
+
+    #[test]
+    fn complete_domain_rejects_invalid_or_exhausted_indexes_without_panicking() {
+        let empty = NaptDomain {
+            first: 0,
+            count: 0,
+            offset: 0,
+        };
+        assert_eq!(empty.candidate(0), 0);
+        let domain = NaptDomain::new([10, 0, 0, 1], 0, &crate::CgnatLayout::default());
+        assert_eq!(domain.candidate(domain.count), 0);
+        assert_eq!(domain.candidate(u32::MAX), 0);
+    }
+
+    #[test]
+    fn vacant_claim_never_overwrites_a_foreign_insertion_racing_the_lookup() {
+        use std::cell::RefCell;
+        let origin = [192, 0, 2, 7];
+        let foreign = crate::FlowState::masquerade([192, 0, 2, 8], 43001);
+        let state = RefCell::new(None);
+        let observed = napt_slot(state.borrow().as_ref(), origin, 43000);
+        // Another CPU wins after the first lookup and before our NOEXIST.
+        *state.borrow_mut() = Some(foreign);
+        let result = napt_claim(
+            observed,
+            || {
+                assert!(state.borrow().is_some());
+                Err(-17)
+            },
+            || {
+                matches!(
+                    napt_slot(state.borrow().as_ref(), origin, 43000),
+                    NaptSlot::Owned
+                )
+            },
+        );
+        assert_eq!(result, NaptClaim::Busy);
+        assert!(napt_binding_matches(
+            state.borrow().as_ref().unwrap(),
+            [192, 0, 2, 8],
+            43001
+        ));
+    }
+
+    #[test]
+    fn same_flow_racing_a_vacant_lookup_reuses_the_winning_binding() {
+        let own = crate::FlowState::masquerade([192, 0, 2, 7], 43000);
+        assert_eq!(
+            napt_claim(
+                NaptSlot::Vacant,
+                || Err(-17),
+                || napt_binding_matches(&own, [192, 0, 2, 7], 43000)
+            ),
+            NaptClaim::Existing
+        );
+        assert_eq!(
+            napt_claim(NaptSlot::Vacant, || Ok(()), || panic!("no race")),
+            NaptClaim::Inserted
+        );
+        assert_eq!(
+            napt_claim(NaptSlot::Vacant, || Err(-17), || false),
+            NaptClaim::Busy
+        );
+    }
+
+    #[test]
+    fn foreign_live_or_expired_slot_never_invokes_insert_or_delete() {
+        for age in [0, u64::MAX] {
+            let foreign = crate::FlowState {
+                age_ns: age,
+                ..crate::FlowState::masquerade([192, 0, 2, 8], 43001)
+            };
+            let observed = napt_slot(Some(&foreign), [192, 0, 2, 7], 43000);
+            assert_eq!(observed, NaptSlot::Foreign);
+            assert_eq!(
+                napt_claim(
+                    observed,
+                    || panic!("must not overwrite/reclaim foreign"),
+                    || panic!("no insertion attempted")
+                ),
+                NaptClaim::Busy
+            );
+        }
+        let own = crate::FlowState::masquerade([192, 0, 2, 7], 43000);
+        assert_eq!(
+            napt_claim(
+                napt_slot(Some(&own), [192, 0, 2, 7], 43000),
+                || panic!("existing allocation"),
+                || panic!("no race")
+            ),
+            NaptClaim::Existing
+        );
+    }
+
+    #[test]
+    fn claim_unknown_failure_cannot_become_success_or_an_ordinary_collision() {
+        for error in [-1, -12, -22, 17, 0] {
+            assert_eq!(
+                napt_claim(NaptSlot::Vacant, || Err(error), || panic!("not EEXIST")),
+                NaptClaim::Failed
+            );
+        }
+    }
+
+    #[test]
+    fn all_expired_foreign_candidates_still_refuse_admission_without_safe_reclamation() {
+        let seed = napt_seed([198, 18, 20, 50], [198, 18, 10, 254], 43000, 9000);
+        let foreign = crate::FlowState {
+            age_ns: u64::MAX,
+            ..crate::FlowState::masquerade([192, 0, 2, 8], 43001)
+        };
+        let mut visited = Vec::new();
+        let chosen = (0..8).find_map(|probe| {
+            let port = napt_port(seed, probe);
+            visited.push(port);
+            let observed = napt_slot(Some(&foreign), [198, 18, 20, 50], 43000);
+            match napt_claim(
+                observed,
+                || panic!("unsafe reclamation is not an allocation permission"),
+                || panic!("foreign slot does not attempt publication"),
+            ) {
+                NaptClaim::Existing | NaptClaim::Inserted => Some(port),
+                NaptClaim::Busy => None,
+                NaptClaim::Failed => panic!("occupied slots do not attempt a failing syscall"),
+            }
+        });
+        assert!(chosen.is_none());
+        assert_eq!(visited.len(), 8);
+        // This is an explicit availability restriction, not an expiry/GC fix.
+        // A foreign timestamp cannot provide atomic compare/delete ownership.
+        assert_eq!(foreign.age_ns, u64::MAX);
+    }
+
+    #[test]
+    fn allocator_retries_the_next_existing_candidate_after_foreign_race() {
+        let seed = napt_seed([198, 18, 20, 50], [198, 18, 10, 254], 43000, 9000);
+        let mut visited = Vec::new();
+        let chosen = (0..8).find_map(|probe| {
+            let port = napt_port(seed, probe);
+            visited.push(port);
+            let claim = napt_claim(
+                NaptSlot::Vacant,
+                || if probe == 0 { Err(-17) } else { Ok(()) },
+                || false,
+            );
+            match claim {
+                NaptClaim::Inserted | NaptClaim::Existing => Some(port),
+                NaptClaim::Busy => None,
+                NaptClaim::Failed => panic!("unexpected failure"),
+            }
+        });
+        assert_eq!(chosen, Some(napt_port(seed, 1)));
+        assert_eq!(visited, vec![napt_port(seed, 0), napt_port(seed, 1)]);
+    }
 
     #[test]
     fn mixed_version_native_reset_tuple_has_distinct_old_and_new_windows() {

@@ -114,6 +114,50 @@ pub fn plan_tcp_rst(
     }
 }
 
+/// IPv6 version of the same RFC TCP reset, with the RFC 8200 pseudo-header.
+/// `ip_checksum` is zero because IPv6 has no IP-header checksum.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn plan_tcp_rst_v6(
+    ip_src: [u8; 16],
+    ip_dst: [u8; 16],
+    sport: u16,
+    dport: u16,
+    in_seq: u32,
+    in_ack: u32,
+    in_flags: u8,
+    in_seg_len: u32,
+) -> TcpRst {
+    let (seq, ack, flags) = if in_flags & tcp_flags::ACK != 0 {
+        (in_ack, 0, tcp_flags::RST)
+    } else {
+        (
+            0,
+            in_seq.wrapping_add(in_seg_len),
+            tcp_flags::RST | tcp_flags::ACK,
+        )
+    };
+    let segment = rst_tcp_header(dport, sport, seq, ack, flags);
+    // The address sum is order-independent; the reply swaps them on the wire.
+    let mut sum = 20u32 + crate::packet::ip_proto::TCP as u32;
+    for i in 0..8 {
+        sum += u16::from_be_bytes([ip_src[2 * i], ip_src[2 * i + 1]]) as u32;
+        sum += u16::from_be_bytes([ip_dst[2 * i], ip_dst[2 * i + 1]]) as u32;
+    }
+    for i in 0..10 {
+        sum += u16::from_be_bytes([segment[2 * i], segment[2 * i + 1]]) as u32;
+    }
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
+    TcpRst {
+        seq,
+        ack,
+        flags,
+        ip_checksum: 0,
+        tcp_checksum: !(sum as u16),
+    }
+}
+
 /// The 20-byte IPv4 header of a RST response (checksum field left zero for
 /// [`ipv4_checksum`]). Total length 40 (20 IP + 20 TCP), TTL 64, protocol TCP.
 fn rst_ip_header(src: [u8; 4], dst: [u8; 4]) -> [u8; 20] {
@@ -360,6 +404,47 @@ mod tests {
             1,
         );
         assert_ne!(a.tcp_checksum, b.tcp_checksum);
+    }
+
+    #[test]
+    fn ipv6_reset_checksum_and_sequence_cover_the_complete_pseudo_header() {
+        let src: [u8; 16] = "2001:db8:1234::50"
+            .parse::<std::net::Ipv6Addr>()
+            .unwrap()
+            .octets();
+        let dst: [u8; 16] = "2001:db8:9876::100"
+            .parse::<std::net::Ipv6Addr>()
+            .unwrap()
+            .octets();
+        for (flags, seq, ack, size) in [
+            (tcp_flags::SYN, u32::MAX, 0, 1),
+            (tcp_flags::ACK, 20, 300, 0),
+        ] {
+            let rst = plan_tcp_rst_v6(src, dst, 51000, 18082, seq, ack, flags, size);
+            let mut segment = rst_tcp_header(18082, 51000, rst.seq, rst.ack, rst.flags);
+            segment[16..18].copy_from_slice(&rst.tcp_checksum.to_be_bytes());
+            let mut pseudo = Vec::new();
+            pseudo.extend_from_slice(&dst);
+            pseudo.extend_from_slice(&src);
+            pseudo.extend_from_slice(&20u32.to_be_bytes());
+            pseudo.extend_from_slice(&[0, 0, 0, 6]);
+            pseudo.extend_from_slice(&segment);
+            assert_eq!(ones_complement(&pseudo), 0);
+            if flags == tcp_flags::SYN {
+                assert_eq!(
+                    (rst.seq, rst.ack, rst.flags),
+                    (0, 0, tcp_flags::RST | tcp_flags::ACK)
+                );
+            } else {
+                assert_eq!((rst.seq, rst.ack, rst.flags), (300, 0, tcp_flags::RST));
+            }
+            let mut changed = src;
+            changed[0] ^= 1;
+            assert_ne!(
+                rst.tcp_checksum,
+                plan_tcp_rst_v6(changed, dst, 51000, 18082, seq, ack, flags, size).tcp_checksum
+            );
+        }
     }
 
     #[test]

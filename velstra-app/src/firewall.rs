@@ -43,6 +43,520 @@ use velstra_config::{
     ResolvedSrv6LocalSid, ResolvedSrv6Route, ResolvedSynProxy, ResolvedTunnel, RuntimeConfig,
 };
 
+/// Bounded diagnostics only: no timing sample participates in readiness,
+/// authority, admission or timeout decisions. Logging happens on another
+/// thread, never synchronously in a Firewall critical section.
+pub(crate) mod timing {
+    use std::{
+        sync::{
+            OnceLock,
+            atomic::{AtomicU64, Ordering},
+            mpsc::{SyncSender, sync_channel},
+        },
+        thread::ThreadId,
+        time::Instant,
+    };
+
+    const SLOW_NS: u64 = 20_000_000;
+    const REPORT_INTERVAL_NS: u64 = 1_000_000_000;
+    const QUEUE_CAPACITY: usize = 64;
+    // Diagnostic threshold only; unrelated to authority/freshness limits.
+    const HEARTBEAT_REPORT_NS: u64 = 60_000_000;
+
+    #[derive(Clone, Copy, Debug)]
+    #[repr(usize)]
+    pub(crate) enum Phase {
+        ReconcileLockWait,
+        ReconcileLockHold,
+        HaLockWait,
+        HaLockHold,
+        HaStateLockWait,
+        HaPolicy,
+        HaGuards,
+        HaReadRole,
+        HaPublish,
+        HaTickLateness,
+        HaPublicationGap,
+        Reload,
+        HostPrepare,
+        HostObserver,
+        HostRevalidate,
+        LocalAddressInsert,
+        LocalAddressRevalidate,
+        ReaderDrain,
+        MapApply,
+        FullTransaction,
+    }
+    const PHASE_COUNT: usize = Phase::FullTransaction as usize + 1;
+
+    impl Phase {
+        fn synchronous(self) -> bool {
+            !matches!(
+                self,
+                Self::ReconcileLockWait
+                    | Self::HaLockWait
+                    | Self::HaLockHold
+                    | Self::HaStateLockWait
+                    | Self::HaTickLateness
+                    | Self::HaPublicationGap
+            )
+        }
+    }
+
+    struct Budget {
+        next: AtomicU64,
+        suppressed: AtomicU64,
+    }
+    impl Budget {
+        const fn new() -> Self {
+            Self {
+                next: AtomicU64::new(0),
+                suppressed: AtomicU64::new(0),
+            }
+        }
+
+        fn admit(&self, now: u64, elapsed: u64) -> Option<u64> {
+            if elapsed < SLOW_NS || now == u64::MAX {
+                return None;
+            }
+            let mut next = self.next.load(Ordering::Relaxed);
+            loop {
+                if now < next {
+                    self.suppressed.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                match self.next.compare_exchange_weak(
+                    next,
+                    now.saturating_add(REPORT_INTERVAL_NS),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return Some(self.suppressed.swap(0, Ordering::Relaxed)),
+                    Err(current) => next = current,
+                }
+            }
+        }
+    }
+
+    static BUDGETS: [Budget; PHASE_COUNT] = [const { Budget::new() }; PHASE_COUNT];
+    static REPORTER: OnceLock<Option<SyncSender<Report>>> = OnceLock::new();
+    static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+    struct Report {
+        phase: Phase,
+        boot_start_ns: u64,
+        boot_end_ns: u64,
+        elapsed_ns: u64,
+        thread_cpu_ns: Option<u64>,
+        suppressed: u64,
+        heartbeat: Option<HeartbeatReport>,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct TickObservation {
+        wait_entry_boot_ns: u64,
+        resume_boot_before_ns: u64,
+        resume_boot_after_ns: u64,
+        nominal_lateness_ns: u64,
+    }
+
+    impl TickObservation {
+        fn from_samples(
+            wait_entry_boot_ns: u64,
+            scheduled: tokio::time::Instant,
+            resumed: tokio::time::Instant,
+            resume_boot_before_ns: u64,
+            resume_boot_after_ns: u64,
+        ) -> Self {
+            Self {
+                wait_entry_boot_ns,
+                resume_boot_before_ns,
+                resume_boot_after_ns,
+                nominal_lateness_ns: resumed
+                    .saturating_duration_since(scheduled)
+                    .as_nanos()
+                    .min(u64::MAX as u128) as u64,
+            }
+        }
+
+        fn valid(self) -> bool {
+            self.wait_entry_boot_ns <= self.resume_boot_before_ns
+                && self.resume_boot_before_ns <= self.resume_boot_after_ns
+                && self.resume_boot_after_ns != u64::MAX
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct Publication {
+        agent_updated_ns: u64,
+        completed_observed_boot_ns: u64,
+    }
+
+    #[derive(Debug)]
+    struct HeartbeatReport {
+        tick: TickObservation,
+        previous: Option<Publication>,
+        current: Option<Publication>,
+        completion_gap_ns: Option<u64>,
+    }
+
+    #[derive(Default)]
+    pub(crate) struct Heartbeat {
+        previous: Option<Publication>,
+    }
+
+    impl Heartbeat {
+        pub(crate) fn tick(
+            &self,
+            wait_entry_boot_ns: u64,
+            scheduled: tokio::time::Instant,
+        ) -> TickObservation {
+            // BOOTTIME brackets the resumed Instant sample. Do not subtract
+            // different clock domains or pretend the samples are simultaneous.
+            let before = crate::ha::now_ns();
+            let resumed = tokio::time::Instant::now();
+            let after = crate::ha::now_ns();
+            let tick = TickObservation::from_samples(
+                wait_entry_boot_ns,
+                scheduled,
+                resumed,
+                before,
+                after,
+            );
+            report_heartbeat(
+                Phase::HaTickLateness,
+                // Also report a long cross-clock sampling bracket: a vCPU
+                // pause after the Instant read must not vanish from evidence.
+                tick.nominal_lateness_ns.max(after.saturating_sub(before)),
+                HeartbeatReport {
+                    tick,
+                    previous: self.previous,
+                    current: None,
+                    completion_gap_ns: None,
+                },
+            );
+            tick
+        }
+
+        pub(crate) fn published(&mut self, tick: TickObservation, agent_updated_ns: u64) {
+            self.published_at(tick, agent_updated_ns, crate::ha::now_ns());
+        }
+
+        fn published_at(&mut self, tick: TickObservation, agent_updated_ns: u64, completed: u64) {
+            if !tick.valid()
+                || completed == u64::MAX
+                || completed < tick.resume_boot_after_ns
+                || completed < agent_updated_ns
+                || self.previous.is_some_and(|previous| {
+                    completed < previous.completed_observed_boot_ns
+                        || agent_updated_ns < previous.agent_updated_ns
+                })
+            {
+                return;
+            }
+            let current = Publication {
+                agent_updated_ns,
+                completed_observed_boot_ns: completed,
+            };
+            let gap = self
+                .previous
+                .and_then(|previous| completed.checked_sub(previous.completed_observed_boot_ns));
+            report_heartbeat(
+                Phase::HaPublicationGap,
+                gap.unwrap_or(0),
+                HeartbeatReport {
+                    tick,
+                    previous: self.previous,
+                    current: Some(current),
+                    completion_gap_ns: gap,
+                },
+            );
+            self.previous = Some(current);
+        }
+    }
+
+    fn report_heartbeat(phase: Phase, metric: u64, heartbeat: HeartbeatReport) {
+        if !heartbeat_reportable(heartbeat.tick, metric) {
+            return;
+        }
+        let Some(Some(sender)) = REPORTER.get() else {
+            return;
+        };
+        let end = heartbeat
+            .current
+            .map_or(heartbeat.tick.resume_boot_after_ns, |publication| {
+                publication.completed_observed_boot_ns
+            });
+        let Some(suppressed) = BUDGETS[phase as usize].admit(end, metric) else {
+            return;
+        };
+        let report = Report {
+            phase,
+            boot_start_ns: heartbeat.tick.wait_entry_boot_ns,
+            boot_end_ns: end,
+            elapsed_ns: metric,
+            thread_cpu_ns: None,
+            suppressed,
+            heartbeat: Some(heartbeat),
+        };
+        if sender.try_send(report).is_err() {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn heartbeat_reportable(tick: TickObservation, metric: u64) -> bool {
+        metric >= HEARTBEAT_REPORT_NS && tick.valid()
+    }
+
+    pub(crate) fn initialize() {
+        REPORTER.get_or_init(|| {
+            let (sender, receiver) = sync_channel::<Report>(QUEUE_CAPACITY);
+            match std::thread::Builder::new()
+                .name("ha-timing-log".into())
+                .spawn(move || {
+                    while let Ok(report) = receiver.recv() {
+                        let dropped = DROPPED.swap(0, Ordering::Relaxed);
+                        if let Some(heartbeat) = report.heartbeat {
+                            log::info!(target: "velstra::ha_timing",
+                                "heartbeat phase={:?} wait_entry_boot_ns={} resume_boot_before_ns={} resume_boot_after_ns={} nominal_lateness_ns={} previous_agent_updated_ns={:?} previous_completed_observed_boot_ns={:?} agent_updated_ns={:?} completed_observed_boot_ns={:?} completion_gap_ns={:?} suppressed={} queue_dropped={}",
+                                report.phase, heartbeat.tick.wait_entry_boot_ns,
+                                heartbeat.tick.resume_boot_before_ns, heartbeat.tick.resume_boot_after_ns,
+                                heartbeat.tick.nominal_lateness_ns,
+                                heartbeat.previous.map(|p| p.agent_updated_ns),
+                                heartbeat.previous.map(|p| p.completed_observed_boot_ns),
+                                heartbeat.current.map(|p| p.agent_updated_ns),
+                                heartbeat.current.map(|p| p.completed_observed_boot_ns),
+                                heartbeat.completion_gap_ns, report.suppressed, dropped);
+                        } else {
+                            log::info!(target: "velstra::ha_timing",
+                            "slow phase={:?} boot_start_ns={} boot_end_ns={} elapsed_ns={} thread_cpu_ns={:?} suppressed={} queue_dropped={}",
+                            report.phase, report.boot_start_ns, report.boot_end_ns,
+                            report.elapsed_ns, report.thread_cpu_ns, report.suppressed, dropped);
+                        }
+                    }
+                }) {
+                Ok(_) => Some(sender),
+                Err(error) => {
+                    log::warn!("HA timing diagnostics unavailable: {error}");
+                    None
+                }
+            }
+        });
+    }
+
+    fn thread_cpu_ns() -> Option<u64> {
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: time points to initialized, writable timespec storage.
+        if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) } != 0 {
+            return None;
+        }
+        Some(
+            (time.tv_sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(time.tv_nsec as u64),
+        )
+    }
+
+    pub(crate) struct Span {
+        phase: Phase,
+        start: Instant,
+        boot_start_ns: u64,
+        cpu_start_ns: Option<u64>,
+        thread: ThreadId,
+    }
+    impl Span {
+        pub(crate) fn start(phase: Phase) -> Self {
+            Self {
+                phase,
+                start: Instant::now(),
+                boot_start_ns: crate::ha::now_ns(),
+                cpu_start_ns: thread_cpu_ns(),
+                thread: std::thread::current().id(),
+            }
+        }
+    }
+    impl Drop for Span {
+        fn drop(&mut self) {
+            let elapsed_ns = self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            let Some(Some(sender)) = REPORTER.get() else {
+                return;
+            };
+            let boot_end_ns = crate::ha::now_ns();
+            if self.boot_start_ns == u64::MAX {
+                return;
+            }
+            let Some(suppressed) = BUDGETS[self.phase as usize].admit(boot_end_ns, elapsed_ns)
+            else {
+                return;
+            };
+            // Never attribute other executor tasks' CPU time to an async
+            // waiter, even if it resumes on the same worker. Synchronous
+            // phases additionally require the same OS thread at both ends.
+            let thread_cpu_ns = (self.phase.synchronous()
+                && self.thread == std::thread::current().id())
+            .then(thread_cpu_ns)
+            .flatten()
+            .zip(self.cpu_start_ns)
+            .and_then(|(after, before)| after.checked_sub(before));
+            let report = Report {
+                phase: self.phase,
+                boot_start_ns: self.boot_start_ns,
+                boot_end_ns,
+                elapsed_ns,
+                thread_cpu_ns,
+                suppressed,
+                heartbeat: None,
+            };
+            if sender.try_send(report).is_err() {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn tick_sample(lateness: u64) -> TickObservation {
+            let scheduled = tokio::time::Instant::now();
+            TickObservation::from_samples(
+                1_000,
+                scheduled,
+                scheduled + std::time::Duration::from_nanos(lateness),
+                2_000,
+                2_010,
+            )
+        }
+
+        #[test]
+        fn heartbeat_lateness_uses_nominal_tick_not_normal_wait_duration() {
+            let on_time = tick_sample(0);
+            assert_eq!(on_time.nominal_lateness_ns, 0);
+            assert!(!heartbeat_reportable(on_time, on_time.nominal_lateness_ns));
+            let delayed = tick_sample(60_000_000);
+            assert_eq!(delayed.nominal_lateness_ns, 60_000_000);
+            assert!(heartbeat_reportable(delayed, delayed.nominal_lateness_ns));
+            assert!(!heartbeat_reportable(delayed, HEARTBEAT_REPORT_NS - 1));
+            assert!(!Phase::HaTickLateness.synchronous());
+            assert!(!Phase::HaPublicationGap.synchronous());
+        }
+
+        #[test]
+        fn heartbeat_retains_cross_clock_bounds_without_inventing_exact_boot_deadline() {
+            let mut tick = tick_sample(0);
+            tick.resume_boot_after_ns += HEARTBEAT_REPORT_NS;
+            assert_eq!(tick.nominal_lateness_ns, 0);
+            assert!(heartbeat_reportable(
+                tick,
+                tick.resume_boot_after_ns - tick.resume_boot_before_ns
+            ));
+            tick.resume_boot_after_ns = u64::MAX;
+            assert!(!heartbeat_reportable(tick, HEARTBEAT_REPORT_NS));
+            tick.resume_boot_after_ns = tick.resume_boot_before_ns - 1;
+            assert!(!heartbeat_reportable(tick, HEARTBEAT_REPORT_NS));
+        }
+
+        #[test]
+        fn heartbeat_publication_tracks_only_successful_valid_completion_observations() {
+            let tick = tick_sample(0);
+            let mut heartbeat = Heartbeat::default();
+            assert!(heartbeat.previous.is_none());
+            heartbeat.published_at(tick, 2_020, 2_030);
+            assert_eq!(heartbeat.previous.unwrap().agent_updated_ns, 2_020);
+            // Caller does not invoke published on write failure. A failed
+            // diagnostic clock also cannot overwrite the successful baseline.
+            heartbeat.published_at(tick, 2_040, u64::MAX);
+            assert_eq!(
+                heartbeat.previous.unwrap().completed_observed_boot_ns,
+                2_030
+            );
+            heartbeat.published_at(tick, 2_050, 2_040);
+            assert_eq!(
+                heartbeat.previous.unwrap().completed_observed_boot_ns,
+                2_030
+            );
+            heartbeat.published_at(tick, 62_000_000, 62_000_010);
+            let previous = heartbeat.previous.unwrap();
+            assert_eq!(previous.agent_updated_ns, 62_000_000);
+            assert_eq!(previous.completed_observed_boot_ns, 62_000_010);
+            heartbeat.published_at(tick, 62_000_000, 62_000_009);
+            assert_eq!(
+                heartbeat.previous.unwrap().completed_observed_boot_ns,
+                62_000_010
+            );
+            heartbeat.published_at(tick, 61_999_999, 62_000_020);
+            assert_eq!(heartbeat.previous.unwrap().agent_updated_ns, 62_000_000);
+            assert_eq!(
+                heartbeat.previous.unwrap().completed_observed_boot_ns,
+                62_000_010
+            );
+        }
+
+        #[test]
+        fn timing_threshold_does_not_spend_slow_report_budget() {
+            let budget = Budget::new();
+            assert_eq!(budget.admit(7, SLOW_NS - 1), None);
+            assert_eq!(budget.admit(7, SLOW_NS), Some(0));
+            assert_eq!(budget.admit(8, SLOW_NS), None);
+            assert_eq!(budget.admit(7 + REPORT_INTERVAL_NS, SLOW_NS), Some(1));
+        }
+
+        #[test]
+        fn timing_rate_limit_counts_suppressed_without_extending_window() {
+            let budget = Budget::new();
+            assert_eq!(budget.admit(100, SLOW_NS), Some(0));
+            for tick in 101..201 {
+                assert_eq!(budget.admit(tick, SLOW_NS), None);
+            }
+            assert_eq!(budget.admit(100 + REPORT_INTERVAL_NS, SLOW_NS), Some(100));
+            assert_eq!(budget.admit(100 + 2 * REPORT_INTERVAL_NS, SLOW_NS), Some(0));
+        }
+
+        #[test]
+        fn timing_failed_clock_never_consumes_or_overflows_budget() {
+            let budget = Budget::new();
+            assert_eq!(budget.admit(u64::MAX, SLOW_NS), None);
+            assert_eq!(budget.admit(u64::MAX - 1, SLOW_NS), Some(0));
+            assert_eq!(budget.admit(u64::MAX - 1, SLOW_NS), None);
+        }
+
+        #[test]
+        fn timing_queue_is_bounded_and_does_not_wait_for_consumer() {
+            let (sender, _receiver) = sync_channel(QUEUE_CAPACITY);
+            for value in 0..QUEUE_CAPACITY {
+                assert!(sender.try_send(value).is_ok());
+            }
+            assert!(matches!(
+                sender.try_send(QUEUE_CAPACITY),
+                Err(std::sync::mpsc::TrySendError::Full(_))
+            ));
+        }
+
+        #[test]
+        fn timing_async_phases_never_attribute_executor_cpu_to_waiter() {
+            for phase in [
+                Phase::ReconcileLockWait,
+                Phase::HaLockWait,
+                Phase::HaLockHold,
+                Phase::HaStateLockWait,
+            ] {
+                assert!(!phase.synchronous());
+            }
+            for phase in [
+                Phase::HostObserver,
+                Phase::MapApply,
+                Phase::ReaderDrain,
+                Phase::ReconcileLockHold,
+            ] {
+                assert!(phase.synchronous());
+            }
+        }
+    }
+}
+
 /// Duplicated diagnostic FDs and their policy names. Reading per-CPU maps can
 /// be expensive at capacity; do it off the async executor and outside the HA
 /// configuration mutex. The firewall retains ownership of the actual maps.
@@ -168,7 +682,11 @@ pub struct Firewall {
     /// [`reconfigure`]: Firewall::reconfigure
     applied: RuntimeConfig,
     applied_host: PreparedHostConfig,
+    applied_intent: AppliedIntent,
     last_apply_error: Option<String>,
+    // A failed maintenance fence must not look healthy even if reading the
+    // gate subsequently reports READY. Only successful reconciliation clears it.
+    expiry_failed: bool,
     /// The configuration as it arrived, before the advertised rules were merged
     /// into it.
     ///
@@ -283,30 +801,38 @@ impl Firewall {
             concat!(env!("OUT_DIR"), "/velstra")
         )))?;
         let mut ebpf = Ebpf::load(&object).context("loading eBPF object for verification")?;
+        let mut rejected = Vec::new();
         for name in [
             "velstra",
             "velstra_main",
+            "velstra_v4_state",
             "velstra_guest_delivery",
             "velstra_forward",
             "velstra_v6",
             "velstra_local",
             "velstra_v6_state",
             "velstra_icmp_nat",
+            "velstra_related",
         ] {
             let program: &mut Xdp = ebpf
                 .program_mut(name)
                 .ok_or_else(|| anyhow!("missing {name}"))?
                 .try_into()?;
-            program
-                .load()
-                .with_context(|| format!("verifying {name}"))?;
-            println!("verified {name}");
+            match program.load() {
+                Ok(()) => println!("verified {name}"),
+                Err(error) => rejected.push(format!("verifying {name}: {error:#}")),
+            }
         }
         for name in [
             "velstra_egress",
             "velstra_egress_v4",
             "velstra_egress_v6",
+            "velstra_egress_v6_state",
+            "velstra_masquerade",
             "velstra_egress_icmp",
+            "velstra_deferred_snat",
+            "velstra_related_egress",
+            "velstra_related_egress_apply",
             "velstra_bum",
             "velstra_ha_guard",
         ] {
@@ -314,17 +840,28 @@ impl Firewall {
                 .program_mut(name)
                 .ok_or_else(|| anyhow!("missing {name}"))?
                 .try_into()?;
-            program
-                .load()
-                .with_context(|| format!("verifying {name}"))?;
-            println!("verified {name}");
+            match program.load() {
+                Ok(()) => println!("verified {name}"),
+                Err(error) => rejected.push(format!("verifying {name}: {error:#}")),
+            }
         }
         let exit: &mut aya::programs::RawTracePoint = ebpf
             .program_mut("velstra_ha_exit")
             .ok_or_else(|| anyhow!("missing velstra_ha_exit"))?
             .try_into()?;
-        exit.load().context("verifying velstra_ha_exit")?;
-        println!("verified velstra_ha_exit");
+        match exit.load() {
+            Ok(()) => println!("verified velstra_ha_exit"),
+            Err(error) => rejected.push(format!("verifying velstra_ha_exit: {error:#}")),
+        }
+        // Report every rejected entry point, not just the first. Never attach
+        // anything, and never convert partial load success into exit status 0.
+        if !rejected.is_empty() {
+            bail!(
+                "{} eBPF programs rejected:\n{}",
+                rejected.len(),
+                rejected.join("\n")
+            );
+        }
         Ok(())
     }
 
@@ -378,7 +915,16 @@ impl Firewall {
                 .context("closing the initial datapath gate")?;
         }
         let prepared = prepare_host_config(cfg)?;
-        apply_config(&mut ebpf, cfg, None, &prepared, false)?;
+        // This object's ordinary packet programs have not been attached yet;
+        // unlike a live rewrite, initialization has no readers to drain.
+        apply_config_quiesced(
+            &mut ebpf,
+            cfg,
+            None,
+            &prepared,
+            false,
+            &ReaderQuiescence::Unattached,
+        )?;
 
         // Load the tail-call target (`velstra_forward`) and register it in the
         // `VELSTRA_PROGS` program array, so the main program's
@@ -462,6 +1008,7 @@ impl Firewall {
             (3, "velstra_local"),
             (4, "velstra_v6_state"),
             (5, "velstra_icmp_nat"),
+            (7, "velstra_related"),
         ] {
             let fd = {
                 let program: &mut Xdp = ebpf
@@ -476,6 +1023,27 @@ impl Firewall {
                     .ok_or_else(|| anyhow!("VELSTRA_PROGS missing"))?,
             )?;
             programs.set(slot, &fd, 0)?;
+        }
+
+        // Register the state-admission continuation before attaching ingress.
+        // A missing stage is fatal: skipping it would bypass the final verdict
+        // and conntrack publication rather than merely an optional transform.
+        {
+            let fd = {
+                let program: &mut Xdp = ebpf
+                    .program_mut("velstra_v4_state")
+                    .ok_or_else(|| anyhow!("missing velstra_v4_state"))?
+                    .try_into()?;
+                program
+                    .load()
+                    .context("loading IPv4 state-admission stage")?;
+                program.fd()?.try_clone()?
+            };
+            let mut programs = ProgramArray::try_from(
+                ebpf.map_mut("V4_STATE_PROGS")
+                    .ok_or_else(|| anyhow!("V4_STATE_PROGS missing"))?,
+            )?;
+            programs.set(0, &fd, 0)?;
         }
 
         let program: &mut Xdp = ebpf
@@ -534,6 +1102,7 @@ impl Firewall {
             attach_mode: mode,
             applied: cfg.clone(),
             applied_host: prepared.clone(),
+            applied_intent: AppliedIntent { current: true },
             last_apply_error: None,
             base: cfg.clone(),
             flowspec: Vec::new(),
@@ -553,6 +1122,7 @@ impl Firewall {
             egress_attached,
             explicit_egress_ifaces: if egress { ifaces.to_vec() } else { Vec::new() },
             conntrack: None,
+            expiry_failed: false,
             runtime_blocks: BTreeMap::new(),
             portal_sessions: BTreeMap::new(),
             runtime_mappings: BTreeMap::new(),
@@ -873,7 +1443,18 @@ impl Firewall {
     /// `--auto-attach` prefix. `program_interfaces` defers a not-yet-present
     /// interface's maps; this loop completes the job when it appears.
     pub fn reconcile_config_interfaces(&mut self, present: &[String], mode: AttachMode) {
+        let hook_counts = (
+            self.xdp_links.len(),
+            self.bum_attached.len(),
+            self.egress_attached.len(),
+        );
         self.prune_stale_links();
+        let hooks_unchanged = hook_counts
+            == (
+                self.xdp_links.len(),
+                self.bum_attached.len(),
+                self.egress_attached.len(),
+            );
         let present_set: HashSet<&str> = present.iter().map(String::as_str).collect();
 
         // A guest can recreate a TAP under the same name between two polls.
@@ -885,21 +1466,29 @@ impl Firewall {
             .filter(|(name, _)| !self.xdp_links.contains_key(*name))
             .map(|(name, _)| name.clone())
             .collect();
-        let route_devices_changed = match route_interface_indices(&self.applied.routes) {
-            Ok(indices) => indices != self.route_ifindices,
+        // One observation feeds every address-derived map. An observation error
+        // is not an empty inventory: retaining old grants in that case could
+        // admit traffic under a subnet the interface no longer owns.
+        // Always recover the canonical accepted source intent. A failed reopen
+        // can leave `applied` ahead of the source inputs restored by the caller;
+        // applied_intent excludes that state from the additive path below.
+        let merged = self.merged_config();
+        let prepared = match prepare_host_config(&merged) {
+            Ok(prepared) => prepared,
             Err(error) => {
-                warn!("checking route interfaces failed; keeping current routes: {error:#}");
-                false
+                self.block_host_refresh(&error);
+                return;
             }
         };
-        let recovery_required = self
-            .configuration_state()
-            .map(|state| state != CONFIG_READY)
-            .unwrap_or(true);
+        let host_changed = prepared != self.applied_host;
+        let configuration_state = self.configuration_state().ok();
+        let recovery_required =
+            configuration_state != Some(CONFIG_READY) || !self.applied_intent.current;
         if recovery_required {
             log::info!("retrying configuration recovery while traffic remains blocked");
         }
-        let mut changed = !stale.is_empty() || route_devices_changed || recovery_required;
+        let mut attachments_unchanged = hooks_unchanged && stale.is_empty();
+        let mut changed = !attachments_unchanged || host_changed || recovery_required;
         for name in stale {
             self.config_attached.remove(&name);
             self.attached.retain(|(attached, _)| attached != &name);
@@ -915,6 +1504,7 @@ impl Firewall {
             .filter(|i| !self.attached.iter().any(|(n, _)| n == &i.name))
             .map(|i| (i.name.clone(), i.policy, i.vni))
             .collect();
+        attachments_unchanged &= todo.is_empty();
         for (name, policy, vni) in todo {
             match self.attach_config_iface(&name, mode, policy, vni) {
                 Ok(chosen) => {
@@ -930,23 +1520,85 @@ impl Firewall {
             }
         }
 
-        if !changed {
-            // DHCP can acquire, renew or withdraw an address without changing
-            // the interface name/index or desired configuration. Refresh only
-            // SNAT targets; do not quiesce policy or reset established flows.
-            if let Err(error) = program_masquerade(&mut self.ebpf, &self.applied.interfaces) {
-                warn!("refreshing live masquerade addresses failed: {error:#}");
-            }
-        }
         if changed {
-            // Refresh every ifindex-keyed map, including the guest firewall
-            // and BUM hooks. A controller need not resend an unchanged config
-            // just because Linux gave a recreated TAP a new interface ID.
-            if let Err(error) = self.reprogram() {
-                warn!("reprogramming recreated interfaces failed: {error:#}");
+            if self
+                .applied_intent
+                .allows_address_refresh(configuration_state, attachments_unchanged)
+                && let Some(additions) = local_address_additions(&self.applied_host, &prepared)
+            {
+                // No policy meaning changed: only new exact local-address keys
+                // became valid. Each atomic insertion is a conservative subset
+                // of the observed target, so existing readers need no drain.
+                // Do not touch epochs, NAT/flow state, or temporary grant timers.
+                let result = self.add_observed_local_addresses(&merged, &prepared, &additions);
+                if let Err(error) = result {
+                    // An insertion may have partly succeeded. Retain the old
+                    // snapshot and close the gate: the next closed full refresh
+                    // removes any partial keys before reopening traffic.
+                    self.block_host_refresh(&error);
+                    return;
+                }
+                self.applied_host = prepared;
+                self.activate_held_links(false);
+                return;
+            }
+            // This also covers DHCP/secondary-address changes without a link
+            // event. Quiesce once, refresh all derived permissions atomically,
+            // and keep conntrack plus original temporary-grant deadlines.
+            // An identical inventory causes no writes or policy-epoch churn.
+            if let Err(error) = self.reprogram_prepared(merged, prepared, false, true) {
+                warn!("refreshing live interface inventory failed: {error:#}");
             }
         }
         self.activate_held_links(false);
+    }
+
+    fn add_observed_local_addresses(
+        &mut self,
+        cfg: &RuntimeConfig,
+        prepared: &PreparedHostConfig,
+        additions: &BTreeSet<[u8; 8]>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.configuration_state()? == CONFIG_READY,
+            "additive address refresh requires a ready configuration"
+        );
+        {
+            let _timing = timing::Span::start(timing::Phase::LocalAddressInsert);
+            let mut map: HashMap<_, [u8; 8], u8> = HashMap::try_from(
+                self.ebpf
+                    .map_mut("LOCAL_EGRESS_ADDRS")
+                    .ok_or_else(|| anyhow!("LOCAL_EGRESS_ADDRS map missing"))?,
+            )?;
+            for key in additions {
+                map.insert(key, 1, 0)
+                    .context("adding observed local IPv4 address")?;
+            }
+        }
+        // Check every prepared host field, including observed overlay MACs,
+        // before acknowledging the snapshot. Never accept stale observations.
+        let _timing = timing::Span::start(timing::Phase::LocalAddressRevalidate);
+        anyhow::ensure!(
+            prepare_host_config(cfg)? == *prepared,
+            "host inventory changed during additive local-address refresh"
+        );
+        Ok(())
+    }
+
+    fn block_host_refresh(&mut self, error: &anyhow::Error) {
+        // Even if closing the map gate itself fails, force a complete retry.
+        // In particular, never leave partial additive address grants eligible
+        // for the no-change shortcut when host facts revert to the old set.
+        self.applied_intent.begin();
+        self.last_apply_error = Some(format!("live interface observation failed: {error:#}"));
+        if let Err(close_error) = self.set_configuration_state(CONFIG_FAILED) {
+            log::error!(
+                "could not close the datapath after interface observation failed: {close_error:#}"
+            );
+        }
+        warn!(
+            "live interface observation failed; traffic remains blocked until recovery: {error:#}"
+        );
     }
 
     /// The check a commit waits on: the held links that exist and are still
@@ -1063,6 +1715,13 @@ impl Firewall {
     }
 
     pub fn reconfigure_with_reset(&mut self, cfg: &RuntimeConfig, reset: bool) -> Result<()> {
+        let _timing = timing::Span::start(timing::Phase::Reload);
+        // Query callers already check this, but controller updates call us
+        // directly. Never replace the base or touch maps while HA/sync sidecars
+        // still use the old configuration (even when reset was requested).
+        if self.requires_restart(cfg) {
+            anyhow::bail!("restart-required: HA, conntrack sync or flow export changed");
+        }
         let previous = std::mem::replace(&mut self.base, cfg.clone());
         if let Err(cause) = self.reprogram_with_reset(reset) {
             self.base = previous;
@@ -1212,36 +1871,81 @@ impl Firewall {
         merged.validate_firewall_capacity()?;
         // Resolve fallible host identity before changing any active hooks/maps.
         let prepared = prepare_host_config(&merged)?;
+        self.reprogram_prepared(merged, prepared, reset, false)
+    }
+
+    fn reprogram_prepared(
+        &mut self,
+        merged: RuntimeConfig,
+        prepared: PreparedHostConfig,
+        reset: bool,
+        host_refresh: bool,
+    ) -> Result<()> {
+        let _timing = timing::Span::start(timing::Phase::FullTransaction);
+        merged.validate_firewall_capacity()?;
+        self.applied_intent.begin();
         let previous = self.applied.clone();
         let previous_host = self.applied_host.clone();
-        let forwards = self.port_forward_snapshot()?;
+        // A rollback may restore policy intent, but cannot make old host facts
+        // current again. Never reopen that stale inventory after a failed
+        // refresh, even when rewriting the old maps happened to succeed.
+        let reopen_rollback = !host_refresh && prepared.ipv4 == previous_host.ipv4;
         self.set_configuration_state(CONFIG_UPDATING)?;
         if reset {
             self.runtime_blocks.clear();
             self.portal_sessions.clear();
             self.runtime_mappings.clear();
         }
-        if let Err(error) = synchronize_packet_readers() {
-            let _ = self.set_configuration_state(CONFIG_FAILED);
-            self.last_apply_error = Some(format!("could not drain packet readers: {error:#}"));
-            return Err(error).context("configuration update blocked; firewall remains closed");
-        }
+        let quiesced = match ReaderQuiescence::drain_with(synchronize_packet_readers) {
+            Ok(quiesced) => quiesced,
+            Err(error) => {
+                let _ = self.set_configuration_state(CONFIG_FAILED);
+                self.last_apply_error = Some(format!("could not drain packet readers: {error:#}"));
+                return Err(error).context("configuration update blocked; firewall remains closed");
+            }
+        };
+        let forwards = match self.port_forward_snapshot() {
+            Ok(forwards) => forwards,
+            Err(error) => {
+                let _ = self.set_configuration_state(CONFIG_FAILED);
+                self.last_apply_error =
+                    Some(format!("could not snapshot port forwards: {error:#}"));
+                return Err(error)
+                    .context("configuration snapshot failed; firewall remains closed");
+            }
+        };
+        let mut host_still_current = true;
         let update = (|| -> Result<HashSet<MappingKey>> {
             self.sync_egress_attachments(&merged)?;
-            apply_config(&mut self.ebpf, &merged, Some(&previous), &prepared, reset)?;
-            self.reapply_runtime_mappings(&merged)
+            apply_config_quiesced(
+                &mut self.ebpf,
+                &merged,
+                Some(&previous),
+                &prepared,
+                reset,
+                &quiesced,
+            )?;
+            let retained = self.reapply_runtime_mappings(&merged, &prepared.ipv4)?;
+            // Other map writers also resolve Linux names. If a link/address
+            // changed during the transaction, none of those mixed identities
+            // may become active. Retry a new coherent snapshot next poll.
+            let observed = revalidate_host_config(&merged, &prepared);
+            host_still_current = observed.is_ok();
+            observed.context("host inventory changed or became unreadable during policy update")?;
+            Ok(retained)
         })();
         let retained_mappings = match update {
             Ok(retained) => retained,
             Err(error) => {
                 let rollback = (|| -> Result<()> {
                     self.sync_egress_attachments(&previous)?;
-                    apply_config(
+                    apply_config_quiesced(
                         &mut self.ebpf,
                         &previous,
                         Some(&merged),
                         &previous_host,
                         reset,
+                        &quiesced,
                     )?;
                     self.restore_port_forward_snapshot(&forwards)?;
                     let blocks: Vec<String> = self
@@ -1260,7 +1964,29 @@ impl Firewall {
                 match rollback {
                     Ok(()) => {
                         self.last_apply_error = Some(format!("{error:#}"));
-                        self.reopen_configuration()?;
+                        if reopen_rollback && host_still_current {
+                            // Early map failures never reach the candidate's
+                            // final observation; rollback itself can also race
+                            // Linux network changes. Only a fresh observation
+                            // of the previous intent can authorize reopening.
+                            if let Err(observation_error) =
+                                revalidate_host_config(&previous, &previous_host)
+                            {
+                                self.last_apply_error = Some(format!(
+                                    "{error:#}; rollback host observation: {observation_error:#}"
+                                ));
+                                let _ = self.set_configuration_state(CONFIG_FAILED);
+                                return Err(error).context(
+                                    "rollback host facts are stale or unreadable; firewall remains closed until reconciliation succeeds",
+                                );
+                            }
+                            self.reopen_configuration()?;
+                        } else {
+                            let _ = self.set_configuration_state(CONFIG_FAILED);
+                            return Err(error).context(
+                                "host refresh failed; firewall remains closed until reconciliation succeeds",
+                            );
+                        }
                         return Err(error)
                             .context("update failed; previous configuration restored");
                     }
@@ -1282,8 +2008,10 @@ impl Firewall {
         self.applied = merged;
         self.route_ifindices = prepared.route_ifindices.clone();
         self.applied_host = prepared;
-        self.reopen_configuration()?;
+        let reopened = self.reopen_configuration();
+        self.applied_intent.finish(reopened)?;
         self.last_apply_error = None;
+        self.expiry_failed = false;
         Ok(())
     }
 
@@ -1316,6 +2044,9 @@ impl Firewall {
 
     pub fn configuration_status(&self) -> Result<String> {
         let state = match self.configuration_state()? {
+            CONFIG_READY if self.expiry_failed => {
+                "Failed (expiry maintenance; forwarding state uncertain)"
+            }
             CONFIG_READY => "Ready",
             CONFIG_UPDATING if self.last_apply_error.is_none() => "Updating",
             _ => "Failed (traffic blocked)",
@@ -1376,7 +2107,11 @@ impl Firewall {
 
     /// Keep unexpired temporary grants across a successful policy refresh,
     /// while configured forwards and removal of their policy take precedence.
-    fn reapply_runtime_mappings(&mut self, cfg: &RuntimeConfig) -> Result<HashSet<MappingKey>> {
+    fn reapply_runtime_mappings(
+        &mut self,
+        cfg: &RuntimeConfig,
+        ipv4: &Ipv4Inventory,
+    ) -> Result<HashSet<MappingKey>> {
         let now = Instant::now();
         let active: Vec<_> = self
             .runtime_mappings
@@ -1392,7 +2127,7 @@ impl Firewall {
             .collect();
         let mut retained = HashSet::new();
         for ((policy, proto, port), (internal, internal_port, _)) in active {
-            let reply = resolve_reply_policy(internal, &cfg.interfaces);
+            let reply = resolve_reply_policy(internal, &cfg.interfaces, ipv4);
             let value = PortFwd::new(internal, internal_port).with_reply_policy(reply);
             self.write_mapping(policy, proto, port, Some(value))?;
             retained.insert((policy, proto, port));
@@ -1556,7 +2291,8 @@ impl Firewall {
                  refusing to crowd out the configured port-forwards"
             );
         }
-        let reply = resolve_reply_policy(internal, &self.applied.interfaces);
+        let reply =
+            resolve_reply_policy(internal, &self.applied.interfaces, &self.applied_host.ipv4);
         let value = PortFwd::new(internal, internal_port).with_reply_policy(reply);
         self.write_mapping(policy, proto, external_port, Some(value))?;
         self.runtime_mappings
@@ -2068,6 +2804,25 @@ impl Firewall {
         Ok(Stats { rows })
     }
 
+    /// Duplicate diagnostics FDs only. All bounded occupancy walks run after
+    /// the caller releases the configuration mutex, never on the packet path.
+    pub fn capacity_snapshot(&self) -> crate::capacity::Snapshot {
+        crate::capacity::Snapshot::new(
+            ["CONNTRACK", "FW_FLOWS", "SYN_FLOWS"]
+                .into_iter()
+                .map(|name| {
+                    let duplicate = (|| -> Result<MapData> {
+                        let Some(aya::maps::Map::LruHashMap(data)) = self.ebpf.map(name) else {
+                            bail!("{name} LRU map missing");
+                        };
+                        Ok(MapData::from_fd(data.fd().as_fd().try_clone_to_owned()?)?)
+                    })();
+                    (name, duplicate)
+                })
+                .collect(),
+        )
+    }
+
     /// Duplicate `LOCAL_MACS` for the learn-and-advertise task. Keep the map in
     /// the firewall too, so a policy-namespace reset can clear learned state.
     pub fn take_local_macs(&mut self) -> Result<HashMap<MapData, LocalMacKey, LocalMac>> {
@@ -2119,6 +2874,56 @@ impl Firewall {
             .into_iter()
             .filter(|(key, state)| !state.expired(key.proto, now, self.applied.conntrack))
             .collect())
+    }
+
+    /// Explicit standalone maintenance, under the same exclusive firewall lock
+    /// as policy updates. No periodic sweep and no SYN-proxy state reclamation.
+    pub fn expire_state(&mut self, table: &str, limit: usize) -> Result<crate::expiry::Report> {
+        let eligibility = crate::expiry::Eligibility {
+            ha: self.applied.ha.is_some() || self.base.ha.is_some(),
+            replication: self.applied.conntrack_sync.is_some()
+                || self.base.conntrack_sync.is_some(),
+            current_intent: self.applied_intent.current && !self.expiry_failed,
+        };
+        let timeouts = self.applied.conntrack;
+        let drain = || ReaderQuiescence::drain_with(synchronize_packet_readers).map(|_| ());
+        let result = match table {
+            "nat" => {
+                let handle = self.conntrack_handle()?;
+                let mut map = handle
+                    .try_lock()
+                    .context("NAT handle busy; maintenance not started")?;
+                crate::expiry::collect(
+                    &mut self.ebpf,
+                    &mut *map,
+                    eligibility,
+                    limit,
+                    |key, state, now| state.expired(key.proto, now, timeouts),
+                    drain,
+                )
+            }
+            "firewall" => {
+                let mut map = self.fw_flows_handle()?;
+                crate::expiry::collect(
+                    &mut self.ebpf,
+                    &mut map,
+                    eligibility,
+                    limit,
+                    |key, state, now| state.expired(key.proto, now, timeouts),
+                    drain,
+                )
+            }
+            _ => bail!("expiry table must be nat or firewall"),
+        };
+        if let Err(error) = &result {
+            // Preconditions may refuse without touching a healthy datapath.
+            // Never erase an existing failure or claim readiness on read error.
+            if crate::expiry::mutation_attempted(error) {
+                self.expiry_failed = true;
+                self.last_apply_error = Some(format!("expiry maintenance: {error:#}"));
+            }
+        }
+        result
     }
 
     /// Duplicate the userspace FD for HA sync while retaining the map in the
@@ -2222,10 +3027,17 @@ fn bump_memlock_rlimit() {
 fn spawn_log_forwarder(ebpf: &mut Ebpf) {
     match aya_log::EbpfLogger::init(ebpf) {
         Ok(logger) => {
-            let mut logger = match tokio::io::unix::AsyncFd::with_interest(
-                logger,
-                tokio::io::Interest::READABLE,
-            ) {
+            // SAFETY: EbpfLogger owns its RingBuf<MapData> and therefore the
+            // registered map FD. AsyncFd owns the logger until deregistration;
+            // the task only flushes records, never replaces/closes its map.
+            // Aya's flush() advances ring positions without exchanging the FD.
+            let registered = unsafe {
+                tokio::io::unix::AsyncFd::register_with_interest(
+                    logger,
+                    tokio::io::Interest::READABLE,
+                )
+            };
+            let mut logger = match registered {
                 Ok(fd) => fd,
                 Err(e) => {
                     warn!("could not register eBPF log fd: {e}");
@@ -2637,14 +3449,86 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
 }
 
 /// Host-dependent values must be observed before a candidate changes policy.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct PreparedHostConfig {
     overlay: OverlayConfig,
     srv6: Srv6Config,
     route_ifindices: BTreeMap<String, u32>,
+    ipv4: Ipv4Inventory,
+}
+
+/// The merged source intent and the applied maps are known to agree only after
+/// a complete successful transaction, including reopening. In particular, a
+/// failed reopen or successful rollback cannot authorize an additive shortcut.
+struct AppliedIntent {
+    current: bool,
+}
+
+impl AppliedIntent {
+    fn begin(&mut self) {
+        self.current = false;
+    }
+
+    fn finish(&mut self, reopened: Result<()>) -> Result<()> {
+        reopened?;
+        self.current = true;
+        Ok(())
+    }
+
+    fn allows_address_refresh(&self, state: Option<u32>, hooks_unchanged: bool) -> bool {
+        self.current && state == Some(CONFIG_READY) && hooks_unchanged
+    }
+}
+
+/// Plan a host-only refresh for the *same applied intent*. Every exclusion must
+/// take the ordinary closed-gate transaction instead. Exact old address tuples
+/// remain present; each new tuple has an already represented mask/network on
+/// that interface. Hence subnet membership is identical for every possible
+/// target, including ambiguous reply policies and runtime mapping destinations.
+/// Only exact LOCAL_EGRESS_ADDRS membership grows; all other maps are unchanged.
+fn local_address_additions(
+    previous: &PreparedHostConfig,
+    observed: &PreparedHostConfig,
+) -> Option<BTreeSet<[u8; 8]>> {
+    if previous.overlay != observed.overlay
+        || previous.srv6 != observed.srv6
+        || previous.route_ifindices != observed.route_ifindices
+        || previous.ipv4.len() != observed.ipv4.len()
+    {
+        return None;
+    }
+    let mut additions = BTreeSet::new();
+    for (name, old) in &previous.ipv4 {
+        let new = observed.ipv4.get(name)?;
+        if old.ifindex != new.ifindex
+            || old.primary != new.primary
+            || old.dhcp_mac != new.dhcp_mac
+            || !old.prefixes.is_subset(&new.prefixes)
+        {
+            return None;
+        }
+        for (address, mask) in new.prefixes.difference(&old.prefixes) {
+            let network = u32::from_be_bytes(*address) & u32::from_be_bytes(*mask);
+            if !old.prefixes.iter().any(|(old_address, old_mask)| {
+                old_mask == mask
+                    && (u32::from_be_bytes(*old_address) & u32::from_be_bytes(*mask)) == network
+            }) {
+                return None;
+            }
+            if !old
+                .prefixes
+                .iter()
+                .any(|(old_address, _)| old_address == address)
+            {
+                additions.insert(local_egress_address_key(new.ifindex, *address));
+            }
+        }
+    }
+    Some(additions)
 }
 
 fn prepare_host_config(cfg: &RuntimeConfig) -> Result<PreparedHostConfig> {
+    let _timing = timing::Span::start(timing::Phase::HostPrepare);
     let overlay = match cfg.overlay.as_ref() {
         Some(o) => {
             let local_mac = match o.local_mac {
@@ -2675,7 +3559,21 @@ fn prepare_host_config(cfg: &RuntimeConfig) -> Result<PreparedHostConfig> {
         overlay,
         srv6,
         route_ifindices: route_interface_indices(&cfg.routes)?,
+        ipv4: read_ipv4_inventory(&cfg.interfaces)?,
     })
+}
+
+fn revalidate_host_config(cfg: &RuntimeConfig, prepared: &PreparedHostConfig) -> Result<()> {
+    let _timing = timing::Span::start(timing::Phase::HostRevalidate);
+    anyhow::ensure!(
+        read_ipv4_inventory(&cfg.interfaces)? == prepared.ipv4,
+        "interface IPv4 inventory no longer matches the prepared policy"
+    );
+    anyhow::ensure!(
+        route_interface_indices(&cfg.routes)? == prepared.route_ifindices,
+        "route interface identities no longer match the prepared policy"
+    );
+    Ok(())
 }
 
 fn route_interface_indices(routes: &[ResolvedRoute]) -> Result<BTreeMap<String, u32>> {
@@ -2699,15 +3597,57 @@ fn route_interface_indices(routes: &[ResolvedRoute]) -> Result<BTreeMap<String, 
     Ok(indices)
 }
 
-/// Write a [`RuntimeConfig`] into the policy maps. When `old` is `Some`, its
-/// entries are removed first so a live reconfigure cannot leave stale rules.
-fn apply_config(
+/// Evidence for one continuously closed policy transaction, never a request to
+/// skip synchronization. The initial object has no attached packet readers;
+/// every live transaction must instead complete the real global reader drain.
+/// Do not retain this capability across reopening APPLY_STATE or releasing the
+/// firewall's exclusive writer. It deliberately has no reopening Drop action.
+enum ReaderQuiescence {
+    Unattached,
+    Drained,
+}
+
+impl ReaderQuiescence {
+    fn drain_with(drain: impl FnOnce() -> Result<()>) -> Result<Self> {
+        drain()?;
+        Ok(Self::Drained)
+    }
+
+    fn validate(&self, gate: u32, replaces_live: bool) -> Result<()> {
+        anyhow::ensure!(
+            gate == CONFIG_UPDATING,
+            "policy writer requires a closed update gate"
+        );
+        anyhow::ensure!(
+            !replaces_live || matches!(self, Self::Drained),
+            "live policy replacement requires drained packet readers"
+        );
+        Ok(())
+    }
+}
+
+/// Write policy under a continuously closed, already-quiesced gate. Candidate
+/// and rollback share the same drain: neither this function nor its caller
+/// reopens APPLY_STATE between them. New XDP/TC/BUM entries reject that gate,
+/// and the first grace period already drained older invocations (including
+/// their tail calls), even while CONFIG_EPOCH becomes even between writes.
+/// When `old` is `Some`, remove its entries before installing the replacement.
+fn apply_config_quiesced(
     ebpf: &mut Ebpf,
     cfg: &RuntimeConfig,
     old: Option<&RuntimeConfig>,
     prepared: &PreparedHostConfig,
     reset: bool,
+    quiesced: &ReaderQuiescence,
 ) -> Result<()> {
+    let _timing = timing::Span::start(timing::Phase::MapApply);
+    let gate = Array::<_, u32>::try_from(
+        ebpf.map("APPLY_STATE")
+            .ok_or_else(|| anyhow!("APPLY_STATE map missing"))?,
+    )?
+    .get(&0, 0)
+    .context("checking the quiesced policy writer gate")?;
+    quiesced.validate(gate, old.is_some())?;
     cfg.validate_firewall_capacity()?;
     let writing = {
         let mut epoch = Array::<_, u64>::try_from(
@@ -2724,7 +3664,6 @@ fn apply_config(
         writing
     };
     if let Some(old) = old {
-        synchronize_packet_readers()?;
         if reset {
             reset_runtime_namespace(ebpf)?;
         }
@@ -2758,6 +3697,14 @@ fn apply_config(
         }
     }
     program_fail_closed(ebpf, cfg.fail_closed)?;
+    // Replicated mappings must remain discoverable by deployed peers. A
+    // service restart creates fresh, unpinned NAT maps before changing modes.
+    Array::<_, u32>::try_from(
+        ebpf.map_mut("NAPT_MODE")
+            .ok_or_else(|| anyhow!("NAPT_MODE map missing"))?,
+    )?
+    .set(0, standalone_napt_mode(cfg), 0)
+    .context("programming standalone NAT allocation mode")?;
     let mut timeouts = Array::<_, velstra_common::ConntrackTimeouts>::try_from(
         ebpf.map_mut("CT_TIMEOUTS")
             .ok_or_else(|| anyhow!("CT_TIMEOUTS map missing"))?,
@@ -2769,10 +3716,10 @@ fn apply_config(
     program_policies(ebpf, &cfg.policies)?;
     program_interfaces(ebpf, &cfg.interfaces)?;
     program_routes(ebpf, &cfg.routes)?;
-    program_services(ebpf, &cfg.services, &cfg.interfaces)?;
-    program_port_forwards(ebpf, &cfg.port_forwards, &cfg.interfaces)?;
+    program_services(ebpf, &cfg.services, &cfg.interfaces, &prepared.ipv4)?;
+    program_port_forwards(ebpf, &cfg.port_forwards, &cfg.interfaces, &prepared.ipv4)?;
     program_synproxy(ebpf, &cfg.synproxy)?;
-    program_masquerade(ebpf, &cfg.interfaces)?;
+    program_masquerade(ebpf, &cfg.interfaces, &prepared.ipv4)?;
     program_mss_clamp(ebpf, &cfg.interfaces)?;
     program_port_bindings(ebpf, &cfg.interfaces)?;
     program_port_limits(ebpf, &cfg.interfaces)?;
@@ -2855,6 +3802,10 @@ fn reset_runtime_namespace(ebpf: &mut Ebpf) -> Result<()> {
 /// it cannot parse instead of passing it. Slot `0` is always written — including
 /// the `false` (fail-open) default — so a `reconfigure` that turns the flag off
 /// actually takes it back rather than leaving the old value in the map.
+fn standalone_napt_mode(cfg: &RuntimeConfig) -> u32 {
+    u32::from(cfg.ha.is_none() && cfg.conntrack_sync.is_none())
+}
+
 fn program_fail_closed(ebpf: &mut Ebpf, fail_closed: bool) -> Result<()> {
     let mut map: Array<_, u32> = Array::try_from(
         ebpf.map_mut("FAIL_CLOSED")
@@ -3320,6 +4271,7 @@ fn program_services(
     ebpf: &mut Ebpf,
     services: &[ResolvedService],
     interfaces: &[ResolvedInterface],
+    ipv4: &Ipv4Inventory,
 ) -> Result<()> {
     if services.is_empty() {
         return Ok(());
@@ -3349,7 +4301,7 @@ fn program_services(
                 let reply = if service.reply_policy != 0 {
                     service.reply_policy
                 } else {
-                    pool_reply_policy(&service.backends, interfaces)
+                    pool_reply_policy(&service.backends, interfaces, ipv4)
                 };
                 ServiceValue::new_router_nat(start, count, reply)
                     .with_client_affinity(service.client_affinity)
@@ -3389,12 +4341,13 @@ fn program_port_forwards(
     ebpf: &mut Ebpf,
     forwards: &[ResolvedPortForward],
     interfaces: &[ResolvedInterface],
+    ipv4: &Ipv4Inventory,
 ) -> Result<()> {
     // Deliberately no early return: deleting the last port forward is the case
     // where leaving the map untouched kept forwarding it inward.
     //
-    // Resolve each target's reply policy before borrowing the map (the lookup reads
-    // the OS). A config that states one explicitly wins: it can name a zone reached
+    // Resolve each target's reply policy from the common host snapshot. A config
+    // that states one explicitly wins: it can name a zone reached
     // over a route, which no interface subnet contains.
     let prepared: Vec<(ScopedPortKey, PortFwd)> = forwards
         .iter()
@@ -3402,12 +4355,13 @@ fn program_port_forwards(
             let reply = if pf.reply_policy != 0 {
                 pf.reply_policy
             } else {
-                resolve_reply_policy(pf.dst_ip, interfaces)
+                resolve_reply_policy(pf.dst_ip, interfaces, ipv4)
             };
             (
                 ScopedPortKey::new(pf.policy, pf.proto, pf.port),
                 PortFwd::new_hairpin(pf.dst_ip, pf.dst_port, pf.match_dst, pf.snat_ip)
-                    .with_reply_policy(reply),
+                    .with_reply_policy(reply)
+                    .with_local_destination(pf.local_destination),
             )
         })
         .collect();
@@ -3515,7 +4469,6 @@ fn local_egress_addresses(
 ) -> HashSet<[u8; 8]> {
     interfaces
         .iter()
-        .filter(|i| i.masquerade || i.dhcp_client)
         .flat_map(|i| {
             let Ok(ifindex) = index(&i.name) else {
                 return Vec::new();
@@ -3589,16 +4542,20 @@ fn set_link_up(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Reconcile egress ifindex → public IPv4 without clearing conntrack. This is
-/// called on policy changes AND ordinary link polling: leases can arrive well
-/// after apply and can change while the desired configuration stays identical.
-fn program_masquerade(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Result<()> {
+/// Program the same observed addresses used to derive NAT reply permissions.
+/// The caller holds the configuration gate closed during this whole update.
+fn program_masquerade(
+    ebpf: &mut Ebpf,
+    interfaces: &[ResolvedInterface],
+    ipv4: &Ipv4Inventory,
+) -> Result<()> {
     let clients: BTreeMap<_, _> = interfaces
         .iter()
         .filter(|i| i.dhcp_client)
         .filter_map(|i| {
-            let index = if_nametoindex(&i.name).ok()?;
-            let mac = read_iface_mac(&i.name).ok()?;
+            let observed = ipv4.get(&i.name)?;
+            let index = observed.ifindex;
+            let mac = observed.dhcp_mac?;
             Some((
                 index,
                 [mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 0, 0],
@@ -3615,8 +4572,22 @@ fn program_masquerade(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Resu
             map.insert(index, mac, 0)?;
         }
     }
-    let prepared = masquerade_targets(interfaces, if_nametoindex, read_iface_ipv4);
-    let local = local_egress_addresses(interfaces, if_nametoindex, read_iface_ipv4_all);
+    let index = |name: &str| {
+        ipv4.get(name)
+            .map(|iface| iface.ifindex)
+            .ok_or_else(|| anyhow!("interface {name} is absent from the host snapshot"))
+    };
+    let prepared = masquerade_targets(interfaces, index, |name| {
+        ipv4.get(name)
+            .and_then(|iface| iface.primary)
+            .ok_or_else(|| anyhow!("interface {name} has no primary IPv4 address"))
+    });
+    let local = local_egress_addresses(interfaces, index, |name| {
+        Ok(ipv4
+            .get(name)
+            .map(|iface| iface.prefixes.iter().map(|(ip, _)| *ip).collect())
+            .unwrap_or_default())
+    });
     {
         let mut map: HashMap<_, [u8; 8], u8> = HashMap::try_from(
             ebpf.map_mut("LOCAL_EGRESS_ADDRS")
@@ -3968,26 +4939,247 @@ fn program_npt66(ebpf: &mut Ebpf, rules: &[ResolvedNpt66]) -> Result<()> {
     Ok(())
 }
 
-/// Read an interface's first IPv4 address via `getifaddrs(3)`. Returns an error
-/// if the interface has no IPv4 assigned (e.g. DHCP not up yet).
+type Ipv4Prefix = ([u8; 4], [u8; 4]);
+type Ipv4Inventory = BTreeMap<String, InterfaceIpv4>;
+
+/// Normalized, permission-relevant facts from one rtnetlink snapshot. Address
+/// ordering is irrelevant except for the primary address used by masquerade.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InterfaceIpv4 {
+    ifindex: u32,
+    primary: Option<[u8; 4]>,
+    prefixes: BTreeSet<Ipv4Prefix>,
+    dhcp_mac: Option<[u8; 6]>,
+}
+
+fn normalize_interface_ipv4(
+    iface: &ResolvedInterface,
+    ifindex: u32,
+    addresses: &[Ipv4Prefix],
+    mac: Option<[u8; 6]>,
+) -> Result<InterfaceIpv4> {
+    anyhow::ensure!(ifindex != 0, "interface {} has invalid index 0", iface.name);
+    let dhcp_mac = if iface.dhcp_client {
+        Some(mac.ok_or_else(|| anyhow!("DHCP interface {} has no Ethernet MAC", iface.name))?)
+    } else {
+        None
+    };
+    Ok(InterfaceIpv4 {
+        ifindex,
+        // An explicit SNAT address wins, so an unrelated address-order change
+        // must not cause policy epoch churn on that interface.
+        primary: if iface.masquerade && iface.snat_address.is_none() {
+            addresses.first().map(|(ip, _)| *ip)
+        } else {
+            None
+        },
+        prefixes: addresses.iter().copied().collect(),
+        dhcp_mac,
+    })
+}
+
+/// Keep the netlink ifindex/address association, not glibc's IPv4 ifa_name:
+/// getifaddrs exposes IFA_LABEL there and loses the actual owning ifindex.
+/// In particular, interpreting an arbitrary label's prefix as a device name
+/// could grant a different zone's reply policy. iproute2's JSON preserves the
+/// actual owning link; labels are never used for authorization.
+fn read_ipv4_inventory(interfaces: &[ResolvedInterface]) -> Result<Ipv4Inventory> {
+    let _timing = timing::Span::start(timing::Phase::HostObserver);
+    let mut inventory = BTreeMap::new();
+    for link in crate::host_inventory::read()? {
+        let Some(iface) = interfaces.iter().find(|iface| iface.name == link.name) else {
+            continue;
+        };
+        let mac = if iface.dhcp_client {
+            Some(
+                link.mac
+                    .context("DHCP interface has no MAC")?
+                    .try_into()
+                    .map_err(|_| anyhow!("DHCP interface has no Ethernet MAC"))?,
+            )
+        } else {
+            None
+        };
+        inventory.insert(
+            link.name,
+            normalize_interface_ipv4(iface, link.index, &link.addresses, mac)?,
+        );
+    }
+    Ok(inventory)
+}
+
+/// Test-only differential oracle. Production never falls back to an external
+/// observer, including after a native dump fails or is interrupted.
+#[cfg(test)]
+fn read_ipv4_inventory_ip(interfaces: &[ResolvedInterface]) -> Result<Ipv4Inventory> {
+    let ip = std::env::var("VELSTRA_IP_BIN").unwrap_or_else(|_| "ip".into());
+    let mut command = std::process::Command::new(ip);
+    // Do not filter -4 here: ip suppresses links with no address in the chosen
+    // family. Empty addr_info must remain distinguishable from a missing link.
+    command.args(["-j", "-details", "address", "show"]);
+    parse_ipv4_inventory(&read_inventory_output(command)?, interfaces)
+}
+
+/// Bound both wall time and allocation. A hung/failed/truncated observation
+/// must close the gate rather than be mistaken for an address withdrawal.
+#[cfg(test)]
+fn read_inventory_output(mut command: std::process::Command) -> Result<Vec<u8>> {
+    let _timing = timing::Span::start(timing::Phase::HostObserver);
+    use std::{io::Read, process::Stdio};
+    const LIMIT: usize = 8 * 1024 * 1024;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("starting live interface observation")?;
+    let result = (|| -> Result<Vec<u8>> {
+        let mut stdout = child
+            .stdout
+            .take()
+            .context("interface observer has no stdout")?;
+        // SAFETY: stdout is an owned, valid pipe FD. Preserve its current flags.
+        let flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0
+            || unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                < 0
+        {
+            return Err(std::io::Error::last_os_error()).context("bounding interface observation");
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            loop {
+                match stdout.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(length) => {
+                        anyhow::ensure!(
+                            bytes.len() + length <= LIMIT,
+                            "interface inventory exceeds 8 MiB"
+                        );
+                        bytes.extend_from_slice(&buffer[..length]);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error).context("reading interface inventory"),
+                }
+            }
+            if let Some(status) = child.try_wait().context("waiting for interface observer")? {
+                anyhow::ensure!(status.success(), "interface observer failed: {status}");
+                // The next read after the writer exits drains any final bytes
+                // that arrived between the first read and try_wait.
+                stdout
+                    .take((LIMIT + 1 - bytes.len()) as u64)
+                    .read_to_end(&mut bytes)
+                    .context("draining interface inventory")?;
+                anyhow::ensure!(bytes.len() <= LIMIT, "interface inventory exceeds 8 MiB");
+                return Ok(bytes);
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "interface observer timed out after 2 seconds"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
+}
+
+#[cfg(test)]
+fn parse_ipv4_inventory(bytes: &[u8], interfaces: &[ResolvedInterface]) -> Result<Ipv4Inventory> {
+    #[derive(serde::Deserialize)]
+    struct Link {
+        ifindex: u32,
+        ifname: String,
+        address: Option<String>,
+        addr_info: Vec<Address>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Address {
+        family: String,
+        local: String,
+        prefixlen: u8,
+    }
+    let links: Vec<Link> = serde_json::from_slice(bytes).context("decoding interface inventory")?;
+    let mut names = HashSet::new();
+    let mut indices = HashSet::new();
+    let mut inventory = BTreeMap::new();
+    for link in links {
+        anyhow::ensure!(link.ifindex > 0, "invalid observed interface index");
+        anyhow::ensure!(
+            names.insert(link.ifname.clone()),
+            "duplicate observed interface name"
+        );
+        anyhow::ensure!(
+            indices.insert(link.ifindex),
+            "duplicate observed interface index"
+        );
+        let Some(iface) = interfaces.iter().find(|iface| iface.name == link.ifname) else {
+            continue;
+        };
+        let mut addresses = Vec::new();
+        for address in link.addr_info {
+            if address.family != "inet" {
+                anyhow::ensure!(address.family == "inet6", "unknown observed address family");
+                continue;
+            }
+            anyhow::ensure!(
+                address.prefixlen <= 32,
+                "invalid observed IPv4 prefix length"
+            );
+            let ip: std::net::Ipv4Addr = address
+                .local
+                .parse()
+                .context("invalid observed IPv4 address")?;
+            let mask = u32::MAX
+                .checked_shl(u32::from(32 - address.prefixlen))
+                .unwrap_or(0);
+            addresses.push((ip.octets(), mask.to_be_bytes()));
+        }
+        let mac = if iface.dhcp_client {
+            Some(parse_mac(
+                link.address
+                    .as_deref()
+                    .context("DHCP interface has no MAC")?,
+            )?)
+        } else {
+            None
+        };
+        let observed = normalize_interface_ipv4(iface, link.ifindex, &addresses, mac)?;
+        inventory.insert(link.ifname, observed);
+    }
+    Ok(inventory)
+}
+
 /// The policy a reply from `target` will arrive under: the policy bound to the
-/// interface whose live IPv4 subnet contains it. `0` when no interface's subnet
+/// interface whose observed IPv4 subnet contains it. `0` when no interface's subnet
 /// does (the host is reached over a route, or its segment has no address yet) — or
 /// when two interfaces on *different* policies both match, since one entry cannot
 /// name two zones and picking either would admit nothing while looking resolved.
 ///
-/// Read from the live OS rather than derived from the config on purpose: an
+/// Derived from the common live snapshot rather than the config on purpose: an
 /// interface may be DHCP-addressed, in which case its subnet is not in the config
 /// at all, and a compile-time guess would also go stale when the address moves.
-fn resolve_reply_policy(target: [u8; 4], interfaces: &[ResolvedInterface]) -> PolicyId {
+fn resolve_reply_policy(
+    target: [u8; 4],
+    interfaces: &[ResolvedInterface],
+    ipv4: &Ipv4Inventory,
+) -> PolicyId {
     let want = u32::from_be_bytes(target);
     let mut found: Option<PolicyId> = None;
     for iface in interfaces {
-        let Ok((addr, mask)) = read_iface_ipv4_net(&iface.name) else {
+        let Some(observed) = ipv4.get(&iface.name) else {
             continue;
         };
-        let mask = u32::from_be_bytes(mask);
-        if (want & mask) != (u32::from_be_bytes(addr) & mask) {
+        if !observed.prefixes.iter().any(|(addr, mask)| {
+            let mask = u32::from_be_bytes(*mask);
+            (want & mask) == (u32::from_be_bytes(*addr) & mask)
+        }) {
             continue;
         }
         match found {
@@ -4001,10 +5193,14 @@ fn resolve_reply_policy(target: [u8; 4], interfaces: &[ResolvedInterface]) -> Po
 
 /// The one policy every member of `backends` answers under, or `0` if they do not
 /// all agree (or none resolves). See [`resolve_reply_policy`].
-fn pool_reply_policy(backends: &[Backend], interfaces: &[ResolvedInterface]) -> PolicyId {
+fn pool_reply_policy(
+    backends: &[Backend],
+    interfaces: &[ResolvedInterface],
+    ipv4: &Ipv4Inventory,
+) -> PolicyId {
     let mut agreed: Option<PolicyId> = None;
     for backend in backends {
-        let policy = resolve_reply_policy(backend.ip, interfaces);
+        let policy = resolve_reply_policy(backend.ip, interfaces, ipv4);
         if policy == 0 {
             return 0;
         }
@@ -4015,87 +5211,6 @@ fn pool_reply_policy(backends: &[Backend], interfaces: &[ResolvedInterface]) -> 
         }
     }
     agreed.unwrap_or(0)
-}
-
-/// An interface's live IPv4 address **and netmask**, both as network-order octets.
-/// The netmask is what makes subnet containment answerable; [`read_iface_ipv4`]
-/// keeps returning the address alone for callers that only need that.
-fn read_iface_ipv4_net(iface: &str) -> Result<([u8; 4], [u8; 4])> {
-    use std::os::raw::c_int;
-    let mut ifap: *mut libc::ifaddrs = core::ptr::null_mut();
-    // SAFETY: `getifaddrs` fills `ifap` with an owned linked list we free below.
-    if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
-        bail!("getifaddrs failed for {iface}");
-    }
-    let mut result: Option<([u8; 4], [u8; 4])> = None;
-    let mut cur = ifap;
-    while !cur.is_null() {
-        // SAFETY: `cur` is a valid node for the duration of this iteration.
-        let node = unsafe { &*cur };
-        if !node.ifa_addr.is_null() && !node.ifa_netmask.is_null() {
-            // SAFETY: both point at kernel-owned sockaddrs; we read sa_family
-            // first and only reinterpret as sockaddr_in when it is AF_INET.
-            let family = unsafe { (*node.ifa_addr).sa_family } as c_int;
-            let name = unsafe { std::ffi::CStr::from_ptr(node.ifa_name) };
-            if family == libc::AF_INET && name.to_bytes() == iface.as_bytes() {
-                let sin = node.ifa_addr as *const libc::sockaddr_in;
-                let mask = node.ifa_netmask as *const libc::sockaddr_in;
-                // s_addr is network byte order — its native bytes are the octets.
-                result = Some((
-                    unsafe { (*sin).sin_addr.s_addr }.to_ne_bytes(),
-                    unsafe { (*mask).sin_addr.s_addr }.to_ne_bytes(),
-                ));
-                break;
-            }
-        }
-        cur = node.ifa_next;
-    }
-    // SAFETY: frees the list `getifaddrs` allocated; `ifap` is not used after.
-    unsafe { libc::freeifaddrs(ifap) };
-    result.ok_or_else(|| anyhow!("interface {iface} has no IPv4 address"))
-}
-
-fn read_iface_ipv4(iface: &str) -> Result<[u8; 4]> {
-    read_iface_ipv4_all(iface)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("interface {iface} has no IPv4 address"))
-}
-
-fn read_iface_ipv4_all(iface: &str) -> Result<Vec<[u8; 4]>> {
-    use std::os::raw::c_int;
-    let mut ifap: *mut libc::ifaddrs = core::ptr::null_mut();
-    // SAFETY: `getifaddrs` fills `ifap` with an owned linked list we free below.
-    if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
-        bail!("getifaddrs failed for {iface}");
-    }
-    let mut result: Vec<[u8; 4]> = Vec::new();
-    let mut cur = ifap;
-    while !cur.is_null() {
-        // SAFETY: `cur` is a valid node for the duration of this iteration.
-        let node = unsafe { &*cur };
-        if !node.ifa_addr.is_null() {
-            // SAFETY: ifa_addr points at a sockaddr; we only read sa_family then,
-            // if AF_INET, reinterpret as sockaddr_in (both kernel-owned).
-            let family = unsafe { (*node.ifa_addr).sa_family } as c_int;
-            let name = unsafe { std::ffi::CStr::from_ptr(node.ifa_name) };
-            if family == libc::AF_INET && name.to_bytes() == iface.as_bytes() {
-                let sin = node.ifa_addr as *const libc::sockaddr_in;
-                // s_addr is in network byte order — its native bytes are the octets.
-                let octets = unsafe { (*sin).sin_addr.s_addr }.to_ne_bytes();
-                if !result.contains(&octets) {
-                    result.push(octets);
-                }
-            }
-        }
-        cur = node.ifa_next;
-    }
-    // SAFETY: frees the list `getifaddrs` allocated; `ifap` is not used after.
-    unsafe { libc::freeifaddrs(ifap) };
-    if result.is_empty() {
-        bail!("interface {iface} has no IPv4 address")
-    }
-    Ok(result)
 }
 
 /// Program the Phase 4 overlay maps: `OVERLAY_CONFIG` (this host's VTEP, a single
@@ -4735,6 +5850,7 @@ fn ensure_reader_barrier_supported() -> Result<()> {
 }
 
 fn synchronize_packet_readers() -> Result<()> {
+    let _timing = timing::Span::start(timing::Phase::ReaderDrain);
     loop {
         // SAFETY: GLOBAL takes integer arguments and no pointers. Its kernel
         // RCU grace period drains readers that passed the now-closed gate.
@@ -4895,6 +6011,11 @@ fn attach_egress(
         (0, "velstra_egress_v4"),
         (1, "velstra_egress_v6"),
         (2, "velstra_egress_icmp"),
+        (3, "velstra_deferred_snat"),
+        (4, "velstra_masquerade"),
+        (5, "velstra_egress_v6_state"),
+        (6, "velstra_related_egress"),
+        (7, "velstra_related_egress_apply"),
     ] {
         let fd = {
             let program: &mut SchedClassifier = ebpf
@@ -5075,6 +6196,695 @@ mod tests {
     use super::*;
 
     #[test]
+    fn complete_napt_domain_requires_absence_of_both_ha_and_sync() {
+        let base = serde_json::from_value::<velstra_config::FileConfig>(serde_json::json!({}))
+            .unwrap()
+            .resolve()
+            .unwrap();
+        assert_eq!(standalone_napt_mode(&base), 1);
+        let mut ha = base.clone();
+        ha.ha = Some(
+            serde_json::from_value(serde_json::json!({
+                "enabled": false, "cluster": "test", "node": 1, "interfaces": []
+            }))
+            .unwrap(),
+        );
+        // Even a disabled HA configuration cannot opt into a mapping format
+        // that deployed synchronized peers cannot discover.
+        assert_eq!(standalone_napt_mode(&ha), 0);
+        let sync = serde_json::from_value::<velstra_config::FileConfig>(serde_json::json!({
+            "conntrack_sync": { "listen": "0.0.0.0:5429", "peer": ["10.0.0.2:5429"],
+                "secret": "unit-test-credential-at-least-32-bytes" }
+        }))
+        .unwrap()
+        .resolve()
+        .unwrap();
+        assert_eq!(standalone_napt_mode(&sync), 0);
+        ha.conntrack_sync = sync.conntrack_sync;
+        assert_eq!(standalone_napt_mode(&ha), 0);
+    }
+
+    #[test]
+    fn direct_and_controller_reconfigure_guard_precedes_all_configuration_mutation() {
+        let source = include_str!("firewall.rs");
+        let body = source
+            .split("pub fn reconfigure_with_reset(")
+            .nth(1)
+            .unwrap()
+            .split("/// Replace the advertised")
+            .next()
+            .unwrap();
+        assert!(
+            body.find("self.requires_restart(cfg)").unwrap()
+                < body.find("std::mem::replace").unwrap()
+        );
+        assert!(
+            body.find("restart-required").unwrap()
+                < body.find("self.reprogram_with_reset(reset)").unwrap()
+        );
+        assert!(!body.contains("if !reset"));
+    }
+
+    #[test]
+    fn quiesced_initial_writer_requires_unattached_closed_gate() {
+        let initial = ReaderQuiescence::Unattached;
+        initial.validate(CONFIG_UPDATING, false).unwrap();
+        assert!(initial.validate(CONFIG_UPDATING, true).is_err());
+        for state in [CONFIG_READY, CONFIG_FAILED, u32::MAX] {
+            assert!(initial.validate(state, false).is_err());
+        }
+    }
+
+    #[test]
+    fn quiesced_live_candidate_and_rollback_share_exactly_one_drain() {
+        let drains = std::cell::Cell::new(0);
+        let quiesced = ReaderQuiescence::drain_with(|| {
+            drains.set(drains.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        quiesced.validate(CONFIG_UPDATING, true).unwrap(); // candidate
+        quiesced.validate(CONFIG_UPDATING, true).unwrap(); // rollback
+        assert_eq!(drains.get(), 1);
+        assert!(quiesced.validate(CONFIG_READY, true).is_err());
+        assert!(quiesced.validate(CONFIG_FAILED, true).is_err());
+    }
+
+    #[test]
+    fn quiesced_failed_first_barrier_never_authorizes_a_writer() {
+        let mut writes = 0;
+        let result =
+            ReaderQuiescence::drain_with(|| Err(anyhow!("injected global reader drain failure")))
+                .and_then(|quiesced| {
+                    quiesced.validate(CONFIG_UPDATING, true)?;
+                    writes += 1;
+                    Ok(())
+                });
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "injected global reader drain failure"
+        );
+        assert_eq!(writes, 0);
+    }
+
+    fn ipv4_test_interfaces() -> Vec<ResolvedInterface> {
+        serde_json::from_value::<velstra_config::FileConfig>(serde_json::json!({
+            "policy": [{"id":1,"name":"lan"}, {"id":2,"name":"other"}],
+            "interface": [{"name":"lan0","policy":1}, {"name":"other0","policy":2}]
+        }))
+        .unwrap()
+        .resolve()
+        .unwrap()
+        .interfaces
+    }
+
+    fn address_addition_fixture() -> (PreparedHostConfig, PreparedHostConfig) {
+        let previous = PreparedHostConfig {
+            overlay: OverlayConfig::DISABLED,
+            srv6: Srv6Config::DISABLED,
+            route_ifindices: BTreeMap::from([("lan0".into(), 9)]),
+            ipv4: BTreeMap::from([(
+                "lan0".into(),
+                InterfaceIpv4 {
+                    ifindex: 9,
+                    primary: Some([192, 0, 2, 1]),
+                    dhcp_mac: Some([2, 0, 0, 0, 0, 1]),
+                    prefixes: BTreeSet::from([([192, 0, 2, 1], [255, 255, 255, 0])]),
+                },
+            )]),
+        };
+        let mut observed = previous.clone();
+        observed
+            .ipv4
+            .get_mut("lan0")
+            .unwrap()
+            .prefixes
+            .insert(([192, 0, 2, 100], [255, 255, 255, 0]));
+        (previous, observed)
+    }
+
+    #[test]
+    fn monotonic_local_address_addition_requires_completed_intent_and_live_hooks() {
+        let mut intent = AppliedIntent { current: true };
+        assert!(intent.allows_address_refresh(Some(CONFIG_READY), true));
+        for state in [
+            None,
+            Some(CONFIG_FAILED),
+            Some(CONFIG_UPDATING),
+            Some(u32::MAX),
+        ] {
+            assert!(!intent.allows_address_refresh(state, true));
+        }
+        assert!(!intent.allows_address_refresh(Some(CONFIG_READY), false));
+        // All policy/FlowSpec/learned-route transactions invalidate the same
+        // capability before mutations. Rollback reopening READY is not success.
+        intent.begin();
+        assert!(!intent.allows_address_refresh(Some(CONFIG_READY), true));
+        assert!(
+            intent
+                .finish(Err(anyhow!("injected failed reopen")))
+                .is_err()
+        );
+        assert!(!intent.allows_address_refresh(Some(CONFIG_READY), true));
+        // Only a fresh successful full application of merged source intent
+        // restores the capability; failed candidates cannot be acknowledged.
+        intent.begin();
+        intent.finish(Ok(())).unwrap();
+        assert!(intent.allows_address_refresh(Some(CONFIG_READY), true));
+    }
+
+    #[test]
+    fn monotonic_local_address_addition_retains_exact_host_keys() {
+        let (previous, observed) = address_addition_fixture();
+        assert_eq!(
+            local_address_additions(&previous, &observed),
+            Some(BTreeSet::from([local_egress_address_key(
+                9,
+                [192, 0, 2, 100]
+            )]))
+        );
+        assert_eq!(
+            local_address_additions(&previous, &previous),
+            Some(BTreeSet::new())
+        );
+    }
+
+    #[test]
+    fn monotonic_local_address_addition_preserves_all_reply_memberships() {
+        let (mut previous, mut observed) = address_addition_fixture();
+        // The proof includes overlap between different policies, not merely a
+        // currently configured DNAT target. Runtime mappings use this resolver
+        // too, and must retain their existing reply policy and expiry.
+        let overlap = InterfaceIpv4 {
+            ifindex: 10,
+            primary: None,
+            dhcp_mac: None,
+            prefixes: BTreeSet::from([([192, 0, 2, 129], [255, 255, 255, 128])]),
+        };
+        previous.ipv4.insert("other0".into(), overlap.clone());
+        observed.ipv4.insert("other0".into(), overlap);
+        assert!(local_address_additions(&previous, &observed).is_some());
+        let interfaces = ipv4_test_interfaces();
+        for subnet in [1, 2, 3] {
+            for host in 0..=255 {
+                let target = [192, 0, subnet, host];
+                assert_eq!(
+                    resolve_reply_policy(target, &interfaces, &previous.ipv4),
+                    resolve_reply_policy(target, &interfaces, &observed.ipv4),
+                    "reply policy changed for {target:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn monotonic_local_address_addition_rejects_changed_permissions_and_identity() {
+        let (previous, observed) = address_addition_fixture();
+        let mut cases = Vec::new();
+        let mut changed = observed.clone();
+        changed
+            .ipv4
+            .get_mut("lan0")
+            .unwrap()
+            .prefixes
+            .remove(&([192, 0, 2, 1], [255, 255, 255, 0]));
+        cases.push(("deletion", changed));
+        for (label, prefix) in [
+            ("new subnet", ([198, 51, 100, 1], [255, 255, 255, 0])),
+            ("wider prefix", ([192, 0, 2, 100], [255, 255, 0, 0])),
+            (
+                "different prefix length",
+                ([192, 0, 2, 100], [255, 255, 255, 255]),
+            ),
+        ] {
+            let mut changed = observed.clone();
+            changed
+                .ipv4
+                .get_mut("lan0")
+                .unwrap()
+                .prefixes
+                .insert(prefix);
+            cases.push((label, changed));
+        }
+        let mut changed = observed.clone();
+        changed.ipv4.get_mut("lan0").unwrap().primary = Some([192, 0, 2, 100]);
+        cases.push(("DHCP/masquerade primary", changed));
+        let mut changed = observed.clone();
+        changed.ipv4.get_mut("lan0").unwrap().dhcp_mac = Some([2, 0, 0, 0, 0, 2]);
+        cases.push(("DHCP MAC", changed));
+        let mut changed = observed.clone();
+        changed.ipv4.get_mut("lan0").unwrap().ifindex = 10;
+        cases.push(("recreated link", changed));
+        let mut changed = observed.clone();
+        changed.route_ifindices.insert("lan0".into(), 10);
+        cases.push(("route interface", changed));
+        let mut changed = observed.clone();
+        changed.ipv4.remove("lan0");
+        cases.push(("missing interface", changed));
+        let mut changed = observed.clone();
+        changed
+            .ipv4
+            .insert("other0".into(), observed.ipv4["lan0"].clone());
+        cases.push(("new interface", changed));
+        let mut changed = observed.clone();
+        changed.overlay = OverlayConfig::new([192, 0, 2, 1], [2, 0, 0, 0, 0, 1], 4789, 0, 1500);
+        cases.push(("overlay", changed));
+        let mut changed = observed.clone();
+        changed.srv6 = Srv6Config::new([0; 16], [2, 0, 0, 0, 0, 1], 1500);
+        cases.push(("SRv6", changed));
+        for (label, changed) in cases {
+            assert!(
+                local_address_additions(&previous, &changed).is_none(),
+                "accepted {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn reply_policy_uses_every_prefix_and_withdraws_without_a_match() {
+        let interfaces = ipv4_test_interfaces();
+        let lan = &interfaces[0];
+        let prefixes = [
+            ([192, 0, 2, 1], [255, 255, 255, 0]),
+            ([10, 44, 16, 1], [255, 255, 240, 0]),
+        ];
+        let mut inventory = BTreeMap::from([(
+            lan.name.clone(),
+            normalize_interface_ipv4(lan, 9, &prefixes, None).unwrap(),
+        )]);
+        assert_eq!(
+            resolve_reply_policy([192, 0, 2, 4], &interfaces, &inventory),
+            1
+        );
+        assert_eq!(
+            resolve_reply_policy([10, 44, 31, 254], &interfaces, &inventory),
+            1
+        );
+        assert_eq!(
+            resolve_reply_policy([10, 44, 32, 1], &interfaces, &inventory),
+            0
+        );
+        inventory
+            .get_mut("lan0")
+            .unwrap()
+            .prefixes
+            .remove(&prefixes[1]);
+        assert_eq!(
+            resolve_reply_policy([10, 44, 31, 254], &interfaces, &inventory),
+            0
+        );
+        inventory.clear();
+        assert_eq!(
+            resolve_reply_policy([192, 0, 2, 4], &interfaces, &inventory),
+            0
+        );
+    }
+
+    #[test]
+    fn overlapping_zones_and_backend_pools_never_guess_a_reply_policy() {
+        let mut interfaces = ipv4_test_interfaces();
+        let prefixes = [([10, 44, 16, 1], [255, 255, 240, 0])];
+        let inventory: Ipv4Inventory = interfaces
+            .iter()
+            .enumerate()
+            .map(|(index, iface)| {
+                (
+                    iface.name.clone(),
+                    normalize_interface_ipv4(iface, index as u32 + 9, &prefixes, None).unwrap(),
+                )
+            })
+            .collect();
+        let backend = Backend::new([10, 44, 20, 2], 80);
+        assert_eq!(resolve_reply_policy(backend.ip, &interfaces, &inventory), 0);
+        interfaces[1].policy = interfaces[0].policy;
+        assert_eq!(resolve_reply_policy(backend.ip, &interfaces, &inventory), 1);
+        assert_eq!(pool_reply_policy(&[backend], &interfaces, &inventory), 1);
+        assert_eq!(pool_reply_policy(&[], &interfaces, &inventory), 0);
+        assert_eq!(
+            pool_reply_policy(
+                &[backend, Backend::new([203, 0, 113, 2], 80)],
+                &interfaces,
+                &inventory,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn inventory_normalization_ignores_only_semantically_irrelevant_order() {
+        let mut iface = ipv4_test_interfaces().remove(0);
+        let first = ([192, 0, 2, 1], [255, 255, 255, 0]);
+        let second = ([10, 44, 16, 1], [255, 255, 240, 0]);
+        let observed = |iface: &ResolvedInterface, addresses: &[Ipv4Prefix], mac| {
+            normalize_interface_ipv4(iface, 9, addresses, mac).unwrap()
+        };
+        assert_eq!(
+            observed(&iface, &[first, second, first], None),
+            observed(&iface, &[second, first], None),
+            "non-SNAT prefix order/duplicates have no policy effect"
+        );
+        iface.masquerade = true;
+        assert_ne!(
+            observed(&iface, &[first, second], None),
+            observed(&iface, &[second, first], None),
+            "a changed kernel primary changes implicit SNAT"
+        );
+        assert_eq!(observed(&iface, &[], None).primary, None);
+        iface.snat_address = Some([203, 0, 113, 10]);
+        assert_eq!(
+            observed(&iface, &[first, second], None),
+            observed(&iface, &[second, first], None),
+            "explicit SNAT must not depend on primary ordering"
+        );
+        iface.dhcp_client = true;
+        assert!(normalize_interface_ipv4(&iface, 9, &[first], None).is_err());
+        let mac = [2, 0, 0, 0, 0, 1];
+        assert_eq!(observed(&iface, &[first], Some(mac)).dhcp_mac, Some(mac));
+        assert_ne!(
+            observed(&iface, &[first], Some(mac)),
+            observed(&iface, &[first], Some([2, 0, 0, 0, 0, 2]))
+        );
+        assert!(normalize_interface_ipv4(&iface, 0, &[first], Some(mac)).is_err());
+    }
+
+    #[test]
+    fn ipv4_labels_cannot_reassign_an_address_to_a_different_policy() {
+        let interfaces = ipv4_test_interfaces();
+        let json = serde_json::json!([
+            {"ifindex":9,"ifname":"lan0","addr_info":[
+                {"family":"inet","local":"192.0.2.1","prefixlen":24,"label":"lan0"},
+                {"family":"inet","local":"10.44.16.1","prefixlen":20,"label":"other0:forged"},
+                {"family":"inet6","local":"fe80::1","prefixlen":64}
+            ]},
+            {"ifindex":10,"ifname":"other0","addr_info":[]}
+        ]);
+        let inventory =
+            parse_ipv4_inventory(&serde_json::to_vec(&json).unwrap(), &interfaces).unwrap();
+        assert_eq!(inventory["lan0"].prefixes.len(), 2);
+        assert!(inventory["other0"].prefixes.is_empty());
+        assert_eq!(
+            resolve_reply_policy([10, 44, 20, 2], &interfaces, &inventory),
+            1
+        );
+        assert_eq!(inventory["other0"].ifindex, 10);
+    }
+
+    #[test]
+    fn malformed_or_ambiguous_inventory_is_never_an_empty_success() {
+        let interfaces = ipv4_test_interfaces();
+        for json in [
+            serde_json::json!({}),
+            serde_json::json!([{"ifindex":9,"ifname":"lan0"}]),
+            serde_json::json!([{"ifindex":0,"ifname":"lan0","addr_info":[]}]),
+            serde_json::json!([
+                {"ifindex":9,"ifname":"lan0","addr_info":[]},
+                {"ifindex":9,"ifname":"other0","addr_info":[]}
+            ]),
+            serde_json::json!([
+                {"ifindex":9,"ifname":"lan0","addr_info":[]},
+                {"ifindex":10,"ifname":"lan0","addr_info":[]}
+            ]),
+            serde_json::json!([{"ifindex":9,"ifname":"lan0","addr_info":[
+                {"family":"inet","local":"192.0.2.1","prefixlen":33}
+            ]}]),
+            serde_json::json!([{"ifindex":9,"ifname":"lan0","addr_info":[
+                {"family":"inet","local":"::1","prefixlen":24}
+            ]}]),
+            serde_json::json!([{"ifindex":9,"ifname":"lan0","addr_info":[
+                {"family":"surprise","local":"192.0.2.1","prefixlen":24}
+            ]}]),
+        ] {
+            assert!(
+                parse_ipv4_inventory(&serde_json::to_vec(&json).unwrap(), &interfaces).is_err(),
+                "{json}"
+            );
+        }
+        assert!(parse_ipv4_inventory(b"[{", &interfaces).is_err());
+        assert!(parse_ipv4_inventory(b"[]", &interfaces).unwrap().is_empty());
+    }
+
+    // A child of this test executable supplies controlled subprocess failure
+    // modes without changing global environment or requiring a host shell.
+    #[test]
+    fn inventory_observer_subprocess_fixture() {
+        use std::io::Write;
+        match std::env::var("VELSTRA_TEST_OBSERVER_CHILD").as_deref() {
+            Ok("timeout") => std::thread::sleep(Duration::from_secs(10)),
+            Ok("oversize") => {
+                let mut out = std::io::stdout().lock();
+                for _ in 0..2304 {
+                    if out.write_all(&[b'x'; 4096]).is_err() {
+                        break;
+                    }
+                }
+            }
+            Ok("failed") => std::process::exit(9),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn observer_spawn_status_time_and_output_failures_are_bounded_errors() {
+        assert!(
+            read_inventory_output(std::process::Command::new("/no-such-velstra-observer")).is_err()
+        );
+        for mode in ["failed", "timeout", "oversize"] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args([
+                "--exact",
+                "firewall::tests::inventory_observer_subprocess_fixture",
+                "--nocapture",
+            ]);
+            command.env("VELSTRA_TEST_OBSERVER_CHILD", mode);
+            let before = Instant::now();
+            let error = read_inventory_output(command).unwrap_err();
+            let message = format!("{error:#}");
+            let expected = match mode {
+                "failed" => "failed",
+                "timeout" => "timed out",
+                _ => "exceeds",
+            };
+            assert!(message.contains(expected), "{mode}: {message}");
+            assert!(
+                before.elapsed() < Duration::from_secs(4),
+                "{mode}: unbounded observer"
+            );
+        }
+    }
+
+    #[test]
+    fn real_rtnetlink_inventory_distinguishes_loopback_from_an_absent_link() {
+        let mut interfaces = ipv4_test_interfaces();
+        interfaces[0].name = "lo".into();
+        interfaces[1].name = "velstra-no-such".into();
+        let inventory = read_ipv4_inventory(&interfaces).unwrap();
+        assert_eq!(inventory.len(), 1);
+        let observed = inventory.get("lo").unwrap();
+        assert_eq!(observed.ifindex, if_nametoindex("lo").unwrap());
+        assert!(
+            observed
+                .prefixes
+                .contains(&([127, 0, 0, 1], [255, 0, 0, 0]))
+        );
+        assert_eq!(
+            resolve_reply_policy([127, 0, 0, 2], &interfaces, &inventory),
+            1
+        );
+        assert_eq!(inventory, read_ipv4_inventory_ip(&interfaces).unwrap());
+    }
+
+    #[test]
+    fn native_inventory_matches_ip_for_every_present_host_link() {
+        let base = ipv4_test_interfaces().remove(0);
+        let interfaces: Vec<_> = crate::host_inventory::read()
+            .unwrap()
+            .into_iter()
+            .map(|link| {
+                let mut iface = base.clone();
+                iface.name = link.name;
+                iface.masquerade = true;
+                iface.snat_address = None;
+                iface.dhcp_client = link.mac.as_ref().is_some_and(|mac| mac.len() == 6);
+                iface
+            })
+            .collect();
+        assert!(!interfaces.is_empty());
+        assert_eq!(
+            read_ipv4_inventory(&interfaces).unwrap(),
+            read_ipv4_inventory_ip(&interfaces).unwrap()
+        );
+    }
+
+    /// Run explicitly where user/network namespaces are available. All link
+    /// mutations happen in a child whose network namespace differs from its
+    /// parent's; no sudo and no mutations to the developer/runner namespace.
+    #[test]
+    #[ignore = "requires unshare user/network namespaces and iproute2"]
+    fn native_inventory_isolated_namespace_parity() {
+        let output = std::process::Command::new("unshare")
+            .args(["-Urn", "--"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "firewall::tests::native_inventory_namespace_fixture",
+                "--nocapture",
+            ])
+            .env(
+                "VELSTRA_TEST_INVENTORY_PARENT_NS",
+                std::fs::read_link("/proc/self/ns/net").unwrap(),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn native_inventory_namespace_fixture() {
+        let Some(parent) = std::env::var_os("VELSTRA_TEST_INVENTORY_PARENT_NS") else {
+            return;
+        };
+        assert_ne!(
+            std::fs::read_link("/proc/self/ns/net").unwrap(),
+            std::path::PathBuf::from(parent),
+            "refusing mutations outside a new network namespace"
+        );
+        let ip = |args: &[&str]| {
+            let output = std::process::Command::new("ip")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "ip {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        ip(&["link", "set", "lo", "up"]);
+        for name in ["lan0", "empty0", "v6only0"] {
+            ip(&["link", "add", name, "type", "dummy"]);
+            ip(&["link", "set", name, "up"]);
+        }
+        ip(&["address", "add", "192.0.2.1/24", "dev", "lan0"]);
+        ip(&[
+            "address",
+            "add",
+            "192.0.2.9/24",
+            "dev",
+            "lan0",
+            "label",
+            "lan0:vip",
+        ]);
+        ip(&[
+            "address",
+            "add",
+            "198.51.100.10/24",
+            "dev",
+            "lan0",
+            "preferred_lft",
+            "0",
+            "valid_lft",
+            "30",
+        ]);
+        ip(&[
+            "address",
+            "add",
+            "203.0.113.1",
+            "peer",
+            "203.0.113.2/32",
+            "dev",
+            "lan0",
+        ]);
+        ip(&[
+            "-6",
+            "address",
+            "add",
+            "2001:db8::1/64",
+            "dev",
+            "v6only0",
+            "nodad",
+        ]);
+        let base = ipv4_test_interfaces().remove(0);
+        let mut interfaces: Vec<_> = ["lan0", "empty0", "v6only0", "absent0"]
+            .into_iter()
+            .map(|name| {
+                let mut iface = base.clone();
+                iface.name = name.into();
+                iface.masquerade = true;
+                iface.dhcp_client = true;
+                iface
+            })
+            .collect();
+        let parity = |interfaces: &[ResolvedInterface]| {
+            let native = read_ipv4_inventory(interfaces).unwrap();
+            assert_eq!(native, read_ipv4_inventory_ip(interfaces).unwrap());
+            native
+        };
+        let initial = parity(&interfaces);
+        assert_eq!(initial["lan0"].primary, Some([192, 0, 2, 1]));
+        assert!(
+            initial["lan0"]
+                .prefixes
+                .contains(&([203, 0, 113, 1], [255; 4]))
+        );
+        assert!(
+            !initial["lan0"]
+                .prefixes
+                .iter()
+                .any(|(address, _)| *address == [203, 0, 113, 2])
+        );
+        assert!(initial["empty0"].prefixes.is_empty() && initial["v6only0"].prefixes.is_empty());
+        assert!(!initial.contains_key("absent0"));
+        interfaces[0].snat_address = Some([192, 0, 2, 99]);
+        assert_eq!(parity(&interfaces)["lan0"].primary, None);
+        ip(&["link", "set", "lan0", "address", "02:00:00:00:00:99"]);
+        assert_eq!(
+            parity(&interfaces)["lan0"].dhcp_mac,
+            Some([2, 0, 0, 0, 0, 0x99])
+        );
+        ip(&[
+            "address",
+            "add",
+            "10.99.0.1/24",
+            "dev",
+            "lan0",
+            "preferred_lft",
+            "0",
+            "valid_lft",
+            "1",
+        ]);
+        assert!(
+            parity(&interfaces)["lan0"]
+                .prefixes
+                .iter()
+                .any(|(address, _)| *address == [10, 99, 0, 1])
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while read_ipv4_inventory(&interfaces).unwrap()["lan0"]
+            .prefixes
+            .iter()
+            .any(|(address, _)| *address == [10, 99, 0, 1])
+        {
+            assert!(
+                Instant::now() < deadline,
+                "kernel address lifetime did not expire"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        parity(&interfaces);
+        ip(&["link", "delete", "lan0"]);
+        assert!(!parity(&interfaces).contains_key("lan0"));
+        ip(&["link", "add", "lan0", "type", "dummy"]);
+        let replacement = parity(&interfaces);
+        assert_ne!(replacement["lan0"].ifindex, initial["lan0"].ifindex);
+        assert!(replacement["lan0"].prefixes.is_empty());
+    }
+
+    #[test]
     fn masquerade_follows_live_addresses_and_preserves_explicit_snat() {
         let cfg = serde_json::from_value::<velstra_config::FileConfig>(serde_json::json!({
             "interface": [
@@ -5216,7 +7026,7 @@ mod tests {
     }
 
     #[test]
-    fn local_dhcp_addresses_are_scoped_to_the_actual_client_interface() {
+    fn local_addresses_are_scoped_to_the_actual_interface() {
         let cfg = serde_json::from_value::<velstra_config::FileConfig>(serde_json::json!({
             "interface": [{"name":"wan0", "policy":0, "dhcp_client":true},
                           {"name":"lan0", "policy":0}]
@@ -5227,11 +7037,18 @@ mod tests {
         let keys = local_egress_addresses(
             &cfg.interfaces,
             |name| Ok(if name == "wan0" { 10 } else { 11 }),
-            |_| Ok(vec![[198, 18, 88, 100]]),
+            |name| {
+                Ok(vec![if name == "wan0" {
+                    [198, 18, 88, 100]
+                } else {
+                    [198, 18, 20, 1]
+                }])
+            },
         );
-        assert_eq!(keys.len(), 1);
+        assert_eq!(keys.len(), 2);
         assert!(keys.contains(&local_egress_address_key(10, [198, 18, 88, 100])));
         assert!(!keys.contains(&local_egress_address_key(11, [198, 18, 88, 100])));
+        assert!(keys.contains(&local_egress_address_key(11, [198, 18, 20, 1])));
         assert!(local_egress_addresses(&cfg.interfaces, |_| Ok(10), |_| Ok(vec![])).is_empty());
     }
 
@@ -5448,6 +7265,38 @@ mod tests {
         let rendered = stats.render();
         assert!(rendered.contains("dropped_blocklist"));
         assert!(rendered.contains("25.00%"), "drop rate; got:\n{rendered}");
+    }
+
+    #[test]
+    fn nat_failure_reason_counters_are_visible_without_double_counting_drops() {
+        let rows = (0..Counter::COUNT)
+            .map(|index| {
+                let counter = Counter::from_u32(index).unwrap();
+                let value = match counter {
+                    Counter::RxPackets => 100,
+                    Counter::EgressDropped => 7,
+                    Counter::EgressNatNoCandidate => 5,
+                    Counter::EgressNatClaimFailed => 2,
+                    Counter::FirewallStateWriteFailed => 3,
+                    _ => 0,
+                };
+                (counter, value)
+            })
+            .collect();
+        let stats = Stats { rows };
+        assert!(!is_drop_counter(Counter::EgressNatNoCandidate));
+        assert!(!is_drop_counter(Counter::EgressNatClaimFailed));
+        assert!(!is_drop_counter(Counter::FirewallStateWriteFailed));
+        assert_eq!(stats.get(Counter::EgressNatNoCandidate), 5);
+        assert_eq!(stats.get(Counter::EgressNatClaimFailed), 2);
+        let rendered = stats.render();
+        assert!(rendered.contains("egress_nat_no_candidate"));
+        assert!(rendered.contains("egress_nat_claim_failed"));
+        assert!(rendered.contains("firewall_state_write_failed"));
+        assert!(
+            rendered.contains("7.00%"),
+            "reason counts must not inflate drop rate: {rendered}"
+        );
     }
 }
 

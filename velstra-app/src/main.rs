@@ -13,12 +13,15 @@
 //! ```
 
 mod btf;
+mod capacity;
 mod conntrack_sync;
 mod controller_client;
+mod expiry;
 mod firewall;
 mod flows;
 mod flowspec;
 mod ha;
+mod host_inventory;
 mod ipfix;
 mod mapping;
 mod packet_events;
@@ -82,9 +85,10 @@ struct RunArgs {
     #[arg(long, default_value_t = 0)]
     auto_policy: u32,
 
-    /// Serve a read-only query socket at this path (`stats`, `flows`, `top`), so
-    /// an operator or a product CLI can ask the live data plane what it is doing
-    /// instead of scraping the agent's log. Unset ⇒ no socket.
+    /// Serve a privileged query/control socket (`stats`, `flows`, `reload`,
+    /// `expire-state`). Place it in a root-owned 0700 directory; access permits
+    /// policy changes and bounded maintenance, not only diagnostics.
+    /// Unset ⇒ no socket.
     #[arg(long)]
     query_socket: Option<PathBuf>,
 
@@ -284,6 +288,7 @@ fn default_node_id() -> String {
 
 /// `velstra run` — the daemon.
 async fn run(args: RunArgs) -> Result<()> {
+    firewall::timing::initialize();
     if args.iface.is_empty() && args.auto_attach.is_none() && args.controllers.is_empty() {
         anyhow::bail!(
             "specify at least one --iface, --auto-attach <prefix>, or --controller (config-driven attach)"
@@ -326,6 +331,9 @@ async fn run(args: RunArgs) -> Result<()> {
         RuntimeConfig::passthrough()
     };
 
+    if let Some(sync) = &initial.conntrack_sync {
+        sync.require_authenticated()?;
+    }
     log_policy("policy", &initial);
     if initial.ha.is_some() {
         anyhow::ensure!(
@@ -547,28 +555,18 @@ async fn run(args: RunArgs) -> Result<()> {
                     cts.listen,
                     cts.peers.len()
                 );
-                if cts.secret.is_some() {
-                    match firewall.lock().await.syn_flows_handle() {
-                        Ok(synproxy) => {
-                            tokio::spawn(conntrack_sync::secure::run(
-                                firewall.clone(),
-                                conntrack,
-                                fw_flows,
-                                synproxy,
-                                ha_state.clone(),
-                                cts,
-                            ));
-                        }
-                        Err(error) => warn!("could not start authenticated state sync: {error:#}"),
+                match firewall.lock().await.syn_flows_handle() {
+                    Ok(synproxy) => {
+                        tokio::spawn(conntrack_sync::secure::run(
+                            firewall.clone(),
+                            conntrack,
+                            fw_flows,
+                            synproxy,
+                            ha_state.clone(),
+                            cts,
+                        ));
                     }
-                } else {
-                    tokio::spawn(conntrack_sync::run(
-                        conntrack,
-                        fw_flows,
-                        cts.listen,
-                        cts.peers,
-                        cts.interval_secs,
-                    ));
+                    Err(error) => warn!("could not start authenticated state sync: {error:#}"),
                 }
             }
             Err(e) => warn!("could not start conntrack-sync: {e:#}"),
@@ -740,10 +738,11 @@ async fn config_attach_loop(firewall: Arc<Mutex<Firewall>>, mode: AttachMode) {
     loop {
         ticker.tick().await;
         let present = list_interfaces();
-        firewall
-            .lock()
-            .await
-            .reconcile_config_interfaces(&present, mode);
+        let wait = firewall::timing::Span::start(firewall::timing::Phase::ReconcileLockWait);
+        let mut fw = firewall.lock().await;
+        drop(wait);
+        let _hold = firewall::timing::Span::start(firewall::timing::Phase::ReconcileLockHold);
+        fw.reconcile_config_interfaces(&present, mode);
     }
 }
 

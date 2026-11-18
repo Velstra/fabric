@@ -501,10 +501,9 @@ impl FlowState {
     }
 
     pub fn idle_ns(&self, now: u64) -> u64 {
-        if now < self.last_seen_ns {
-            return u64::MAX;
-        }
-        (now - self.last_seen_ns).saturating_add(self.age_ns)
+        // Match FirewallState: another CPU may refresh after `now` was read.
+        now.saturating_sub(self.last_seen_ns)
+            .saturating_add(self.age_ns)
     }
 
     /// This entry rewrites the packet's **source** (SNAT a reply) rather than
@@ -642,6 +641,35 @@ impl FlowState {
         (a | b | c | d) != 0
     }
 
+    /// The original client/VIP tuple used by a router-NAT firewall handshake.
+    ///
+    /// Call only for an unexpired entry looked up in the reserved router NAT
+    /// namespace (policy zero). A SYN and the backend's SYN/ACK have different
+    /// wire tuples; tracking them separately never completes either handshake.
+    /// This derives their common tuple from existing replicated NAT state,
+    /// without changing the HA wire layout or skipping TCP state validation.
+    #[inline]
+    pub fn router_firewall_flow(&self, flow: &mut FlowKey) -> bool {
+        if self.is_origin() {
+            // Ordinary masquerade remains isolated in its own policy.
+            return false;
+        }
+        flow.policy = 0;
+        if self.is_reverse() {
+            flow.src_ip = self.nat_ip;
+            if self.nat_port != 0 {
+                flow.src_port = self.nat_port;
+            }
+            if self.has_second() {
+                flow.dst_ip = self.nat2_ip;
+                if self.nat2_port != 0 {
+                    flow.dst_port = self.nat2_port;
+                }
+            }
+        }
+        true
+    }
+
     /// Account one packet of `bytes` to this entry.
     ///
     /// Saturating rather than wrapping: a counter that rolls over turns a busy
@@ -664,8 +692,8 @@ pub struct PortFwd {
     /// Internal host the connection is rewritten to.
     pub ip: [u8; 4],
     /// Match guard: only DNAT when the packet's destination equals this address.
-    /// `[0; 4]` means "match any destination" — the plain WAN port-forward, where
-    /// the ingress policy + port already scope the match. A **hairpin** (NAT
+    /// `[0; 4]` omits this exact-IP guard; `flags` may still require an address
+    /// owned by the ingress interface. A **hairpin** (NAT
     /// reflection) entry programmed under an *internal* zone's policy sets this to
     /// the box's public address, so it only catches internal clients dialling the
     /// public IP — never internal-to-internal traffic to the same port.
@@ -683,8 +711,9 @@ pub struct PortFwd {
     pub reply_policy: PolicyId,
     /// Internal port (`0` keeps the original destination port).
     pub port: u16,
-    /// Explicit padding, always zero.
-    pub _pad: u16,
+    /// Bit 0 restricts DNAT to a local address on the ingress interface.
+    /// Other bits are reserved and zero. Layout remains 20 bytes.
+    pub flags: u16,
 }
 
 impl PortFwd {
@@ -698,7 +727,7 @@ impl PortFwd {
             snat_ip: [0; 4],
             reply_policy: 0,
             port,
-            _pad: 0,
+            flags: 0,
         }
     }
 
@@ -712,7 +741,7 @@ impl PortFwd {
             snat_ip,
             reply_policy: 0,
             port,
-            _pad: 0,
+            flags: 0,
         }
     }
 
@@ -724,6 +753,26 @@ impl PortFwd {
             reply_policy,
             ..self
         }
+    }
+
+    #[inline]
+    pub const fn with_local_destination(self, local: bool) -> Self {
+        Self {
+            flags: local as u16,
+            ..self
+        }
+    }
+
+    #[inline]
+    pub const fn requires_local_destination(&self) -> bool {
+        self.flags & 1 != 0
+    }
+
+    /// The same guard must protect firewall admission and the eventual rewrite.
+    #[inline]
+    pub fn matches_destination(&self, destination: [u8; 4], local: bool) -> bool {
+        (self.match_dst == [0; 4] || self.match_dst == destination)
+            && (!self.requires_local_destination() || local)
     }
 }
 
@@ -752,6 +801,50 @@ const fn replace_addr(check: u16, old: [u8; 4], new: [u8; 4]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn router_nat_handshake_uses_the_original_client_vip_tuple_in_both_directions() {
+        let client = [10, 1, 0, 3];
+        let vip = [198, 51, 100, 1];
+        let server = [10, 1, 0, 2];
+        let lan = [10, 1, 0, 1];
+        let original = FlowKey::new(7, client, vip, 40000, 8080, ip_proto::TCP);
+        let mut canonical = original;
+        assert!(FlowState::forward(server, 8443).router_firewall_flow(&mut canonical));
+        assert_eq!(canonical.policy, 0);
+        assert_eq!(canonical.src_ip, client);
+        assert_eq!(canonical.dst_ip, vip);
+        for (state, destination) in [
+            (FlowState::reverse(vip, 8080), client),
+            (FlowState::reverse2(vip, 8080, client, 0), lan),
+        ] {
+            let mut reply = FlowKey::new(9, server, destination, 8443, 40000, ip_proto::TCP);
+            assert!(state.router_firewall_flow(&mut reply));
+            assert_eq!(reply.src_ip, canonical.dst_ip);
+            assert_eq!(reply.dst_ip, canonical.src_ip);
+            assert_eq!(reply.src_port, canonical.dst_port);
+            assert_eq!(reply.dst_port, canonical.src_port);
+            assert_eq!(reply.policy, canonical.policy);
+        }
+        let mut masquerade = original;
+        assert!(!FlowState::masquerade(client, 40000).router_firewall_flow(&mut masquerade));
+        assert_eq!(masquerade, original);
+    }
+
+    #[test]
+    fn router_nat_canonical_ports_preserve_zero_sentinels_and_honor_secondary_rewrites() {
+        let flow = FlowKey::new(3, [10, 0, 0, 2], [10, 0, 0, 1], 8443, 50000, ip_proto::UDP);
+        let mut preserved = flow;
+        assert!(FlowState::reverse([192, 0, 2, 1], 0).router_firewall_flow(&mut preserved));
+        assert_eq!((preserved.src_port, preserved.dst_port), (8443, 50000));
+        let mut mapped = flow;
+        assert!(
+            FlowState::reverse2([192, 0, 2, 1], 8080, [10, 0, 0, 3], 40000)
+                .router_firewall_flow(&mut mapped)
+        );
+        assert_eq!((mapped.src_port, mapped.dst_port), (8080, 40000));
+        assert_eq!(mapped.dst_ip, [10, 0, 0, 3]);
+    }
     use crate::forward::ipv4_checksum;
 
     #[test]
@@ -994,6 +1087,18 @@ mod tests {
         assert_eq!(hp.ip, [10, 0, 0, 9]);
         assert_eq!(hp.match_dst, [198, 51, 100, 1]);
         assert_eq!(hp.snat_ip, [10, 0, 0, 1]);
+    }
+
+    #[test]
+    fn port_forward_admission_cannot_escape_its_destination_guard() {
+        let transit = PortFwd::new([10, 0, 0, 9], 8443);
+        assert!(transit.matches_destination([203, 0, 113, 9], false));
+        let appliance = transit.with_local_destination(true);
+        assert!(appliance.matches_destination([198, 51, 100, 1], true));
+        assert!(!appliance.matches_destination([10, 0, 0, 9], false));
+        let reflected = PortFwd::new_hairpin([10, 0, 0, 9], 8443, [198, 51, 100, 1], [10, 0, 0, 1]);
+        assert!(reflected.matches_destination([198, 51, 100, 1], false));
+        assert!(!reflected.matches_destination([10, 0, 0, 9], true));
     }
 
     #[test]
