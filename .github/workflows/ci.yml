@@ -156,7 +156,9 @@ jobs:
   loadcheck:
     name: ebpf verifier load-check (root)
     if: github.event_name != 'schedule'
-    runs-on: ubuntu-latest
+    # Match the explicit build/datapath baseline; do not migrate the tool
+    # packaging and verifier kernel implicitly when ubuntu-latest moves.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
