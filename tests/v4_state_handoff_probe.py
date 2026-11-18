@@ -339,6 +339,8 @@ def exercise(pid, interface):
 
         try:
             policy(0)
+            packet_check("strict source validation rejects an unroutable source",
+                         transport_packet(17, "203.0.113.20", peer, 42000, 7777), 1)
             datagram = transport_packet(17, local, peer, 42000, 7777)
             for name, frame in (
                 ("valid Ethernet padding retained", ipv4_variant(datagram, padding=bytes(18))),
@@ -428,6 +430,13 @@ def main():
         subprocess.run(["ip", "link", "add", interface, "type", "veth", "peer", "name", "handoff-peer"], check=True)
         subprocess.run(["ip", "link", "set", "handoff-peer", "up"], check=True)
         subprocess.run(["ip", "link", "set", interface, "up"], check=True)
+        # Strict uRPF requires a reverse path for every legitimate fixture
+        # source. Never rely on the host's inherited forwarding defaults making
+        # bpf_fib_lookup decline the question. These addresses/routes and the
+        # forwarding switch exist only inside the verified private namespace.
+        for address in ("192.0.2.1/24", "198.51.100.1/24"):
+            subprocess.run(["ip", "address", "add", address, "dev", interface], check=True)
+        Path(f"/proc/sys/net/ipv4/conf/{interface}/forwarding").write_text("1\n")
         with (root / "agent.log").open("wb") as log:
             process = subprocess.Popen([str(binary), "run", "--iface", interface, "--config", str(config),
                                         "--stats-interval", "0"], stdout=log, stderr=subprocess.STDOUT)
