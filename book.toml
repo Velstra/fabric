@@ -1,0 +1,14 @@
+[book]
+title = "Velstra Fabric"
+description = "Configure, verify and operate the Velstra networking dataplane."
+language = "en"
+src = "docs"
+
+[build]
+create-missing = false
+
+[output.html]
+site-url = "/fabric/"
+git-repository-url = "https://github.com/Velstra/fabric"
+edit-url-template = "https://github.com/Velstra/fabric/edit/main/{path}"
+additional-css = ["theme/fabric.css"]

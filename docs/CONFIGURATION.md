@@ -1,345 +1,91 @@
-# Configuration reference
+# Manage topology and APIs
 
-Velstra has **two** configuration surfaces, and it matters which one you are
-looking at:
-
-| Surface | Written by | Contents |
-|---|---|---|
-| **Topology file** (`--topology`) | you | the fabric's *intent* — hosts, networks, ports, tenants, services |
-| **Node config** (`--config`, or served by the controller) | the controller | one host's derived *reality* — policies, tunnels, FDB entries, VIPs |
-
-You declare the first. The controller computes the second, per host, and pushes
-it. Writing node configs by hand is supported (a standalone agent needs no
-controller — see [`examples/rules.toml`](../examples/rules.toml) and friends), but
-in a fabric they are an **output**: anything you hand-write there is replaced on
-the next derive.
-
-The same entities the topology file declares are also drivable at runtime over
-the northbound API — gRPC, the `orch` CLI, and REST. See
-[Northbound API](#northbound-api) below.
-
----
+The controller takes the fabric's declarations through `--topology` or the management API. The agent takes per-node policy through `--config` or receives it from a controller. Use the [worked topology](https://github.com/Velstra/fabric/blob/main/examples/topology.toml) to try both hosts and inspect their ports without running an agent.
 
 ## Topology file
 
-One TOML file describes the whole virtual fabric. Blocks may appear in any order;
-the loader resolves them in dependency order (hosts → networks → subnets →
-security groups → IP-VRFs → ports → load balancers) and rejects a reference to
-something that does not exist.
-
-A worked seed lives in [`examples/topology.toml`](../examples/topology.toml).
-
-### `[[host]]` — a physical node (VTEP)
+A network groups tenant ports by VNI. The example below is a complete single-host topology for inspection. It names a lab interface; no agents attach when only the controller is running.
 
 ```toml
 [[host]]
-id             = "host-1"
-vtep           = "10.10.0.1"          # underlay VTEP address (IPv4)
+id = "host-1"
+vtep = "10.10.0.1"
 underlay_iface = "eth0"
-underlay_mac   = "02:00:00:00:00:11"
-encap          = "vxlan"              # or "geneve"; default vxlan
-udp_port       = 4789                 # default per encap (4789 / 6081)
-underlay_mtu   = 1500                 # sizes the overlay MTU guard
-```
+underlay_mac = "02:00:00:00:00:11"
 
-The `underlay_mac` is what peers address encapsulated frames to. A wrong one is
-not a validation error — it is a black hole — so it is worth checking against
-`ip link` on the node.
-
-### `[[network]]` — a tenant L2 segment
-
-```toml
 [[network]]
-vni            = 5000
-name           = "blue"
-subnet         = "192.168.100.0/24"   # IPAM allocates port addresses from here
-default_action = "pass"               # pass (default) | drop | reject
-drop_icmp      = false
-```
+vni = 5000
+name = "blue"
+subnet = "192.168.100.0/24"
 
-The VNI doubles as the segment's default firewall **policy id**, which is why a
-port with no security group is filtered by its network's `default_action` /
-`drop_icmp`.
-
-### `[[subnet]]` — first-class addressing (optional, dual-stack)
-
-A network may carry several subnets — typically one IPv4 and one IPv6. Use these
-instead of `[[network]].subnet` when you need a gateway, a bounded pool, or v6.
-
-```toml
-[[subnet]]
-id          = "blue-v4"
-vni         = 5000
-cidr        = "192.168.100.0/24"
-gateway     = "192.168.100.1"
-pool_start  = "192.168.100.10"        # bounds what IPAM hands out
-pool_end    = "192.168.100.200"
-enable_dhcp = true
-```
-
-The gateway and both pool bounds must lie inside the CIDR. Runtime IPAM
-allocations and port↔subnet bindings are **not** persisted here — in cluster mode
-they live in the Raft snapshot; this file holds declarations only.
-
-### `[[security_group]]` — a reusable rule set
-
-```toml
-[[security_group]]
-name           = "web"
-default_action = "drop"
-stateful       = true                 # reply traffic of tracked flows is allowed
-drop_icmp      = false
-blocklist      = ["198.51.100.0/24"]  # source CIDRs dropped outright
-
-[[security_group.rule]]
-proto  = "tcp"
-port   = 443
-action = "pass"                       # default: drop
-log    = false
-src    = "10.0.0.0/8"                 # optional; absent = from any source
-```
-
-Each group gets a deterministic policy id, so its rules survive restarts and
-re-derives. A rule with a source constraint wins over a `from any` rule on the
-same port. Ports bind a group by name (see `[[port]]`).
-
-### `[[ip_vrf]]` — a tenant's routed context (B7, symmetric IRB)
-
-Groups several L2 segments into one routed context, so traffic *between* them is
-routed rather than bridged, behind one anycast gateway.
-
-```toml
-[[ip_vrf]]
-l3_vni      = 50100
-name        = "tenant-a"
-gateway_mac = "02:00:5e:00:00:aa"     # identical on every host of this tenant
-networks    = [5000, 5001]
-```
-
-Deliberately the same shape as wren's `[[bgp.evpn.ip-vrf]]` — one operator
-configures both sides of the same tenant.
-
-- The **gateway MAC must be unicast and non-zero**: it becomes the inner *source*
-  MAC of a routed frame, and a multicast one is unroutable. Keeping it identical
-  fabric-wide is what lets a migrated workload keep its default-gateway ARP entry.
-- A network belongs to **at most one** IP-VRF. Two would make a packet's tenant
-  ambiguous, and the datapath would resolve it by map-insertion order.
-- Every listed network must exist, and a network cannot be removed while a VRF
-  still routes it.
-- The L3 VNI has its own 24-bit number space: an L3 VNI numerically equal to some
-  L2 VNI is a different context, not the same one.
-
-The remote prefixes themselves are **learned**, not configured — they arrive as
-BGP EVPN type-5 routes over wren's `monitor evpn` stream and become `[[irb_route]]`
-entries in the derived node config.
-
-### `[[port]]` — a VM/workload NIC
-
-```toml
 [[port]]
-network        = 5000
-host           = "host-1"
-tap            = "tap-blue-1"
-ip             = "192.168.100.10"     # omit to auto-allocate
-security_group = "web"                # binds the group by name
-# policy       = 7                    # raw policy id; `security_group` wins
-```
-
-The port's id is derived as `port-<vni>-<ip>` and is what the API and pool
-members refer to.
-
-### `[[load_balancer]]` — a virtual service (LBaaS)
-
-A VIP fronting a pool of fabric ports, DNAT-rewritten in XDP at the ingress host.
-
-```toml
-[[load_balancer]]
-id    = "web-vip"
-vni   = 5000
-vip   = "192.168.100.200"
-port  = 80
-proto = "tcp"                         # tcp (default) or udp
-
-[[load_balancer.member]]
+network = 5000
 host = "host-1"
-tap  = "tap-blue-1"
-port = 8080                           # omit to keep the client's original port
+tap = "tap-blue-1"
+ip = "192.168.100.10"
 ```
 
-A member names its port the way this file names ports — by `host` + `tap` — not
-by the generated port id, which you cannot know when the address is
-auto-allocated. Over the API a member names the port id directly.
+Save this as `topology.toml`. Start the controller as in the [quickstart](quickstart.md#start-the-example), passing this file to `--topology`. Run `velstra-controller orch list-ports` and look for `port-5000-192.168.100.10`.
 
-Rejected, because the datapath would accept each of these and then misbehave:
-
-- a second load balancer on the same `(vni, vip, port, proto)` — it would
-  *overwrite* the first in the service map rather than collide;
-- a VIP equal to a port's own address — that port's traffic would be DNAT'd away
-  from it;
-- a member on another network — load balancing across a tenant boundary;
-- a protocol other than TCP/UDP, or service port `0`.
-
-An **empty pool is legal**: a drained service passes traffic through and counts
-`lb_no_backend`. Removing a member's port drains it from the pool automatically.
-
----
+| Block | What to set | Important relationship |
+|---|---|---|
+| `[[host]]` | Host ID, underlay interface, IPv4 VTEP and MAC | For a UDP overlay choose VXLAN or Geneve. An SRv6 locator drives service-SID derivation for a configured SRv6 host. |
+| `[[network]]` | VNI, name, optional IPv4 allocation subnet and default action | On a port without a separate policy, the VNI supplies the default policy ID. |
+| `[[subnet]]` | ID, VNI, CIDR and optional gateway/pool bounds | Supports IPv4 and IPv6. Gateway and bounds must lie inside the prefix. |
+| `[[port]]` | Network, host, tap, optional IP and security group | Omitting the IP requests allocation; migrating a port preserves its assigned identity. |
+| `[[security_group]]` | Name, default action, optional statefulness and rules | Bind by name from the port. Rules can match a source prefix as well as protocol and port. |
+| `[[ip_vrf]]` | L3 VNI, anycast gateway MAC and member network VNIs | A network belongs to at most one VRF. Learned EVPN routes feed its routed context. |
+| `[[load_balancer]]` | VNI, VIP, TCP/UDP port and member ports | Refer to members by host/tap in TOML and port ID in the API. The VIP and members must belong to the intended network. |
 
 ## Northbound API
 
-Every entity above is also drivable at runtime. All three front-ends propose the
-same replicated mutations, so they agree in single-controller and Raft-cluster
-mode alike.
+The `orch` CLI uses the gRPC management service, normally at `127.0.0.1:50052`. Use the live CLI for the flags supported by the installed build:
 
-### CLI
-
-```shell
-velstra-controller orch [--endpoint http://127.0.0.1:50052] <verb> [flags]
+```sh
+./target/debug/velstra-controller orch --help
+./target/debug/velstra-controller orch add-load-balancer --help
 ```
 
-| Entity | Verbs |
+In Raft mode send topology writes to the leader. With file-backed topology, mutations update the backing file. Use a disposable copy when experimenting.
+
+### Read the REST API
+
+To open a local HTTP interface, add `--rest-listen 127.0.0.1:9500` to the quickstart's controller command. With that controller running:
+
+```sh
+curl --fail --silent http://127.0.0.1:9500/healthz
+curl --fail --silent http://127.0.0.1:9500/v1/ports
+```
+
+The health endpoint returns `{"status":"ok"}`. The ports response describes the model currently held by the controller. The REST listener is opt-in; a loopback lab with no tokens grants local clients access.
+
+| Resource or operation | Endpoint |
 |---|---|
-| hosts | `add-host` |
-| networks | `add-network` |
-| ports | `create-port`, `remove-port`, `migrate-port`, `list-ports` |
-| security groups | `add-security-group`, `remove-security-group`, `list-security-groups`, `bind-port` |
-| subnets / IPAM | `add-subnet`, `remove-subnet`, `list-subnets`, `bind-subnet`, `unbind-addr`, `alloc-addr`, `release-addr` |
-| floating IPs | `alloc-floating-ip`, `associate-floating-ip`, `disassociate-floating-ip`, `release-floating-ip`, `list-floating-ips` |
-| IP-VRFs | `add-ip-vrf`, `remove-ip-vrf`, `list-ip-vrfs` |
-| load balancers | `add-load-balancer`, `remove-load-balancer`, `list-load-balancers` |
+| Read/change topology | `/v1/hosts`, `/v1/networks`, `/v1/ports`, `/v1/subnets`, `/v1/security-groups`, `/v1/ip-vrfs` |
+| Inspect public addresses or service pools | `/v1/floating-ips`, `/v1/load-balancers` |
+| Read retained operations | `GET /v1/audit` |
+| Subscribe to new audit entries | `GET /v1/events` (SSE) |
 
-Host and network *removal* are gRPC/REST-only today — the CLI has no
-`remove-host` / `remove-network` verb.
-
-```shell
-velstra-controller orch add-ip-vrf --l3-vni 50100 --name tenant-a \
-    --gateway-mac 02:00:5e:00:00:aa --network 5000 --network 5001
-
-velstra-controller orch add-load-balancer --id web-vip --vni 5000 \
-    --vip 192.168.100.200 --port 80 --member port-5000-192.168.100.10:8080
-```
-
-A member takes `:draining` to stop it receiving *new* connections while the
-ones it has finish — how a machine is taken out of service without cutting
-anybody off. `--client-affinity` sends every connection from one client address
-to the same backend, for a service that keeps something per client between
-connections; it spreads worse by design, and a client behind a large NAT counts
-as one client.
-
-```shell
-velstra-controller orch add-load-balancer --id web-vip --vni 5000 \
-    --vip 192.168.100.200 --port 80 --client-affinity \
-    --member port-5000-192.168.100.10:8080 \
-    --member port-5000-192.168.100.11:8080:draining
-```
-
-### REST
-
-Started only when `--rest-listen <addr>` is given (there is no default port).
-Bearer tokens map to caller identities with `--rest-token <cn>=<secret>`; with no
-tokens configured the gateway is open, mirroring the admin channel's default.
-
-Fabric resources live under `/v1`; `/healthz` and `/version` are unversioned
-probes.
-
-| Path | Methods |
-|---|---|
-| `/v1/hosts`, `/v1/hosts/<id>` | `GET` `POST` / `GET` `DELETE` |
-| `/v1/networks`, `/v1/networks/<vni>` | `GET` `POST` / `GET` `DELETE` |
-| `/v1/ports`, `/v1/ports/<id>` | `GET` `POST` / `GET` `DELETE` |
-| `/v1/subnets`, `/v1/subnets/<id>` | `GET` `POST` / `GET` `DELETE` |
-| `/v1/security-groups`, `/v1/security-groups/<name>` | `GET` `POST` / `GET` `DELETE` |
-| `/v1/ip-vrfs`, `/v1/ip-vrfs/<l3_vni>` | `GET` `POST` / `GET` `DELETE` |
-| `/v1/load-balancers`, `/v1/load-balancers/<id>` | `GET` `POST` / `GET` `DELETE` |
-| `/v1/floating-ips`, `/v1/floating-ips/<id>` | `GET` `POST` / `GET` `DELETE` |
-| `/v1/floating-ips/<id>/associate`, `/v1/floating-ips/<id>/disassociate` | `POST` |
-| `/v1/audit` | `GET` |
-| `/v1/events` | `GET` (SSE) |
-| `/healthz`, `/version` | `GET` |
-
-Reads are open; **mutations are admin-only** (a node token may only register its
-own host and create ports on it) and every one of them — allowed or denied — is
-recorded in the audit log.
-
-```shell
-curl -H "Authorization: Bearer $ADMIN_TOKEN" \
-     -X POST http://127.0.0.1:9500/v1/load-balancers \
-     -d '{"id":"web-vip","vni":5000,"vip":"192.168.100.200","port":80,
-          "members":[{"port_id":"port-5000-192.168.100.10","port":8080}]}'
-```
-
-#### Change events
-
-`GET /v1/events` is a Server-Sent Events stream of the same records the audit log
-keeps — which operation touched which target, by whom, and whether it succeeded.
-That is enough for a consuming product to react by re-reading the affected
-resource, instead of polling the whole fabric.
-
-```
-event: audit
-id: 9
-data: {"seq":9,"ts_millis":1785014747925,"actor":"ops-admin",
-       "operation":"network.create","target":"vni=101","result":"ok"}
-```
-
-Only records emitted *after* subscribing are delivered; `GET /v1/audit` serves
-the backlog, so a consumer that wants both reads the backlog first and
-de-duplicates on `seq`. A subscriber that cannot keep up is **lagged**, not
-blocked — it gets an `event: lagged` naming how many records it missed and the
-stream continues. Back-pressure is deliberately not an option here: a slow
-consumer must never stall the fabric's mutations.
-
-#### Webhooks
-
-`--webhook <url>` (repeatable) POSTs each record to an endpoint as JSON — the
-push counterpart of the stream, for consumers that cannot hold a connection open.
-
-Each URL gets its own delivery task and its own subscription, so endpoints lag,
-retry and fail independently: one hung endpoint neither silences the others nor
-slows the API. Delivery is **best-effort with bounded retries** (3 attempts,
-exponential backoff, 5s timeout), not exactly-once — a consumer that needs
-completeness reconciles against `GET /v1/audit`, which is what the monotonic
-`seq` is for.
-
-Errors use one envelope throughout:
-
-```json
-{ "status": 400, "message": "load balancer \"web\": 10.0.0.5:80 is already fronted by \"other\" on this network" }
-```
-
-### gRPC
-
-`VelstraOrchestrator` on the admin port, defined in
-[`velstra-proto/proto/velstra.proto`](../velstra-proto/proto/velstra.proto) —
-the authority for field numbers and message shapes. The CLI is a thin client over
-it.
-
----
+A slow subscriber may receive a lag notification. A consumer needing continuity should reconcile against the audit endpoint and deduplicate by sequence number. Webhook delivery retries transient failures and is best-effort. For the full set of routes and message fields, see the [HTTP router](https://github.com/Velstra/fabric/blob/main/velstra-controller/src/rest.rs) and the [gRPC contract](https://github.com/Velstra/fabric/blob/main/velstra-proto/proto/velstra.proto).
 
 ## Derived node config
 
-What the controller pushes to each agent. You do not write this, but knowing its
-shape is the fastest way to read what your intent actually produced:
+See [the node configuration examples](https://github.com/Velstra/fabric/tree/main/examples) for each dataplane path. Inspect `[[interface]]` to find a local tap's policy and VNI, `[[neighbor]]` and `[[nd_neighbor]]` for the tenant IP/MAC bindings, and `[[tunnel]]` or `[[srv6_route]]` for a remote destination. A load-balanced VIP becomes a `[[service]]` under each relevant ingress policy. Direct edits to generated state are replaced on reconciliation.
 
-| Block | Meaning |
+## Field and command reference
+
+These definitions track the implementation at each revision:
+
+| I need the complete… | Reference |
 |---|---|
-| `[[policy]]` | one per participating network and per bound security group |
-| `[[interface]]` | a local tap, bound to its policy + VNI |
-| `[[tunnel]]` | a remote tenant address → the VTEP hosting it |
-| `[[mac_route]]` | EVPN-learned MAC → VTEP (L2 bridging) |
-| `[[neighbor]]` / `[[nd_neighbor]]` | ARP / IPv6 ND suppression entries |
-| `[[flood_vtep]]` | the BUM head-end replication set for a VNI |
-| `[[irb_route]]` | a learned remote prefix, routed via the anycast gateway |
-| `[[service]]` | a load-balanced VIP, once per policy id on the segment |
-| `[overlay]` | this host's VTEP identity and encapsulation |
+| Topology TOML fields, defaults and relationships | [Topology parser](https://github.com/Velstra/fabric/blob/main/velstra-controller/src/topology.rs) and [full two-network topology](https://github.com/Velstra/fabric/blob/main/examples/topology.toml) |
+| Node policy, service, NAT and overlay configuration | [Typed schema and validation](https://github.com/Velstra/fabric/blob/main/velstra-config/src/config.rs) and [sample node files](https://github.com/Velstra/fabric/tree/main/examples) |
+| Current management verbs and option defaults | `velstra-controller orch --help`, followed by `velstra-controller orch <verb> --help` |
+| REST methods, request limits and response types | [HTTP routes and handlers](https://github.com/Velstra/fabric/blob/main/velstra-controller/src/rest.rs) |
+| Protobuf request and response messages | [velstra.proto](https://github.com/Velstra/fabric/blob/main/velstra-proto/proto/velstra.proto) |
 
-A load balancer appears once per policy id in play on its segment, not once per
-network: the datapath looks a service up under the **ingress port's** policy id,
-which equals the VNI only for ports with no security group.
+### Service pools
 
----
+The local exercise includes `web-vip` with two member ports. In the TOML file, each `[[load_balancer.member]]` references a host and tap. In the CLI, members use `port-id:backend-port`. For example, `port-5000-192.168.100.10:8080` selects port 8080 on the first example VM. A port must belong to the VIP's network. A duplicate VIP/port/protocol tuple or a VIP colliding with a workload port is rejected.
 
-## See also
-
-- [ARCHITECTURE.md](ARCHITECTURE.md) — how the pieces fit together
-- [TESTING.md](TESTING.md) — running the datapath against real traffic
-- [`examples/`](../examples/) — worked configs for each surface
+Use `draining` to stop selecting a member for new flows while its established flows finish. Client affinity selects by source address and can concentrate load when many clients share a NAT address. An empty pool passes traffic through and increments `lb_no_backend`.

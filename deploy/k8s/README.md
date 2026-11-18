@@ -19,8 +19,8 @@ The manifests use local `:latest` images with `IfNotPresent`.
 Main-branch pushes do not publish images; releases require version tags.
 
 Set the underlay interface and network in [20-agent.yaml](20-agent.yaml),
-then [bootstrap the network](../../docs/kubernetes.md#3-bootstrap-the-network)
+then [bootstrap the network](../../docs/kubernetes.md#bootstrap-the-network)
 through the elected controller leader.
 
 [Deployment and TLS guide](../../docs/kubernetes.md) ·
-[Kind traffic walkthrough](../../docs/TESTING.md)
+[Traffic checks](../../docs/TESTING.md)
