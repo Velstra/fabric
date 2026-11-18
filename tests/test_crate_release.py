@@ -108,6 +108,39 @@ class ReleaseGuards(unittest.TestCase):
                 with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                     release.inspect_archive(path, self.package, self.head)
 
+    def test_publish_upload_is_scoped_and_hash_bound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            path = target / "package" / "tmp-registry" / f"{self.package['name']}-1.2.3.crate"
+            path.parent.mkdir(parents=True)
+            self.make_archive(path)
+            digest = release.inspect_archive(path, self.package, self.head)
+            for expected, remote_digest, succeeds in (
+                (digest, digest, True), ("0"*64, digest, False), (digest, "0"*64, False)
+            ):
+                env = dict(self.context, TESTED_CRATE_SHA256=expected, CARGO_REGISTRY_TOKEN="fixture-only")
+                with self.subTest(expected=expected, remote=remote_digest), \
+                     patch.dict(release.os.environ, env, clear=True), \
+                     patch.object(sys, "argv", ["crate_release.py", "publish"]), \
+                     patch.object(release, "metadata", return_value=(self.package, target)), \
+                     patch.object(release, "run", return_value=self.head), \
+                     patch.object(release, "guard"), \
+                     patch.object(sys, "stdout", new_callable=io.StringIO), \
+                     patch.object(release.subprocess, "run") as upload, \
+                     patch.object(release, "registry", return_value={"version": {
+                         "num": "1.2.3", "checksum": remote_digest, "yanked": False}}):
+                    if succeeds:
+                        release.main()
+                    else:
+                        with self.assertRaises(ValueError):
+                            release.main()
+                    if expected != digest:
+                        upload.assert_not_called()
+                    else:
+                        upload.assert_called_once_with(
+                            ("cargo", "publish", "--locked", "--registry", "crates-io",
+                             "--package", self.package["name"]), cwd=release.ROOT, check=True)
+
     def test_actual_environment_protection(self):
         environment = {"id": 7, "deployment_branch_policy":
                        {"protected_branches": False, "custom_branch_policies": True},

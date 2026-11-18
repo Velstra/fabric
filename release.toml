@@ -9,8 +9,8 @@
 #   cargo release patch        # 0.3.0 -> 0.3.1   (a bug-fix release)
 #
 # That bumps every crate, makes ONE GPG-signed commit and a signed `vX.Y.Z` tag,
-# and pushes. Pushing the tag triggers .github/workflows/release.yml, which
-# publishes a GitHub release whose body is that version's CHANGELOG section.
+# and pushes. Tag pushes run crate packaging checks; registry publication
+# requires a separate manual request and approval.
 #
 # NOTE: this is a *virtual* workspace with a single root CHANGELOG.md, so we do
 # NOT use `[[pre-release-replacements]]` — cargo-release would apply it per crate
