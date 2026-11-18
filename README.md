@@ -1,5 +1,10 @@
 # Velstra Fabric
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/brand/logo-on-dark.svg">
+  <img src=".github/brand/logo.svg" alt="Velstra Fabric" height="72">
+</picture>
+
 Rust networking stack: an eBPF/XDP firewall and NAT dataplane, a per-host agent,
 a controller and a Kubernetes CNI plugin.
 For the complete firewall appliance, use [Sentinel](https://github.com/Velstra/sentinel).
