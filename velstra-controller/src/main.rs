@@ -280,24 +280,7 @@ struct OrchArgs {
 #[derive(Debug, Subcommand)]
 enum OrchAction {
     /// Register a host (VTEP).
-    AddHost {
-        #[arg(long)]
-        id: String,
-        #[arg(long)]
-        vtep: String,
-        #[arg(long)]
-        iface: String,
-        #[arg(long)]
-        mac: String,
-        /// `vxlan` (default), `geneve` or `srv6`.
-        #[arg(long, default_value = "vxlan")]
-        encap: String,
-        /// SRv6 locator as `prefix/len` (e.g. `fc00:0:1::/64`). Required with
-        /// `--encap srv6`, refused without it: every service SID this host
-        /// instantiates is derived from it.
-        #[arg(long)]
-        srv6_locator: Option<String>,
-    },
+    AddHost(AddHostArgs),
     /// Define a network (tenant).
     AddNetwork {
         #[arg(long)]
@@ -347,26 +330,7 @@ enum OrchAction {
     ListPorts,
     /// Register a named security group (B5). Rules are given as repeated
     /// `--allow proto:port` / `--deny proto:port` (e.g. `--allow tcp:80`).
-    AddSecurityGroup {
-        #[arg(long)]
-        name: String,
-        /// Default action for unmatched traffic: `pass` (default) or `drop`.
-        #[arg(long, default_value = "pass")]
-        default_action: String,
-        #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
-        drop_icmp: bool,
-        #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
-        stateful: bool,
-        /// Allow a `proto:port` (e.g. `tcp:80`), repeatable.
-        #[arg(long = "allow")]
-        allow: Vec<String>,
-        /// Deny a `proto:port` (e.g. `tcp:22`), repeatable.
-        #[arg(long = "deny")]
-        deny: Vec<String>,
-        /// Source CIDR to blocklist, repeatable.
-        #[arg(long = "block")]
-        block: Vec<String>,
-    },
+    AddSecurityGroup(AddSecurityGroupArgs),
     /// Remove a security group by name.
     RemoveSecurityGroup {
         #[arg(long)]
@@ -407,33 +371,7 @@ enum OrchAction {
     ListIpVrfs,
     /// Define a load-balanced service (D2 LBaaS): a VIP fronting a pool of
     /// fabric ports. Members are `port-id[:backend-port]`, repeatable.
-    AddLoadBalancer {
-        #[arg(long)]
-        id: String,
-        #[arg(long)]
-        vni: u32,
-        #[arg(long)]
-        vip: String,
-        #[arg(long)]
-        port: u16,
-        /// `tcp` (default) or `udp`.
-        #[arg(long, default_value = "tcp")]
-        proto: String,
-        /// A pool member as `port-id`, `port-id:backend-port`, or either with
-        /// `:draining` appended — take no new connections there and let the
-        /// ones it has finish. Repeatable.
-        #[arg(long = "member")]
-        member: Vec<String>,
-        /// Send every connection from one client address to the same backend.
-        ///
-        /// Off by default, which is the even spread: one client's four
-        /// connections reach four backends. Turn it on for a service that
-        /// keeps something per client between connections. The cost is that
-        /// one client is one backend, so a pool fronting few busy clients
-        /// spreads worse.
-        #[arg(long)]
-        client_affinity: bool,
-    },
+    AddLoadBalancer(AddLoadBalancerArgs),
     /// Remove a load-balanced service by id.
     RemoveLoadBalancer {
         #[arg(long)]
@@ -442,23 +380,7 @@ enum OrchAction {
     /// List all load-balanced services in the fabric.
     ListLoadBalancers,
     /// Define a first-class subnet under a network (D2).
-    AddSubnet {
-        #[arg(long)]
-        id: String,
-        #[arg(long)]
-        vni: u32,
-        /// CIDR, IPv4 or IPv6 (e.g. `192.168.50.0/24` or `2001:db8::/64`).
-        #[arg(long)]
-        cidr: String,
-        #[arg(long)]
-        gateway: Option<String>,
-        #[arg(long)]
-        pool_start: Option<String>,
-        #[arg(long)]
-        pool_end: Option<String>,
-        #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
-        enable_dhcp: bool,
-    },
+    AddSubnet(AddSubnetArgs),
     /// Remove a subnet by id.
     RemoveSubnet {
         #[arg(long)]
@@ -526,6 +448,98 @@ enum OrchAction {
     },
     /// List all floating IPs in the fabric.
     ListFloatingIps,
+}
+
+// Keep large argument builders in separate functions so the generated
+// orchestration parser does not require one oversized debug stack frame.
+#[derive(Debug, Args)]
+struct AddHostArgs {
+    #[arg(long)]
+    id: String,
+    #[arg(long)]
+    vtep: String,
+    #[arg(long)]
+    iface: String,
+    #[arg(long)]
+    mac: String,
+    /// `vxlan` (default), `geneve` or `srv6`.
+    #[arg(long, default_value = "vxlan")]
+    encap: String,
+    /// SRv6 locator as `prefix/len` (e.g. `fc00:0:1::/64`). Required with
+    /// `--encap srv6`, refused without it: every service SID this host
+    /// instantiates is derived from it.
+    #[arg(long)]
+    srv6_locator: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct AddSecurityGroupArgs {
+    #[arg(long)]
+    name: String,
+    /// Default action for unmatched traffic: `pass` (default) or `drop`.
+    #[arg(long, default_value = "pass")]
+    default_action: String,
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
+    drop_icmp: bool,
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
+    stateful: bool,
+    /// Allow a `proto:port` (e.g. `tcp:80`), repeatable.
+    #[arg(long = "allow")]
+    allow: Vec<String>,
+    /// Deny a `proto:port` (e.g. `tcp:22`), repeatable.
+    #[arg(long = "deny")]
+    deny: Vec<String>,
+    /// Source CIDR to blocklist, repeatable.
+    #[arg(long = "block")]
+    block: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct AddLoadBalancerArgs {
+    #[arg(long)]
+    id: String,
+    #[arg(long)]
+    vni: u32,
+    #[arg(long)]
+    vip: String,
+    #[arg(long)]
+    port: u16,
+    /// `tcp` (default) or `udp`.
+    #[arg(long, default_value = "tcp")]
+    proto: String,
+    /// A pool member as `port-id`, `port-id:backend-port`, or either with
+    /// `:draining` appended — take no new connections there and let the
+    /// ones it has finish. Repeatable.
+    #[arg(long = "member")]
+    member: Vec<String>,
+    /// Send every connection from one client address to the same backend.
+    ///
+    /// Off by default, which is the even spread: one client's four
+    /// connections reach four backends. Turn it on for a service that
+    /// keeps something per client between connections. The cost is that
+    /// one client is one backend, so a pool fronting few busy clients
+    /// spreads worse.
+    #[arg(long)]
+    client_affinity: bool,
+}
+
+#[derive(Debug, Args)]
+struct AddSubnetArgs {
+    #[arg(long)]
+    id: String,
+    #[arg(long)]
+    vni: u32,
+    /// CIDR, IPv4 or IPv6 (e.g. `192.168.50.0/24` or `2001:db8::/64`).
+    #[arg(long)]
+    cidr: String,
+    #[arg(long)]
+    gateway: Option<String>,
+    #[arg(long)]
+    pool_start: Option<String>,
+    #[arg(long)]
+    pool_end: Option<String>,
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
+    enable_dhcp: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2757,14 +2771,14 @@ async fn orch(args: OrchArgs) -> Result<()> {
         VelstraOrchestratorClient::new(client_channel(&args.endpoint, &args.tls).await?);
 
     match args.action {
-        OrchAction::AddHost {
+        OrchAction::AddHost(AddHostArgs {
             id,
             vtep,
             srv6_locator,
             iface,
             mac,
             encap,
-        } => {
+        }) => {
             let encap = match encap.as_str() {
                 "geneve" => Encap::Geneve,
                 "vxlan" => Encap::Vxlan,
@@ -2856,7 +2870,7 @@ async fn orch(args: OrchArgs) -> Result<()> {
                 );
             }
         }
-        OrchAction::AddSecurityGroup {
+        OrchAction::AddSecurityGroup(AddSecurityGroupArgs {
             name,
             default_action,
             drop_icmp,
@@ -2864,7 +2878,7 @@ async fn orch(args: OrchArgs) -> Result<()> {
             allow,
             deny,
             block,
-        } => {
+        }) => {
             let default_action = match default_action.as_str() {
                 "pass" => Action::Pass,
                 "drop" => Action::Drop,
@@ -2970,7 +2984,7 @@ async fn orch(args: OrchArgs) -> Result<()> {
                 );
             }
         }
-        OrchAction::AddLoadBalancer {
+        OrchAction::AddLoadBalancer(AddLoadBalancerArgs {
             id,
             vni,
             vip,
@@ -2978,7 +2992,7 @@ async fn orch(args: OrchArgs) -> Result<()> {
             proto,
             member,
             client_affinity,
-        } => {
+        }) => {
             let proto = match proto.as_str() {
                 "tcp" => Proto::Tcp,
                 "udp" => Proto::Udp,
@@ -3047,7 +3061,7 @@ async fn orch(args: OrchArgs) -> Result<()> {
                 );
             }
         }
-        OrchAction::AddSubnet {
+        OrchAction::AddSubnet(AddSubnetArgs {
             id,
             vni,
             cidr,
@@ -3055,7 +3069,7 @@ async fn orch(args: OrchArgs) -> Result<()> {
             pool_start,
             pool_end,
             enable_dhcp,
-        } => {
+        }) => {
             client
                 .add_subnet(SubnetSpec {
                     id: id.clone(),
@@ -3249,6 +3263,145 @@ fn parse_cli_rule(spec: &str, action: Action) -> Result<PortRule> {
         limit: 0,
         burst: 0,
     })
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> OrchAction {
+        let Command::Orch(args) = Cli::try_parse_from(
+            ["velstra-controller", "orch"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )
+        .expect("valid orchestration arguments")
+        .command
+        else {
+            panic!("expected orchestration command");
+        };
+        args.action
+    }
+
+    #[test]
+    fn extracted_argument_groups_preserve_defaults() {
+        let OrchAction::AddHost(host) = parse(&[
+            "add-host",
+            "--id",
+            "host-a",
+            "--vtep",
+            "192.0.2.10",
+            "--iface",
+            "eth0",
+            "--mac",
+            "02:00:00:00:00:01",
+        ]) else {
+            panic!("expected host");
+        };
+        assert_eq!(host.encap, "vxlan");
+        assert_eq!(host.srv6_locator, None);
+        let OrchAction::AddSecurityGroup(group) = parse(&["add-security-group", "--name", "web"])
+        else {
+            panic!("expected security group");
+        };
+        assert_eq!(group.default_action, "pass");
+        assert!(!group.drop_icmp && !group.stateful);
+        assert!(group.allow.is_empty() && group.deny.is_empty() && group.block.is_empty());
+        let OrchAction::AddLoadBalancer(lb) = parse(&[
+            "add-load-balancer",
+            "--id",
+            "web",
+            "--vni",
+            "100",
+            "--vip",
+            "192.0.2.20",
+            "--port",
+            "443",
+        ]) else {
+            panic!("expected load balancer");
+        };
+        assert_eq!(lb.proto, "tcp");
+        assert!(!lb.client_affinity);
+        assert!(lb.member.is_empty());
+        let OrchAction::AddSubnet(subnet) = parse(&[
+            "add-subnet",
+            "--id",
+            "lan",
+            "--vni",
+            "100",
+            "--cidr",
+            "192.0.2.0/24",
+        ]) else {
+            panic!("expected subnet");
+        };
+        assert!(!subnet.enable_dhcp);
+        assert!(
+            subnet.gateway.is_none() && subnet.pool_start.is_none() && subnet.pool_end.is_none()
+        );
+    }
+
+    #[test]
+    fn extracted_argument_groups_preserve_repeated_flags_and_booleans() {
+        let OrchAction::AddSecurityGroup(group) = parse(&[
+            "add-security-group",
+            "--name",
+            "web",
+            "--allow",
+            "tcp:80",
+            "--allow",
+            "tcp:443",
+            "--deny",
+            "tcp:22",
+            "--block",
+            "198.51.100.0/24",
+            "--stateful",
+            "true",
+            "--drop-icmp",
+            "false",
+            "--default-action",
+            "drop",
+        ]) else {
+            panic!("expected security group");
+        };
+        assert_eq!(group.allow, ["tcp:80", "tcp:443"]);
+        assert_eq!(group.deny, ["tcp:22"]);
+        assert_eq!(group.block, ["198.51.100.0/24"]);
+        assert!(group.stateful && !group.drop_icmp);
+        assert_eq!(group.default_action, "drop");
+    }
+
+    #[test]
+    fn extracted_argument_groups_reject_missing_and_invalid_values() {
+        for args in [
+            vec!["add-host", "--id", "host-a"],
+            vec!["add-security-group", "--name", "web", "--stateful", "maybe"],
+            vec![
+                "add-load-balancer",
+                "--id",
+                "web",
+                "--vni",
+                "100",
+                "--vip",
+                "192.0.2.20",
+                "--port",
+                "65536",
+            ],
+            vec![
+                "add-subnet",
+                "--id",
+                "lan",
+                "--vni",
+                "bad",
+                "--cidr",
+                "192.0.2.0/24",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(["velstra-controller", "orch"].into_iter().chain(args))
+                    .is_err()
+            );
+        }
+    }
 }
 
 #[cfg(test)]
