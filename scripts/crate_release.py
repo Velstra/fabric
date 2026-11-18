@@ -27,6 +27,8 @@ def run(*args):
 
 
 def metadata():
+    require(run("cargo", "--version").split()[1] == "1.100.0",
+            "publication requires the reviewed Cargo 1.100.0")
     data = json.loads(run("cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"))
     packages = [p for p in data["packages"] if p["name"] == POLICY["package"]]
     require(len(packages) == 1, "selected package missing or ambiguous")
@@ -156,7 +158,9 @@ def main():
     args = parser.parse_args()
     package, target = metadata()
     version = version_for_event(package, os.environ)
-    path = target / "package" / f"{package['name']}-{version}.crate"
+    # Cargo 1.100 stages publish archives in its temporary registry, including
+    # --dry-run. Do not search other directories and accept a stale archive.
+    path = target / "package" / "tmp-registry" / f"{package['name']}-{version}.crate"
     if args.command == "plan":
         print(json.dumps({"package": package["name"], "version": version}))
         if os.environ.get("GITHUB_OUTPUT"):
