@@ -1,5 +1,7 @@
 [package]
 name = "velstra-proto"
+publish = ["crates-io"]
+include = ["src/**", "README.md", "build.rs", "proto/velstra.proto"]
 version = "0.4.1"
 edition.workspace = true
 rust-version.workspace = true
