@@ -23,3 +23,6 @@ target/
 # HTTPS integration test and the rest_tls unit tests load by path.
 !velstra-controller/tests/fixtures/*.pem
 !velstra-controller/tests/fixtures/*.key
+
+# Generated mdBook documentation
+/book/

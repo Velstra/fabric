@@ -1,0 +1,15 @@
+/* Keep mdBook's keyboard navigation, search and theme switcher. */
+.light {
+  --bg: #f8f7f2;
+  --fg: #242521;
+  --sidebar-bg: #eeeee7;
+  --sidebar-active: #9c3020;
+  --links: #923324;
+  --table-header-bg: #e8e8df;
+}
+.content main { max-width: 78ch; }
+.content h1 { letter-spacing: -.04em; line-height: 1.13; }
+.content h2 { letter-spacing: -.025em; margin-top: 1.9em; }
+.content pre { border-radius: .4em; }
+.content table { margin: 1.25em 0; }
+.content th, .content td { text-align: left; }

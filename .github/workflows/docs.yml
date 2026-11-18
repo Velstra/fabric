@@ -1,0 +1,45 @@
+name: Operator handbook
+on:
+  pull_request:
+    paths: ['docs/**', 'theme/**', 'book.toml', 'scripts/check-handbook.py', '.github/workflows/docs.yml']
+  push:
+    branches: [main]
+    paths: ['docs/**', 'theme/**', 'book.toml', 'scripts/check-handbook.py', '.github/workflows/docs.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with mdBook 0.4.52
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/mdbook.tgz" https://github.com/rust-lang/mdBook/releases/download/v0.4.52/mdbook-v0.4.52-x86_64-unknown-linux-musl.tar.gz
+          echo "c96bdabf3754d9e016fb803c1565a41050434479b2dc1e02a87c8d0da7524c6c  $RUNNER_TEMP/mdbook.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/mdbook.tgz" -C "$RUNNER_TEMP" mdbook
+          "$RUNNER_TEMP/mdbook" build
+          python3 scripts/check-handbook.py
+      - uses: actions/upload-pages-artifact@v3
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        with:
+          path: book
+  deploy:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    concurrency:
+      group: fabric-pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.publish.outputs.page_url }}
+    steps:
+      - name: Publish operator handbook
+        id: publish
+        uses: actions/deploy-pages@v4
