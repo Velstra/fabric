@@ -368,8 +368,7 @@ pub fn encode_frames(records: &[TcpWireRecord]) -> Result<Vec<Vec<u8>>, TcpCodec
             return Err(TcpCodecError::DuplicateKey);
         }
         if count == TCP_FRAME_RECORDS || frame.len() + 2 + wire.len() > TCP_FRAME_BYTES {
-            frames.push(frame);
-            frame = Vec::new();
+            frames.push(std::mem::take(&mut frame));
             count = 0;
         }
         frame.extend_from_slice(&(wire.len() as u16).to_le_bytes());

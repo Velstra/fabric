@@ -4982,7 +4982,9 @@ fn try_encap(
 
     // Either route (IRB) or bridge (MAC FDB, then the L3 FDB) — and in the routed
     // case encapsulate with the tenant's L3 VNI instead of the ingress segment's.
-    let (ep, encap_vni, rewrite): (TunnelEndpoint, u32, Option<IrbRewrite>) = match irb {
+    // Initialize the bridge payload too: an unused Option payload can become
+    // an uninitialized register spill across helpers in this inlined frame.
+    let (ep, encap_vni, rewrite, routed): (TunnelEndpoint, u32, IrbRewrite, bool) = match irb {
         Some(irb) => {
             // Routing decrements the TTL, so a packet that cannot survive the hop
             // is dropped here — before anything is rewritten or encapsulated.
@@ -4990,7 +4992,7 @@ fn try_encap(
                 bump(Counter::ForwardTtlExceeded);
                 return Ok(Some(xdp_action::XDP_DROP));
             };
-            (irb.tunnel_endpoint(), irb.l3_vni, Some(rw))
+            (irb.tunnel_endpoint(), irb.l3_vni, rw, true)
         }
         None => {
             // B1: a true L2 overlay bridges by the inner destination MAC. Try the
@@ -5010,7 +5012,17 @@ fn try_encap(
                     }
                 }
             };
-            (ep, vni, None)
+            (
+                ep,
+                vni,
+                IrbRewrite {
+                    inner_dst_mac: [0; 6],
+                    inner_src_mac: [0; 6],
+                    new_ttl: 0,
+                    new_checksum: 0,
+                },
+                false,
+            )
         }
     };
 
@@ -5071,7 +5083,8 @@ fn try_encap(
     // constants, which is what the verifier needs to accept the writes. Doing it
     // here rather than before the grow means a refused grow (handled above) never
     // leaves a locally-passed frame with a half-applied rewrite.
-    if let Some(rw) = rewrite {
+    if routed {
+        let rw = rewrite;
         const I_ETH_DST: usize = OVERLAY_OUTER_LEN + O_ETH_DST;
         const I_ETH_SRC: usize = OVERLAY_OUTER_LEN + O_ETH_SRC;
         const I_IP_TTL: usize = OVERLAY_OUTER_LEN + O_IP_TTL;
