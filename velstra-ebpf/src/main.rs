@@ -3473,9 +3473,18 @@ fn try_velstra_v4_state(ctx: &XdpContext, s: &V4StateScratch) -> Result<u32, ()>
                 dst_port,
             );
         }
-        return reject_packet(
+        // A segment too short to answer still matched a reject rule: refuse it
+        // anyway. Letting the parse failure reach the fail-open default turned a
+        // reject rule into a pass for a truncated TCP header (DP-33).
+        return match reject_packet(
             ctx, ihl_bytes, src_addr, dst_addr, src_port, dst_port, proto,
-        );
+        ) {
+            Ok(action) => Ok(action),
+            Err(()) => {
+                bump(Counter::Malformed);
+                Ok(xdp_action::XDP_DROP)
+            }
+        };
     }
 
     if local_dhcp {
@@ -4128,8 +4137,13 @@ fn try_velstra_v6_state(ctx: &XdpContext) -> Result<u32, ()> {
         action.as_u32() as u64 | (((want_log) as u64) << 8) | ((counter as u64) << 16),
     );
     bump(counter);
-    if action == Action::Reject && proto == ip_proto::TCP && !link_layer::raw_ip(ifindex) {
-        return Ok(reject_v6::tcp(ctx, off));
+    if action == Action::Reject && !link_layer::raw_ip(ifindex) {
+        if proto == ip_proto::TCP {
+            return Ok(reject_v6::tcp(ctx, off));
+        }
+        if proto == ip_proto::UDP {
+            return Ok(reject_v6::udp(ctx, off));
+        }
     }
     if action != Action::Pass {
         if want_log {

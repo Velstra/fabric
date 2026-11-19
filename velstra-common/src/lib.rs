@@ -120,8 +120,10 @@ pub use portal::{
 };
 pub use ratelimit::RateBucket;
 pub use reject::{
-    ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, IcmpUnreach, TcpRst, icmp, icmp_checksum,
-    plan_icmp_unreachable, plan_tcp_rst, plan_tcp_rst_v6, tcp_flags,
+    ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, ICMPV6_UNREACH_FRAME, ICMPV6_UNREACH_PREPEND,
+    ICMPV6_UNREACH_QUOTE, IcmpUnreach, Icmpv6Unreach, TcpRst, icmp, icmp_checksum,
+    icmpv6_error_allowed, plan_icmp_unreachable, plan_icmpv6_port_unreachable, plan_tcp_rst,
+    plan_tcp_rst_v6, tcp_flags,
 };
 pub use srv6::{
     SRV6_L2_OUTER_LEN, Srv6Config, Srv6Encap, Srv6Endpoint, Srv6FloodSet, Srv6IrbEndpoint,

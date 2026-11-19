@@ -1,7 +1,15 @@
-//! Plain IPv6/TCP reject. Extension-header/fragment rejects remain unsupported;
-//! never reinterpret their payload at fixed TCP offsets or answer a reset.
-use aya_ebpf::{bindings::xdp_action, helpers::bpf_xdp_adjust_tail, programs::XdpContext};
-use velstra_common::{Counter, ip_proto, plan_tcp_rst_v6, tcp_flags};
+//! Plain IPv6 reject: a TCP RST, or an ICMPv6 port-unreachable for UDP.
+//! Extension-header/fragment rejects remain unsupported; never reinterpret
+//! their payload at fixed L4 offsets or answer them.
+use aya_ebpf::{
+    bindings::xdp_action,
+    helpers::{bpf_xdp_adjust_head, bpf_xdp_adjust_tail},
+    programs::XdpContext,
+};
+use velstra_common::{
+    Counter, ICMPV6_UNREACH_FRAME, ICMPV6_UNREACH_PREPEND, ICMPV6_UNREACH_QUOTE,
+    icmpv6_error_allowed, ip_proto, plan_icmpv6_port_unreachable, plan_tcp_rst_v6, tcp_flags,
+};
 
 use super::{bump, ptr_at};
 
@@ -80,6 +88,58 @@ fn try_tcp(ctx: &XdpContext, off: usize) -> Result<u32, ()> {
         *((data + 6) as *mut [u8; 6]) = eth[..6].try_into().map_err(|_| ())?;
         *((data + 14) as *mut [u8; 40]) = reply_ip;
         *((data + 54) as *mut [u8; 20]) = reply_tcp;
+    }
+    bump(Counter::Rejected);
+    Ok(xdp_action::XDP_TX)
+}
+
+/// Answer a rejected IPv6 UDP datagram with an ICMPv6 port-unreachable bounced
+/// out the ingress interface (DP-35: it used to be dropped, so a rejected UDP
+/// port looked like a filtered one and the sender waited for its timeout).
+///
+/// The frame grows by a fresh IPv6 + ICMPv6 header at the head, which leaves the
+/// datagram's own IPv6 and UDP headers exactly where the 48-byte quote belongs,
+/// and is trimmed behind the quote. Anything RFC 4443 says must not be answered
+/// is dropped instead (see `icmpv6_error_allowed`).
+#[inline(never)]
+pub(super) fn udp(ctx: &XdpContext, off: usize) -> u32 {
+    try_udp(ctx, off).unwrap_or(xdp_action::XDP_DROP)
+}
+
+#[inline(always)]
+fn try_udp(ctx: &XdpContext, off: usize) -> Result<u32, ()> {
+    if off != 54 {
+        return Ok(xdp_action::XDP_DROP);
+    }
+    let quote = unsafe { *ptr_at::<[u8; ICMPV6_UNREACH_QUOTE]>(ctx, 14)? };
+    let eth = unsafe { *ptr_at::<[u8; 14]>(ctx, 0)? };
+    let frame_len = ctx.data_end() - ctx.data();
+    if quote[6] != ip_proto::UDP || !icmpv6_error_allowed(&quote, eth[0]) || frame_len > 65535 {
+        return Ok(xdp_action::XDP_DROP);
+    }
+    let plan = plan_icmpv6_port_unreachable(&quote);
+    if unsafe { bpf_xdp_adjust_head(ctx.ctx, -(ICMPV6_UNREACH_PREPEND as i32)) } != 0 {
+        return Err(());
+    }
+    // `frame_len` is at least the 62 bytes the quote read proved, so the grown
+    // frame is never shorter than the error and this only ever trims.
+    let grown = frame_len + ICMPV6_UNREACH_PREPEND;
+    if unsafe { bpf_xdp_adjust_tail(ctx.ctx, ICMPV6_UNREACH_FRAME as i32 - grown as i32) } != 0 {
+        return Err(());
+    }
+    // Both helpers invalidated packet pointers: prove the whole reply again
+    // before any write.
+    let data = ctx.data();
+    if data + ICMPV6_UNREACH_FRAME > ctx.data_end() {
+        return Err(());
+    }
+    unsafe {
+        *((data) as *mut [u8; 6]) = eth[6..12].try_into().map_err(|_| ())?;
+        *((data + 6) as *mut [u8; 6]) = eth[..6].try_into().map_err(|_| ())?;
+        *((data + 12) as *mut [u8; 2]) = [0x86, 0xdd];
+        *((data + 14) as *mut [u8; 40]) = plan.ip;
+        *((data + 54) as *mut [u8; 8]) = plan.icmp;
+        *((data + 62) as *mut [u8; ICMPV6_UNREACH_QUOTE]) = quote;
     }
     bump(Counter::Rejected);
     Ok(xdp_action::XDP_TX)
