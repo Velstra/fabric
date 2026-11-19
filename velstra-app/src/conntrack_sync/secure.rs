@@ -2326,6 +2326,39 @@ mod tests {
         ));
     }
 
+    /// The compiler stream emits a rule to the appliance symbolically
+    /// (`dst-local` and no address, expanded by the agent from the live host
+    /// inventory). Whichever form the integrated compiler emits, the digest
+    /// must be member-independent, and a symbolic rule to the appliance must
+    /// not hash like a rule to any destination.
+    #[test]
+    fn policy_fingerprint_is_member_independent_for_symbolic_local_rules() {
+        let symbolic = |node| {
+            let mut cfg = member_policy(node, node == 2, None);
+            for p in &mut cfg.policies {
+                for r in p.port_rules.iter_mut().filter(|r| r.dst_local) {
+                    r.dst = None;
+                    r.dst6 = None;
+                }
+            }
+            cfg
+        };
+        assert_eq!(
+            policy_fingerprint(&symbolic(1)).unwrap(),
+            policy_fingerprint(&symbolic(2)).unwrap()
+        );
+        let mut any = symbolic(1);
+        for p in &mut any.policies {
+            for r in &mut p.port_rules {
+                r.dst_local = false;
+            }
+        }
+        assert_ne!(
+            policy_fingerprint(&symbolic(1)).unwrap(),
+            policy_fingerprint(&any).unwrap()
+        );
+    }
+
     #[test]
     fn a_member_local_mark_needs_a_destination() {
         let error = serde_json::from_value::<velstra_config::FileConfig>(serde_json::json!({
