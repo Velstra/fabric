@@ -3640,6 +3640,54 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     Ok(xdp_action::XDP_DROP)
 }
 
+/// The IPv4 firewall's log lines, each in a frame of its own (see
+/// `log_egress_drop`): inlined, aya-log's per-argument serialisation was
+/// explored once per verifier path reaching it, and the ALLOW line sits on the
+/// path every admitted packet continues along.
+#[inline(never)]
+fn log_v4_drop(ctx: &XdpContext, src_addr: [u8; 4], proto: u8, dst_port: u16, reason: Counter) {
+    info!(
+        ctx,
+        "DROP {}.{}.{}.{} proto={} dport={} reason={}",
+        src_addr[0],
+        src_addr[1],
+        src_addr[2],
+        src_addr[3],
+        proto,
+        dst_port,
+        reason.label(),
+    );
+}
+
+#[inline(never)]
+fn log_v4_reject(ctx: &XdpContext, src_addr: [u8; 4], proto: u8, dst_port: u16) {
+    info!(
+        ctx,
+        "REJECT {}.{}.{}.{} proto={} dport={}",
+        src_addr[0],
+        src_addr[1],
+        src_addr[2],
+        src_addr[3],
+        proto,
+        dst_port,
+    );
+}
+
+#[inline(never)]
+fn log_v4_allow(ctx: &XdpContext, src_addr: [u8; 4], proto: u8, dst_port: u16, reason: Counter) {
+    info!(
+        ctx,
+        "ALLOW {}.{}.{}.{} proto={} dport={} reason={}",
+        src_addr[0],
+        src_addr[1],
+        src_addr[2],
+        src_addr[3],
+        proto,
+        dst_port,
+        reason.label(),
+    );
+}
+
 #[inline(always)]
 fn try_velstra_v4_state(ctx: &XdpContext, s: &V4StateScratch) -> Result<u32, ()> {
     let src_addr = s.src_addr;
@@ -3789,17 +3837,7 @@ fn try_velstra_v4_state(ctx: &XdpContext, s: &V4StateScratch) -> Result<u32, ()>
     if action == Action::Drop {
         bump(fw_counter);
         if want_log {
-            info!(
-                ctx,
-                "DROP {}.{}.{}.{} proto={} dport={} reason={}",
-                src_addr[0],
-                src_addr[1],
-                src_addr[2],
-                src_addr[3],
-                proto,
-                dst_port,
-                fw_counter.label(),
-            );
+            log_v4_drop(ctx, src_addr, proto, dst_port, fw_counter);
         }
         return Ok(xdp_action::XDP_DROP);
     }
@@ -3808,16 +3846,7 @@ fn try_velstra_v4_state(ctx: &XdpContext, s: &V4StateScratch) -> Result<u32, ()>
     // non-TCP) bounced back out the ingress interface — instead of black-holing.
     if action == Action::Reject {
         if want_log {
-            info!(
-                ctx,
-                "REJECT {}.{}.{}.{} proto={} dport={}",
-                src_addr[0],
-                src_addr[1],
-                src_addr[2],
-                src_addr[3],
-                proto,
-                dst_port,
-            );
+            log_v4_reject(ctx, src_addr, proto, dst_port);
         }
         // A segment too short to answer still matched a reject rule: refuse it
         // anyway. Letting the parse failure reach the fail-open default turned a
@@ -3844,17 +3873,7 @@ fn try_velstra_v4_state(ctx: &XdpContext, s: &V4StateScratch) -> Result<u32, ()>
     // new (non-established) flow it admits. Gated on the rule's own bit so a
     // policy that logs globally still only logs drops/rejects, not every pass.
     if rule_log && action == Action::Pass && !established {
-        info!(
-            ctx,
-            "ALLOW {}.{}.{}.{} proto={} dport={} reason={}",
-            src_addr[0],
-            src_addr[1],
-            src_addr[2],
-            src_addr[3],
-            proto,
-            dst_port,
-            fw_counter.label(),
-        );
+        log_v4_allow(ctx, src_addr, proto, dst_port, fw_counter);
     }
 
     let log = cfg.has_flag(ConfigFlags::LOG);
