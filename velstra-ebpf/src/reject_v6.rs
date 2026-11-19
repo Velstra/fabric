@@ -3,12 +3,12 @@
 //! their payload at fixed L4 offsets or answer them.
 use aya_ebpf::{
     bindings::xdp_action,
-    helpers::{bpf_xdp_adjust_head, bpf_xdp_adjust_tail},
+    helpers::{bpf_csum_diff, bpf_xdp_adjust_head, bpf_xdp_adjust_tail},
     programs::XdpContext,
 };
 use velstra_common::{
     Counter, ICMPV6_UNREACH_FRAME, ICMPV6_UNREACH_PREPEND, ICMPV6_UNREACH_QUOTE,
-    icmpv6_error_allowed, icmpv6_port_unreachable_checksum, ip_proto, plan_tcp_rst_v6, tcp_flags,
+    icmpv6_error_allowed, ip_proto, plan_tcp_rst_v6, tcp_flags,
 };
 
 use super::{bump, ptr_at};
@@ -119,7 +119,6 @@ fn try_udp(ctx: &XdpContext, off: usize) -> Result<u32, ()> {
     if quote[6] != ip_proto::UDP || !icmpv6_error_allowed(quote, eth_dst0) || frame_len > 65535 {
         return Ok(xdp_action::XDP_DROP);
     }
-    let checksum = icmpv6_port_unreachable_checksum(quote);
     if unsafe { bpf_xdp_adjust_head(ctx.ctx, -(ICMPV6_UNREACH_PREPEND as i32)) } != 0 {
         return Err(());
     }
@@ -151,9 +150,46 @@ fn try_udp(ctx: &XdpContext, off: usize) -> Result<u32, ()> {
             [0x60, 0, 0, 0, 0, (8 + ICMPV6_UNREACH_QUOTE) as u8, 58, 64];
         *((data + 22) as *mut [u8; 16]) = *((data + QUOTE + 24) as *const [u8; 16]);
         *((data + 38) as *mut [u8; 16]) = *((data + QUOTE + 8) as *const [u8; 16]);
-        // ICMPv6 destination-unreachable / port-unreachable.
-        let csum = checksum.to_be_bytes();
-        *((data + 54) as *mut [u8; 8]) = [1, 4, csum[0], csum[1], 0, 0, 0, 0];
+        // ICMPv6 destination-unreachable / port-unreachable, checksum last.
+        *((data + 54) as *mut [u8; 8]) = [1, 4, 0, 0, 0, 0, 0, 0];
+    }
+    // The checksum by `bpf_csum_diff` over the frame itself: the pseudo-header's
+    // addresses are the new IPv6 header's (22..54), then length 56 and next
+    // header 58, then the ICMPv6 header and the quote (54..110). An unrolled
+    // word loop here cost a 376-byte sub-program frame, and under the IPv6 state
+    // stage's 136 the verifier refused the pair ("combined stack size of 2 calls
+    // is 528"). The sum is in memory byte order, which one's-complement
+    // arithmetic does not mind as long as the result goes back the same way.
+    let mut tail = [0u8, 0, 0, (8 + ICMPV6_UNREACH_QUOTE) as u8, 0, 0, 0, 58];
+    let sum = unsafe {
+        let addresses = bpf_csum_diff(core::ptr::null_mut(), 0, (data + 22) as *mut u32, 32, 0);
+        let lengths = bpf_csum_diff(
+            core::ptr::null_mut(),
+            0,
+            tail.as_mut_ptr().cast(),
+            8,
+            addresses as u32,
+        );
+        bpf_csum_diff(
+            core::ptr::null_mut(),
+            0,
+            (data + 54) as *mut u32,
+            (8 + ICMPV6_UNREACH_QUOTE) as u32,
+            lengths as u32,
+        )
+    };
+    if sum < 0 {
+        return Err(());
+    }
+    let mut folded = sum as u64;
+    folded = (folded & 0xffff) + (folded >> 16);
+    folded = (folded & 0xffff) + (folded >> 16);
+    let checksum = (!(folded as u16)).to_ne_bytes();
+    if data + ICMPV6_UNREACH_FRAME > ctx.data_end() {
+        return Err(());
+    }
+    unsafe {
+        *((data + 56) as *mut [u8; 2]) = checksum;
     }
     bump(Counter::Rejected);
     Ok(xdp_action::XDP_TX)
