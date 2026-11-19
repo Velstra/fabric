@@ -325,7 +325,13 @@ pub fn plan_nat(
         if rewrite_port {
             c = csum_replace_u16(c, old_port, new_port);
         }
-        c
+        // RFC 768: a UDP checksum computing to zero is transmitted as all
+        // ones; zero on the wire would mean "no checksum" (DP-42).
+        if proto == ip_proto::UDP && c == 0 {
+            0xffff
+        } else {
+            c
+        }
     } else {
         l4_checksum
     };
@@ -475,7 +481,8 @@ pub struct FlowState {
     pub nat2_port: u16,
     /// Bit flags; see [`FlowState::REVERSE`].
     pub flags: u16,
-    /// Explicit padding, always zero.
+    /// Node-local TCP lifetime bits ([`crate::nat_lifetime`]); zero for
+    /// non-TCP and for legacy/imported bindings. Never sent to a peer.
     pub _pad: u16,
     /// Packets this entry accounted for; see the type's *Accounting* section.
     pub packets: u64,
@@ -489,17 +496,15 @@ pub struct FlowState {
 }
 
 impl FlowState {
+    /// TCP bindings follow their lifetime bits (`_pad`, see
+    /// [`crate::nat_lifetime`]): embryonic and closed connections no longer
+    /// hold a public port for the established timeout.
     #[inline(always)]
     pub fn expired(&self, proto: u8, now: u64, timeouts: crate::ConntrackTimeouts) -> bool {
-        crate::FirewallState {
-            last_seen_ns: self.last_seen_ns,
-            age_ns: self.age_ns,
-            phase: crate::FirewallState::ESTABLISHED,
-            reply: 0,
-        }
-        .expired(proto, now, timeouts)
+        self.idle_ns(now) >= crate::nat_lifetime::timeout_ns(self._pad, proto, timeouts)
     }
 
+    #[inline(always)]
     pub fn idle_ns(&self, now: u64) -> u64 {
         // Match FirewallState: another CPU may refresh after `now` was read.
         now.saturating_sub(self.last_seen_ns)
@@ -800,6 +805,39 @@ const fn replace_addr(check: u16, old: [u8; 4], new: [u8; 4]) -> u16 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn udp_translation_never_emits_the_no_checksum_value() {
+        let mut saw_all_ones = false;
+        for check in 1..=u16::MAX {
+            let nat = plan_nat(
+                [192, 168, 50, 100],
+                41000,
+                [198, 18, 10, 100],
+                52000,
+                0,
+                check,
+                ip_proto::UDP,
+            );
+            assert_ne!(nat.new_l4_checksum, 0, "input checksum {check:#06x}");
+            saw_all_ones |= nat.new_l4_checksum == 0xffff;
+        }
+        assert!(saw_all_ones);
+        // TCP has no such rule: zero is an ordinary checksum value there.
+        assert!((1..=u16::MAX).any(|check| {
+            plan_nat(
+                [192, 168, 50, 100],
+                41000,
+                [198, 18, 10, 100],
+                52000,
+                0,
+                check,
+                ip_proto::TCP,
+            )
+            .new_l4_checksum
+                == 0
+        }));
+    }
+
     use super::*;
 
     #[test]

@@ -1268,6 +1268,7 @@ mod tests {
                     age_ns: 0,
                     phase: FirewallState::ESTABLISHED,
                     reply: 1,
+                    ..FirewallState::UNTRACKED
                 },
                 0,
             )
@@ -1491,6 +1492,7 @@ mod tests {
             age_ns: 0,
             phase: FirewallState::ESTABLISHED,
             reply: 1,
+            ..FirewallState::UNTRACKED
         };
         store.firewall.insert(fw_key, old_fw, 0).unwrap();
         let successor_fw = FirewallState {
@@ -1577,6 +1579,7 @@ mod tests {
                             age_ns: 0,
                             phase: FirewallState::ESTABLISHED,
                             reply: 0,
+                            ..FirewallState::UNTRACKED
                         },
                         0,
                     )
@@ -1650,6 +1653,7 @@ mod tests {
             age_ns: 0,
             phase: FirewallState::ESTABLISHED,
             reply: 1,
+            ..FirewallState::UNTRACKED
         };
         let source_control =
             FirewallKey::ipv4(FlowKey::new(3, [10, 3, 0, 1], [10, 3, 0, 3], 4000, 5440, 6));
