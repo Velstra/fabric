@@ -3178,11 +3178,8 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
                 .ok_or_else(|| anyhow!("PORT_RULES map missing"))?,
         )?;
         for policy in &old.policies {
-            for rule in policy
-                .port_rules
-                .iter()
-                .filter(|r| r.dst.is_none() && r.src6.is_none() && r.dst6.is_none())
-            {
+            // The same predicate that placed the rule, or a deleted rule stays.
+            for rule in policy.port_rules.iter().filter(|r| in_v4_source_trie(r)) {
                 let (prefix, addr) = port_rule_src_lpm(&rule.src);
                 let _ = rules.remove(&Key::new(
                     prefix,
@@ -3211,7 +3208,11 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
                 .ok_or_else(|| anyhow!("PORT_RULES6 map missing"))?,
         )?;
         for policy in &old.policies {
-            for rule in policy.port_rules.iter().filter(|r| r.src6.is_some()) {
+            // `in_v6_source_trie`, not `src6.is_some()`: an address-less rule
+            // lives here too (DP-11), and sweeping only the rules that name an
+            // IPv6 source left a deleted address-less rule enforced on IPv6
+            // after a live reconfigure.
+            for rule in policy.port_rules.iter().filter(|r| in_v6_source_trie(r)) {
                 let (prefix, addr) = port_rule_src6_lpm(&rule.src6);
                 let _ = rules.remove(&Key::new(
                     prefix,
@@ -6299,6 +6300,22 @@ mod tests {
                 (28, false, false),
             ]
         );
+    }
+
+    /// Programming and the stale-entry sweep must agree on where a rule
+    /// lives. They disagreed once: address-less rules moved into the IPv6 trie
+    /// and the sweep kept looking only for rules that name an IPv6 source, so a
+    /// rule deleted by a live reconfigure kept dropping IPv6 (found by
+    /// checks.icmptype and checks.phase2-dataplane).
+    #[test]
+    fn rule_programming_and_the_stale_sweep_use_one_placement() {
+        let source = include_str!("firewall.rs");
+        let code = &source[..source.find("#[cfg(test)]\nmod tests").unwrap()];
+        for predicate in ["in_v4_source_trie(r)", "in_v6_source_trie(r)"] {
+            assert_eq!(code.matches(predicate).count(), 2, "{predicate}");
+        }
+        assert!(!code.contains("filter(|r| r.src6.is_some())"));
+        assert!(!code.contains("filter(|(_, r)| r.src6.is_some())"));
     }
 
     #[test]
