@@ -103,8 +103,8 @@ use velstra_common::{
     build_encap, build_srv6_encap, check_cookie, csum_replace_u32, decide, decide_egress,
     decode_vni, epoch_of, gate_admits_unauthenticated, icmp, icmp_checksum, icmp_type_probe,
     icmpv6_link_control, ip_proto, ipv6_ext_len, is_ipv6_ext, is_overlay_dport, legacy_napt_seed,
-    lpm_key_addr, make_cookie, masquerade_commit, napt_binding_matches, napt_claim,
-    napt_find_existing, napt_port, napt_seed, napt_slot, plan_arp_reply, plan_forward,
+    lpm_key_addr, make_cookie, masquerade_commit, mss_clamp_csum_operands, napt_binding_matches,
+    napt_claim, napt_find_existing, napt_port, napt_seed, napt_slot, plan_arp_reply, plan_forward,
     plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_server_ack, plan_server_syn,
     plan_srv6_irb, plan_syn_ack, plan_tcp_rst, select_backend, session_hash, stateful_verdict,
     tcp_flags, translate_to_client, translate_to_server, unaddressed_uplink_drops,
@@ -6583,9 +6583,13 @@ fn clamp_mss_egress(ctx: &TcContext, ihl_bytes: usize, proto: u8, ifindex: u32) 
                     return;
                 }
                 // The option is part of the TCP payload for checksum purposes,
-                // so this is an L4 replace with the old and new values as
-                // native-endian integers — the same shape the NAT path uses.
-                let _ = ctx.l4_csum_replace(O_L4 + 16, current as u64, limit as u64, 2);
+                // so this is an L4 replace. The helper takes the two values as
+                // the bytes sit in the packet (`__be16`), not as MSS numbers:
+                // passing those wrote a wrong checksum on every clamped SYN
+                // (DP-09). `mss_clamp_csum_operands` is the one place that
+                // conversion lives, and it is model-tested on the host.
+                let (from, to) = mss_clamp_csum_operands(current, limit);
+                let _ = ctx.l4_csum_replace(O_L4 + 16, from, to, 2);
                 bump(Counter::MssClamped);
                 return;
             }

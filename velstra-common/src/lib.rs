@@ -43,6 +43,7 @@ mod icmpv6;
 mod lb;
 mod mac;
 mod masquerade;
+mod mss;
 mod npt;
 mod overlay;
 mod packet;
@@ -88,6 +89,7 @@ pub use masquerade::{
     masquerade_commit, napt_binding_matches, napt_claim, napt_find_existing, napt_port,
     napt_search_count, napt_seed, napt_slot, unaddressed_uplink_drops,
 };
+pub use mss::mss_clamp_csum_operands;
 pub use npt::{Npt66, npt66_rewrite, oc_add};
 pub use overlay::{
     ARP_REPLY, ARP_REQUEST, ArpEntry, ArpKey, ArpReply, ETHERTYPE_ARP, Encap, FloodSet,
