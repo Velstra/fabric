@@ -1794,7 +1794,7 @@ pub fn velstra_local(ctx: XdpContext) -> u32 {
 /// TC dispatcher: separate v4/v6 tail programs each have a fresh BPF stack.
 /// A shared generation snapshot spans the dispatch and complete rule decision.
 #[map]
-static EGRESS_PROGS: ProgramArray = ProgramArray::with_max_entries(8, 0);
+static EGRESS_PROGS: ProgramArray = ProgramArray::with_max_entries(9, 0);
 
 #[classifier]
 pub fn velstra_egress(ctx: TcContext) -> i32 {
@@ -1928,6 +1928,25 @@ pub fn velstra_egress_v6_state(ctx: TcContext) -> i32 {
         return TC_ACT_SHOT as i32;
     }
     let action = try_egress_v6_state(&ctx).unwrap_or(TC_ACT_SHOT as i32);
+    if epoch::unchanged(before) {
+        link_layer::finish_tc(&ctx, action)
+    } else {
+        TC_ACT_SHOT as i32
+    }
+}
+
+/// The IPv4 egress state stage (see [`try_egress_v4_state`]). A missing tail
+/// target, a stale or foreign decision or a changed generation fails closed.
+#[classifier]
+pub fn velstra_egress_v4_state(ctx: TcContext) -> i32 {
+    if !ha_permits(unsafe { (*ctx.skb.skb).ifindex }) {
+        return TC_ACT_SHOT as i32;
+    }
+    let before = epoch::egress_snapshot();
+    if !epoch::unchanged(before) {
+        return TC_ACT_SHOT as i32;
+    }
+    let action = try_egress_v4_state(&ctx).unwrap_or(TC_ACT_SHOT as i32);
     if epoch::unchanged(before) {
         link_layer::finish_tc(&ctx, action)
     } else {
@@ -2466,12 +2485,119 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
         ipv4.tot_len(),
     );
     let verdict = decide_egress(&meta, &cfg, blocklisted, rule_action);
+    let Some(decision) = V4_EGRESS_DECISION.get_ptr_mut(0) else {
+        return Ok(TC_ACT_SHOT as i32);
+    };
+    let generation = epoch::egress_snapshot();
+    if !epoch::unchanged(generation) {
+        return Ok(TC_ACT_SHOT as i32);
+    }
+    // SAFETY: this CPU's own slot. Written in full, `ready` last; the state
+    // stage consumes it before using any field.
+    unsafe {
+        *decision = V4EgressDecision {
+            epoch: generation,
+            rule,
+            policy: policy_id,
+            ifindex,
+            flags: cfg.flags,
+            counter: verdict.counter as u32,
+            action: verdict.action.as_u32(),
+            len: (ctx.data_end() - ctx.data()) as u32,
+            src: src_addr,
+            dst: dst_addr,
+            nat_ip: nat_ip.unwrap_or([0; 4]),
+            src_port,
+            dst_port,
+            ihl: ihl_bytes as u16,
+            proto,
+            icmp_type,
+            nat: nat_ip.is_some() as u8,
+            ready: 0,
+        };
+        core::ptr::write_volatile(&raw mut (*decision).ready, 1);
+        EGRESS_PROGS.tail_call(ctx, 8);
+    }
+    // An unregistered state stage is a broken firewall, never a bypass.
+    Ok(TC_ACT_SHOT as i32)
+}
+
+/// The IPv4 egress policy verdict, handed from [`try_egress`] to the state
+/// stage across a tail call. Single-use, tied to the egress interface, the
+/// frame length and the egress generation it was decided under.
+#[repr(C)]
+struct V4EgressDecision {
+    epoch: u64,
+    rule: u64,
+    policy: PolicyId,
+    ifindex: u32,
+    flags: u32,
+    counter: u32,
+    action: u32,
+    len: u32,
+    src: [u8; 4],
+    dst: [u8; 4],
+    nat_ip: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    ihl: u16,
+    proto: u8,
+    icmp_type: u8,
+    nat: u8,
+    ready: u8,
+}
+
+#[map]
+static V4_EGRESS_DECISION: PerCpuArray<V4EgressDecision> = PerCpuArray::with_max_entries(1, 0);
+
+/// Connection state, RELATED errors, the drop and the NAT dispatch for a
+/// packet leaving on IPv4, after [`try_egress`] decided the policy verdict.
+///
+/// A separate program for the verifier, the same split IPv6 egress has: in one
+/// program every combination of the parse, MASQUERADE, blocklist, rule-trie and
+/// verdict branches carried the whole state machine and NAT tail with it, and
+/// `velstra_egress_v4` reached 938,411 of the 1,000,000-instruction limit on
+/// 6.18. Behaviour is unchanged; only the verifier's exploration is split.
+#[inline(always)]
+fn try_egress_v4_state(ctx: &TcContext) -> Result<i32, ()> {
+    let slot = V4_EGRESS_DECISION.get_ptr_mut(0).ok_or(())?;
+    // Consume before any verdict, accounting, state publication or rewrite.
+    let ready = unsafe { core::ptr::read_volatile(&raw const (*slot).ready) };
+    unsafe { core::ptr::write_volatile(&raw mut (*slot).ready, 0) };
+    let a = unsafe { &*slot };
+    let ifindex = unsafe { (*ctx.skb.skb).ifindex };
+    if ready != 1
+        || a.ifindex != ifindex
+        || a.epoch != epoch::egress_snapshot()
+        || !epoch::unchanged(a.epoch)
+        || a.len != (ctx.data_end() - ctx.data()) as u32
+        || !(Ipv4Hdr::LEN as u16..=60).contains(&a.ihl)
+    {
+        return Err(());
+    }
+    let cfg = GlobalConfig {
+        default_action: 0,
+        flags: a.flags,
+    };
+    let rule = a.rule;
+    let proto = a.proto;
+    let icmp_type = a.icmp_type;
+    let ihl_bytes = a.ihl as usize;
+    let src_addr = a.src;
+    let dst_addr = a.dst;
+    let src_port = a.src_port;
+    let dst_port = a.dst_port;
+    let nat_ip = if a.nat != 0 { Some(a.nat_ip) } else { None };
+    let verdict = Verdict {
+        action: Action::from_u32(a.action),
+        counter: Counter::from_u32(a.counter).unwrap_or(Counter::EgressDropped),
+    };
     let stateful = nat_ip.is_none()
         && cfg.has_flag(ConfigFlags::STATEFUL)
         && matches!(proto, ip_proto::TCP | ip_proto::UDP | ip_proto::ICMP)
         && ihl_bytes == Ipv4Hdr::LEN;
     let mut fwkey = ct_key4(
-        FlowKey::new(policy_id, src_addr, dst_addr, src_port, dst_port, proto),
+        FlowKey::new(a.policy, src_addr, dst_addr, src_port, dst_port, proto),
         ctx.data(),
         ctx.data_end(),
         EthHdr::LEN + ihl_bytes,
@@ -2516,17 +2642,7 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
         // The policy-wide log flag, or this rule's own per-rule log bit.
         let want_log = cfg.has_flag(ConfigFlags::LOG) || port_rule_logs(rule);
         if want_log {
-            info!(
-                ctx,
-                "EGRESS DROP -> {}.{}.{}.{} proto={} dport={} reason={}",
-                dst_addr[0],
-                dst_addr[1],
-                dst_addr[2],
-                dst_addr[3],
-                proto,
-                dst_port,
-                reason.label(),
-            );
+            log_egress_drop(ctx, dst_addr, proto, dst_port, reason);
         }
         return Ok(TC_ACT_SHOT as i32);
     }
@@ -2573,6 +2689,26 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
     }
 
     Ok(TC_ACT_OK as i32)
+}
+
+/// The egress drop log line, in a frame of its own. aya-log serialises every
+/// argument with its own bounds checks; inlined, that code was explored once
+/// per verifier path reaching the drop, i.e. for every combination of the
+/// policy, state and NAT branches above it. As a sub-program it is verified
+/// once per distinct caller state at the call.
+#[inline(never)]
+fn log_egress_drop(ctx: &TcContext, dst_addr: [u8; 4], proto: u8, dst_port: u16, reason: Counter) {
+    info!(
+        ctx,
+        "EGRESS DROP -> {}.{}.{}.{} proto={} dport={} reason={}",
+        dst_addr[0],
+        dst_addr[1],
+        dst_addr[2],
+        dst_addr[3],
+        proto,
+        dst_port,
+        reason.label(),
+    );
 }
 
 /// How many ephemeral ports the masquerade NAPT probe tries before refusing a
@@ -3640,6 +3776,54 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     Ok(xdp_action::XDP_DROP)
 }
 
+/// The IPv4 firewall's log lines, each in a frame of its own (see
+/// `log_egress_drop`): inlined, aya-log's per-argument serialisation was
+/// explored once per verifier path reaching it, and the ALLOW line sits on the
+/// path every admitted packet continues along.
+#[inline(never)]
+fn log_v4_drop(ctx: &XdpContext, src_addr: [u8; 4], proto: u8, dst_port: u16, reason: Counter) {
+    info!(
+        ctx,
+        "DROP {}.{}.{}.{} proto={} dport={} reason={}",
+        src_addr[0],
+        src_addr[1],
+        src_addr[2],
+        src_addr[3],
+        proto,
+        dst_port,
+        reason.label(),
+    );
+}
+
+#[inline(never)]
+fn log_v4_reject(ctx: &XdpContext, src_addr: [u8; 4], proto: u8, dst_port: u16) {
+    info!(
+        ctx,
+        "REJECT {}.{}.{}.{} proto={} dport={}",
+        src_addr[0],
+        src_addr[1],
+        src_addr[2],
+        src_addr[3],
+        proto,
+        dst_port,
+    );
+}
+
+#[inline(never)]
+fn log_v4_allow(ctx: &XdpContext, src_addr: [u8; 4], proto: u8, dst_port: u16, reason: Counter) {
+    info!(
+        ctx,
+        "ALLOW {}.{}.{}.{} proto={} dport={} reason={}",
+        src_addr[0],
+        src_addr[1],
+        src_addr[2],
+        src_addr[3],
+        proto,
+        dst_port,
+        reason.label(),
+    );
+}
+
 #[inline(always)]
 fn try_velstra_v4_state(ctx: &XdpContext, s: &V4StateScratch) -> Result<u32, ()> {
     let src_addr = s.src_addr;
@@ -3789,17 +3973,7 @@ fn try_velstra_v4_state(ctx: &XdpContext, s: &V4StateScratch) -> Result<u32, ()>
     if action == Action::Drop {
         bump(fw_counter);
         if want_log {
-            info!(
-                ctx,
-                "DROP {}.{}.{}.{} proto={} dport={} reason={}",
-                src_addr[0],
-                src_addr[1],
-                src_addr[2],
-                src_addr[3],
-                proto,
-                dst_port,
-                fw_counter.label(),
-            );
+            log_v4_drop(ctx, src_addr, proto, dst_port, fw_counter);
         }
         return Ok(xdp_action::XDP_DROP);
     }
@@ -3808,16 +3982,7 @@ fn try_velstra_v4_state(ctx: &XdpContext, s: &V4StateScratch) -> Result<u32, ()>
     // non-TCP) bounced back out the ingress interface — instead of black-holing.
     if action == Action::Reject {
         if want_log {
-            info!(
-                ctx,
-                "REJECT {}.{}.{}.{} proto={} dport={}",
-                src_addr[0],
-                src_addr[1],
-                src_addr[2],
-                src_addr[3],
-                proto,
-                dst_port,
-            );
+            log_v4_reject(ctx, src_addr, proto, dst_port);
         }
         // A segment too short to answer still matched a reject rule: refuse it
         // anyway. Letting the parse failure reach the fail-open default turned a
@@ -3844,17 +4009,7 @@ fn try_velstra_v4_state(ctx: &XdpContext, s: &V4StateScratch) -> Result<u32, ()>
     // new (non-established) flow it admits. Gated on the rule's own bit so a
     // policy that logs globally still only logs drops/rejects, not every pass.
     if rule_log && action == Action::Pass && !established {
-        info!(
-            ctx,
-            "ALLOW {}.{}.{}.{} proto={} dport={} reason={}",
-            src_addr[0],
-            src_addr[1],
-            src_addr[2],
-            src_addr[3],
-            proto,
-            dst_port,
-            fw_counter.label(),
-        );
+        log_v4_allow(ctx, src_addr, proto, dst_port, fw_counter);
     }
 
     let log = cfg.has_flag(ConfigFlags::LOG);
@@ -6930,7 +7085,11 @@ const MAX_TCP_OPTS: usize = 10;
 /// Written with `bpf_skb_store_bytes` rather than a pointer, so the variable
 /// option offset never becomes a packet-pointer the verifier has to bound, and
 /// the checksum is fixed with `bpf_l4_csum_replace` from the two values.
-#[inline(always)]
+///
+/// A sub-program, not inlined: its option walk forks the verifier's state at
+/// every option, and inlined into `try_egress` each of those states carried
+/// the rest of the egress program with it.
+#[inline(never)]
 fn clamp_mss_egress(ctx: &TcContext, ihl_bytes: usize, proto: u8, ifindex: u32) {
     if proto != ip_proto::TCP || ihl_bytes != Ipv4Hdr::LEN {
         return;
