@@ -1165,6 +1165,22 @@ impl Firewall {
             .as_ref()
             .map(|persist| persist.pin_program_arrays(&ebpf))
             .transpose()?;
+        // Link-layer framing before the first packet can reach the program.
+        for name in ifaces {
+            program_link_layer(&mut ebpf, name)?;
+        }
+        // The policy is programmed and every ingress tail call registered, so
+        // open the gate before attaching. A fresh attach sees no packet before
+        // this point either way; an ADOPTED link runs the new program the
+        // instant it is swapped in, and a gate still closed until the end of
+        // start-up dropped all traffic for the seconds the egress programs
+        // took to load (measured: a 3.2 s TCP stall across a restart).
+        Array::<_, u32>::try_from(
+            ebpf.map_mut("APPLY_STATE")
+                .ok_or_else(|| anyhow!("APPLY_STATE map missing"))?,
+        )?
+        .set(0, CONFIG_READY, 0)
+        .context("opening the datapath gate before attaching")?;
         let program: &mut Xdp = ebpf
             .program_mut("velstra")
             .ok_or_else(|| anyhow!("eBPF object has no `velstra` program"))?
@@ -1182,10 +1198,6 @@ impl Firewall {
             let (chosen, link) = attach_with_fallback(program, iface, mode, persist.as_ref())?;
             xdp_links.insert(iface.clone(), link);
             attached.push((iface.clone(), chosen));
-        }
-
-        for name in ifaces {
-            program_link_layer(&mut ebpf, name)?;
         }
 
         // Which interfaces need the TC egress hook, and why — see
