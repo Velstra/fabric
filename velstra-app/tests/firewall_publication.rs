@@ -38,22 +38,22 @@ struct ScratchLayout {
     flow: FlowKey,
 }
 
-const SCRATCH_WORDS: usize = 20;
+const SCRATCH_WORDS: usize = 24;
 const SCRATCH_POISON: u64 = 0xa5a5_a5a5_a5a5_a5a5;
 const SCRATCH_DECLARATION: &str = "#[repr(C)]\nstruct Scratch {\n    key: FirewallKey,\n    reverse: FirewallKey,\n    state: FirewallState,\n    reverse_state: FirewallState,\n    flow: FlowKey,\n}";
 const _: () = {
     assert!(size_of::<FirewallKey>() == 44);
     assert!(offset_of!(FirewallKey, src) == 4);
     assert!(offset_of!(FirewallKey, dst) == 20);
-    assert!(size_of::<FirewallState>() == 24);
+    assert!(size_of::<FirewallState>() == 40);
     assert!(size_of::<FlowKey>() == 20);
     assert!(align_of::<ScratchLayout>() == 8);
     assert!(size_of::<ScratchLayout>() == SCRATCH_WORDS * size_of::<u64>());
     assert!(offset_of!(ScratchLayout, key) == 0);
     assert!(offset_of!(ScratchLayout, reverse) == 44);
     assert!(offset_of!(ScratchLayout, state) == 88);
-    assert!(offset_of!(ScratchLayout, reverse_state) == 112);
-    assert!(offset_of!(ScratchLayout, flow) == 136);
+    assert!(offset_of!(ScratchLayout, reverse_state) == 128);
+    assert!(offset_of!(ScratchLayout, flow) == 168);
 };
 
 fn check_scratch_source_layout() -> Result<()> {

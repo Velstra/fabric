@@ -4,11 +4,11 @@ use aya_ebpf::{
     maps::{Array, PerCpuArray},
 };
 use velstra_common::{
-    ConntrackTimeouts, FirewallKey, FirewallState, FlowKey, StatePublication, ip_proto,
-    publish_state_pair,
+    ConntrackTimeouts, Counter, FirewallKey, FirewallState, FlowKey, ResetCheck, StatePublication,
+    ip_proto, publish_state_pair, tcp_flags,
 };
 
-use super::{CONNTRACK, FW_FLOWS, ROUTER_NAT_POLICY};
+use super::{CONNTRACK, FW_FLOWS, ROUTER_NAT_POLICY, bump};
 
 #[map]
 static CT_TIMEOUTS: Array<ConntrackTimeouts> = Array::with_max_entries(1, 0);
@@ -26,20 +26,177 @@ pub(super) fn ct_control(data: usize, end: usize, off: usize, proto: u8) -> u8 {
     if proto == ip_proto::UDP {
         return 0;
     }
-    let pos = if proto == ip_proto::TCP {
-        off + 12
-    } else {
-        off
-    };
-    let head = read_head4(data, end, pos);
+    if proto == ip_proto::TCP {
+        // Also captures this segment's sequence evidence for the state
+        // machine below; every classify/record caller computes control first.
+        return capture_tcp(data, end, off);
+    }
+    let head = read_head4(data, end, off);
     if head == u64::MAX {
         return 255;
     }
-    if proto == ip_proto::TCP {
-        (head >> 8) as u8
-    } else {
-        head as u8
+    head as u8
+}
+
+/// The TCP header fields of the packet whose `control` was computed last on
+/// this CPU. A per-CPU slot rather than arguments: every classify/record call
+/// site already passes the control byte, and the TC/XDP frames calling them
+/// have no stack left for a sequence tuple. Consumers require `flags` to equal
+/// the control byte they were given.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TcpSegment {
+    seq: u32,
+    ack: u32,
+    window: u16,
+    flags: u8,
+    /// `CSUM_*`, computed only for resets.
+    checksum: u8,
+    valid: u32,
+}
+const CSUM_UNKNOWN: u8 = 0;
+const CSUM_GOOD: u8 = 1;
+const CSUM_BAD: u8 = 2;
+
+#[map]
+static CT_SEGMENT: PerCpuArray<TcpSegment> = PerCpuArray::with_max_entries(1, 0);
+
+/// Read flags, sequence, acknowledgement and window. Returns the flags byte,
+/// or 255 for a truncated header (exactly the historical `ct_control` value).
+#[inline(never)]
+fn capture_tcp(data: usize, end: usize, off: usize) -> u8 {
+    let head = read_head4(data, end, off + 12);
+    if head == u64::MAX {
+        return 255;
     }
+    let flags = (head >> 8) as u8;
+    let Some(segment) = CT_SEGMENT.get_ptr_mut(0) else {
+        return flags;
+    };
+    let seq = read_head4(data, end, off + 4);
+    let ack = read_head4(data, end, off + 8);
+    // read_head4 returns the four wire bytes as a little-endian integer.
+    unsafe {
+        (*segment).seq = (seq as u32).swap_bytes();
+        (*segment).ack = (ack as u32).swap_bytes();
+        (*segment).window = ((head >> 16) as u16).swap_bytes();
+        (*segment).flags = flags;
+        (*segment).checksum = CSUM_UNKNOWN;
+        (*segment).valid = (seq != u64::MAX && ack != u64::MAX) as u32;
+    }
+    flags
+}
+
+/// Record whether this packet's TCP checksum is valid when it is a reset.
+/// Called at XDP ingress only: there wire checksums are always complete, and
+/// the call site has the verifier budget for the bounded sum. TC egress keeps
+/// `CSUM_UNKNOWN`; sequence validation still applies there.
+#[inline(never)]
+pub(super) fn ct_verify_reset(data: usize, end: usize, off: usize, control: u8) {
+    if control == 255 || control & tcp_flags::RST == 0 {
+        return;
+    }
+    let checksum = tcp_checksum(data, end, off);
+    if let Some(segment) = CT_SEGMENT.get_ptr_mut(0) {
+        unsafe {
+            if (*segment).flags == control {
+                (*segment).checksum = checksum;
+            }
+        }
+    }
+}
+
+/// Verify an IPv4 TCP segment's checksum (only resets pay for this). The sum
+/// runs over at most 64 bytes in a constant-bound loop; a longer segment, one
+/// whose length is not a multiple of four, or IPv6 is `CSUM_UNKNOWN` and keeps
+/// sequence validation as its only gate. XDP receive-side checksums are
+/// complete (virtio-net disables guest checksum offload under XDP), so no
+/// CHECKSUM_PARTIAL form is accepted.
+#[inline(never)]
+fn tcp_checksum(data: usize, end: usize, off: usize) -> u8 {
+    let ip = read_head4(data, end, 14);
+    if ip == u64::MAX || (ip as u8) >> 4 != 4 {
+        return CSUM_UNKNOWN;
+    }
+    let ihl = ((ip as u8) & 0x0f) as usize * 4;
+    let total = ((ip >> 16) as u16).swap_bytes() as usize;
+    if off != 14 + ihl || total < ihl + 20 {
+        return CSUM_UNKNOWN;
+    }
+    let length = total - ihl;
+    if length > 64 || length % 4 != 0 {
+        return CSUM_UNKNOWN;
+    }
+    let src = read_head4(data, end, 26);
+    let dst = read_head4(data, end, 30);
+    if src == u64::MAX || dst == u64::MAX {
+        return CSUM_UNKNOWN;
+    }
+    // One's-complement sums are byte-order independent: add the wire words as
+    // read (byte-swapped) and the pseudo-header constants byte-swapped too.
+    let pseudo: u64 = (src & 0xffff)
+        + (src >> 16)
+        + (dst & 0xffff)
+        + (dst >> 16)
+        + (ip_proto::TCP as u16).swap_bytes() as u64
+        + (length as u16).swap_bytes() as u64;
+    let mut sum = pseudo;
+    let mut i = 0usize;
+    while i < 16 {
+        if i * 4 >= length {
+            break;
+        }
+        let word = read_head4(data, end, off + i * 4);
+        if word == u64::MAX {
+            return CSUM_UNKNOWN;
+        }
+        sum += (word & 0xffff) + (word >> 16);
+        i += 1;
+    }
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
+    if sum == 0xffff { CSUM_GOOD } else { CSUM_BAD }
+}
+
+/// This packet's captured segment, if it is the one `control` was read from.
+#[inline(always)]
+fn segment(control: u8) -> Option<TcpSegment> {
+    let segment = CT_SEGMENT.get(0).copied()?;
+    if segment.flags != control || segment.valid == 0 {
+        return None;
+    }
+    Some(segment)
+}
+
+/// RFC 5961 admission of a reset that matches live state: 1 forwards it, 2
+/// refuses it. Exact and in-window resets are forwarded; only an exact one
+/// will tear state down (see `reset_tears_down`).
+#[inline(never)]
+fn reset_verdict(state: &FirewallState, control: u8) -> u8 {
+    let Some(segment) = segment(control) else {
+        return 1;
+    };
+    if segment.checksum == CSUM_BAD || state.reset_check(segment.seq) == ResetCheck::Invalid {
+        bump(Counter::TcpInvalidReset);
+        return 2;
+    }
+    1
+}
+
+/// Whether an admitted reset ends the connection. Without sequence evidence
+/// (imported/legacy state, or a capture mismatch) the historical behaviour
+/// stands; a reset with a wrong checksum never ends one.
+#[inline(always)]
+fn reset_tears_down(state: &FirewallState, control: u8) -> bool {
+    let Some(segment) = segment(control) else {
+        return true;
+    };
+    segment.checksum != CSUM_BAD
+        && matches!(
+            state.reset_check(segment.seq),
+            ResetCheck::Exact | ResetCheck::Unknown
+        )
 }
 
 /// Keep a variable-offset packet read and its range proof in one small frame.
@@ -240,11 +397,25 @@ fn scratch_key4(key: &mut FirewallKey, flow: &FlowKey) {
 #[inline(never)]
 pub(super) fn ct_classify(key: &FirewallKey, control: u8) -> u8 {
     let Some(state) = (unsafe { FW_FLOWS.get(key) }) else {
+        // DP-37: scans and malformed flag combinations never belong to a
+        // connection. Port zero marks a non-first fragment (no TCP header).
+        if key.proto == ip_proto::TCP
+            && key.src_port != 0
+            && key.dst_port != 0
+            && !FirewallState::tcp_flags_plausible(control)
+        {
+            bump(Counter::TcpInvalidFlags);
+            return 2;
+        }
         return 0;
     };
     let now = unsafe { bpf_ktime_get_ns() };
     let timeouts = timeouts();
-    state.classify(key.proto, control, now, timeouts)
+    let verdict = state.classify(key.proto, control, now, timeouts);
+    if verdict == 1 && key.proto == ip_proto::TCP && control & tcp_flags::RST != 0 {
+        return reset_verdict(state, control);
+    }
+    verdict
 }
 
 /// Preserve an admitted WAN-initiated connection's routed response. This reads
@@ -308,6 +479,11 @@ unsafe fn record_scratch(scratch: *mut Scratch, control: u8) -> StatePublication
             core::ptr::write_volatile(&raw mut (*scratch).state.age_ns, old.age_ns);
             core::ptr::write_volatile(&raw mut (*scratch).state.phase, old.phase);
             core::ptr::write_volatile(&raw mut (*scratch).state.reply, old.reply);
+            core::ptr::write_volatile(&raw mut (*scratch).state.acks[0], old.acks[0]);
+            core::ptr::write_volatile(&raw mut (*scratch).state.acks[1], old.acks[1]);
+            core::ptr::write_volatile(&raw mut (*scratch).state.windows[0], old.windows[0]);
+            core::ptr::write_volatile(&raw mut (*scratch).state.windows[1], old.windows[1]);
+            core::ptr::write_volatile(&raw mut (*scratch).state.track, old.track);
             if !(*scratch).state.expired(proto, now, timeouts()) {
                 (*scratch).state.next_phase(proto, control)
             } else {
@@ -316,13 +492,29 @@ unsafe fn record_scratch(scratch: *mut Scratch, control: u8) -> StatePublication
         } else {
             None
         };
+        let old_phase = (*scratch).state.phase;
         if let Some(phase) = phase {
+            if phase == FirewallState::RESET && !reset_tears_down(&(*scratch).state, control) {
+                // In-window but not exact (RFC 5961 challenge-ACK case), or a
+                // bad checksum: forwarded at most, and no state is touched.
+                return StatePublication::NoChange;
+            }
             (*scratch).state.phase = phase;
         } else if FirewallState::is_opener(proto, control) {
             (*scratch).state.phase = FirewallState::NEW;
             (*scratch).state.reply = 0;
+            (*scratch).state.acks = [0; 2];
+            (*scratch).state.windows = [0; 2];
+            (*scratch).state.track = 0;
         } else {
             return StatePublication::NoChange;
+        }
+        if proto == ip_proto::TCP
+            && let Some(segment) = segment(control)
+        {
+            (*scratch)
+                .state
+                .track_segment(old_phase, control, segment.ack, segment.window);
         }
         (*scratch).state.last_seen_ns = now;
         (*scratch).state.age_ns = 0;
@@ -362,6 +554,7 @@ pub(super) fn ct_seed_reply(flow: &FlowKey, control: u8) -> StatePublication {
             age_ns: 0,
             phase: FirewallState::NEW,
             reply: 1,
+            ..FirewallState::UNTRACKED
         };
         (*scratch).reverse_state = (*scratch).state.reverse();
         publish_scratch(scratch)
@@ -387,6 +580,7 @@ pub(super) fn ct_router_open(flow: &FlowKey, control: u8) -> StatePublication {
             age_ns: 0,
             phase: FirewallState::NEW,
             reply: 0,
+            ..FirewallState::UNTRACKED
         };
         (*scratch).reverse_state = (*scratch).state.reverse();
         publish_scratch(scratch)
@@ -407,6 +601,7 @@ pub(super) fn ct_cookie_admitted(flow: &FlowKey) -> StatePublication {
             age_ns: 0,
             phase: FirewallState::ESTABLISHED,
             reply: 0,
+            ..FirewallState::UNTRACKED
         };
         (*scratch).reverse_state = (*scratch).state.reverse();
         publish_scratch(scratch)
