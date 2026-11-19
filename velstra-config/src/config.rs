@@ -10,7 +10,7 @@
 //!
 //! ```toml
 //! default_action = "pass"   # "pass" or "drop"
-//! drop_icmp      = true      # block all ping traffic
+//! drop_icmp      = true      # refuse new inbound ICMP (answers, related errors, ND pass)
 //! log      = false     # emit an aya-log line per drop (costly)
 //! source_validation = "strict"  # uRPF: "disable" (default), "loose", "strict"
 //!
@@ -888,7 +888,11 @@ pub struct FileConfig {
     pub conntrack: ConntrackConfig,
     /// Verdict for traffic that matches no rule. Defaults to `pass`.
     pub default_action: ActionName,
-    /// Drop all ICMP traffic.
+    /// Refuse new inbound ICMP/ICMPv6 — an unsolicited ping. The answer to a
+    /// ping the box or a host behind it sent, an ICMP error about a tracked
+    /// connection, and IPv6 neighbour discovery/MLD always pass; the egress hook
+    /// applies it only on a tenant tap (`egress_default_drop`), whose egress
+    /// side is the guest's inbound one.
     pub drop_icmp: bool,
     /// Log every dropped packet via `aya-log` (debugging aid; costly).
     pub log: bool,

@@ -324,7 +324,8 @@ def client(args):
         "stateful-off": [("port-min", False)],
         "stateful-off-allow": [("unrelated-non-nat", True)],
         "explicit-deny": [("port-min", False)],
-        "block-icmp": [("port-min", False)],
+        # block-icmp refuses new ICMP, never an error about a tracked flow.
+        "block-icmp": [("port-min", True)],
         **{case: [(case, False)] for case in HELD},
     }
     capture = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_IP))

@@ -39,6 +39,7 @@ mod firewall_session;
 mod forward;
 mod fragment_guard;
 mod icmp_related;
+mod icmpv6;
 mod lb;
 mod mac;
 mod masquerade;
@@ -73,6 +74,10 @@ pub use icmp_related::{
     RelatedChecksums, related_checksum_copy_length, related_checksums,
     related_hairpin_firewall_candidate, related_icmp_error,
 };
+pub use icmpv6::{
+    ICMPV6_ERROR_QUOTE, MLD_HOP_LIMIT, ND_HOP_LIMIT, icmpv6_link_control, icmpv6_type,
+    related_icmpv6_error, related_icmpv6_key,
+};
 pub use lb::{
     Backend, FlowKey, FlowState, Nat, PortFwd, ServiceKey, ServiceValue, plan_dnat,
     plan_icmp_echo_nat, plan_nat, select_backend, session_hash,
@@ -103,9 +108,10 @@ pub use parse::{ParseResult, parse_frame};
 pub use policy::{
     Action, CONFIG_FAILED, CONFIG_READY, CONFIG_UPDATING, Counter, MAX_BLOCKLIST, MAX_RULE_LIMITS,
     PORT_RULE_IN_ONLY, PORT_RULE_LOG, PORT_RULE_OUT_ONLY, PORT_RULE_PRESENT, PORT_RULE_V4_ONLY,
-    PORT_RULE_V6_ONLY, Verdict, admit_established_egress_reply, decide, decide_egress,
-    port_rule_action, port_rule_bits, port_rule_excluded, port_rule_limit, port_rule_logs,
-    port_rule_present, port_rule_value, port_rule_winner, port_rule_with_limit,
+    PORT_RULE_V6_ONLY, StateFacts, Verdict, admit_established_egress_reply, decide, decide_egress,
+    egress_posture, port_rule_action, port_rule_bits, port_rule_denies, port_rule_excluded,
+    port_rule_limit, port_rule_logs, port_rule_present, port_rule_value, port_rule_winner,
+    port_rule_with_limit, stateful_verdict,
 };
 pub use portal::{
     PortalClientKey, PortalGate, PortalSeenKey, gate_admits_unauthenticated, v6_source_is_v4_mapped,
