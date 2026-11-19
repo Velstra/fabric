@@ -2655,43 +2655,6 @@ fn account_masquerade_binding(key: &FlowKey, origin: [u8; 4], port: u16, bytes: 
     true
 }
 
-/// DP-26: the replicated allocator keeps the legacy eight-candidate claim
-/// first (identical semantics for mixed-version peers) and, only when all
-/// eight are busy, searches and claims within the larger HA window instead of
-/// refusing the connection deterministically on every retransmission.
-#[inline(never)]
-fn ha_claim_napt(
-    flow: &FlowKey,
-    origin: [u8; 4],
-    public: [u8; 4],
-    layout: &CgnatLayout,
-    bytes: u64,
-) -> u32 {
-    let legacy = claim_legacy_napt(flow, origin, public, layout, bytes);
-    if legacy != 0 || origin != flow.src_ip {
-        // Claimed, failed, or an HA WireGuard VIP flow (origin is the VIP):
-        // the window search keys bindings on the packet's own source.
-        return legacy;
-    }
-    let existing = napt_domain::existing_window(flow, public, layout, napt_domain::HA_WINDOW);
-    if existing != 0 {
-        let key = FlowKey::new(
-            flow.policy,
-            flow.dst_ip,
-            public,
-            flow.dst_port,
-            existing,
-            flow.proto,
-        );
-        return if account_masquerade_binding(&key, origin, flow.src_port, bytes) {
-            existing as u32
-        } else {
-            napt_domain::FAILED
-        };
-    }
-    napt_domain::claim_window(flow, public, layout, bytes, napt_domain::HA_WINDOW)
-}
-
 /// Keep the replicated allocator's exact eight-candidate claim semantics in
 /// its own frame, so standalone loop callbacks fit the combined BPF stack.
 #[inline(never)]
@@ -2911,7 +2874,17 @@ fn masquerade_egress(
         let result = if napt_domain::enabled() {
             napt_domain::allocate(&flow, wan_ip, &layout, bytes)
         } else {
-            ha_claim_napt(&flow, reply_target, wan_ip, &layout, bytes)
+            // DP-26: the exact legacy eight-candidate claim first (identical
+            // semantics for mixed-version peers); only when all eight are
+            // busy, the larger HA window instead of a deterministic refusal.
+            // An HA WireGuard VIP flow (origin is the VIP) keeps the legacy
+            // claim: the window keys bindings on the packet's own source.
+            let legacy = claim_legacy_napt(&flow, reply_target, wan_ip, &layout, bytes);
+            if legacy != 0 || reply_target != src_addr {
+                legacy
+            } else {
+                napt_domain::allocate_window(&flow, wan_ip, &layout, bytes, napt_domain::HA_WINDOW)
+            }
         };
         if result & napt_domain::FAILED != 0 {
             bump(Counter::EgressNatClaimFailed);

@@ -288,11 +288,11 @@ pub fn existing_window(flow: &FlowKey, public: [u8; 4], layout: &CgnatLayout, wi
     if ok { s.result as u16 } else { 0 }
 }
 
-/// Claim the first free candidate within the first `window` candidates, as
-/// `allocate` does over the whole domain. The caller has already searched the
-/// window for an existing binding.
+/// `allocate` restricted to the first `window` candidates: reuse this flow's
+/// live binding there, else claim the first free candidate. Same frame shape
+/// as `allocate`, so the masquerade tail's cumulative stack is unchanged.
 #[inline(never)]
-pub fn claim_window(
+pub fn allocate_window(
     flow: &FlowKey,
     public: [u8; 4],
     layout: &CgnatLayout,
@@ -305,6 +305,23 @@ pub fn claim_window(
     } else {
         s.domain.count
     };
+    if unsafe {
+        bpf_loop(
+            count,
+            find_owned as *mut c_void,
+            (&mut s as *mut Search).cast(),
+            0,
+        )
+    } < 0
+    {
+        return FAILED;
+    }
+    if s.result != 0 {
+        if account_masquerade_binding(&s.reverse, s.origin, s.private_port, bytes) {
+            return s.result;
+        }
+        return FAILED;
+    }
     if unsafe {
         bpf_loop(
             count,
