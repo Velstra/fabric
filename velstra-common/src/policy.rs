@@ -431,11 +431,16 @@ pub enum Counter {
     /// cannot evict other clients' bindings. Reason subset of EgressDropped
     /// (masquerade) or DroppedRule (destination NAT).
     NatOpenerRequired = 53,
+    /// A destination-NAT or load-balancer reverse entry could not be claimed
+    /// because a live entry of another flow holds the same reply tuple; the
+    /// packet is refused instead of overwriting it (DP-24). Reason subset of
+    /// DroppedRule.
+    NatClaimCollision = 54,
 }
 
 impl Counter {
     /// Number of distinct counters — the `max_entries` of the `STATS` map.
-    pub const COUNT: u32 = 54;
+    pub const COUNT: u32 = 55;
 
     /// The array index of this counter.
     #[inline]
@@ -495,6 +500,7 @@ impl Counter {
             51 => Counter::EgressNatUnsupportedDropped,
             52 => Counter::FragmentNatTranslated,
             53 => Counter::NatOpenerRequired,
+            54 => Counter::NatClaimCollision,
             36 => Counter::SynproxyChallenged,
             37 => Counter::SynproxyAdmitted,
             38 => Counter::SynproxyRejected,
@@ -565,6 +571,7 @@ impl Counter {
             Counter::EgressNatUnsupportedDropped => "egress_nat_unsupported_dropped",
             Counter::FragmentNatTranslated => "fragment_nat_translated",
             Counter::NatOpenerRequired => "nat_opener_required",
+            Counter::NatClaimCollision => "nat_claim_collision",
             Counter::SynproxyChallenged => "synproxy_challenged",
             Counter::SynproxyAdmitted => "synproxy_admitted",
             Counter::SynproxyRejected => "synproxy_rejected",
@@ -905,7 +912,8 @@ mod tests {
             Counter::EgressNatUnsupportedDropped.label(),
             "egress_nat_unsupported_dropped"
         );
-        assert_eq!(Counter::COUNT, 54);
+        assert_eq!(Counter::NatClaimCollision.index(), 54);
+        assert_eq!(Counter::COUNT, 55);
     }
 
     #[test]

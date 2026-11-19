@@ -566,10 +566,12 @@ pub mod nat_lifetime {
             } else {
                 timeouts.tcp_established
             }
-        } else if proto == crate::ip_proto::UDP {
-            timeouts.udp_stream
-        } else {
+        } else if proto == crate::ip_proto::ICMP {
             timeouts.icmp
+        } else {
+            // UDP, and address-only bindings of portless protocols (GRE,
+            // ESP, SCTP...), which Linux's generic conntrack keeps for 600 s.
+            timeouts.udp_stream
         };
         seconds as u64 * 1_000_000_000
     }
@@ -1056,6 +1058,8 @@ mod tests {
         assert_eq!(timeout_ns(0, 6, T), s(T.tcp_established));
         assert_eq!(timeout_ns(0, 17, T), s(T.udp_stream));
         assert_eq!(timeout_ns(0, 1, T), s(T.icmp));
+        assert_eq!(timeout_ns(0, 47, T), s(T.udp_stream));
+        assert_eq!(timeout_ns(0, 58, T), s(T.udp_stream));
         // Unknown bits are discarded, non-TCP never gains bits.
         assert_eq!(observe(0xff00, 6, ACK), 0);
         assert_eq!(observe(0, 17, tcp_flags::FIN), 0);

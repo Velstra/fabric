@@ -68,6 +68,7 @@ mod conntrack;
 mod deferred_nat;
 mod epoch;
 mod frag_nat;
+mod generic_nat;
 mod icmp_nat;
 mod icmp_related;
 mod link_layer;
@@ -620,15 +621,40 @@ fn publish_nat(key: &FlowKey, nat_ip: u32, ports: u32, nat2_ip: u32, meta: u64) 
         core::ptr::write_volatile(&raw mut (*state).nat2_ip, nat2_ip.to_ne_bytes());
         core::ptr::write_volatile(&raw mut (*state).nat_port, ports as u16);
         core::ptr::write_volatile(&raw mut (*state).nat2_port, (ports >> 16) as u16);
-        core::ptr::write_volatile(&raw mut (*state).flags, meta as u16);
+        core::ptr::write_volatile(&raw mut (*state).flags, meta as u16 & !NAT_CLAIM);
         core::ptr::write_volatile(&raw mut (*state)._pad, (meta >> 16) as u16);
         core::ptr::write_volatile(&raw mut (*state).packets, (bytes != 0) as u64);
         core::ptr::write_volatile(&raw mut (*state).bytes, bytes);
         core::ptr::write_volatile(&raw mut (*state).last_seen_ns, bpf_ktime_get_ns());
         core::ptr::write_volatile(&raw mut (*state).age_ns, 0);
+        if meta as u16 & NAT_CLAIM == 0 {
+            return CONNTRACK.insert(key, &*state, 0).is_ok();
+        }
+        // DP-24: a reverse entry is claimed, never blindly overwritten.
+        if CONNTRACK.insert(key, &*state, BPF_NOEXIST as u64).is_ok() {
+            return true;
+        }
+        let replaceable = match CONNTRACK.get(key) {
+            Some(existing) => velstra_common::nat_entry_replaceable(
+                existing,
+                &*state,
+                key.proto,
+                bpf_ktime_get_ns(),
+                conntrack::timeouts(),
+            ),
+            None => true,
+        };
+        if !replaceable {
+            bump(Counter::NatClaimCollision);
+            return false;
+        }
         CONNTRACK.insert(key, &*state, 0).is_ok()
     }
 }
+
+/// `nat_meta` flag: publish as a claim (BPF_NOEXIST, see `publish_nat`).
+/// Never stored: FlowState flags use only the low bits.
+const NAT_CLAIM: u16 = 1 << 15;
 
 #[inline(always)]
 fn nat_ports(primary: u16, secondary: u16) -> u32 {
@@ -2553,15 +2579,9 @@ fn try_masquerade(ctx: &TcContext) -> Result<i32, ()> {
     let ifindex = unsafe { (*ctx.skb.skb).ifindex };
     let wan_ip = unsafe { MASQUERADE.get(&ifindex) }.copied().ok_or(())?;
     if !matches!(proto, ip_proto::TCP | ip_proto::UDP) {
-        // GRE, ESP, SCTP, 6in4 and other protocols without ports have no
-        // address-only translation here. Refuse an inside source rather than
-        // send it to the uplink untranslated (DP-04).
-        if masquerade_source_exempt(ifindex, [ip[12], ip[13], ip[14], ip[15]], wan_ip) {
-            return Ok(TC_ACT_OK as i32);
-        }
-        bump(Counter::EgressDropped);
-        bump(Counter::EgressNatUnsupportedDropped);
-        return Ok(TC_ACT_SHOT as i32);
+        // GRE, ESP, SCTP, 6in4 and other protocols without ports: address-
+        // only translation, never an untranslated inside source (DP-04).
+        return Ok(generic_nat::egress(ctx, ifindex, wan_ip));
     }
     let ports: [u8; 4] = ctx.load(EthHdr::LEN + ihl).map_err(|_| ())?;
     let policy = unsafe { IFACE_POLICY.get(&ifindex) }.copied().unwrap_or(0);
@@ -3372,6 +3392,18 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
             u32::from_ne_bytes(src_addr),
             u32::from_ne_bytes(dst_addr),
             frag_nat::meta(proto, 0, 0, u16::from_be_bytes(ipv4.id), checksum),
+        )
+    {
+        return Ok(xdp_action::XDP_PASS);
+    }
+    // DP-04: the reply of an address-only (portless protocol) masquerade.
+    if !matches!(proto, ip_proto::TCP | ip_proto::UDP | ip_proto::ICMP)
+        && u16::from_be_bytes(ipv4.frags) & 0x1fff == 0
+        && generic_nat::ingress(
+            ctx,
+            u32::from_ne_bytes(src_addr),
+            u32::from_ne_bytes(dst_addr),
+            proto as u32 | (checksum as u32) << 16,
         )
     {
         return Ok(xdp_action::XDP_PASS);
@@ -5821,7 +5853,7 @@ fn try_load_balance(
         u32::from_ne_bytes(dst_addr),
         nat_ports(dst_port, 0),
         0,
-        nat_meta(FlowState::REVERSE, lifetime, 0),
+        nat_meta(FlowState::REVERSE | NAT_CLAIM, lifetime, 0),
     ) {
         // The forward key differs from the lookup key at the top of this function
         // only in its namespace (that lookup already falls back to the router-NAT
@@ -5846,6 +5878,12 @@ fn try_load_balance(
                 return Ok(Some(xdp_action::XDP_DROP));
             }
         }
+    } else {
+        // The reply tuple belongs to a live foreign flow (or the map refused
+        // the write): DNAT without a reverse entry would hand that flow's
+        // replies to the wrong client. Refuse; a retransmission retries.
+        bump(Counter::DroppedRule);
+        return Ok(Some(xdp_action::XDP_DROP));
     }
     // Clear the backend's reply through its own zone's stateful firewall, which on
     // a deny-by-default internal zone would otherwise drop it before the rewrite
@@ -6012,7 +6050,11 @@ fn try_port_forward(
             u32::from_ne_bytes(dst_addr),
             nat_ports(dst_port, 0),
             0,
-            nat_meta(FlowState::REVERSE, nat_lifetime::opening(proto, control), 0),
+            nat_meta(
+                FlowState::REVERSE | NAT_CLAIM,
+                nat_lifetime::opening(proto, control),
+                0,
+            ),
         );
         (src_addr, src_port, published)
     };
@@ -6024,7 +6066,12 @@ fn try_port_forward(
         reply_port,
         proto,
     );
-    if reverse_ready {
+    if !reverse_ready {
+        // As in try_load_balance: never DNAT without our own reverse entry.
+        bump(Counter::DroppedRule);
+        return Ok(Some(xdp_action::XDP_DROP));
+    }
+    {
         // Forward: rewrite subsequent packets of this flow. The packet in hand is
         // this flow's first and travels forward, so the entry opens with it
         // already accounted rather than losing it.
