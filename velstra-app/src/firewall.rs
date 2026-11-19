@@ -821,7 +821,10 @@ impl Firewall {
                 .ok_or_else(|| anyhow!("missing {name}"))?
                 .try_into()?;
             match program.load() {
-                Ok(()) => println!("verified {name}"),
+                Ok(()) => {
+                    println!("verified {name}");
+                    report_verified_insns(name, program.info());
+                }
                 Err(error) => rejected.push(format!("verifying {name}: {error:#}")),
             }
         }
@@ -843,7 +846,10 @@ impl Firewall {
                 .ok_or_else(|| anyhow!("missing {name}"))?
                 .try_into()?;
             match program.load() {
-                Ok(()) => println!("verified {name}"),
+                Ok(()) => {
+                    println!("verified {name}");
+                    report_verified_insns(name, program.info());
+                }
                 Err(error) => rejected.push(format!("verifying {name}: {error:#}")),
             }
         }
@@ -2976,6 +2982,20 @@ fn in_v4_source_trie(rule: &ResolvedRule) -> bool {
 /// The cost is one more trie entry per address-less rule.
 fn in_v6_source_trie(rule: &ResolvedRule) -> bool {
     rule.src6.is_some() || (addressless(rule) && rule.scope & PORT_RULE_V4_ONLY == 0)
+}
+
+/// How much of the verifier's one-million-instruction complexity budget a loaded
+/// program used, on its own line so the `verified <name>` lines stay exact.
+/// Headroom is what a datapath change spends, and it differs per kernel, so the
+/// verifier checks record it rather than only pass or fail.
+fn report_verified_insns(
+    name: &str,
+    info: std::result::Result<aya::programs::ProgramInfo, aya::programs::ProgramError>,
+) {
+    match info.map(|info| info.verified_instruction_count()) {
+        Ok(Some(count)) => println!("verifier-insns {name} {count}"),
+        Ok(None) | Err(_) => println!("verifier-insns {name} unknown"),
+    }
 }
 
 /// Raise the locked-memory rlimit so map allocation succeeds on older kernels
