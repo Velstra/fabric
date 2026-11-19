@@ -505,7 +505,10 @@ fn account_flow(key: &FlowKey, bytes: u64, control: u8) -> Option<FlowState> {
         (*entry).account(bytes);
         // DP-07: embryonic and closed TCP connections stop holding a binding
         // for the established timeout. Bits are node-local, never replicated.
-        (*entry)._pad = nat_lifetime::observe((*entry)._pad, key.proto, control);
+        // Write only on change: see `nat_lifetime::update` (lost-update race).
+        if let Some(bits) = nat_lifetime::update((*entry)._pad, key.proto, control) {
+            (*entry)._pad = bits;
+        }
         (*entry).last_seen_ns = now;
         (*entry).age_ns = 0;
         Some(*entry)
@@ -523,12 +526,13 @@ fn nat_lifetime_update(key: &FlowKey, control: u8, created: bool) {
         return;
     };
     unsafe {
-        let bits = if created {
-            nat_lifetime::opening(key.proto, control)
-        } else {
-            (*entry)._pad
-        };
-        (*entry)._pad = nat_lifetime::observe(bits, key.proto, control);
+        if created {
+            // Only this CPU knows the binding yet: its first segment is a SYN.
+            (*entry)._pad = nat_lifetime::opening(key.proto, control);
+        } else if let Some(bits) = nat_lifetime::update((*entry)._pad, key.proto, control) {
+            // Write only on change: see `nat_lifetime::update`.
+            (*entry)._pad = bits;
+        }
     }
 }
 

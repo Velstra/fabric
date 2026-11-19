@@ -538,6 +538,23 @@ pub mod nat_lifetime {
         bits
     }
 
+    /// The bits to WRITE for one segment, or `None` when nothing changes.
+    /// Bindings are updated through plain read-modify-write from several CPUs
+    /// (a SYN-ACK at ingress racing the handshake ACK at egress). Writing only
+    /// on change keeps a stale reader from putting EMBRYONIC back: a write
+    /// that still carries EMBRYONIC also adds FIN or RESET, whose timeouts
+    /// dominate, so a lost update can at worst drop a FIN/RESET bit (the
+    /// binding then keeps the established timeout, the historical lifetime).
+    #[inline(always)]
+    pub fn update(bits: u16, proto: u8, control: u8) -> Option<u16> {
+        let new = observe(bits, proto, control);
+        if new == bits & KNOWN && bits & !KNOWN == 0 {
+            None
+        } else {
+            Some(new)
+        }
+    }
+
     /// Bits for a binding a packet with `control` is about to create.
     #[inline(always)]
     pub fn opening(proto: u8, control: u8) -> u16 {
@@ -1060,6 +1077,20 @@ mod tests {
         assert_eq!(timeout_ns(0, 1, T), s(T.icmp));
         assert_eq!(timeout_ns(0, 47, T), s(T.udp_stream));
         assert_eq!(timeout_ns(0, 58, T), s(T.udp_stream));
+        // Lost-update race: ingress reads EMBRYONIC for a SYN-ACK while egress
+        // clears it for the handshake ACK. The SYN-ACK changes nothing, so it
+        // writes nothing and cannot resurrect EMBRYONIC over the clear.
+        use super::nat_lifetime::update;
+        let read_by_ingress = EMBRYONIC;
+        let after_egress = update(EMBRYONIC, 6, ACK).unwrap();
+        assert_eq!(after_egress, 0);
+        assert_eq!(update(read_by_ingress, 6, SYN | ACK), None);
+        assert_eq!(update(0, 6, ACK), None);
+        assert_eq!(update(0, 6, tcp_flags::FIN | ACK), Some(FIN));
+        // A write that keeps EMBRYONIC also sets a dominating close bit.
+        let w = update(EMBRYONIC, 6, SYN | tcp_flags::RST).unwrap();
+        assert!(w & RESET != 0 && timeout_ns(w, 6, T) == s(T.tcp_closing));
+        assert_eq!(update(0, 17, 0), None);
         // Unknown bits are discarded, non-TCP never gains bits.
         assert_eq!(observe(0xff00, 6, ACK), 0);
         assert_eq!(observe(0, 17, tcp_flags::FIN), 0);
