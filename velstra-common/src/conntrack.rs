@@ -117,7 +117,46 @@ pub struct FirewallState {
     pub phase: u32,
     /// 1 for the responder's direction, 0 for the initiator's.
     pub reply: u32,
+    /// Last cumulative ACK SENT by the initiator (`[0]`) and the responder
+    /// (`[1]`): what that peer expects the other one to send next. Indexed by
+    /// absolute direction, so both keys of a pair carry identical values.
+    /// Meaningful only while the matching `TRACK_ACK` bit is set.
+    pub acks: [u32; 2],
+    /// Last raw (unscaled) TCP window advertised by initiator / responder.
+    pub windows: [u16; 2],
+    /// Node-local TCP tracking bits (`TRACK_*`). Never replicated: an entry
+    /// imported from a peer, or written by an older datapath, has zero here and
+    /// means "sequence unknown", which keeps the historical reset behaviour
+    /// until both directions have been observed again.
+    pub track: u32,
 }
+
+/// What a TCP reset's sequence number says about the connection it names,
+/// judged against the receiver's last cumulative ACK (RFC 5961 section 3.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResetCheck {
+    /// The receiver's ACK was never observed: no sequence evidence either way.
+    Unknown,
+    /// Exactly the next expected sequence number: the connection really ends.
+    Exact,
+    /// Plausible but not exact. Forward it (the endpoint answers with a
+    /// challenge ACK) and change no state.
+    InWindow,
+    /// Outside any window the receiver could have advertised: a blind forgery.
+    Invalid,
+}
+
+/// The largest receive window a peer can advertise: 65535 scaled by the RFC
+/// 7323 maximum shift of 14. Without parsing the SYN's window-scale option the
+/// reset window is bounded by assuming the maximum shift. That only decides
+/// whether a NON-exact reset is forwarded to the endpoint (which checks its own
+/// exact window again); state is torn down only by an exact match.
+pub const RESET_WINDOW_MAX: u32 = 65535 << 14;
+
+/// Half-closed TCP (one FIN seen) keeps at least Linux's FIN_WAIT/CLOSE_WAIT
+/// order of idle time. The configured closing timeout applies once both sides
+/// have sent FIN, or after a reset.
+pub const HALF_CLOSE_MIN_S: u32 = 120;
 
 impl FirewallState {
     pub const NEW: u32 = 1;
@@ -126,11 +165,67 @@ impl FirewallState {
     pub const CLOSING: u32 = 4;
     pub const RESET: u32 = 5;
 
+    /// `acks[0]` / `acks[1]` hold an observed ACK.
+    pub const TRACK_ACK0: u32 = 1;
+    pub const TRACK_ACK1: u32 = 2;
+    /// The initiator / responder has sent a FIN.
+    pub const TRACK_FIN0: u32 = 4;
+    pub const TRACK_FIN1: u32 = 8;
+    /// The initiator sent a fresh SYN on this established tuple. Only a SYN-ACK
+    /// from the responder turns that into a new connection; any other answer
+    /// (a challenge ACK from a live endpoint) cancels it.
+    pub const TRACK_REOPEN: u32 = 16;
+
+    /// Base value for struct-update syntax: no tracking evidence at all.
+    pub const UNTRACKED: Self = Self {
+        last_seen_ns: 0,
+        age_ns: 0,
+        phase: 0,
+        reply: 0,
+        acks: [0; 2],
+        windows: [0; 2],
+        track: 0,
+    };
+
+    /// A state with the four replicated fields and no local tracking.
+    #[inline(always)]
+    pub const fn untracked(last_seen_ns: u64, age_ns: u64, phase: u32, reply: u32) -> Self {
+        Self {
+            last_seen_ns,
+            age_ns,
+            phase,
+            reply,
+            acks: [0; 2],
+            windows: [0; 2],
+            track: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn both_fins(&self) -> bool {
+        self.track & (Self::TRACK_FIN0 | Self::TRACK_FIN1) == Self::TRACK_FIN0 | Self::TRACK_FIN1
+    }
+
+    #[inline(always)]
+    fn one_fin(&self) -> bool {
+        self.track & (Self::TRACK_FIN0 | Self::TRACK_FIN1) != 0 && !self.both_fins()
+    }
+
     #[inline(always)]
     pub fn timeout_ns(&self, proto: u8, timeouts: ConntrackTimeouts) -> u64 {
         let seconds = if proto == ip_proto::TCP {
             match self.phase {
                 Self::ESTABLISHED => timeouts.tcp_established,
+                // A half-closed connection may legitimately idle while the
+                // other side still sends. Legacy/imported CLOSING state has no
+                // FIN bits and keeps the configured closing timeout.
+                Self::CLOSING if self.one_fin() => {
+                    if timeouts.tcp_closing > HALF_CLOSE_MIN_S {
+                        timeouts.tcp_closing
+                    } else {
+                        HALF_CLOSE_MIN_S
+                    }
+                }
                 Self::CLOSING | Self::RESET => timeouts.tcp_closing,
                 _ => timeouts.tcp_syn,
             }
@@ -177,17 +272,34 @@ impl FirewallState {
         }
     }
 
+    /// Linux `tcp_valid_flags`: the only TCP flag combinations (ignoring PSH,
+    /// ECE and CWR) a real stack sends. NULL, XMAS, FIN without ACK, SYN+FIN
+    /// and SYN+RST are scans or attacks, never part of a connection.
+    #[inline(always)]
+    pub fn tcp_flags_plausible(control: u8) -> bool {
+        const URG: u8 = 0x20;
+        let core =
+            control & (tcp_flags::FIN | tcp_flags::SYN | tcp_flags::RST | tcp_flags::ACK | URG);
+        matches!(
+            core,
+            tcp_flags::SYN
+                | 0x22 // SYN|URG
+                | 0x12 // SYN|ACK
+                | tcp_flags::RST
+                | 0x14 // RST|ACK
+                | 0x11 // FIN|ACK
+                | 0x31 // FIN|ACK|URG
+                | tcp_flags::ACK
+                | 0x30 // ACK|URG
+        )
+    }
+
     #[inline(always)]
     pub fn new(proto: u8, control: u8, now: u64) -> Option<Self> {
         if !Self::is_opener(proto, control) {
             return None;
         }
-        Some(Self {
-            last_seen_ns: now,
-            age_ns: 0,
-            phase: Self::NEW,
-            reply: 0,
-        })
+        Some(Self::untracked(now, 0, Self::NEW, 0))
     }
 
     #[inline(always)]
@@ -269,6 +381,19 @@ impl FirewallState {
                     Self::SYN_RECV if self.reply == 0 && ack && !syn && !fin => {
                         phase = Self::ESTABLISHED
                     }
+                    // A SYN-ACK after ESTABLISHED is the responder retransmitting
+                    // because the initiator's final ACK was lost (DP-25a). It
+                    // starts a new connection only after a reopening SYN.
+                    Self::ESTABLISHED if self.reply == 1 && syn && ack && !fin => {
+                        if self.track & Self::TRACK_REOPEN != 0 {
+                            phase = Self::SYN_RECV;
+                        }
+                    }
+                    // The initiator reusing a tuple whose old connection died
+                    // silently (DP-25b). Forwarded without a state change: only
+                    // the responder's SYN-ACK proves the old connection is gone,
+                    // so a spoofed SYN cannot tear down a live one.
+                    Self::ESTABLISHED if self.reply == 0 && syn && !ack && !fin => {}
                     Self::ESTABLISHED | Self::CLOSING if ack && !syn => {
                         if fin {
                             phase = Self::CLOSING;
@@ -297,6 +422,157 @@ impl FirewallState {
             ..self
         }
     }
+
+    /// Judge a reset travelling in this entry's direction (`reply` names its
+    /// sender) by its sequence number. See [`ResetCheck`].
+    #[inline(always)]
+    pub fn reset_check(&self, seq: u32) -> ResetCheck {
+        // Explicit branches instead of indexing keep bounds-check panics out of
+        // the eBPF object.
+        let (known, expected, window) = if self.reply & 1 == 0 {
+            (
+                self.track & Self::TRACK_ACK1 != 0,
+                self.acks[1],
+                self.windows[1],
+            )
+        } else {
+            (
+                self.track & Self::TRACK_ACK0 != 0,
+                self.acks[0],
+                self.windows[0],
+            )
+        };
+        if !known {
+            return ResetCheck::Unknown;
+        }
+        if seq == expected {
+            return ResetCheck::Exact;
+        }
+        let scaled = (window as u32) << 14;
+        let bound = if scaled > RESET_WINDOW_MAX {
+            RESET_WINDOW_MAX
+        } else {
+            scaled
+        };
+        // Either side of the last ACK: reordering can leave the recorded ACK
+        // slightly behind or ahead of the endpoint's real RCV.NXT.
+        if seq.wrapping_sub(expected) <= bound || expected.wrapping_sub(seq) <= bound {
+            ResetCheck::InWindow
+        } else {
+            ResetCheck::Invalid
+        }
+    }
+
+    /// Record the sequence evidence of one admitted segment sent in this
+    /// entry's direction. `old_phase` is the phase before the transition this
+    /// segment caused. Resets never move the evidence: a forged one must not
+    /// teach the tracker a sequence number.
+    #[inline(always)]
+    pub fn track_segment(&mut self, old_phase: u32, control: u8, ack: u32, window: u16) {
+        if control & tcp_flags::RST != 0 {
+            return;
+        }
+        let syn = control & tcp_flags::SYN != 0;
+        let has_ack = control & tcp_flags::ACK != 0;
+        if old_phase == Self::ESTABLISHED && self.phase == Self::SYN_RECV {
+            // The responder accepted a reopening SYN: a new sequence space.
+            self.track = 0;
+        }
+        let initiator = self.reply & 1 == 0;
+        if initiator {
+            self.windows[0] = window;
+            if has_ack {
+                self.acks[0] = ack;
+                self.track |= Self::TRACK_ACK0;
+            }
+            if control & tcp_flags::FIN != 0 {
+                self.track |= Self::TRACK_FIN0;
+            }
+            if syn && !has_ack && self.phase == Self::ESTABLISHED {
+                self.track |= Self::TRACK_REOPEN;
+            }
+        } else {
+            self.windows[1] = window;
+            if has_ack {
+                self.acks[1] = ack;
+                self.track |= Self::TRACK_ACK1;
+            }
+            if control & tcp_flags::FIN != 0 {
+                self.track |= Self::TRACK_FIN1;
+            }
+            if !syn {
+                self.track &= !Self::TRACK_REOPEN;
+            }
+        }
+    }
+}
+
+/// NAT binding (`FlowState`) TCP lifetime bits, kept in `FlowState::_pad`. The
+/// field never crosses the HA wire (sync encodes it as zero), so an imported
+/// or legacy binding reads as "established", exactly its previous lifetime.
+pub mod nat_lifetime {
+    /// Created by a SYN; no non-SYN segment has been accounted to it yet.
+    pub const EMBRYONIC: u16 = 1;
+    /// A FIN has been accounted to this binding.
+    pub const FIN: u16 = 2;
+    /// A reset has been accounted to this binding.
+    pub const RESET: u16 = 4;
+    const KNOWN: u16 = EMBRYONIC | FIN | RESET;
+
+    /// Lifetime bits after one TCP segment with `control` flags was translated
+    /// through the binding. Non-TCP bindings never carry bits.
+    #[inline(always)]
+    pub fn observe(bits: u16, proto: u8, control: u8) -> u16 {
+        if proto != crate::ip_proto::TCP {
+            return bits;
+        }
+        let mut bits = bits & KNOWN;
+        if control & crate::tcp_flags::RST != 0 {
+            bits |= RESET;
+        } else if control & crate::tcp_flags::SYN == 0 {
+            bits &= !EMBRYONIC;
+        }
+        if control & crate::tcp_flags::FIN != 0 {
+            bits |= FIN;
+        }
+        bits
+    }
+
+    /// Bits for a binding a packet with `control` is about to create.
+    #[inline(always)]
+    pub fn opening(proto: u8, control: u8) -> u16 {
+        if proto == crate::ip_proto::TCP && control & crate::tcp_flags::SYN != 0 {
+            EMBRYONIC
+        } else {
+            0
+        }
+    }
+
+    /// Idle timeout of a NAT binding. UDP/ICMP and bits-free TCP keep the
+    /// historical "established" timeout.
+    #[inline(always)]
+    pub fn timeout_ns(bits: u16, proto: u8, timeouts: crate::ConntrackTimeouts) -> u64 {
+        let seconds = if proto == crate::ip_proto::TCP {
+            if bits & RESET != 0 {
+                timeouts.tcp_closing
+            } else if bits & FIN != 0 {
+                if timeouts.tcp_closing > super::HALF_CLOSE_MIN_S {
+                    timeouts.tcp_closing
+                } else {
+                    super::HALF_CLOSE_MIN_S
+                }
+            } else if bits & EMBRYONIC != 0 {
+                timeouts.tcp_syn
+            } else {
+                timeouts.tcp_established
+            }
+        } else if proto == crate::ip_proto::UDP {
+            timeouts.udp_stream
+        } else {
+            timeouts.icmp
+        };
+        seconds as u64 * 1_000_000_000
+    }
 }
 
 #[cfg(feature = "user")]
@@ -321,6 +597,7 @@ mod tests {
             age_ns: 4_000_000_000,
             phase: 1,
             reply: 1,
+            ..FirewallState::UNTRACKED
         };
         assert_eq!(state.idle_ns(1), 4_000_000_000);
         assert!(!state.expired(1, 999_999_999, t));
@@ -389,6 +666,7 @@ mod tests {
                 age_ns: 0,
                 phase,
                 reply: 0,
+                ..FirewallState::UNTRACKED
             };
             let end = 100 + seconds * 1_000_000_000;
             assert!(!state.expired(proto, end - 1, custom));
@@ -421,7 +699,7 @@ mod tests {
         assert_ne!(a, FirewallKey { family: 6, ..a });
         assert_ne!(a, FirewallKey { src_port: 124, ..a });
         assert_eq!(core::mem::size_of::<FirewallKey>(), 44);
-        assert_eq!(core::mem::size_of::<FirewallState>(), 24);
+        assert_eq!(core::mem::size_of::<FirewallState>(), 40);
     }
 
     fn closing() -> FirewallState {
@@ -430,6 +708,7 @@ mod tests {
             age_ns: 0,
             phase: FirewallState::CLOSING,
             reply: 0,
+            ..FirewallState::UNTRACKED
         }
     }
 
@@ -449,15 +728,22 @@ mod tests {
     }
 
     #[test]
-    fn active_connections_do_not_accept_new_syn_as_established() {
-        for reply in [0, 1] {
-            let state = FirewallState {
-                phase: FirewallState::ESTABLISHED,
-                reply,
-                ..closing()
-            };
-            assert_eq!(state.classify(6, tcp_flags::SYN, 2, T), 2);
-        }
+    fn active_connections_forward_an_initiator_syn_without_changing_state() {
+        let state = FirewallState {
+            phase: FirewallState::ESTABLISHED,
+            reply: 0,
+            ..closing()
+        };
+        // DP-25b: a SYN reusing a silently dead tuple is forwarded, but the
+        // established state stays until the responder answers with a SYN-ACK.
+        assert_eq!(state.classify(6, tcp_flags::SYN, 2, T), 1);
+        assert_eq!(
+            state.next_phase(6, tcp_flags::SYN),
+            Some(FirewallState::ESTABLISHED)
+        );
+        // The responder never opens with a bare SYN on a live tuple.
+        let responder = FirewallState { reply: 1, ..state };
+        assert_eq!(responder.classify(6, tcp_flags::SYN, 2, T), 2);
     }
 
     #[test]
@@ -529,6 +815,7 @@ mod tests {
             age_ns: 0,
             phase: FirewallState::ESTABLISHED,
             reply: 0,
+            ..FirewallState::UNTRACKED
         };
         // Deterministic interleaving: A reads the clock, B refreshes the map,
         // then A reads the map. The old subtraction expired/deleted this flow.
@@ -556,5 +843,221 @@ mod tests {
         assert!(state.is_routed_reply(17, 0, 2, T));
         assert!(!FirewallState { reply: 0, ..state }.is_routed_reply(17, 0, 2, T));
         assert!(!state.is_routed_reply(17, 0, 1 + T.udp as u64 * 1_000_000_000, T));
+    }
+
+    fn established(reply: u32) -> FirewallState {
+        FirewallState {
+            last_seen_ns: 1,
+            phase: FirewallState::ESTABLISHED,
+            reply,
+            acks: [1_000, 5_000],
+            windows: [512, 64],
+            track: FirewallState::TRACK_ACK0 | FirewallState::TRACK_ACK1,
+            ..FirewallState::UNTRACKED
+        }
+    }
+
+    #[test]
+    fn state_layout_appends_tracking_after_the_replicated_fields() {
+        assert_eq!(core::mem::size_of::<FirewallState>(), 40);
+        assert_eq!(core::mem::offset_of!(FirewallState, phase), 16);
+        assert_eq!(core::mem::offset_of!(FirewallState, reply), 20);
+        assert_eq!(core::mem::offset_of!(FirewallState, acks), 24);
+        assert_eq!(core::mem::offset_of!(FirewallState, windows), 32);
+        assert_eq!(core::mem::offset_of!(FirewallState, track), 36);
+    }
+
+    #[test]
+    fn a_reset_is_exact_only_at_the_receivers_last_ack() {
+        // Responder (reply 1) resets: judged against the initiator's ACK.
+        let server = established(1);
+        assert_eq!(server.reset_check(1_000), ResetCheck::Exact);
+        assert_eq!(server.reset_check(1_001), ResetCheck::InWindow);
+        assert_eq!(server.reset_check(999), ResetCheck::InWindow);
+        assert_eq!(
+            server.reset_check(1_000 + (512 << 14)),
+            ResetCheck::InWindow
+        );
+        assert_eq!(
+            server.reset_check(1_000 + (512 << 14) + 1),
+            ResetCheck::Invalid
+        );
+        // The tcp-reset-validation fixture's blind displacement.
+        assert_eq!(
+            server.reset_check(1_000u32.wrapping_add(0x4000_0000)),
+            ResetCheck::Invalid
+        );
+        // Initiator (reply 0) resets: judged against the responder's ACK/window.
+        let client = established(0);
+        assert_eq!(client.reset_check(5_000), ResetCheck::Exact);
+        assert_eq!(client.reset_check(5_000 + (64 << 14)), ResetCheck::InWindow);
+        assert_eq!(client.reset_check(5_001 + (64 << 14)), ResetCheck::Invalid);
+    }
+
+    #[test]
+    fn reset_window_is_capped_and_wraps_serially() {
+        let mut state = established(1);
+        state.windows[0] = u16::MAX;
+        state.acks[0] = u32::MAX - 10;
+        assert_eq!(state.reset_check(5), ResetCheck::InWindow);
+        assert_eq!(
+            state.reset_check((u32::MAX - 10).wrapping_add(RESET_WINDOW_MAX + 1)),
+            ResetCheck::Invalid
+        );
+        state.windows[0] = 0;
+        assert_eq!(state.reset_check(u32::MAX - 10), ResetCheck::Exact);
+        assert_eq!(state.reset_check(u32::MAX - 9), ResetCheck::Invalid);
+    }
+
+    #[test]
+    fn an_unobserved_receiver_ack_gives_no_sequence_evidence() {
+        let mut state = established(1);
+        state.track = FirewallState::TRACK_ACK1;
+        assert_eq!(state.reset_check(12_345), ResetCheck::Unknown);
+        // Imported/legacy state carries no tracking at all.
+        let legacy = FirewallState::untracked(1, 0, FirewallState::ESTABLISHED, 0);
+        assert_eq!(legacy.reset_check(0), ResetCheck::Unknown);
+    }
+
+    #[test]
+    fn tracking_records_ack_window_and_fin_per_direction_but_never_from_reset() {
+        let mut state = FirewallState::untracked(1, 0, FirewallState::ESTABLISHED, 0);
+        state.track_segment(FirewallState::ESTABLISHED, ACK, 77, 9);
+        assert_eq!((state.acks, state.windows), ([77, 0], [9, 0]));
+        assert_eq!(state.track, FirewallState::TRACK_ACK0);
+        let mut reverse = state.reverse();
+        reverse.track_segment(FirewallState::ESTABLISHED, ACK | tcp_flags::FIN, 88, 3);
+        assert_eq!((reverse.acks, reverse.windows), ([77, 88], [9, 3]));
+        assert_eq!(
+            reverse.track,
+            FirewallState::TRACK_ACK0 | FirewallState::TRACK_ACK1 | FirewallState::TRACK_FIN1
+        );
+        let before = reverse;
+        reverse.track_segment(FirewallState::ESTABLISHED, tcp_flags::RST | ACK, 1, 1);
+        assert_eq!(reverse, before);
+    }
+
+    #[test]
+    fn retransmitted_synack_after_established_is_valid_and_keeps_state() {
+        let server = established(1);
+        assert_eq!(server.classify(6, SYN | ACK, 2, T), 1);
+        assert_eq!(
+            server.next_phase(6, SYN | ACK),
+            Some(FirewallState::ESTABLISHED)
+        );
+    }
+
+    #[test]
+    fn a_reopening_syn_becomes_a_new_connection_only_after_the_synack() {
+        let mut client = established(0);
+        let old = client.phase;
+        client.phase = client.next_phase(6, SYN).unwrap();
+        client.track_segment(old, SYN, 0, 100);
+        assert_ne!(client.track & FirewallState::TRACK_REOPEN, 0);
+        // A live endpoint answers with a challenge ACK: reopen is cancelled.
+        let mut live = client.reverse();
+        live.phase = live.next_phase(6, ACK).unwrap();
+        live.track_segment(FirewallState::ESTABLISHED, ACK, 5_000, 64);
+        assert_eq!(live.track & FirewallState::TRACK_REOPEN, 0);
+        assert_eq!(live.phase, FirewallState::ESTABLISHED);
+        // A dead endpoint's replacement answers SYN-ACK: new sequence space.
+        let mut fresh = client.reverse();
+        let old = fresh.phase;
+        fresh.phase = fresh.next_phase(6, SYN | ACK).unwrap();
+        assert_eq!(fresh.phase, FirewallState::SYN_RECV);
+        fresh.track_segment(old, SYN | ACK, 4242, 10);
+        assert_eq!(fresh.track, FirewallState::TRACK_ACK1);
+        assert_eq!(fresh.reset_check(1), ResetCheck::Unknown);
+    }
+
+    #[test]
+    fn half_close_outlives_the_closing_timeout_but_full_close_does_not() {
+        let mut state = established(0);
+        state.phase = FirewallState::CLOSING;
+        state.track |= FirewallState::TRACK_FIN0;
+        assert_eq!(
+            state.timeout_ns(6, T),
+            HALF_CLOSE_MIN_S as u64 * 1_000_000_000
+        );
+        state.track |= FirewallState::TRACK_FIN1;
+        assert_eq!(state.timeout_ns(6, T), T.tcp_closing as u64 * 1_000_000_000);
+        // Legacy CLOSING without FIN evidence keeps the configured timeout.
+        let legacy = FirewallState::untracked(1, 0, FirewallState::CLOSING, 0);
+        assert_eq!(
+            legacy.timeout_ns(6, T),
+            T.tcp_closing as u64 * 1_000_000_000
+        );
+        let long = ConntrackTimeouts {
+            tcp_closing: 600,
+            ..T
+        };
+        state.track &= !FirewallState::TRACK_FIN1;
+        assert_eq!(state.timeout_ns(6, long), 600 * 1_000_000_000);
+    }
+
+    #[test]
+    fn only_real_stack_flag_combinations_are_plausible() {
+        const PSH: u8 = 0x08;
+        const URG: u8 = 0x20;
+        for valid in [
+            SYN,
+            SYN | ACK,
+            SYN | URG,
+            ACK,
+            ACK | PSH,
+            ACK | URG | PSH,
+            tcp_flags::RST,
+            tcp_flags::RST | ACK,
+            tcp_flags::FIN | ACK,
+            tcp_flags::FIN | ACK | PSH,
+            SYN | 0x40 | 0x80,
+        ] {
+            assert!(FirewallState::tcp_flags_plausible(valid), "{valid:#x}");
+        }
+        for invalid in [
+            0,
+            tcp_flags::FIN,
+            tcp_flags::FIN | PSH | URG,
+            SYN | tcp_flags::FIN,
+            SYN | tcp_flags::RST,
+            tcp_flags::RST | tcp_flags::FIN | ACK,
+            PSH,
+            SYN | ACK | tcp_flags::FIN,
+        ] {
+            assert!(!FirewallState::tcp_flags_plausible(invalid), "{invalid:#x}");
+        }
+    }
+
+    #[test]
+    fn nat_bindings_get_lifetimes_from_what_crossed_them() {
+        use super::nat_lifetime::{EMBRYONIC, FIN, RESET, observe, opening, timeout_ns};
+        let s = |n: u32| n as u64 * 1_000_000_000;
+        assert_eq!(opening(6, SYN), EMBRYONIC);
+        assert_eq!(opening(6, ACK), 0);
+        assert_eq!(opening(17, 0), 0);
+        assert_eq!(timeout_ns(EMBRYONIC, 6, T), s(T.tcp_syn));
+        assert_eq!(
+            timeout_ns(observe(EMBRYONIC, 6, SYN | ACK), 6, T),
+            s(T.tcp_syn)
+        );
+        let established = observe(EMBRYONIC, 6, ACK);
+        assert_eq!(established, 0);
+        assert_eq!(timeout_ns(established, 6, T), s(T.tcp_established));
+        assert_eq!(
+            timeout_ns(observe(0, 6, tcp_flags::FIN | ACK), 6, T),
+            s(HALF_CLOSE_MIN_S)
+        );
+        assert_eq!(
+            timeout_ns(observe(FIN, 6, tcp_flags::RST), 6, T),
+            s(T.tcp_closing)
+        );
+        assert_eq!(observe(0, 6, tcp_flags::RST) & RESET, RESET);
+        // Legacy/imported (zero) bits keep the historical lifetime.
+        assert_eq!(timeout_ns(0, 6, T), s(T.tcp_established));
+        assert_eq!(timeout_ns(0, 17, T), s(T.udp_stream));
+        assert_eq!(timeout_ns(0, 1, T), s(T.icmp));
+        // Unknown bits are discarded, non-TCP never gains bits.
+        assert_eq!(observe(0xff00, 6, ACK), 0);
+        assert_eq!(observe(0, 17, tcp_flags::FIN), 0);
     }
 }

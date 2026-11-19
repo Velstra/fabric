@@ -63,12 +63,14 @@ fn kernel_expiry_maintenance() -> Result<()> {
         age_ns: 0,
         phase: FirewallState::ESTABLISHED,
         reply: 0,
+        ..FirewallState::UNTRACKED
     };
     let expired = FirewallState {
         last_seen_ns: 0,
         age_ns: u64::MAX,
         phase: FirewallState::NEW,
         reply: 1,
+        ..FirewallState::UNTRACKED
     };
     let mut rows = Vec::new();
     for cycle in 0..16 {

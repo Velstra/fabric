@@ -408,11 +408,34 @@ pub enum Counter {
     /// DroppedRule (or SynproxyRejected for a cookie admission failure).
     /// Not a flow count, capacity measurement or proof of paired atomicity.
     FirewallStateWriteFailed = 48,
+    /// A TCP reset that must not change connection state was refused: its
+    /// sequence number is outside every window the receiver could have
+    /// advertised, or its TCP checksum is wrong (RFC 5961). Reason subset of
+    /// DroppedRule (ingress) or EgressDropped (TC egress), counting packets.
+    TcpInvalidReset = 49,
+    /// A TCP segment with a flag combination no real stack sends (NULL, XMAS,
+    /// SYN+FIN, SYN+RST, FIN without ACK) was refused on a stateful hook with
+    /// no connection state. Reason subset of DroppedRule / EgressDropped.
+    TcpInvalidFlags = 50,
+    /// A packet that would have left a masquerade uplink with a source the
+    /// box does not own, and that the datapath cannot translate (a protocol
+    /// without ports, or an ICMP message that is neither an echo request nor a
+    /// related error), was refused instead of leaking the private source.
+    /// Reason subset of EgressDropped.
+    EgressNatUnsupportedDropped = 51,
+    /// A non-first IPv4 fragment was translated with the address rewrite
+    /// recorded from its datagram's first fragment.
+    FragmentNatTranslated = 52,
+    /// A TCP segment that cannot open a connection (no SYN) found no NAT
+    /// binding and was refused rather than allocating one: non-opener floods
+    /// cannot evict other clients' bindings. Reason subset of EgressDropped
+    /// (masquerade) or DroppedRule (destination NAT).
+    NatOpenerRequired = 53,
 }
 
 impl Counter {
     /// Number of distinct counters — the `max_entries` of the `STATS` map.
-    pub const COUNT: u32 = 49;
+    pub const COUNT: u32 = 54;
 
     /// The array index of this counter.
     #[inline]
@@ -467,6 +490,11 @@ impl Counter {
             46 => Counter::EgressNatNoCandidate,
             47 => Counter::EgressNatClaimFailed,
             48 => Counter::FirewallStateWriteFailed,
+            49 => Counter::TcpInvalidReset,
+            50 => Counter::TcpInvalidFlags,
+            51 => Counter::EgressNatUnsupportedDropped,
+            52 => Counter::FragmentNatTranslated,
+            53 => Counter::NatOpenerRequired,
             36 => Counter::SynproxyChallenged,
             37 => Counter::SynproxyAdmitted,
             38 => Counter::SynproxyRejected,
@@ -532,6 +560,11 @@ impl Counter {
             Counter::EgressNatNoCandidate => "egress_nat_no_candidate",
             Counter::EgressNatClaimFailed => "egress_nat_claim_failed",
             Counter::FirewallStateWriteFailed => "firewall_state_write_failed",
+            Counter::TcpInvalidReset => "tcp_invalid_reset",
+            Counter::TcpInvalidFlags => "tcp_invalid_flags",
+            Counter::EgressNatUnsupportedDropped => "egress_nat_unsupported_dropped",
+            Counter::FragmentNatTranslated => "fragment_nat_translated",
+            Counter::NatOpenerRequired => "nat_opener_required",
             Counter::SynproxyChallenged => "synproxy_challenged",
             Counter::SynproxyAdmitted => "synproxy_admitted",
             Counter::SynproxyRejected => "synproxy_rejected",
@@ -866,7 +899,13 @@ mod tests {
             Counter::FirewallStateWriteFailed.label(),
             "firewall_state_write_failed"
         );
-        assert_eq!(Counter::COUNT, 49);
+        assert_eq!(Counter::TcpInvalidReset.index(), 49);
+        assert_eq!(Counter::NatOpenerRequired.index(), 53);
+        assert_eq!(
+            Counter::EgressNatUnsupportedDropped.label(),
+            "egress_nat_unsupported_dropped"
+        );
+        assert_eq!(Counter::COUNT, 54);
     }
 
     #[test]

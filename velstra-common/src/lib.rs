@@ -61,14 +61,20 @@ mod telemetry;
 pub use cgnat::CgnatLayout;
 pub use cidr::{Cidr4, Cidr6, CidrError, mask_v4, mask_v6, parse_cidr_v4, parse_cidr_v6};
 pub use config::{ConfigFlags, GlobalConfig, SourceValidation};
-pub use conntrack::{ConntrackTimeouts, FirewallKey, FirewallState};
+pub use conntrack::{
+    ConntrackTimeouts, FirewallKey, FirewallState, HALF_CLOSE_MIN_S, RESET_WINDOW_MAX, ResetCheck,
+    nat_lifetime,
+};
 pub use dhcp::{DHCP_FIB_NOT_FORWARDED, dhcp_fib_is_local, dhcpv4_reply_matches};
 pub use firewall_session::{FirewallSession, FirewallSessionKey, SessionDirection, SessionError};
 pub use forward::{
     ForwardOutcome, Rewrite, RouteEntry, csum_replace_u16, decrement_ttl, ipv4_checksum,
     plan_forward,
 };
-pub use fragment_guard::forwarded_masquerade_fragment_drops;
+pub use fragment_guard::{
+    FRAGMENT_HOOK_EGRESS, FRAGMENT_HOOK_INGRESS, FRAGMENT_NAT_TIMEOUT_NS, FragmentKey, FragmentNat,
+    FragmentPosition, forwarded_masquerade_fragment_drops,
+};
 pub use icmp_related::{
     RelatedChecksums, related_checksum_copy_length, related_checksums,
     related_hairpin_firewall_candidate, related_icmp_error,

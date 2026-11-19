@@ -309,6 +309,7 @@ fn populate(ebpf: &mut Ebpf, count: usize) -> Result<Vec<(FirewallKey, FirewallS
             age_ns: 17,
             phase: FirewallState::ESTABLISHED,
             reply: (index % 2) as u32,
+            ..FirewallState::UNTRACKED
         };
         map.insert(key, state, 1)?;
         entries.push((key, state));
