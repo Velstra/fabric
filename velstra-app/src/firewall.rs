@@ -748,6 +748,8 @@ pub struct Firewall {
     state_adopted: bool,
     /// The bpffs pin directory when `[state] persist` is on (DP-12, DP-27).
     persist: Option<crate::persist::Persist>,
+    /// Where this agent's tail-call program arrays are pinned, when persisting.
+    program_arrays: Option<std::path::PathBuf>,
     /// Consecutive polls whose host inventory was torn by a concurrent change
     /// even after [`crate::host_inventory::read`]'s own retries (DP-32).
     torn_inventory_polls: u32,
@@ -1157,6 +1159,12 @@ impl Firewall {
             programs.set(0, &fd, 0)?;
         }
 
+        // Before anything is attached: from here on a dead agent's links must
+        // still find their tail-call targets.
+        let program_arrays = persist
+            .as_ref()
+            .map(|persist| persist.pin_program_arrays(&ebpf))
+            .transpose()?;
         let program: &mut Xdp = ebpf
             .program_mut("velstra")
             .ok_or_else(|| anyhow!("eBPF object has no `velstra` program"))?
@@ -1238,6 +1246,7 @@ impl Firewall {
             sizing,
             state_adopted: state_dir.as_ref().is_some_and(|dir| dir.adopted),
             persist,
+            program_arrays,
             runtime_blocks: BTreeMap::new(),
             portal_sessions: BTreeMap::new(),
             runtime_mappings: BTreeMap::new(),
@@ -1280,6 +1289,11 @@ impl Firewall {
                 }
             }
             Err(error) => warn!("listing pinned hooks: {error:#}"),
+        }
+        if let Some(keep) = &self.program_arrays
+            && let Err(error) = persist.sweep_program_arrays(keep)
+        {
+            warn!("removing the previous agent's program arrays: {error:#}");
         }
     }
 

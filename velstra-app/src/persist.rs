@@ -37,6 +37,15 @@ use crate::state_tables::Sizing;
 pub const ROOT: &str = "/sys/fs/bpf/velstra";
 const LINKS: &str = "links";
 const STATE_PREFIX: &str = "state-";
+const PROGS_PREFIX: &str = "progs-";
+
+/// The tail-call program arrays. The kernel empties a program array once no
+/// user-space reference to it remains (to break reference cycles), so a dead
+/// agent's pinned links would keep running programs whose every tail call
+/// fails — dropping all traffic instead of enforcing the last policy. Each
+/// agent therefore pins its own arrays, under a directory of its own; the next
+/// agent removes them once its programs have replaced the old ones.
+pub const PROGRAM_ARRAYS: [&str; 3] = ["VELSTRA_PROGS", "V4_STATE_PROGS", "EGRESS_PROGS"];
 
 /// Bump when the **meaning** of any field of `FirewallKey`, `FirewallState`,
 /// `FlowKey`, `FlowState` or `SynFlow` changes without its size changing. A
@@ -316,6 +325,41 @@ impl Persist {
             }
         }
         Ok(pins)
+    }
+
+    /// Pin this agent's tail-call program arrays (see [`PROGRAM_ARRAYS`]) in a
+    /// directory no other agent uses. Returns that directory.
+    pub fn pin_program_arrays(&self, ebpf: &aya::Ebpf) -> Result<PathBuf> {
+        let generation = format!(
+            "{PROGS_PREFIX}{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        );
+        let dir = self.root.join(generation);
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        for name in PROGRAM_ARRAYS {
+            ebpf.map(name)
+                .with_context(|| format!("{name} missing"))?
+                .pin(dir.join(name))
+                .with_context(|| format!("pinning {name}"))?;
+        }
+        Ok(dir)
+    }
+
+    /// Remove every agent's program arrays except `keep`'s. Called once this
+    /// agent's programs own every pinned link: the previous agent's programs
+    /// are then unreachable and may go.
+    pub fn sweep_program_arrays(&self, keep: &Path) -> Result<()> {
+        for entry in read_dir(&self.root)? {
+            let path = entry.path();
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with(PROGS_PREFIX) && path != keep {
+                remove_tree(&path)?;
+            }
+        }
+        Ok(())
     }
 
     /// Detach every pinned link and drop every pinned state map.
