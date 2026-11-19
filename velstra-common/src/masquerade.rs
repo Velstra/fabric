@@ -809,4 +809,18 @@ mod tests {
         };
         assert!(nat_entry_replaceable(&busy, &mine, 17, 200, t));
     }
+
+    #[test]
+    fn the_ha_window_starts_with_exactly_the_legacy_eight_candidates() {
+        // DP-26: an older peer searches only these eight; the HA window must
+        // extend them, not reorder them.
+        let src = [192, 168, 50, 100];
+        let layout = crate::CgnatLayout::default();
+        for seed in [0u32, 1, 7, 32_767, 32_768, 1 << 20, u32::MAX - 100] {
+            let domain = NaptDomain::new(src, seed, &layout);
+            for i in 0..8u16 {
+                assert_eq!(domain.candidate(i as u32), napt_port(seed, i), "{seed} {i}");
+            }
+        }
+    }
 }
