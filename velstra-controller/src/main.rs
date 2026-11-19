@@ -1188,6 +1188,7 @@ fn config_rule_from_proto(r: &PortRule) -> ConfigPortRule {
         log: r.log,
         src: (!r.src.is_empty()).then(|| r.src.clone()),
         dst: (!r.dst.is_empty()).then(|| r.dst.clone()),
+        dst_local: false,
         limit: (r.limit != 0).then_some(r.limit),
         burst: (r.burst != 0).then_some(r.burst),
         icmp_type: (r.icmp_type != 0).then(|| r.icmp_type.min(u8::MAX as u32) as u8),

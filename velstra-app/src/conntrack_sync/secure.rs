@@ -1096,8 +1096,16 @@ pub(crate) fn policy_fingerprint(cfg: &RuntimeConfig) -> Result<[u8; 32]> {
         "block6":p.blocklist6.iter().map(|c| (c.octets,c.prefix)).collect::<Vec<_>>(),
         "mac":p.mac_rules.iter().map(|(m,a)| (*m,a.as_u32())).collect::<Vec<_>>(),
         "portal":p.portal.map(|g| (g.portal4,g.portal6)),
-        "rules":p.port_rules.iter().map(|r| json!([r.name,r.key.proto,r.key.port,r.icmp_type,r.in_interface,r.scope,
-            r.src.map(|c|(c.octets,c.prefix)),r.dst.map(|c|(c.octets,c.prefix)),r.src6.map(|c|(c.octets,c.prefix)),r.dst6.map(|c|(c.octets,c.prefix)),r.action.as_u32(),r.log,r.limit])).collect::<Vec<_>>()
+        "rules":p.port_rules.iter().map(|r| {
+            let mut rule = json!([r.name,r.key.proto,r.key.port,r.icmp_type,r.in_interface,r.scope,
+            r.src.map(|c|(c.octets,c.prefix)),r.dst.map(|c|(c.octets,c.prefix)),r.src6.map(|c|(c.octets,c.prefix)),r.dst6.map(|c|(c.octets,c.prefix)),r.action.as_u32(),r.log,r.limit]);
+            // Symbolic and member-independent; appended only when set, so the
+            // fingerprint of every configuration without one is unchanged.
+            if r.dst_local && let Some(fields) = rule.as_array_mut() {
+                fields.push(json!("dst-local"));
+            }
+            rule
+        }).collect::<Vec<_>>()
     })).collect();
     let mut interfaces: Vec<_> = cfg
         .interfaces

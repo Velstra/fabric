@@ -1920,7 +1920,7 @@ impl Firewall {
             apply_config_quiesced(
                 &mut self.ebpf,
                 &merged,
-                Some(&previous),
+                Some((&previous, &previous_host)),
                 &prepared,
                 reset,
                 &quiesced,
@@ -1942,7 +1942,7 @@ impl Firewall {
                     apply_config_quiesced(
                         &mut self.ebpf,
                         &previous,
-                        Some(&merged),
+                        Some((&merged, &prepared)),
                         &previous_host,
                         reset,
                         &quiesced,
@@ -3071,6 +3071,9 @@ pub fn render_mac(mac: [u8; 6]) -> String {
 /// Remove every map entry that `old` installed, so a reconfigure doesn't leave
 /// stale rules behind. Missing keys are ignored (the entry may already be gone).
 fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
+    // A symbolic rule has no entry of its own to find; its host routes are
+    // only known from the host facts it was written with.
+    crate::local_destination::ensure_concrete(old)?;
     {
         let mut config: HashMap<_, PolicyId, GlobalConfig> = HashMap::try_from(
             ebpf.map_mut("CONFIG")
@@ -3455,6 +3458,10 @@ struct PreparedHostConfig {
     srv6: Srv6Config,
     route_ifindices: BTreeMap<String, u32>,
     ipv4: Ipv4Inventory,
+    /// Every address this host holds, both families, when the configuration
+    /// has a `dst-local` rule to resolve with it; empty otherwise, so a
+    /// configuration without one keeps its old refresh behaviour exactly.
+    local: BTreeSet<std::net::IpAddr>,
 }
 
 /// The merged source intent and the applied maps are known to agree only after
@@ -3490,10 +3497,13 @@ fn local_address_additions(
     previous: &PreparedHostConfig,
     observed: &PreparedHostConfig,
 ) -> Option<BTreeSet<[u8; 8]>> {
+    // A changed local set changes rule-trie entries (`dst-local`), which
+    // only the full closed-gate rewrite may do.
     if previous.overlay != observed.overlay
         || previous.srv6 != observed.srv6
         || previous.route_ifindices != observed.route_ifindices
         || previous.ipv4.len() != observed.ipv4.len()
+        || previous.local != observed.local
     {
         return None;
     }
@@ -3555,19 +3565,40 @@ fn prepare_host_config(cfg: &RuntimeConfig) -> Result<PreparedHostConfig> {
         }
         None => Srv6Config::DISABLED,
     };
+    let (ipv4, local) = observe_host(cfg)?;
     Ok(PreparedHostConfig {
         overlay,
         srv6,
         route_ifindices: route_interface_indices(&cfg.routes)?,
-        ipv4: read_ipv4_inventory(&cfg.interfaces)?,
+        ipv4,
+        local,
     })
+}
+
+/// One rtnetlink observation, as the two host facts derived from it: the
+/// configured interfaces' IPv4 inventory, and — only when a rule needs it —
+/// every address the host holds.
+fn observe_host(cfg: &RuntimeConfig) -> Result<(Ipv4Inventory, BTreeSet<std::net::IpAddr>)> {
+    let _timing = timing::Span::start(timing::Phase::HostObserver);
+    let links = crate::host_inventory::read()?;
+    let local = if crate::local_destination::has_local_rules(cfg) {
+        crate::local_destination::observed(&links)
+    } else {
+        BTreeSet::new()
+    };
+    Ok((ipv4_inventory_from(links, &cfg.interfaces)?, local))
 }
 
 fn revalidate_host_config(cfg: &RuntimeConfig, prepared: &PreparedHostConfig) -> Result<()> {
     let _timing = timing::Span::start(timing::Phase::HostRevalidate);
+    let (ipv4, local) = observe_host(cfg)?;
     anyhow::ensure!(
-        read_ipv4_inventory(&cfg.interfaces)? == prepared.ipv4,
+        ipv4 == prepared.ipv4,
         "interface IPv4 inventory no longer matches the prepared policy"
+    );
+    anyhow::ensure!(
+        local == prepared.local,
+        "host addresses no longer match the prepared local-destination rules"
     );
     anyhow::ensure!(
         route_interface_indices(&cfg.routes)? == prepared.route_ifindices,
@@ -3632,15 +3663,24 @@ impl ReaderQuiescence {
 /// and the first grace period already drained older invocations (including
 /// their tail calls), even while CONFIG_EPOCH becomes even between writes.
 /// When `old` is `Some`, remove its entries before installing the replacement.
+/// `old` is the configuration whose entries are to be removed, with the host
+/// facts it was written with: its `dst-local` rules were written as one
+/// entry per address that host held then, and only those exact entries can be
+/// found again to remove.
 fn apply_config_quiesced(
     ebpf: &mut Ebpf,
     cfg: &RuntimeConfig,
-    old: Option<&RuntimeConfig>,
+    old: Option<(&RuntimeConfig, &PreparedHostConfig)>,
     prepared: &PreparedHostConfig,
     reset: bool,
     quiesced: &ReaderQuiescence,
 ) -> Result<()> {
     let _timing = timing::Span::start(timing::Phase::MapApply);
+    // The writers below see only concrete rules; the symbolic configuration
+    // stays what the caller keeps (and fingerprints).
+    let cfg = &*crate::local_destination::concrete(cfg, &prepared.local);
+    let old_concrete = old.map(|(o, host)| crate::local_destination::concrete(o, &host.local));
+    let old = old_concrete.as_deref();
     let gate = Array::<_, u32>::try_from(
         ebpf.map("APPLY_STATE")
             .ok_or_else(|| anyhow!("APPLY_STATE map missing"))?,
@@ -3862,6 +3902,7 @@ fn program_rate_limits(
 }
 
 fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
+    crate::local_destination::ensure_concrete_policies(policies)?;
     let limit_slots = program_rate_limits(ebpf, policies)?;
     {
         let mut config: HashMap<_, PolicyId, GlobalConfig> = HashMap::try_from(
@@ -4983,10 +5024,18 @@ fn normalize_interface_ipv4(
 /// In particular, interpreting an arbitrary label's prefix as a device name
 /// could grant a different zone's reply policy. iproute2's JSON preserves the
 /// actual owning link; labels are never used for authorization.
+#[cfg(test)]
 fn read_ipv4_inventory(interfaces: &[ResolvedInterface]) -> Result<Ipv4Inventory> {
     let _timing = timing::Span::start(timing::Phase::HostObserver);
+    ipv4_inventory_from(crate::host_inventory::read()?, interfaces)
+}
+
+fn ipv4_inventory_from(
+    links: Vec<crate::host_inventory::Interface>,
+    interfaces: &[ResolvedInterface],
+) -> Result<Ipv4Inventory> {
     let mut inventory = BTreeMap::new();
-    for link in crate::host_inventory::read()? {
+    for link in links {
         let Some(iface) = interfaces.iter().find(|iface| iface.name == link.name) else {
             continue;
         };
@@ -6312,6 +6361,7 @@ mod tests {
                     prefixes: BTreeSet::from([([192, 0, 2, 1], [255, 255, 255, 0])]),
                 },
             )]),
+            local: BTreeSet::new(),
         };
         let mut observed = previous.clone();
         observed
@@ -6351,6 +6401,22 @@ mod tests {
         intent.begin();
         intent.finish(Ok(())).unwrap();
         assert!(intent.allows_address_refresh(Some(CONFIG_READY), true));
+    }
+
+    /// DP-16: with a `dst-local` rule, a new host address (a DHCP lease,
+    /// a VRRP address arriving on failover) changes rule-trie entries. The
+    /// additive shortcut only grows LOCAL_EGRESS_ADDRS and must not be taken,
+    /// or the rule would keep matching the old address set.
+    #[test]
+    fn a_changed_local_destination_set_takes_the_full_rewrite() {
+        let (mut previous, mut observed) = address_addition_fixture();
+        previous.local = BTreeSet::from(["192.0.2.1".parse().unwrap()]);
+        observed.local =
+            BTreeSet::from(["192.0.2.1".parse().unwrap(), "192.0.2.100".parse().unwrap()]);
+        assert_eq!(local_address_additions(&previous, &observed), None);
+        // Unchanged local sets keep the shortcut available.
+        observed.local = previous.local.clone();
+        assert!(local_address_additions(&previous, &observed).is_some());
     }
 
     #[test]

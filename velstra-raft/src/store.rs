@@ -1434,6 +1434,7 @@ mod tests {
                         log: false,
                         src: None,
                         dst: None,
+                        dst_local: false,
                         limit: None,
                         burst: None,
                     }],
