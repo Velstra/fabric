@@ -824,6 +824,34 @@ fn decode_authority(bytes: &[u8], policy: [u8; 32]) -> Result<Option<Authority>>
     }))
 }
 
+/// How often a standby says it is refusing its peer's state because the two
+/// policies differ. The sender reconnects every interval, so one line per
+/// session would flood the journal; none at all (the old debug-only path)
+/// left an unsynchronized pair looking healthy (T4.8-ct).
+const POLICY_REFUSAL_WARN_EVERY: Duration = Duration::from_secs(60);
+
+fn policy_refusal_due(last: &mut Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    let due = last.is_none_or(|at| now.saturating_duration_since(at) >= POLICY_REFUSAL_WARN_EVERY);
+    if due {
+        *last = Some(now);
+    }
+    due
+}
+
+fn warn_policy_refusal(peer: IpAddr, now: std::time::Instant) {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let due = LAST
+        .lock()
+        .map(|mut last| policy_refusal_due(&mut last, now))
+        .unwrap_or(true);
+    if due {
+        warn!(
+            "conntrack-sync: refusing state from {peer}: its firewall policy differs from ours; \
+             no connection state is replicated until both members hold the same policy"
+        );
+    }
+}
+
 struct Receiver {
     firewall: Arc<Mutex<Firewall>>,
     store: Arc<Mutex<Store>>,
@@ -866,10 +894,10 @@ async fn receive(
             initialized || kind == BEGIN,
             "state session requires an initial snapshot"
         );
-        ensure!(
-            fw.sync_policy()? == policy,
-            "peer firewall policy differs; refusing state"
-        );
+        if fw.sync_policy()? != policy {
+            warn_policy_refusal(peer, std::time::Instant::now());
+            bail!("peer firewall policy differs; refusing state");
+        }
         let mut ha = ha.lock().await;
         if kind == BEGIN {
             authority = decode_authority(payload, policy)?;
@@ -2254,6 +2282,25 @@ mod tests {
             policy_fingerprint(&member_policy(1, false, Some("fd42:2::1"))).unwrap(),
             "portal family"
         );
+    }
+
+    #[test]
+    fn a_policy_refusal_is_reported_once_per_interval() {
+        let start = std::time::Instant::now();
+        let mut last = None;
+        assert!(policy_refusal_due(&mut last, start));
+        assert!(!policy_refusal_due(
+            &mut last,
+            start + Duration::from_secs(59)
+        ));
+        assert!(policy_refusal_due(
+            &mut last,
+            start + POLICY_REFUSAL_WARN_EVERY
+        ));
+        assert!(!policy_refusal_due(
+            &mut last,
+            start + Duration::from_secs(61)
+        ));
     }
 
     #[test]
