@@ -897,6 +897,7 @@ impl Firewall {
             "velstra_egress_v4",
             "velstra_egress_v6",
             "velstra_egress_v6_state",
+            "velstra_egress_v4_state",
             "velstra_masquerade",
             "velstra_egress_icmp",
             "velstra_deferred_snat",
@@ -6010,6 +6011,7 @@ fn attach_egress(
         (5, "velstra_egress_v6_state"),
         (6, "velstra_related_egress"),
         (7, "velstra_related_egress_apply"),
+        (8, "velstra_egress_v4_state"),
     ] {
         let fd = {
             let program: &mut SchedClassifier = ebpf
