@@ -687,6 +687,9 @@ pub struct Firewall {
     // A failed maintenance fence must not look healthy even if reading the
     // gate subsequently reports READY. Only successful reconciliation clears it.
     expiry_failed: bool,
+    /// Consecutive polls whose host inventory was torn by a concurrent change
+    /// even after [`crate::host_inventory::read`]'s own retries (DP-32).
+    torn_inventory_polls: u32,
     /// The configuration as it arrived, before the advertised rules were merged
     /// into it.
     ///
@@ -1123,6 +1126,7 @@ impl Firewall {
             explicit_egress_ifaces: if egress { ifaces.to_vec() } else { Vec::new() },
             conntrack: None,
             expiry_failed: false,
+            torn_inventory_polls: 0,
             runtime_blocks: BTreeMap::new(),
             portal_sessions: BTreeMap::new(),
             runtime_mappings: BTreeMap::new(),
@@ -1474,8 +1478,25 @@ impl Firewall {
         // applied_intent excludes that state from the additive path below.
         let merged = self.merged_config();
         let prepared = match prepare_host_config(&merged) {
-            Ok(prepared) => prepared,
+            Ok(prepared) => {
+                self.torn_inventory_polls = 0;
+                prepared
+            }
             Err(error) => {
+                if keep_last_inventory(
+                    crate::host_inventory::is_raced(&error),
+                    &mut self.torn_inventory_polls,
+                ) {
+                    // The host was changing while we looked. The last good
+                    // snapshot stays in force for a bounded number of polls
+                    // rather than blocking every flow on the box (DP-32).
+                    warn!(
+                        "interface observation raced a host change ({}/{MAX_TORN_INVENTORY_POLLS}); \
+                         keeping the last good inventory: {error:#}",
+                        self.torn_inventory_polls
+                    );
+                    return;
+                }
                 self.block_host_refresh(&error);
                 return;
             }
@@ -4484,6 +4505,25 @@ fn local_egress_addresses(
 }
 
 /// Whether the link's owner holds `name` down for this agent to raise.
+/// Polls in a row a torn host inventory may leave the last good snapshot in
+/// force. At the 2-second poll this bounds a stale address grant to about six
+/// seconds, the same order as the poll's own staleness; a host that keeps
+/// changing under every observation for longer than that still closes the gate.
+const MAX_TORN_INVENTORY_POLLS: u32 = 3;
+
+/// Whether a failed inventory poll keeps the last good snapshot (`true`) or
+/// blocks the datapath (`false`). Only a raced observation is tolerated, and
+/// only [`MAX_TORN_INVENTORY_POLLS`] times in a row; any other failure blocks
+/// at once and restarts the count.
+fn keep_last_inventory(raced: bool, consecutive: &mut u32) -> bool {
+    if !raced {
+        *consecutive = 0;
+        return false;
+    }
+    *consecutive = consecutive.saturating_add(1);
+    *consecutive <= MAX_TORN_INVENTORY_POLLS
+}
+
 fn is_held(interfaces: &[ResolvedInterface], name: &str) -> bool {
     interfaces.iter().any(|i| i.activate && i.name == name)
 }
@@ -6918,6 +6958,22 @@ mod tests {
     /// A held link comes up only once it carries its hooks and the policy is in
     /// force: bringing it up any earlier is the unfiltered window the hold
     /// exists to close.
+    #[test]
+    fn a_torn_inventory_keeps_the_last_snapshot_for_a_bounded_number_of_polls() {
+        // DP-32: an interrupted dump used to block the datapath on first sight.
+        let mut polls = 0;
+        for _ in 0..MAX_TORN_INVENTORY_POLLS {
+            assert!(keep_last_inventory(true, &mut polls));
+        }
+        // A host that never settles still fails closed.
+        assert!(!keep_last_inventory(true, &mut polls));
+        assert!(!keep_last_inventory(true, &mut polls));
+        // A real observation failure is never tolerated and resets the count.
+        assert!(!keep_last_inventory(false, &mut polls));
+        assert_eq!(polls, 0);
+        assert!(keep_last_inventory(true, &mut polls));
+    }
+
     #[test]
     fn a_held_link_comes_up_only_attached_and_programmed() {
         let iface = |name: &str, activate: bool| ResolvedInterface {

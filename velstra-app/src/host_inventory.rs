@@ -3,6 +3,13 @@
 //! Separate dumps are not an atomic kernel-wide snapshot. A second link dump
 //! rejects changed owning identities; callers still revalidate before opening
 //! their datapath. Interrupted, incomplete or ambiguous dumps are errors.
+//!
+//! An observation that raced a concurrent change (the kernel flagged the dump
+//! as interrupted, the link set moved between the dumps, an address named a
+//! link the first dump had not seen yet) is a [`RacedObservation`]: nothing is
+//! wrong with the host, the snapshot is merely torn. [`read`] retries those a
+//! bounded number of times before reporting them, so a DHCP renew or a VIP
+//! move during the 2-second poll does not become a datapath outage (DP-32).
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -11,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 
 const LIMIT: usize = 8 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(2);
@@ -27,7 +34,33 @@ const OVERRUN: u16 = 4;
 const MULTI: u16 = 2;
 const DUMP_INTR: u16 = 0x10;
 
+/// Complete fresh observations attempted before a torn snapshot is reported.
+const RACE_ATTEMPTS: usize = 4;
+
 pub(crate) type Prefix = ([u8; 4], [u8; 4]);
+
+/// A snapshot that was torn by a concurrent host change rather than refused
+/// because the kernel answered something malformed. Retrying it is safe: a
+/// fresh dump observes the host after (or before) the change, never a blend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RacedObservation(&'static str);
+
+impl std::fmt::Display for RacedObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for RacedObservation {}
+
+/// Whether `error` (anywhere in its context chain) is a torn snapshot.
+pub(crate) fn is_raced(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RacedObservation>().is_some()
+}
+
+fn raced(reason: &'static str) -> anyhow::Error {
+    anyhow::Error::new(RacedObservation(reason))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Link {
@@ -47,6 +80,28 @@ pub(crate) struct Interface {
 /// Existing libc is sufficient; no subprocess or fixed polling sleep. Kernel
 /// syscalls and scheduling are still subject to the overall observer deadline.
 pub(crate) fn read() -> Result<Vec<Interface>> {
+    retry_raced(RACE_ATTEMPTS, read_once)
+}
+
+/// Run `observe` until it returns anything other than a torn snapshot, at most
+/// `attempts` times. Every other error is returned at once: a malformed or
+/// failed dump is not made better by asking again.
+fn retry_raced<T>(attempts: usize, mut observe: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut attempt = 1;
+    loop {
+        match observe() {
+            Err(error) if is_raced(&error) && attempt < attempts => attempt += 1,
+            Err(error) if is_raced(&error) => {
+                return Err(error).with_context(|| {
+                    format!("interface inventory still torn after {attempts} observations")
+                });
+            }
+            other => return other,
+        }
+    }
+}
+
+fn read_once() -> Result<Vec<Interface>> {
     let mut socket = Socket::open()?;
     let mut first = BTreeMap::new();
     socket.dump(GETLINK, NEWLINK, 16, |payload| {
@@ -70,10 +125,9 @@ fn finish(
     second: BTreeMap<u32, Link>,
     mut addresses: BTreeMap<u32, Vec<Prefix>>,
 ) -> Result<Vec<Interface>> {
-    ensure!(
-        first == second,
-        "link identities changed during address observation"
-    );
+    if first != second {
+        return Err(raced("link identities changed during address observation"));
+    }
     Ok(first
         .into_iter()
         .map(|(index, link)| Interface {
@@ -166,10 +220,10 @@ fn add_address(
         "unknown address family"
     );
     let index = u32_at(payload, 4);
-    ensure!(
-        links.contains_key(&index),
-        "address has unknown owning link"
-    );
+    if !links.contains_key(&index) {
+        // A link created between the link dump and the address dump.
+        return Err(raced("address has unknown owning link"));
+    }
     let size = if family == libc::AF_INET { 4 } else { 16 };
     ensure!(
         usize::from(payload[1]) <= size * 8,
@@ -249,7 +303,9 @@ impl Dump {
             );
             let kind = u16_at(bytes, 4);
             let flags = u16_at(bytes, 6);
-            ensure!(flags & DUMP_INTR == 0, "interrupted netlink dump");
+            if flags & DUMP_INTR != 0 {
+                return Err(raced("interrupted netlink dump"));
+            }
             let payload = &bytes[HEADER..length];
             ensure!(!self.done, "data after netlink completion");
             match kind {
@@ -272,7 +328,7 @@ impl Dump {
                     // A successful ACK alone does not complete a dump.
                 }
                 NOOP => {}
-                OVERRUN => bail!("netlink dump overrun"),
+                OVERRUN => return Err(raced("netlink dump overrun")),
                 _ => {
                     ensure!(
                         kind == self.expected && flags & MULTI != 0,
@@ -787,6 +843,72 @@ mod tests {
         let mut after = message(DONE, MULTI, &[0; 4]);
         after.extend(valid);
         assert!(dump().datagram(&after, |_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn a_torn_snapshot_is_classified_as_raced_and_malformed_data_is_not() {
+        for torn in [
+            message(NEWLINK, MULTI | DUMP_INTR, &link(9, "lan0")),
+            message(DONE, MULTI | DUMP_INTR, &[0; 4]),
+            message(OVERRUN, 0, &[]),
+        ] {
+            let error = dump().datagram(&torn, |_| Ok(())).unwrap_err();
+            assert!(is_raced(&error), "not retryable: {error:#}");
+        }
+        for malformed in [
+            message(DONE, MULTI, &(-4i32).to_ne_bytes()),
+            message(ERROR, 0, &[1; 20]),
+            message(NEWLINK, 0, &link(9, "lan0")),
+        ] {
+            let error = dump().datagram(&malformed, |_| Ok(())).unwrap_err();
+            assert!(!is_raced(&error), "retried a refusal: {error:#}");
+        }
+        let mut links = BTreeMap::new();
+        add_link(&mut links, &link(9, "lan0")).unwrap();
+        let moved = BTreeMap::from([(10, links[&9].clone())]);
+        assert!(is_raced(
+            &finish(links.clone(), moved, BTreeMap::new()).unwrap_err()
+        ));
+        let orphan = add_address(&mut BTreeMap::new(), &links, &address(10, [1, 2, 3, 4], 24));
+        assert!(is_raced(&orphan.unwrap_err()));
+    }
+
+    #[test]
+    fn a_raced_observation_is_retried_and_then_reported() {
+        // DP-32: one interrupted dump must not become an outage.
+        let mut calls = 0;
+        let value = retry_raced(4, || {
+            calls += 1;
+            if calls < 3 {
+                Err(raced("interrupted netlink dump"))
+            } else {
+                Ok(calls)
+            }
+        })
+        .unwrap();
+        assert_eq!((value, calls), (3, 3));
+
+        // A host that keeps changing under every observation is still reported,
+        // after exactly the bounded number of attempts, and still as raced.
+        let mut calls = 0;
+        let error = retry_raced(4, || -> Result<()> {
+            calls += 1;
+            Err(raced("interrupted netlink dump"))
+        })
+        .unwrap_err();
+        assert_eq!(calls, 4);
+        assert!(is_raced(&error));
+        assert!(format!("{error:#}").contains("after 4 observations"));
+
+        // Anything else is returned at once: asking again cannot fix it.
+        let mut calls = 0;
+        let error = retry_raced(4, || -> Result<()> {
+            calls += 1;
+            anyhow::bail!("netlink request failed")
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert!(!is_raced(&error));
     }
 
     #[test]
