@@ -34,7 +34,7 @@ use velstra_common::{
     ScopedDstPortKey, ScopedDstPortKey6, ScopedMac, ScopedPortKey, ScopedSrcPortKey,
     ScopedSrcPortKey6, ServiceKey, ServiceValue, Srv6Config, Srv6Endpoint, Srv6FloodSet,
     Srv6IrbEndpoint, Srv6LocalSid, Srv6SidKey, SynFlow, SynProxyCfg, SynProxyKey, TunnelEndpoint,
-    TunnelKey, parse_cidr_v4, parse_cidr_v6, parse_mac, port_rule_value, port_rule_with_limit,
+    TunnelKey, parse_cidr_v4, parse_cidr_v6, parse_mac, port_rule_value,
 };
 use velstra_config::{
     PolicyConfig, PortIdentity, ResolvedFloodVtep, ResolvedInterface, ResolvedIrbRoute,
@@ -625,20 +625,75 @@ impl AttachMode {
 
 /// An attachment owns its kernel link instead of leaving it in Aya's program
 /// collection. Removing a stale interface drops the link and closes its FD.
+///
+/// A **pinned** attachment (`[state] persist`) outlives the process: closing
+/// the FD leaves it attached. Dropping one therefore also removes its pin —
+/// that is what retiring a hook means — unless the agent is shutting down for
+/// a restart, when [`Self::keep_pinned`] leaves the last policy enforcing.
 struct InterfaceLink<L> {
     ifindex: u32,
+    pin: Option<LinkPin>,
     _link: L,
+}
+
+/// A bpffs pin this agent owns, with the kernel id of the link behind it so a
+/// newer pin at the same path is never removed by an older link's drop.
+struct LinkPin {
+    path: std::path::PathBuf,
+    link_id: u32,
+}
+
+impl LinkPin {
+    fn release(self) {
+        let current = aya::programs::links::PinnedLink::from_pin(&self.path)
+            .ok()
+            .map(aya::programs::links::FdLink::from)
+            .and_then(|link| link.info().ok())
+            .map(|info| info.id());
+        if current == Some(self.link_id)
+            && let Err(error) = crate::persist::remove_pin(&self.path)
+        {
+            warn!(
+                "could not detach retired hook {}: {error:#}",
+                self.path.display()
+            );
+        }
+    }
+}
+
+impl<L> Drop for InterfaceLink<L> {
+    fn drop(&mut self) {
+        if let Some(pin) = self.pin.take() {
+            pin.release();
+        }
+    }
 }
 
 impl<L> InterfaceLink<L> {
     fn new(iface: &str, ifindex: u32, link: L) -> Result<Self> {
+        Self::with_pin(iface, ifindex, link, None)
+    }
+
+    fn with_pin(iface: &str, ifindex: u32, link: L, pin: Option<LinkPin>) -> Result<Self> {
+        // Constructed first, so a refusal below drops it and releases the pin.
+        let this = Self {
+            ifindex,
+            pin,
+            _link: link,
+        };
         if if_nametoindex(iface)? != ifindex {
             bail!("interface {iface:?} changed while attaching its datapath");
         }
-        Ok(Self {
-            ifindex,
-            _link: link,
-        })
+        Ok(this)
+    }
+
+    /// Leave this attachment in the kernel when the agent exits.
+    fn keep_pinned(&mut self) {
+        self.pin = None;
+    }
+
+    fn pin_path(&self) -> Option<&std::path::Path> {
+        self.pin.as_ref().map(|pin| pin.path.as_path())
     }
 
     fn is_current(&self, iface: &str) -> bool {
@@ -684,9 +739,15 @@ pub struct Firewall {
     applied_host: PreparedHostConfig,
     applied_intent: AppliedIntent,
     last_apply_error: Option<String>,
-    // A failed maintenance fence must not look healthy even if reading the
-    // gate subsequently reports READY. Only successful reconciliation clears it.
-    expiry_failed: bool,
+    /// Exactly what the six policy tries hold, so a reconfigure writes only
+    /// the difference (DP-28).
+    tries: crate::policy_tries::PolicyTries,
+    /// How the connection-state maps were sized at load (DP-06).
+    sizing: crate::state_tables::Sizing,
+    /// Whether those maps were adopted from the previous agent (DP-27).
+    state_adopted: bool,
+    /// The bpffs pin directory when `[state] persist` is on (DP-12, DP-27).
+    persist: Option<crate::persist::Persist>,
     /// Consecutive polls whose host inventory was torn by a concurrent change
     /// even after [`crate::host_inventory::read`]'s own retries (DP-32).
     torn_inventory_polls: u32,
@@ -890,7 +951,50 @@ impl Firewall {
             env!("OUT_DIR"),
             "/velstra"
         )))?;
+        let total_ram = crate::state_tables::host_memory().unwrap_or(0);
+        let sizing = crate::state_tables::resolve(&cfg.state, total_ram);
+        let state_maps = crate::persist::state_maps(&sizing);
+        let root = std::path::Path::new(crate::persist::ROOT);
+        let (persist, state_dir) = if cfg.state.persist {
+            let persist = crate::persist::Persist::open(root)?;
+            let identity: Vec<(String, u32)> = cfg
+                .interfaces
+                .iter()
+                .map(|i| (i.name.clone(), i.policy))
+                .collect();
+            let tag = crate::persist::layout_tag(&state_maps, &identity);
+            let dir = persist.prepare_state(&tag, &state_maps)?;
+            (Some(persist), Some(dir))
+        } else {
+            // Persistence was switched off: what an earlier agent pinned would
+            // keep enforcing (and refuse this agent's XDP attach) forever.
+            if root.exists() {
+                log::info!("releasing the datapath pinned by a previous agent");
+                crate::persist::Persist::release(root)?;
+            }
+            (None, None)
+        };
+        log::info!(
+            "state tables sized for {} connections ({} firewall, {} NAT, {} SYN-proxy entries; \
+             {} MiB){}",
+            sizing.connections,
+            sizing.fw_flows,
+            sizing.conntrack,
+            sizing.syn_flows,
+            sizing.committed_bytes() >> 20,
+            if cfg.state.connections.is_none() {
+                " from host memory"
+            } else {
+                ""
+            }
+        );
         let mut loader = aya::EbpfLoader::new();
+        for (name, entries) in sizing.maps() {
+            loader.map_max_entries(name, entries);
+        }
+        if let Some(dir) = &state_dir {
+            crate::persist::Persist::apply(&mut loader, &dir.path, &state_maps);
+        }
         if cfg.ha.is_some() {
             loader.map_pin_path("HA_DEADLINE", std::path::Path::new(crate::ha::DEADLINE_PIN));
             loader.map_pin_path("HA_OWNER", std::path::Path::new(crate::ha::OWNER_PIN));
@@ -918,6 +1022,8 @@ impl Firewall {
                 .context("closing the initial datapath gate")?;
         }
         let prepared = prepare_host_config(cfg)?;
+        let plan = PolicyPlan::new(&ebpf, &cfg.policies)?;
+        let mut tries = crate::policy_tries::PolicyTries::default();
         // This object's ordinary packet programs have not been attached yet;
         // unlike a live rewrite, initialization has no readers to drain.
         apply_config_quiesced(
@@ -927,6 +1033,8 @@ impl Firewall {
             &prepared,
             false,
             &ReaderQuiescence::Unattached,
+            &plan,
+            &mut tries,
         )?;
 
         // Load the tail-call target (`velstra_forward`) and register it in the
@@ -1063,7 +1171,7 @@ impl Firewall {
             if xdp_links.contains_key(iface) {
                 continue;
             }
-            let (chosen, link) = attach_with_fallback(program, iface, mode)?;
+            let (chosen, link) = attach_with_fallback(program, iface, mode, persist.as_ref())?;
             xdp_links.insert(iface.clone(), link);
             attached.push((iface.clone(), chosen));
         }
@@ -1082,7 +1190,7 @@ impl Firewall {
         let egress_attached = if egress_ifaces.is_empty() {
             BTreeMap::new()
         } else {
-            attach_egress(&mut ebpf, &egress_ifaces)?
+            attach_egress(&mut ebpf, &egress_ifaces, persist.as_ref())?
         };
 
         let config_attached = cfg
@@ -1125,8 +1233,11 @@ impl Firewall {
             egress_attached,
             explicit_egress_ifaces: if egress { ifaces.to_vec() } else { Vec::new() },
             conntrack: None,
-            expiry_failed: false,
             torn_inventory_polls: 0,
+            tries,
+            sizing,
+            state_adopted: state_dir.as_ref().is_some_and(|dir| dir.adopted),
+            persist,
             runtime_blocks: BTreeMap::new(),
             portal_sessions: BTreeMap::new(),
             runtime_mappings: BTreeMap::new(),
@@ -1134,7 +1245,81 @@ impl Firewall {
         fw.sync_bum_attachments(cfg);
         fw.reopen_configuration()?;
         fw.reconcile_links()?;
+        fw.sweep_unheld_pins();
         Ok(fw)
+    }
+
+    /// Remove every link pin no current attachment holds: hooks the previous
+    /// agent had on interfaces this configuration no longer filters.
+    fn sweep_unheld_pins(&self) {
+        let Some(persist) = &self.persist else {
+            return;
+        };
+        let held: HashSet<&std::path::Path> = self
+            .xdp_links
+            .values()
+            .filter_map(InterfaceLink::pin_path)
+            .chain(
+                self.egress_attached
+                    .values()
+                    .filter_map(InterfaceLink::pin_path),
+            )
+            .collect();
+        match persist.link_pins() {
+            Ok(pins) => {
+                for (_, iface, path) in pins {
+                    if held.contains(path.as_path()) {
+                        continue;
+                    }
+                    log::info!(
+                        "detaching the previous agent's hook on {iface}: no longer configured"
+                    );
+                    if let Err(error) = crate::persist::remove_pin(&path) {
+                        warn!("{error:#}");
+                    }
+                }
+            }
+            Err(error) => warn!("listing pinned hooks: {error:#}"),
+        }
+    }
+
+    /// Leave every pinned hook attached and enforcing when this process exits,
+    /// so the next agent adopts them instead of a link forwarding unfiltered
+    /// in between (DP-12). A no-op unless persisting.
+    pub fn keep_attached_for_restart(&mut self) {
+        if self.persist.is_none() {
+            return;
+        }
+        let mut kept = 0;
+        for link in self.xdp_links.values_mut() {
+            kept += usize::from(link.pin.is_some());
+            link.keep_pinned();
+        }
+        for link in self.egress_attached.values_mut() {
+            kept += usize::from(link.pin.is_some());
+            link.keep_pinned();
+        }
+        log::info!("leaving {kept} pinned hook(s) enforcing for the next agent");
+    }
+
+    /// How the connection-state tables were sized, and whether they were
+    /// adopted from the previous agent.
+    pub fn state_tables(&self) -> (crate::state_tables::Sizing, bool) {
+        (self.sizing, self.state_adopted)
+    }
+
+    /// A duplicate FD of one connection-state map, for the background
+    /// collector: it walks the map without the firewall lock.
+    pub fn state_map(&self, name: &str) -> Result<MapData> {
+        let Some(aya::maps::Map::LruHashMap(data)) = self.ebpf.map(name) else {
+            bail!("{name} LRU map missing");
+        };
+        Ok(MapData::from_fd(data.fd().as_fd().try_clone_to_owned()?)?)
+    }
+
+    /// The applied conntrack timeouts, which decide what has expired.
+    pub fn conntrack_timeouts(&self) -> velstra_common::ConntrackTimeouts {
+        self.applied.conntrack
     }
 
     pub fn reconcile_links(&mut self) -> Result<()> {
@@ -1272,6 +1457,7 @@ impl Firewall {
                     .iter()
                     .map(|(name, _)| name.clone())
                     .collect::<Vec<_>>(),
+                self.persist.as_ref(),
             )?;
             self.egress_attached.extend(links);
         }
@@ -1310,7 +1496,7 @@ impl Firewall {
             .program_mut("velstra")
             .ok_or_else(|| anyhow!("eBPF object has no `velstra` program"))?
             .try_into()?;
-        let (chosen, link) = attach_with_fallback(program, iface, mode)?;
+        let (chosen, link) = attach_with_fallback(program, iface, mode, self.persist.as_ref())?;
         self.xdp_links.insert(iface.to_owned(), link);
         self.attached.push((iface.to_string(), chosen));
         Ok(chosen)
@@ -1432,7 +1618,7 @@ impl Firewall {
             .program_mut("velstra")
             .ok_or_else(|| anyhow!("eBPF object has no `velstra` program"))?
             .try_into()?;
-        let (chosen, link) = attach_with_fallback(program, iface, mode)?;
+        let (chosen, link) = attach_with_fallback(program, iface, mode, self.persist.as_ref())?;
         self.xdp_links.insert(iface.to_owned(), link);
         self.attached.push((iface.to_string(), chosen));
         Ok(chosen)
@@ -1729,6 +1915,8 @@ impl Firewall {
         self.base.ha != cfg.ha
             || self.base.conntrack_sync != cfg.conntrack_sync
             || self.base.flow_export != cfg.flow_export
+            // Table size and pinning are decided when the maps are created.
+            || self.base.state != cfg.state
     }
 
     pub fn reconfigure(&mut self, cfg: &RuntimeConfig) -> Result<()> {
@@ -1741,7 +1929,9 @@ impl Firewall {
         // directly. Never replace the base or touch maps while HA/sync sidecars
         // still use the old configuration (even when reset was requested).
         if self.requires_restart(cfg) {
-            anyhow::bail!("restart-required: HA, conntrack sync or flow export changed");
+            anyhow::bail!(
+                "restart-required: HA, conntrack sync, flow export or the state tables changed"
+            );
         }
         let previous = std::mem::replace(&mut self.base, cfg.clone());
         if let Err(cause) = self.reprogram_with_reset(reset) {
@@ -1902,8 +2092,30 @@ impl Firewall {
         reset: bool,
         host_refresh: bool,
     ) -> Result<()> {
+        let result = self.reprogram_transaction(merged, prepared, reset, host_refresh);
+        release_freed_memory();
+        result
+    }
+
+    fn reprogram_transaction(
+        &mut self,
+        merged: RuntimeConfig,
+        prepared: PreparedHostConfig,
+        reset: bool,
+        host_refresh: bool,
+    ) -> Result<()> {
         let _timing = timing::Span::start(timing::Phase::FullTransaction);
         merged.validate_firewall_capacity()?;
+        if self.unchanged(&merged, &prepared, reset, host_refresh)? {
+            // A commit that changes nothing this agent enforces costs nothing:
+            // no gate, no drain, no write (DP-28).
+            log::info!("configuration unchanged; the datapath was not touched");
+            self.last_apply_error = None;
+            return Ok(());
+        }
+        // Resolved and checked against every trie's capacity while traffic
+        // still flows: a configuration that cannot fit costs no blip (DP-17).
+        let plan = PolicyPlan::new(&self.ebpf, &merged.policies)?;
         self.applied_intent.begin();
         let previous = self.applied.clone();
         let previous_host = self.applied_host.clone();
@@ -1945,6 +2157,8 @@ impl Firewall {
                 &prepared,
                 reset,
                 &quiesced,
+                &plan,
+                &mut self.tries,
             )?;
             let retained = self.reapply_runtime_mappings(&merged, &prepared.ipv4)?;
             // Other map writers also resolve Linux names. If a link/address
@@ -1960,6 +2174,7 @@ impl Firewall {
             Err(error) => {
                 let rollback = (|| -> Result<()> {
                     self.sync_egress_attachments(&previous)?;
+                    let previous_plan = PolicyPlan::new(&self.ebpf, &previous.policies)?;
                     apply_config_quiesced(
                         &mut self.ebpf,
                         &previous,
@@ -1967,6 +2182,8 @@ impl Firewall {
                         &previous_host,
                         reset,
                         &quiesced,
+                        &previous_plan,
+                        &mut self.tries,
                     )?;
                     self.restore_port_forward_snapshot(&forwards)?;
                     let blocks: Vec<String> = self
@@ -2032,8 +2249,26 @@ impl Firewall {
         let reopened = self.reopen_configuration();
         self.applied_intent.finish(reopened)?;
         self.last_apply_error = None;
-        self.expiry_failed = false;
         Ok(())
+    }
+
+    /// Whether `merged` on `prepared` is exactly what the datapath already
+    /// enforces, so a transaction would only rewrite every entry with itself.
+    /// Never for a host refresh (a newly attached interface needs its maps), a
+    /// reset, or a datapath that is not open with current intent.
+    fn unchanged(
+        &self,
+        merged: &RuntimeConfig,
+        prepared: &PreparedHostConfig,
+        reset: bool,
+        host_refresh: bool,
+    ) -> Result<bool> {
+        Ok(!reset
+            && !host_refresh
+            && self.applied_intent.current
+            && *merged == self.applied
+            && *prepared == self.applied_host
+            && self.configuration_state()? == CONFIG_READY)
     }
 
     fn configuration_state(&self) -> Result<u32> {
@@ -2065,9 +2300,6 @@ impl Firewall {
 
     pub fn configuration_status(&self) -> Result<String> {
         let state = match self.configuration_state()? {
-            CONFIG_READY if self.expiry_failed => {
-                "Failed (expiry maintenance; forwarding state uncertain)"
-            }
             CONFIG_READY => "Ready",
             CONFIG_UPDATING if self.last_apply_error.is_none() => "Updating",
             _ => "Failed (traffic blocked)",
@@ -2575,11 +2807,18 @@ impl Firewall {
                     .ok_or_else(|| anyhow!("BLOCKLIST map missing"))?,
             )?;
             for id in policies {
-                let key = Key::new(ScopedAddr::POLICY_BITS + prefix, ScopedAddr::new(id, addr));
+                let scoped = ScopedAddr::new(id, addr);
+                let key = Key::new(ScopedAddr::POLICY_BITS + prefix, scoped);
                 if insert {
                     trie.insert(&key, 1u32, 0)
                         .with_context(|| format!("blocking {cidr} in policy {id}"))?;
-                } else {
+                } else if !self
+                    .tries
+                    .has_block(ScopedAddr::POLICY_BITS + prefix, scoped)
+                {
+                    // A prefix the configuration also blocks stays blocked:
+                    // the tries are written by difference, so nothing would
+                    // put it back until the configuration changed (DP-28).
                     let _ = trie.remove(&key);
                 }
             }
@@ -2594,14 +2833,15 @@ impl Firewall {
                 .ok_or_else(|| anyhow!("BLOCKLIST6 map missing"))?,
         )?;
         for id in policies {
-            let key = Key::new(
-                ScopedAddr6::POLICY_BITS + prefix,
-                ScopedAddr6::new(id, addr),
-            );
+            let scoped = ScopedAddr6::new(id, addr);
+            let key = Key::new(ScopedAddr6::POLICY_BITS + prefix, scoped);
             if insert {
                 trie.insert(&key, 1u32, 0)
                     .with_context(|| format!("blocking {cidr} in policy {id}"))?;
-            } else {
+            } else if !self
+                .tries
+                .has_block6(ScopedAddr6::POLICY_BITS + prefix, scoped)
+            {
                 let _ = trie.remove(&key);
             }
         }
@@ -2825,25 +3065,6 @@ impl Firewall {
         Ok(Stats { rows })
     }
 
-    /// Duplicate diagnostics FDs only. All bounded occupancy walks run after
-    /// the caller releases the configuration mutex, never on the packet path.
-    pub fn capacity_snapshot(&self) -> crate::capacity::Snapshot {
-        crate::capacity::Snapshot::new(
-            ["CONNTRACK", "FW_FLOWS", "SYN_FLOWS"]
-                .into_iter()
-                .map(|name| {
-                    let duplicate = (|| -> Result<MapData> {
-                        let Some(aya::maps::Map::LruHashMap(data)) = self.ebpf.map(name) else {
-                            bail!("{name} LRU map missing");
-                        };
-                        Ok(MapData::from_fd(data.fd().as_fd().try_clone_to_owned()?)?)
-                    })();
-                    (name, duplicate)
-                })
-                .collect(),
-        )
-    }
-
     /// Duplicate `LOCAL_MACS` for the learn-and-advertise task. Keep the map in
     /// the firewall too, so a policy-namespace reset can clear learned state.
     pub fn take_local_macs(&mut self) -> Result<HashMap<MapData, LocalMacKey, LocalMac>> {
@@ -2897,56 +3118,6 @@ impl Firewall {
             .collect())
     }
 
-    /// Explicit standalone maintenance, under the same exclusive firewall lock
-    /// as policy updates. No periodic sweep and no SYN-proxy state reclamation.
-    pub fn expire_state(&mut self, table: &str, limit: usize) -> Result<crate::expiry::Report> {
-        let eligibility = crate::expiry::Eligibility {
-            ha: self.applied.ha.is_some() || self.base.ha.is_some(),
-            replication: self.applied.conntrack_sync.is_some()
-                || self.base.conntrack_sync.is_some(),
-            current_intent: self.applied_intent.current && !self.expiry_failed,
-        };
-        let timeouts = self.applied.conntrack;
-        let drain = || ReaderQuiescence::drain_with(synchronize_packet_readers).map(|_| ());
-        let result = match table {
-            "nat" => {
-                let handle = self.conntrack_handle()?;
-                let mut map = handle
-                    .try_lock()
-                    .context("NAT handle busy; maintenance not started")?;
-                crate::expiry::collect(
-                    &mut self.ebpf,
-                    &mut *map,
-                    eligibility,
-                    limit,
-                    |key, state, now| state.expired(key.proto, now, timeouts),
-                    drain,
-                )
-            }
-            "firewall" => {
-                let mut map = self.fw_flows_handle()?;
-                crate::expiry::collect(
-                    &mut self.ebpf,
-                    &mut map,
-                    eligibility,
-                    limit,
-                    |key, state, now| state.expired(key.proto, now, timeouts),
-                    drain,
-                )
-            }
-            _ => bail!("expiry table must be nat or firewall"),
-        };
-        if let Err(error) = &result {
-            // Preconditions may refuse without touching a healthy datapath.
-            // Never erase an existing failure or claim readiness on read error.
-            if crate::expiry::mutation_attempted(error) {
-                self.expiry_failed = true;
-                self.last_apply_error = Some(format!("expiry maintenance: {error:#}"));
-            }
-        }
-        result
-    }
-
     /// Duplicate the userspace FD for HA sync while retaining the map in the
     /// firewall. Diagnostics and FlowSpec purges must keep working with HA on.
     /// All handles address the same kernel map; no state or counters are copied.
@@ -2968,6 +3139,22 @@ impl Firewall {
     }
 }
 
+/// Hand the memory a large transaction freed back to the kernel (PERF-04).
+///
+/// Parsing and resolving a configuration with tens of thousands of entries
+/// allocates far more transiently than it keeps, on whichever runtime worker
+/// served the reload. glibc keeps freed pages in that thread's arena, so the
+/// agent's resident size ratcheted up with every large commit (148 MB against
+/// 47 MB after a reboot with the same configuration). `malloc_trim` returns the
+/// free pages of every arena.
+pub(crate) fn release_freed_memory() {
+    #[cfg(target_env = "gnu")]
+    // SAFETY: malloc_trim takes no pointers and only releases free memory.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 /// Raise the locked-memory rlimit so map allocation succeeds on older kernels
 /// that still account BPF memory against `RLIMIT_MEMLOCK`.
 /// LPM `(prefix_len, addr)` for a port rule's optional source constraint. `None`
@@ -2976,13 +3163,13 @@ impl Firewall {
 /// the block's bits so a specific source outranks a `from any` rule.
 /// The prefix length an address constraint matches on, for the specificity byte
 /// packed into the rule value. `None` (any) is `0`.
-fn cidr_bits(cidr: &Option<Cidr4>) -> u8 {
+pub(crate) fn cidr_bits(cidr: &Option<Cidr4>) -> u8 {
     cidr.as_ref().map_or(0, |c| c.prefix)
 }
 
 /// The `DST_RULES` LPM prefix + key tail for a destination constraint. Only called
 /// for a rule that has one, so the `None` arm is the unreachable-but-total case.
-fn port_rule_dst_lpm(dst: &Option<Cidr4>) -> (u32, u32) {
+pub(crate) fn port_rule_dst_lpm(dst: &Option<Cidr4>) -> (u32, u32) {
     match dst {
         Some(c) => {
             let (bits, addr) = c.lpm_key();
@@ -2994,12 +3181,12 @@ fn port_rule_dst_lpm(dst: &Option<Cidr4>) -> (u32, u32) {
 
 /// The prefix length an IPv6 address constraint matches on, for the specificity
 /// byte packed into the rule value.
-fn cidr6_bits(cidr: &Option<Cidr6>) -> u8 {
+pub(crate) fn cidr6_bits(cidr: &Option<Cidr6>) -> u8 {
     cidr.as_ref().map_or(0, |c| c.prefix)
 }
 
 /// The `PORT_RULES6` LPM prefix + key tail for an IPv6 source constraint.
-fn port_rule_src6_lpm(src: &Option<Cidr6>) -> (u32, [u8; 16]) {
+pub(crate) fn port_rule_src6_lpm(src: &Option<Cidr6>) -> (u32, [u8; 16]) {
     match src {
         Some(c) => {
             let (bits, addr) = c.lpm_key();
@@ -3010,7 +3197,7 @@ fn port_rule_src6_lpm(src: &Option<Cidr6>) -> (u32, [u8; 16]) {
 }
 
 /// The `DST_RULES6` LPM prefix + key tail for an IPv6 destination constraint.
-fn port_rule_dst6_lpm(dst: &Option<Cidr6>) -> (u32, [u8; 16]) {
+pub(crate) fn port_rule_dst6_lpm(dst: &Option<Cidr6>) -> (u32, [u8; 16]) {
     match dst {
         Some(c) => {
             let (bits, addr) = c.lpm_key();
@@ -3020,7 +3207,7 @@ fn port_rule_dst6_lpm(dst: &Option<Cidr6>) -> (u32, [u8; 16]) {
     }
 }
 
-fn port_rule_src_lpm(src: &Option<Cidr4>) -> (u32, u32) {
+pub(crate) fn port_rule_src_lpm(src: &Option<Cidr4>) -> (u32, u32) {
     match src {
         Some(c) => {
             let (bits, addr) = c.lpm_key();
@@ -3110,149 +3297,8 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
             let _ = gates.remove(&policy.id);
         }
     }
-    {
-        let mut blocklist: LpmTrie<_, ScopedAddr, u32> = LpmTrie::try_from(
-            ebpf.map_mut("BLOCKLIST")
-                .ok_or_else(|| anyhow!("BLOCKLIST map missing"))?,
-        )?;
-        for policy in &old.policies {
-            for cidr in &policy.blocklist {
-                let (prefix, addr) = cidr.lpm_key();
-                let key = Key::new(
-                    ScopedAddr::POLICY_BITS + prefix,
-                    ScopedAddr::new(policy.id, addr),
-                );
-                let _ = blocklist.remove(&key);
-            }
-        }
-    }
-    {
-        let mut blocklist6: LpmTrie<_, ScopedAddr6, u32> = LpmTrie::try_from(
-            ebpf.map_mut("BLOCKLIST6")
-                .ok_or_else(|| anyhow!("BLOCKLIST6 map missing"))?,
-        )?;
-        for policy in &old.policies {
-            for cidr in &policy.blocklist6 {
-                let (prefix, addr) = cidr.lpm_key();
-                let key = Key::new(
-                    ScopedAddr6::POLICY_BITS + prefix,
-                    ScopedAddr6::new(policy.id, addr),
-                );
-                let _ = blocklist6.remove(&key);
-            }
-        }
-    }
-    {
-        let mut rules: LpmTrie<_, ScopedSrcPortKey, u64> = LpmTrie::try_from(
-            ebpf.map_mut("PORT_RULES")
-                .ok_or_else(|| anyhow!("PORT_RULES map missing"))?,
-        )?;
-        for policy in &old.policies {
-            for rule in policy
-                .port_rules
-                .iter()
-                .filter(|r| r.dst.is_none() && r.src6.is_none() && r.dst6.is_none())
-            {
-                let (prefix, addr) = port_rule_src_lpm(&rule.src);
-                let _ = rules.remove(&Key::new(
-                    prefix,
-                    ScopedSrcPortKey::with_ifindex(
-                        policy.id,
-                        rule.key.proto,
-                        rule.icmp_type,
-                        if rule.icmp_type == 0 {
-                            rule.key.port
-                        } else {
-                            0
-                        },
-                        stale_ifindex(&rule.in_interface),
-                        addr,
-                    ),
-                ));
-            }
-        }
-    }
-    {
-        // The v6 tries are cleared the same way: a rule that survives the sweep
-        // because nobody looked in its trie is a rule the operator deleted and
-        // the data plane still enforces.
-        let mut rules: LpmTrie<_, ScopedSrcPortKey6, u64> = LpmTrie::try_from(
-            ebpf.map_mut("PORT_RULES6")
-                .ok_or_else(|| anyhow!("PORT_RULES6 map missing"))?,
-        )?;
-        for policy in &old.policies {
-            for rule in policy.port_rules.iter().filter(|r| r.src6.is_some()) {
-                let (prefix, addr) = port_rule_src6_lpm(&rule.src6);
-                let _ = rules.remove(&Key::new(
-                    prefix,
-                    ScopedSrcPortKey6::with_ifindex(
-                        policy.id,
-                        rule.key.proto,
-                        rule.icmp_type,
-                        if rule.icmp_type == 0 {
-                            rule.key.port
-                        } else {
-                            0
-                        },
-                        stale_ifindex(&rule.in_interface),
-                        addr,
-                    ),
-                ));
-            }
-        }
-    }
-    {
-        let mut rules: LpmTrie<_, ScopedDstPortKey6, u64> = LpmTrie::try_from(
-            ebpf.map_mut("DST_RULES6")
-                .ok_or_else(|| anyhow!("DST_RULES6 map missing"))?,
-        )?;
-        for policy in &old.policies {
-            for rule in policy.port_rules.iter().filter(|r| r.dst6.is_some()) {
-                let (prefix, addr) = port_rule_dst6_lpm(&rule.dst6);
-                let _ = rules.remove(&Key::new(
-                    prefix,
-                    ScopedDstPortKey6::with_ifindex(
-                        policy.id,
-                        rule.key.proto,
-                        rule.icmp_type,
-                        if rule.icmp_type == 0 {
-                            rule.key.port
-                        } else {
-                            0
-                        },
-                        stale_ifindex(&rule.in_interface),
-                        addr,
-                    ),
-                ));
-            }
-        }
-    }
-    {
-        let mut rules: LpmTrie<_, ScopedDstPortKey, u64> = LpmTrie::try_from(
-            ebpf.map_mut("DST_RULES")
-                .ok_or_else(|| anyhow!("DST_RULES map missing"))?,
-        )?;
-        for policy in &old.policies {
-            for rule in policy.port_rules.iter().filter(|r| r.dst.is_some()) {
-                let (prefix, addr) = port_rule_dst_lpm(&rule.dst);
-                let _ = rules.remove(&Key::new(
-                    prefix,
-                    ScopedDstPortKey::with_ifindex(
-                        policy.id,
-                        rule.key.proto,
-                        rule.icmp_type,
-                        if rule.icmp_type == 0 {
-                            rule.key.port
-                        } else {
-                            0
-                        },
-                        stale_ifindex(&rule.in_interface),
-                        addr,
-                    ),
-                ));
-            }
-        }
-    }
+    // The six policy tries are not swept here: they are brought to the new
+    // configuration by difference against what was written (`policy_tries`).
     {
         let mut iface_policy: HashMap<_, u32, PolicyId> = HashMap::try_from(
             ebpf.map_mut("IFACE_POLICY")
@@ -3653,6 +3699,7 @@ impl ReaderQuiescence {
 /// and the first grace period already drained older invocations (including
 /// their tail calls), even while CONFIG_EPOCH becomes even between writes.
 /// When `old` is `Some`, remove its entries before installing the replacement.
+#[allow(clippy::too_many_arguments)]
 fn apply_config_quiesced(
     ebpf: &mut Ebpf,
     cfg: &RuntimeConfig,
@@ -3660,6 +3707,8 @@ fn apply_config_quiesced(
     prepared: &PreparedHostConfig,
     reset: bool,
     quiesced: &ReaderQuiescence,
+    plan: &PolicyPlan,
+    written: &mut crate::policy_tries::PolicyTries,
 ) -> Result<()> {
     let _timing = timing::Span::start(timing::Phase::MapApply);
     let gate = Array::<_, u32>::try_from(
@@ -3734,7 +3783,7 @@ fn apply_config_quiesced(
         .set(0, cfg.conntrack, 0)
         .context("programming conntrack timeouts")?;
 
-    program_policies(ebpf, &cfg.policies)?;
+    program_policies(ebpf, &cfg.policies, plan, written)?;
     program_interfaces(ebpf, &cfg.interfaces)?;
     program_routes(ebpf, &cfg.routes)?;
     program_services(ebpf, &cfg.services, &cfg.interfaces, &prepared.ipv4)?;
@@ -3837,20 +3886,16 @@ fn program_fail_closed(ebpf: &mut Ebpf, fail_closed: bool) -> Result<()> {
     Ok(())
 }
 
-/// Write every policy's firewall maps (`CONFIG`, `BLOCKLIST`, `PORT_RULES`),
-/// scoped by policy id.
-/// Assign each rate-limited rule a `RULE_LIMITS` slot and write its bucket.
+/// Assign each rate-limited rule a `RULE_LIMITS` slot and the bucket it starts
+/// with. Pure, so the policy tries can be computed before the gate closes.
 ///
 /// Slots are handed out in iteration order and are 1-based, since `0` is what a
-/// rule's packed value carries for "unlimited". Returns the slot for each
-/// `(policy id, rule index)` so the trie writers can stamp it into the value.
+/// rule's packed value carries for "unlimited". The slot for each `(policy id,
+/// rule index)` is stamped into the rule's trie value.
 ///
 /// Capacity is validated before any live rules are changed. Keep the defensive
 /// check here too: an unrepresentable limit must never become an unlimited rule.
-fn program_rate_limits(
-    ebpf: &mut Ebpf,
-    policies: &[PolicyConfig],
-) -> Result<std::collections::HashMap<(PolicyId, usize), u32>> {
+pub(crate) fn rate_limit_plan(policies: &[PolicyConfig]) -> Result<RateLimitPlan> {
     let mut slots = std::collections::HashMap::new();
     let mut buckets: Vec<(u32, RateBucket)> = Vec::new();
     for policy in policies {
@@ -3868,22 +3913,56 @@ fn program_rate_limits(
             buckets.push((slot, RateBucket::new(rate, burst)));
         }
     }
-    if buckets.is_empty() {
-        return Ok(slots);
+    Ok(RateLimitPlan { slots, buckets })
+}
+
+/// See [`rate_limit_plan`].
+pub(crate) struct RateLimitPlan {
+    pub(crate) slots: std::collections::HashMap<(PolicyId, usize), u32>,
+    buckets: Vec<(u32, RateBucket)>,
+}
+
+/// Everything a policy write needs that can be worked out — and refused —
+/// before the datapath gate closes.
+pub(crate) struct PolicyPlan {
+    limits: RateLimitPlan,
+    tries: crate::policy_tries::PolicyTries,
+}
+
+impl PolicyPlan {
+    /// Resolve `policies` against this host and refuse what cannot fit.
+    fn new(ebpf: &Ebpf, policies: &[PolicyConfig]) -> Result<Self> {
+        let limits = rate_limit_plan(policies)?;
+        let tries = crate::policy_tries::desired(policies, &limits.slots, rule_ifindex)?;
+        crate::policy_tries::check_capacity(ebpf, &tries)?;
+        Ok(Self { limits, tries })
+    }
+}
+
+fn program_rate_limits(ebpf: &mut Ebpf, plan: &RateLimitPlan) -> Result<()> {
+    if plan.buckets.is_empty() {
+        return Ok(());
     }
     let mut map: Array<_, RateBucket> = Array::try_from(
         ebpf.map_mut("RULE_LIMITS")
             .ok_or_else(|| anyhow!("RULE_LIMITS map missing"))?,
     )?;
-    for (slot, bucket) in &buckets {
+    for (slot, bucket) in &plan.buckets {
         map.set(*slot, bucket, 0)
             .with_context(|| format!("inserting rate limit slot {slot}"))?;
     }
-    Ok(slots)
+    Ok(())
 }
 
-fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
-    let limit_slots = program_rate_limits(ebpf, policies)?;
+/// Write every policy's `CONFIG` and `PORTAL_GATES` entry, then bring the six
+/// policy tries from what was `written` to the plan by difference.
+fn program_policies(
+    ebpf: &mut Ebpf,
+    policies: &[PolicyConfig],
+    plan: &PolicyPlan,
+    written: &mut crate::policy_tries::PolicyTries,
+) -> Result<()> {
+    program_rate_limits(ebpf, &plan.limits)?;
     {
         let mut config: HashMap<_, PolicyId, GlobalConfig> = HashMap::try_from(
             ebpf.map_mut("CONFIG")
@@ -3916,219 +3995,14 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
             }
         }
     }
-    {
-        let mut blocklist: LpmTrie<_, ScopedAddr, u32> = LpmTrie::try_from(
-            ebpf.map_mut("BLOCKLIST")
-                .ok_or_else(|| anyhow!("BLOCKLIST map missing"))?,
-        )?;
-        for policy in policies {
-            for cidr in &policy.blocklist {
-                let (prefix, addr) = cidr.lpm_key();
-                let key = Key::new(
-                    ScopedAddr::POLICY_BITS + prefix,
-                    ScopedAddr::new(policy.id, addr),
-                );
-                blocklist.insert(&key, 1u32, 0).with_context(|| {
-                    format!("inserting blocklist {cidr} (policy {})", policy.id)
-                })?;
-            }
-        }
-    }
-    {
-        let mut blocklist6: LpmTrie<_, ScopedAddr6, u32> = LpmTrie::try_from(
-            ebpf.map_mut("BLOCKLIST6")
-                .ok_or_else(|| anyhow!("BLOCKLIST6 map missing"))?,
-        )?;
-        for policy in policies {
-            for cidr in &policy.blocklist6 {
-                let (prefix, addr) = cidr.lpm_key();
-                let key = Key::new(
-                    ScopedAddr6::POLICY_BITS + prefix,
-                    ScopedAddr6::new(policy.id, addr),
-                );
-                blocklist6.insert(&key, 1u32, 0).with_context(|| {
-                    format!("inserting IPv6 blocklist {cidr} (policy {})", policy.id)
-                })?;
-            }
-        }
-    }
-    {
-        let mut rules: LpmTrie<_, ScopedSrcPortKey, u64> = LpmTrie::try_from(
-            ebpf.map_mut("PORT_RULES")
-                .ok_or_else(|| anyhow!("PORT_RULES map missing"))?,
-        )?;
-        for policy in policies {
-            for (index, rule) in policy
-                .port_rules
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| r.dst.is_none() && r.src6.is_none() && r.dst6.is_none())
-            {
-                let (prefix, addr) = port_rule_src_lpm(&rule.src);
-                let slot = limit_slots.get(&(policy.id, index)).copied().unwrap_or(0);
-                rules
-                    .insert(
-                        &Key::new(
-                            prefix,
-                            ScopedSrcPortKey::with_ifindex(
-                                policy.id,
-                                rule.key.proto,
-                                rule.icmp_type,
-                                if rule.icmp_type == 0 {
-                                    rule.key.port
-                                } else {
-                                    0
-                                },
-                                rule_ifindex(&rule.in_interface)?,
-                                addr,
-                            ),
-                        ),
-                        port_rule_with_limit(
-                            port_rule_value(rule.action, rule.log, cidr_bits(&rule.src))
-                                | rule.scope,
-                            slot,
-                        ) as u64
-                            | ((rule.id() as u64) << 32),
-                        0,
-                    )
-                    .context("inserting port rule")?;
-            }
-        }
-    }
-    {
-        // The IPv6 source trie. A rule lands in exactly one of the four tries —
-        // the family follows from what the operator wrote, and a rule that named
-        // a v6 prefix used to land in none of them at all.
-        let mut rules: LpmTrie<_, ScopedSrcPortKey6, u64> = LpmTrie::try_from(
-            ebpf.map_mut("PORT_RULES6")
-                .ok_or_else(|| anyhow!("PORT_RULES6 map missing"))?,
-        )?;
-        for policy in policies {
-            for (index, rule) in policy
-                .port_rules
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| r.src6.is_some())
-            {
-                let (prefix, addr) = port_rule_src6_lpm(&rule.src6);
-                let slot = limit_slots.get(&(policy.id, index)).copied().unwrap_or(0);
-                rules
-                    .insert(
-                        &Key::new(
-                            prefix,
-                            ScopedSrcPortKey6::with_ifindex(
-                                policy.id,
-                                rule.key.proto,
-                                rule.icmp_type,
-                                if rule.icmp_type == 0 {
-                                    rule.key.port
-                                } else {
-                                    0
-                                },
-                                rule_ifindex(&rule.in_interface)?,
-                                addr,
-                            ),
-                        ),
-                        port_rule_with_limit(
-                            port_rule_value(rule.action, rule.log, cidr6_bits(&rule.src6))
-                                | rule.scope,
-                            slot,
-                        ) as u64
-                            | ((rule.id() as u64) << 32),
-                        0,
-                    )
-                    .context("inserting IPv6 port rule")?;
-            }
-        }
-    }
-    {
-        // The IPv6 destination trie.
-        let mut rules: LpmTrie<_, ScopedDstPortKey6, u64> = LpmTrie::try_from(
-            ebpf.map_mut("DST_RULES6")
-                .ok_or_else(|| anyhow!("DST_RULES6 map missing"))?,
-        )?;
-        for policy in policies {
-            for (index, rule) in policy
-                .port_rules
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| r.dst6.is_some())
-            {
-                let (prefix, addr) = port_rule_dst6_lpm(&rule.dst6);
-                let slot = limit_slots.get(&(policy.id, index)).copied().unwrap_or(0);
-                rules
-                    .insert(
-                        &Key::new(
-                            prefix,
-                            ScopedDstPortKey6::with_ifindex(
-                                policy.id,
-                                rule.key.proto,
-                                rule.icmp_type,
-                                if rule.icmp_type == 0 {
-                                    rule.key.port
-                                } else {
-                                    0
-                                },
-                                rule_ifindex(&rule.in_interface)?,
-                                addr,
-                            ),
-                        ),
-                        port_rule_with_limit(
-                            port_rule_value(rule.action, rule.log, cidr6_bits(&rule.dst6))
-                                | rule.scope,
-                            slot,
-                        ) as u64
-                            | ((rule.id() as u64) << 32),
-                        0,
-                    )
-                    .context("inserting IPv6 destination rule")?;
-            }
-        }
-    }
-    {
-        // Destination-constrained rules live in their own trie: a longest-prefix
-        // match ranks one address field, and it is the *last* one in the key.
-        let mut rules: LpmTrie<_, ScopedDstPortKey, u64> = LpmTrie::try_from(
-            ebpf.map_mut("DST_RULES")
-                .ok_or_else(|| anyhow!("DST_RULES map missing"))?,
-        )?;
-        for policy in policies {
-            for (index, rule) in policy
-                .port_rules
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| r.dst.is_some())
-            {
-                let (prefix, addr) = port_rule_dst_lpm(&rule.dst);
-                let slot = limit_slots.get(&(policy.id, index)).copied().unwrap_or(0);
-                rules
-                    .insert(
-                        &Key::new(
-                            prefix,
-                            ScopedDstPortKey::with_ifindex(
-                                policy.id,
-                                rule.key.proto,
-                                rule.icmp_type,
-                                if rule.icmp_type == 0 {
-                                    rule.key.port
-                                } else {
-                                    0
-                                },
-                                rule_ifindex(&rule.in_interface)?,
-                                addr,
-                            ),
-                        ),
-                        port_rule_with_limit(
-                            port_rule_value(rule.action, rule.log, cidr_bits(&rule.dst))
-                                | rule.scope,
-                            slot,
-                        ) as u64
-                            | ((rule.id() as u64) << 32),
-                        0,
-                    )
-                    .context("inserting destination rule")?;
-            }
-        }
+    let diff = crate::policy_tries::sync_all(ebpf, written, &plan.tries)?;
+    if diff.written + diff.removed > 0 {
+        log::info!(
+            "policy tries: {} written, {} removed, {} unchanged",
+            diff.written,
+            diff.removed,
+            diff.unchanged
+        );
     }
     Ok(())
 }
@@ -4674,7 +4548,7 @@ fn program_masquerade(
 /// be expressed in the map at all, so the honest answer is to refuse the apply
 /// and leave the previous configuration in force — the fail-closed direction for
 /// a firewall, and the one the operator will notice.
-fn rule_ifindex(name: &str) -> Result<u32> {
+pub(crate) fn rule_ifindex(name: &str) -> Result<u32> {
     if name.is_empty() {
         return Ok(0);
     }
@@ -4685,24 +4559,6 @@ fn rule_ifindex(name: &str) -> Result<u32> {
              interface"
         )
     })
-}
-
-/// The same resolution during the stale sweep, where a missing interface is
-/// expected rather than an error.
-///
-/// The sweep runs over the *previous* configuration, and an interface named
-/// there may since have been removed — that is a normal reconfigure, not an
-/// operator mistake, so it must not fail the apply. Falling back to `0` can
-/// remove more than it should, which is harmless in this one position:
-/// `remove_stale` runs immediately before `program_policies` rewrites every rule
-/// of the new configuration, so an over-broad removal is refilled in the same
-/// pass. Under-removal is the failure that matters here, and it is why this is a
-/// separate function rather than a flag on the one above.
-fn stale_ifindex(name: &str) -> u32 {
-    if name.is_empty() {
-        return 0;
-    }
-    if_nametoindex(name).unwrap_or(0)
 }
 
 /// Write the `MAC_RULES` map: a policy's verdicts on sender hardware addresses.
@@ -6046,6 +5902,7 @@ fn egress_interfaces(cfg: &RuntimeConfig, ifaces: &[String], egress: bool) -> Ve
 fn attach_egress(
     ebpf: &mut Ebpf,
     ifaces: &[String],
+    persist: Option<&crate::persist::Persist>,
 ) -> Result<BTreeMap<String, InterfaceLink<SchedClassifierLink>>> {
     for (slot, name) in [
         (0, "velstra_egress_v4"),
@@ -6087,17 +5944,65 @@ fn attach_egress(
         let ifindex = if_nametoindex(iface)?;
         // Idempotent: a pre-existing clsact qdisc is fine.
         let _ = qdisc_add_clsact(iface);
-        let id = program
-            .attach(iface, TcAttachType::Egress)
-            .with_context(|| format!("attaching TC egress program to {iface}"))?;
-        let link = program
-            .take_link(id)
-            .context("owning TC egress attachment")?;
-        links.insert(iface.clone(), InterfaceLink::new(iface, ifindex, link)?);
+        let link = attach_egress_one(program, iface, ifindex, persist)?;
+        links.insert(iface.clone(), link);
         log::info!("attached egress firewall to {iface}");
     }
     // On a partial failure, the links collected so far drop and detach too.
     Ok(links)
+}
+
+/// One egress hook: adopt the previous agent's pinned one when persisting,
+/// else attach (and pin when persisting). A TCX interface takes several
+/// programs, so a pin that is not adopted must be removed before attaching —
+/// two egress firewalls in a row would enforce the old policy and the new one.
+fn attach_egress_one(
+    program: &mut SchedClassifier,
+    iface: &str,
+    ifindex: u32,
+    persist: Option<&crate::persist::Persist>,
+) -> Result<InterfaceLink<SchedClassifierLink>> {
+    let attach = |program: &mut SchedClassifier| -> Result<SchedClassifierLink> {
+        let id = program
+            .attach(iface, TcAttachType::Egress)
+            .with_context(|| format!("attaching TC egress program to {iface}"))?;
+        program.take_link(id).context("owning TC egress attachment")
+    };
+    let Some(persist) = persist else {
+        return InterfaceLink::new(iface, ifindex, attach(program)?);
+    };
+    let path = persist.link_path(crate::persist::LinkRole::Egress, iface);
+    if path.exists() {
+        match swap_pinned::<SchedClassifierLink>(&path, |link| {
+            let id = program.attach_to_link(link)?;
+            Ok(program.take_link(id)?)
+        }) {
+            Ok((link, link_id)) => {
+                log::info!("adopted the pinned egress firewall on {iface}");
+                let pin = LinkPin { path, link_id };
+                return InterfaceLink::with_pin(iface, ifindex, link, Some(pin));
+            }
+            Err(error) => {
+                warn!(
+                    "{iface}: not adopting {}: {error:#}; attaching afresh",
+                    path.display()
+                );
+                crate::persist::remove_pin(&path)?;
+            }
+        }
+    }
+    let link = attach(program)?;
+    if <&aya::programs::links::FdLink>::try_from(&link).is_err() {
+        warn!("{iface}: the egress hook is a netlink tc filter (no TCX); it cannot be pinned");
+        return InterfaceLink::new(iface, ifindex, link);
+    }
+    match pin_link::<SchedClassifierLink>(link, &path) {
+        Ok((link, pin)) => InterfaceLink::with_pin(iface, ifindex, link, Some(pin)),
+        Err(error) => {
+            warn!("{iface}: {error:#}; this egress hook will not survive the agent");
+            InterfaceLink::new(iface, ifindex, attach(program)?)
+        }
+    }
 }
 
 /// Load the B2 `velstra_bum` TC classifier and attach it at **ingress** on each
@@ -6145,19 +6050,51 @@ fn attach_bum_ingress(
     Ok(links)
 }
 
-/// Attach `program`, walking the candidate modes for `mode` until one succeeds.
+/// Attach `program` to `iface`: adopt the previous agent's pinned attachment
+/// when persisting, else walk the candidate modes for `mode` until one
+/// succeeds (and pin the result when persisting).
 fn attach_with_fallback(
     program: &mut Xdp,
     iface: &str,
     mode: AttachMode,
+    persist: Option<&crate::persist::Persist>,
 ) -> Result<(XdpMode, InterfaceLink<XdpLink>)> {
     let ifindex = if_nametoindex(iface)?;
+    let Some(persist) = persist else {
+        let (chosen, link) = attach_xdp_fresh(program, iface, mode)?;
+        return Ok((chosen, InterfaceLink::new(iface, ifindex, link)?));
+    };
+    if let Some(adopted) = adopt_xdp(program, iface, ifindex, mode, persist)? {
+        return Ok(adopted);
+    }
+    let (chosen, link) = attach_xdp_fresh(program, iface, mode)?;
+    let path = persist.link_path(crate::persist::LinkRole::Xdp(xdp_mode_name(chosen)), iface);
+    match pin_link::<XdpLink>(link, &path) {
+        Ok((link, pin)) => Ok((
+            chosen,
+            InterfaceLink::with_pin(iface, ifindex, link, Some(pin))?,
+        )),
+        Err(error) => {
+            // The failed pin released the attachment; take one that at least
+            // lives as long as this agent.
+            warn!("{iface}: {error:#}; this XDP attachment will not survive the agent");
+            let (chosen, link) = attach_xdp_fresh(program, iface, mode)?;
+            Ok((chosen, InterfaceLink::new(iface, ifindex, link)?))
+        }
+    }
+}
+
+fn attach_xdp_fresh(
+    program: &mut Xdp,
+    iface: &str,
+    mode: AttachMode,
+) -> Result<(XdpMode, XdpLink)> {
     let mut last_err = None;
     for candidate in mode.candidates() {
         match program.attach(iface, *candidate) {
             Ok(id) => {
                 let link = program.take_link(id).context("owning XDP attachment")?;
-                return Ok((*candidate, InterfaceLink::new(iface, ifindex, link)?));
+                return Ok((*candidate, link));
             }
             Err(e) => {
                 warn!("attach to {iface} in {candidate:?} mode failed: {e}");
@@ -6169,6 +6106,101 @@ fn attach_with_fallback(
         Some(e) => anyhow!("could not attach XDP program to {iface}: {e}"),
         None => anyhow!("no XDP attach mode was attempted for {iface}"),
     })
+}
+
+/// Swap `program` into the previous agent's pinned XDP attachment on `iface`
+/// (one atomic `bpf_link_update`: the interface is never unfiltered). A pin
+/// that cannot be adopted — another mode, a link whose interface was
+/// recreated — is removed so the fresh attach is not refused.
+fn adopt_xdp(
+    program: &mut Xdp,
+    iface: &str,
+    ifindex: u32,
+    mode: AttachMode,
+    persist: &crate::persist::Persist,
+) -> Result<Option<(XdpMode, InterfaceLink<XdpLink>)>> {
+    for (name, path) in persist.xdp_pins(iface)? {
+        let chosen = xdp_mode_of(name);
+        if mode.candidates().contains(&chosen) {
+            match swap_pinned::<XdpLink>(&path, |link| {
+                let id = program.attach_to_link(link)?;
+                Ok(program.take_link(id)?)
+            }) {
+                Ok((link, link_id)) => {
+                    log::info!("adopted the pinned XDP attachment on {iface} ({chosen:?})");
+                    let pin = LinkPin { path, link_id };
+                    return Ok(Some((
+                        chosen,
+                        InterfaceLink::with_pin(iface, ifindex, link, Some(pin))?,
+                    )));
+                }
+                Err(error) => warn!(
+                    "{iface}: not adopting {}: {error:#}; attaching afresh",
+                    path.display()
+                ),
+            }
+        }
+        crate::persist::remove_pin(&path)?;
+    }
+    Ok(None)
+}
+
+/// Open the pinned link at `path` and hand it to `update`, which swaps the new
+/// program in. Returns the updated link and its kernel id.
+fn swap_pinned<L>(path: &std::path::Path, update: impl FnOnce(L) -> Result<L>) -> Result<(L, u32)>
+where
+    L: TryFrom<aya::programs::links::FdLink, Error = aya::programs::links::LinkError>,
+{
+    let link = aya::programs::links::FdLink::from(
+        aya::programs::links::PinnedLink::from_pin(path).context("opening the pin")?,
+    );
+    let link_id = link.info().context("reading the pinned link")?.id();
+    let typed = L::try_from(link).context("the pin is not this kind of attachment")?;
+    Ok((update(typed).context("bpf_link_update")?, link_id))
+}
+
+/// Pin a freshly attached `link` at `path`. Consumes it: on failure the
+/// attachment is gone and the caller must attach again.
+fn pin_link<L>(link: L, path: &std::path::Path) -> Result<(L, LinkPin)>
+where
+    L: TryFrom<aya::programs::links::FdLink, Error = aya::programs::links::LinkError>,
+    aya::programs::links::FdLink: TryFrom<L, Error = aya::programs::links::LinkError>,
+{
+    let link = aya::programs::links::FdLink::try_from(link)
+        .context("the attachment is not a bpf_link and cannot be pinned")?;
+    let link_id = link.info().context("reading the new link")?.id();
+    // Whatever is still at this path was not adoptable: a defunct link.
+    crate::persist::remove_pin(path)?;
+    let pinned = link
+        .pin(path)
+        .with_context(|| format!("pinning {}", path.display()))?;
+    let link = L::try_from(aya::programs::links::FdLink::from(pinned))
+        .context("re-typing the pinned link")?;
+    Ok((
+        link,
+        LinkPin {
+            path: path.to_path_buf(),
+            link_id,
+        },
+    ))
+}
+
+fn xdp_mode_name(mode: XdpMode) -> crate::persist::XdpModeName {
+    use crate::persist::XdpModeName;
+    match mode {
+        XdpMode::Driver => XdpModeName::Driver,
+        XdpMode::Hardware => XdpModeName::Hardware,
+        _ => XdpModeName::Skb,
+    }
+}
+
+fn xdp_mode_of(name: crate::persist::XdpModeName) -> XdpMode {
+    use crate::persist::XdpModeName;
+    match name {
+        XdpModeName::Driver => XdpMode::Driver,
+        XdpModeName::Hardware => XdpMode::Hardware,
+        XdpModeName::Skb => XdpMode::Skb,
+    }
 }
 
 /// A summed snapshot of the per-CPU statistics.
@@ -7497,15 +7529,6 @@ mod interface_scoping {
             text.contains("nosuchif0"),
             "the refusal must name the interface, got: {text}"
         );
-    }
-
-    /// The sweep is deliberately lenient, and this is the asymmetry that makes
-    /// the pair correct: an interface removed since the last apply is a normal
-    /// reconfigure, and failing there would block the very apply that cleans up.
-    #[test]
-    fn the_stale_sweep_tolerates_an_interface_that_is_gone() {
-        assert_eq!(stale_ifindex("nosuchif0"), 0);
-        assert_eq!(stale_ifindex(""), 0);
     }
 }
 
