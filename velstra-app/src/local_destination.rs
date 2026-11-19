@@ -1,4 +1,4 @@
-//! Rules whose destination is this host (`dst = "local"`).
+//! Rules whose destination is this host (`dst-local = true`).
 //!
 //! An emitter cannot know which addresses a host holds: a DHCP lease, a
 //! SLAAC or DHCPv6 address and a VRRP address that moves between members are
@@ -167,7 +167,7 @@ name = "mgmt-ssh"
 proto = "tcp"
 port = 22
 action = "pass"
-dst = "local"
+dst-local = true
 [[policy.port_rule]]
 name = "web"
 proto = "tcp"
@@ -214,7 +214,7 @@ action = "pass"
 
     #[test]
     fn a_family_scoped_local_rule_takes_only_its_familys_addresses() {
-        let c = cfg(&LOCAL_SSH.replace("dst = \"local\"", "dst = \"local\"\nfamily = \"ipv4\""));
+        let c = cfg(&LOCAL_SSH.replace("dst-local = true", "dst-local = true\nfamily = \"ipv4\""));
         let out = concrete(&c, &local(&["10.0.0.1", "2001:db8::1"]));
         let ssh: Vec<_> = out
             .policies
@@ -236,7 +236,7 @@ action = "pass"
 
     #[test]
     fn local_destination_cannot_be_combined_with_a_source() {
-        let text = LOCAL_SSH.replace("dst = \"local\"", "dst = \"local\"\nsrc = \"10.0.0.0/8\"");
+        let text = LOCAL_SSH.replace("dst-local = true", "dst-local = true\nsrc = \"10.0.0.0/8\"");
         assert!(load(&text).is_err());
     }
 
@@ -246,7 +246,7 @@ action = "pass"
     #[test]
     fn the_policy_fingerprint_sees_a_local_rule_but_no_member_address() {
         let local = cfg(LOCAL_SSH);
-        let any = cfg(&LOCAL_SSH.replace("dst = \"local\"\n", ""));
+        let any = cfg(&LOCAL_SSH.replace("dst-local = true\n", ""));
         let fingerprint = crate::conntrack_sync::secure::policy_fingerprint;
         assert_ne!(fingerprint(&local).unwrap(), fingerprint(&any).unwrap());
         // The fingerprint is of the symbolic configuration the agent keeps —

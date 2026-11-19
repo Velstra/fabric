@@ -3459,7 +3459,7 @@ struct PreparedHostConfig {
     route_ifindices: BTreeMap<String, u32>,
     ipv4: Ipv4Inventory,
     /// Every address this host holds, both families, when the configuration
-    /// has a `dst = "local"` rule to resolve with it; empty otherwise, so a
+    /// has a `dst-local` rule to resolve with it; empty otherwise, so a
     /// configuration without one keeps its old refresh behaviour exactly.
     local: BTreeSet<std::net::IpAddr>,
 }
@@ -3497,7 +3497,7 @@ fn local_address_additions(
     previous: &PreparedHostConfig,
     observed: &PreparedHostConfig,
 ) -> Option<BTreeSet<[u8; 8]>> {
-    // A changed local set changes rule-trie entries (`dst = "local"`), which
+    // A changed local set changes rule-trie entries (`dst-local`), which
     // only the full closed-gate rewrite may do.
     if previous.overlay != observed.overlay
         || previous.srv6 != observed.srv6
@@ -3664,7 +3664,7 @@ impl ReaderQuiescence {
 /// their tail calls), even while CONFIG_EPOCH becomes even between writes.
 /// When `old` is `Some`, remove its entries before installing the replacement.
 /// `old` is the configuration whose entries are to be removed, with the host
-/// facts it was written with: its `dst = "local"` rules were written as one
+/// facts it was written with: its `dst-local` rules were written as one
 /// entry per address that host held then, and only those exact entries can be
 /// found again to remove.
 fn apply_config_quiesced(
@@ -6403,7 +6403,7 @@ mod tests {
         assert!(intent.allows_address_refresh(Some(CONFIG_READY), true));
     }
 
-    /// DP-16: with a `dst = "local"` rule, a new host address (a DHCP lease,
+    /// DP-16: with a `dst-local` rule, a new host address (a DHCP lease,
     /// a VRRP address arriving on failover) changes rule-trie entries. The
     /// additive shortcut only grows LOCAL_EGRESS_ADDRS and must not be taken,
     /// or the rule would keep matching the old address set.

@@ -224,6 +224,18 @@ pub struct PortRule {
     /// one silently — a rule that matches more than it says is worse than no rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dst: Option<String>,
+    /// The destination is **this host** — every address it holds when the
+    /// maps are written, resolved by the agent from its live host inventory
+    /// (DHCP leases, SLAAC/DHCPv6 addresses, a VRRP address while this member
+    /// holds it) and rewritten when that changes. Names no address itself, so
+    /// it is the same rule on every HA member. Mutually exclusive with `src`,
+    /// `dst` and `src-mac`.
+    #[serde(
+        default,
+        rename = "dst-local",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub dst_local: bool,
     /// Rate limit for **new** flows this rule admits, in packets per second. Absent
     /// (or `0`) leaves the rule unlimited. Only meaningful on a rule that passes —
     /// a limit on a drop rule would throttle nothing.
@@ -1294,9 +1306,8 @@ pub struct ResolvedRule {
     pub src6: Option<Cidr6>,
     /// The IPv6 destination constraint.
     pub dst6: Option<Cidr6>,
-    /// The destination is **this host** (`dst = "local"`): every address the
-    /// host holds when the maps are written, resolved by the agent from its
-    /// live host inventory and rewritten when that changes. Mutually exclusive
+    /// The destination is **this host** (see [`PortRule::dst_local`]): every
+    /// address the host holds when the maps are written. Mutually exclusive
     /// with the four address constraints above, which are then all `None`.
     pub dst_local: bool,
     /// What to do on a match.
@@ -1307,9 +1318,6 @@ pub struct ResolvedRule {
     /// is unlimited.
     pub limit: Option<(u32, u32)>,
 }
-
-/// The `dst` value that names this host rather than an address.
-pub const LOCAL_DESTINATION: &str = "local";
 
 /// This host's resolved overlay endpoint. The underlay MAC and egress ifindex
 /// are resolved from the OS at load time by the control plane (like
@@ -1956,7 +1964,7 @@ fn resolve_firewall(
     for rule in port_rules {
         if let Some(mac) = &rule.src_mac {
             // A device verdict, not a port rule: it never reaches the tries.
-            if rule.port != 0 || rule.src.is_some() || rule.dst.is_some() {
+            if rule.port != 0 || rule.src.is_some() || rule.dst.is_some() || rule.dst_local {
                 bail!(
                     "policy {id}: a src-mac rule is a verdict on the device — it cannot \
                      also carry a port or an address"
@@ -2024,14 +2032,22 @@ fn resolve_firewall(
             ),
             None => (None, None),
         };
-        // `dst = "local"` is this host, whatever its addresses are when the
-        // rule is written to the maps (see `ResolvedRule::dst_local`). An
-        // emitter that resolved it from static configuration instead could
-        // not see a DHCP lease or a VRRP address, and widened to "any" when
-        // there was nothing static to see.
-        let dst_local = rule.dst.as_deref() == Some(LOCAL_DESTINATION);
+        // `dst-local` is this host, whatever its addresses are when the rule
+        // is written to the maps (see `PortRule::dst_local`). An emitter that
+        // resolved it from static configuration instead could not see a DHCP
+        // lease or a VRRP address, and widened to "any" when there was
+        // nothing static to see. It names the destination by itself.
+        if rule.dst_local && (rule.dst.is_some() || rule.src.is_some()) {
+            bail!(
+                "policy {id}: rule on {}/{} is dst-local and also names an address; \
+                 dst-local is the destination by itself and the data plane ranks one \
+                 address end per rule",
+                rule.proto.number(),
+                rule.port
+            );
+        }
+        let dst_local = rule.dst_local;
         let (dst, dst6) = match &rule.dst {
-            Some(_) if dst_local => (None, None),
             Some(cidr) if cidr.contains(':') => (
                 None,
                 Some(parse_cidr_v6(cidr).map_err(|e| {

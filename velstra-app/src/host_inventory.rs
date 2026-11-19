@@ -43,7 +43,7 @@ pub(crate) struct Interface {
     /// Preserve kernel order: the first address is implicit masquerade's source.
     pub(crate) addresses: Vec<Prefix>,
     /// The link's IPv6 addresses, in kernel order. Only "is this one of the
-    /// host's own addresses" is asked of them (`dst = "local"` rules), so no
+    /// host's own addresses" is asked of them (`dst-local` rules), so no
     /// prefix length is kept.
     pub(crate) addresses6: Vec<[u8; 16]>,
 }

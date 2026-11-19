@@ -3125,6 +3125,7 @@ mod tests {
             action,
             log: false,
             dst: None,
+            dst_local: false,
             limit: None,
             burst: None,
             src: None,
