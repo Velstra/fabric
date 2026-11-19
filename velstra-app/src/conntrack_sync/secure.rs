@@ -37,7 +37,7 @@ use tokio::{
     time::timeout,
 };
 use velstra_common::{FirewallKey, FirewallState, FlowKey, FlowState, SynFlow};
-use velstra_config::{ResolvedConntrackSync, RuntimeConfig};
+use velstra_config::{ResolvedConntrackSync, ResolvedRule, RuntimeConfig};
 
 use super::{
     Datagram, decode_datagram, decode_key, encode_firewall_batch, encode_key, encode_nat_batch,
@@ -1081,24 +1081,84 @@ pub async fn run(
     }
 }
 
+/// One rule's digest record. A member-local destination (`dst_local`, a rule
+/// "to the appliance itself" expanded to this member's own address) is hashed
+/// as which family it constrains, never as the address: each member holds the
+/// same rule toward a different address of its own.
+fn rule_record(r: &ResolvedRule) -> serde_json::Value {
+    use serde_json::json;
+    let (dst, dst6) = if r.dst_local {
+        (
+            r.dst.map(|_| json!("local")),
+            r.dst6.map(|_| json!("local")),
+        )
+    } else {
+        (
+            r.dst.map(|c| json!((c.octets, c.prefix))),
+            r.dst6.map(|c| json!((c.octets, c.prefix))),
+        )
+    };
+    json!([
+        r.name,
+        r.key.proto,
+        r.key.port,
+        r.icmp_type,
+        r.in_interface,
+        r.scope,
+        r.src.map(|c| (c.octets, c.prefix)),
+        dst,
+        r.src6.map(|c| (c.octets, c.prefix)),
+        dst6,
+        r.action.as_u32(),
+        r.log,
+        r.limit
+    ])
+}
+
+/// One policy's digest record (HA-02). Rules toward this member's own
+/// addresses are kept apart from the ordered rule list and hashed as a set:
+/// one operator rule expands to one entry per local address, and the members
+/// need not have equally many. The portal gate is always this member's own
+/// address in the zone, so only its families are hashed. A policy with neither
+/// hashes exactly as it always has, so a pair whose policy never had a
+/// member-local field keeps the digest an older member computes.
+fn policy_record(p: &velstra_config::PolicyConfig) -> serde_json::Value {
+    use serde_json::json;
+    let mut record = json!({
+        "id":p.id, "global":[p.global.default_action,p.global.flags],
+        "block4":p.blocklist.iter().map(|c| (c.octets,c.prefix)).collect::<Vec<_>>(),
+        "block6":p.blocklist6.iter().map(|c| (c.octets,c.prefix)).collect::<Vec<_>>(),
+        "mac":p.mac_rules.iter().map(|(m,a)| (*m,a.as_u32())).collect::<Vec<_>>(),
+        "portal":p.portal.map(|g| (g.portal4,g.portal6)),
+        "rules":p.port_rules.iter().filter(|r| !r.dst_local).map(rule_record).collect::<Vec<_>>()
+    });
+    let local: BTreeSet<String> = p
+        .port_rules
+        .iter()
+        .filter(|r| r.dst_local)
+        .map(|r| rule_record(r).to_string())
+        .collect();
+    if !local.is_empty() {
+        record["local_rules"] = json!(local);
+    }
+    if let Some(gate) = p.portal {
+        record["portal"] = json!({"local": [gate.portal4 != [0; 4], gate.portal6 != [0; 16]]});
+    }
+    record
+}
+
 /// Canonical, versioned JSON of the shared dataplane policy. Local addresses,
 /// MACs, routes and sync endpoints are excluded; policy IDs, interface bindings,
 /// state lifetimes, filtering and NAT semantics must agree before state applies.
+/// A member's own addresses inside the policy are excluded too, by
+/// [`policy_record`].
 pub(crate) fn policy_fingerprint(cfg: &RuntimeConfig) -> Result<[u8; 32]> {
     use serde_json::json;
     let control = match cfg.ha.as_ref() {
         Some(ha) => ha.validated_control_interfaces(&cfg.interfaces)?,
         None => BTreeSet::new(),
     };
-    let policies: Vec<_> = cfg.policies.iter().map(|p| json!({
-        "id":p.id, "global":[p.global.default_action,p.global.flags],
-        "block4":p.blocklist.iter().map(|c| (c.octets,c.prefix)).collect::<Vec<_>>(),
-        "block6":p.blocklist6.iter().map(|c| (c.octets,c.prefix)).collect::<Vec<_>>(),
-        "mac":p.mac_rules.iter().map(|(m,a)| (*m,a.as_u32())).collect::<Vec<_>>(),
-        "portal":p.portal.map(|g| (g.portal4,g.portal6)),
-        "rules":p.port_rules.iter().map(|r| json!([r.name,r.key.proto,r.key.port,r.icmp_type,r.in_interface,r.scope,
-            r.src.map(|c|(c.octets,c.prefix)),r.dst.map(|c|(c.octets,c.prefix)),r.src6.map(|c|(c.octets,c.prefix)),r.dst6.map(|c|(c.octets,c.prefix)),r.action.as_u32(),r.log,r.limit])).collect::<Vec<_>>()
-    })).collect();
+    let policies: Vec<_> = cfg.policies.iter().map(policy_record).collect();
     let mut interfaces: Vec<_> = cfg
         .interfaces
         .iter()
@@ -2074,6 +2134,140 @@ mod tests {
             "1b44c3c7fa77a9a3092934f444ae00c27033e48fd67bbb1fd12a938024d4d55f"
         );
     }
+    /// One member of a witness pair as Sentinel compiles it: `to firewall`
+    /// rules expanded to this member's own addresses (HA-02). `extra` adds a
+    /// local address the peer does not have.
+    fn member_policy(node: u8, extra: bool, portal: Option<&str>) -> RuntimeConfig {
+        let mut local: Vec<serde_json::Value> = ["10.1.0", "10.3.0"]
+            .iter()
+            .map(|net| {
+                serde_json::json!({"name":"mgmt-ssh","proto":"tcp","port":22,"action":"pass",
+                "dst":format!("{net}.{node}/32"),"dst-local":true})
+            })
+            .collect();
+        local.push(
+            serde_json::json!({"name":"mgmt-ssh","proto":"tcp","port":22,"action":"pass",
+            "dst":format!("fd42::{node}/128"),"dst-local":true}),
+        );
+        if extra {
+            local.push(
+                serde_json::json!({"name":"mgmt-ssh","proto":"tcp","port":22,"action":"pass",
+                "dst":format!("192.0.2.{node}/32"),"dst-local":true}),
+            );
+        }
+        let mut rules = vec![
+            serde_json::json!({"name":"web","proto":"tcp","port":443,"action":"pass","dst":"10.2.0.0/24"}),
+        ];
+        rules.extend(local);
+        let mut policy = serde_json::json!({"id":1,"default_action":"drop","port_rule":rules});
+        if let Some(address) = portal {
+            let family = if address.contains(':') {
+                "address6"
+            } else {
+                "address"
+            };
+            policy["portal"] = serde_json::json!({ family: address });
+        }
+        serde_json::from_value::<velstra_config::FileConfig>(serde_json::json!({
+            "ha":{"enabled":true,"cluster":"test-cluster-0123456789","node":node,"interfaces":["data0"],"control_interfaces":["ctrl"]},
+            "conntrack_sync":{"listen":format!("10.3.0.{node}:5429"),"peer":[format!("10.3.0.{}:5429", 3 - node)],"secret":"fixture-state-secret-at-least-32bytes"},
+            "interface":[{"name":"data0","policy":1,"vni":10},{"name":"ctrl","policy":2,"vni":0}],
+            "policy":[policy,{"id":2,"default_action":"pass"}]
+        })).unwrap().resolve().unwrap()
+    }
+
+    #[test]
+    fn policy_fingerprint_is_member_independent_for_rules_to_the_appliance_itself() {
+        // HA-02: the live pair differed ONLY in `node` and these addresses, and
+        // the standby stayed "policy differs from the owner's" forever.
+        let first = member_policy(1, false, None);
+        assert_eq!(
+            policy_fingerprint(&first).unwrap(),
+            policy_fingerprint(&member_policy(2, false, None)).unwrap()
+        );
+        // One operator rule is one entry per local address; a member with an
+        // extra address still holds the same rule.
+        assert_eq!(
+            policy_fingerprint(&first).unwrap(),
+            policy_fingerprint(&member_policy(2, true, None)).unwrap()
+        );
+        // The captive-portal gate is the member's own address in the zone.
+        assert_eq!(
+            policy_fingerprint(&member_policy(1, false, Some("10.2.0.1"))).unwrap(),
+            policy_fingerprint(&member_policy(2, false, Some("10.2.0.2"))).unwrap()
+        );
+    }
+
+    #[test]
+    fn policy_fingerprint_still_separates_every_member_local_rule_semantic() {
+        let first = member_policy(1, false, None);
+        let expected = policy_fingerprint(&first).unwrap();
+        // The guarded data policy, whatever position resolution gave it.
+        fn rules(cfg: &mut RuntimeConfig) -> &mut Vec<ResolvedRule> {
+            &mut cfg
+                .policies
+                .iter_mut()
+                .find(|p| p.id == 1)
+                .expect("data policy")
+                .port_rules
+        }
+        let mut mutations: Vec<(&str, RuntimeConfig)> = Vec::new();
+        let mut c = first.clone();
+        assert_eq!(rules(&mut c).iter().filter(|r| r.dst_local).count(), 3);
+        for r in rules(&mut c).iter_mut().filter(|r| r.dst_local) {
+            r.key = velstra_common::PortKey::new(6, 2222);
+        }
+        mutations.push(("local port", c));
+        let mut c = first.clone();
+        for r in rules(&mut c).iter_mut().filter(|r| r.dst_local) {
+            r.action = velstra_common::Action::Drop;
+        }
+        mutations.push(("local action", c));
+        let mut c = first.clone();
+        rules(&mut c).retain(|r| !r.dst_local);
+        mutations.push(("no rule to the appliance", c));
+        let mut c = first.clone();
+        for r in rules(&mut c).iter_mut() {
+            r.dst_local = false;
+        }
+        mutations.push(("the same addresses written explicitly", c));
+        let mut c = first.clone();
+        rules(&mut c).retain(|r| r.dst6.is_none());
+        mutations.push(("no IPv6 rule to the appliance", c));
+        let mut c = first.clone();
+        for r in rules(&mut c).iter_mut().filter(|r| r.dst_local) {
+            r.dst = None;
+            r.dst6 = None;
+        }
+        mutations.push(("a local mark on a rule to any destination", c));
+        let mut c = first.clone();
+        for r in rules(&mut c).iter_mut().filter(|r| !r.dst_local) {
+            r.dst = velstra_common::parse_cidr_v4("10.2.1.0/24").ok();
+        }
+        mutations.push(("shared destination", c));
+        mutations.push(("portal present", member_policy(1, false, Some("10.2.0.1"))));
+        for (label, changed) in mutations {
+            assert_ne!(expected, policy_fingerprint(&changed).unwrap(), "{label}");
+        }
+        assert_ne!(
+            policy_fingerprint(&member_policy(1, false, Some("10.2.0.1"))).unwrap(),
+            policy_fingerprint(&member_policy(1, false, Some("fd42:2::1"))).unwrap(),
+            "portal family"
+        );
+    }
+
+    #[test]
+    fn a_member_local_mark_needs_a_destination() {
+        let error = serde_json::from_value::<velstra_config::FileConfig>(serde_json::json!({
+            "policy":[{"id":1,"default_action":"drop","port_rule":[
+                {"name":"bad","proto":"tcp","port":22,"action":"pass","dst-local":true}]}]
+        }))
+        .unwrap()
+        .resolve()
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("dst-local"), "{error:#}");
+    }
+
     #[tokio::test]
     async fn tcp_sender_retires_session_when_snapshot_becomes_unavailable() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

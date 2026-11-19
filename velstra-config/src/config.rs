@@ -224,6 +224,18 @@ pub struct PortRule {
     /// one silently — a rule that matches more than it says is worse than no rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dst: Option<String>,
+    /// `dst` is one of this member's own addresses: the rule was written as
+    /// "to the appliance itself", and the appliance expanded it per address.
+    ///
+    /// Nothing in the data plane reads it. It tells the HA policy digest that
+    /// the address is member-local, so two members holding the same policy (a
+    /// rule to *each one's own* address) agree on it. Requires `dst`.
+    #[serde(
+        default,
+        rename = "dst-local",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub dst_local: bool,
     /// Rate limit for **new** flows this rule admits, in packets per second. Absent
     /// (or `0`) leaves the rule unlimited. Only meaningful on a rule that passes —
     /// a limit on a drop rule would throttle nothing.
@@ -1294,6 +1306,9 @@ pub struct ResolvedRule {
     pub src6: Option<Cidr6>,
     /// The IPv6 destination constraint.
     pub dst6: Option<Cidr6>,
+    /// The destination is this member's own address (see
+    /// [`PortRule::dst_local`]). Only the HA policy digest reads it.
+    pub dst_local: bool,
     /// What to do on a match.
     pub action: Action,
     /// Log packets this rule matches, regardless of the policy-wide flag.
@@ -1988,6 +2003,14 @@ fn resolve_firewall(
                 rule.port
             );
         }
+        if rule.dst_local && rule.dst.is_none() {
+            bail!(
+                "policy {id}: rule on {}/{} is marked dst-local but names no destination; \
+                 a member-local destination is one of this member's own addresses",
+                rule.proto.number(),
+                rule.port
+            );
+        }
         if rule.src.is_some() && rule.dst.is_some() {
             bail!(
                 "policy {id}: rule on {}/{} sets both src and dst; the data plane \
@@ -2077,6 +2100,7 @@ fn resolve_firewall(
             dst,
             src6,
             dst6,
+            dst_local: rule.dst_local,
             action: rule.action.into(),
             log: rule.log,
             limit,
@@ -3397,6 +3421,7 @@ mod tests {
                 dst6: None,
                 src: None,
                 dst: None,
+                dst_local: false,
                 action: Action::Pass,
                 log: false,
                 limit: None,
@@ -3415,6 +3440,7 @@ mod tests {
                 dst6: None,
                 src: None,
                 dst: None,
+                dst_local: false,
                 action: Action::Drop,
                 log: false,
                 limit: None,

@@ -65,6 +65,9 @@ fn port_rule_from_proto(r: &proto::PortRule) -> PortRule {
         } else {
             Some(r.dst.clone())
         },
+        // Appliance-only: the controller never expands a rule per member
+        // address, so nothing it sends is member-local.
+        dst_local: false,
         limit: (r.limit != 0).then_some(r.limit),
         burst: (r.burst != 0).then_some(r.burst),
     }
@@ -1037,6 +1040,7 @@ mod every_field_survives {
             in_interface: Some("eth1".into()),
             src: Some("10.0.0.0/24".into()),
             dst: Some("10.1.0.0/24".into()),
+            dst_local: false,
             limit: Some(50),
             burst: Some(100),
         }
@@ -1065,9 +1069,12 @@ mod every_field_survives {
             in_interface,
             src,
             dst,
+            dst_local,
             limit,
             burst,
         } = &after;
+        // Appliance-only HA digest marker; the controller never emits it.
+        assert!(!dst_local, "dst_local");
         assert_eq!(name, &before.name, "name");
         assert_eq!(*proto, before.proto, "proto");
         assert_eq!(*port, before.port, "port");
