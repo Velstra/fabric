@@ -23,6 +23,7 @@ mod flowspec;
 mod ha;
 mod host_inventory;
 mod ipfix;
+mod local_destination;
 mod mapping;
 mod packet_events;
 mod portal;

@@ -11,9 +11,9 @@ mod proto_convert;
 
 pub use config::{
     ActionName, BackendCfg, ConntrackConfig, EncapName, FileConfig, FloodVtepCfg, ForwardMode,
-    HaConfig, InterfaceFile, IrbRouteCfg, MacRouteCfg, Nd6Cfg, NeighborCfg, Npt66Cfg, OverlayCfg,
-    PolicyConfig, PolicyFile, PortForwardCfg, PortIdentity, PortRule, ProtoName,
-    ResolvedConntrackSync, ResolvedFloodVtep, ResolvedFlowExport, ResolvedInterface,
+    HaConfig, InterfaceFile, IrbRouteCfg, LOCAL_DESTINATION, MacRouteCfg, Nd6Cfg, NeighborCfg,
+    Npt66Cfg, OverlayCfg, PolicyConfig, PolicyFile, PortForwardCfg, PortIdentity, PortRule,
+    ProtoName, ResolvedConntrackSync, ResolvedFloodVtep, ResolvedFlowExport, ResolvedInterface,
     ResolvedIrbRoute, ResolvedMacRoute, ResolvedNd6, ResolvedNeighbor, ResolvedNpt66,
     ResolvedOverlay, ResolvedPortForward, ResolvedRoute, ResolvedRule, ResolvedService,
     ResolvedSrv6, ResolvedSrv6Flood, ResolvedSrv6IrbRoute, ResolvedSrv6LocalSid, ResolvedSrv6Route,

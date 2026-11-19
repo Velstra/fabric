@@ -1294,6 +1294,11 @@ pub struct ResolvedRule {
     pub src6: Option<Cidr6>,
     /// The IPv6 destination constraint.
     pub dst6: Option<Cidr6>,
+    /// The destination is **this host** (`dst = "local"`): every address the
+    /// host holds when the maps are written, resolved by the agent from its
+    /// live host inventory and rewritten when that changes. Mutually exclusive
+    /// with the four address constraints above, which are then all `None`.
+    pub dst_local: bool,
     /// What to do on a match.
     pub action: Action,
     /// Log packets this rule matches, regardless of the policy-wide flag.
@@ -1302,6 +1307,9 @@ pub struct ResolvedRule {
     /// is unlimited.
     pub limit: Option<(u32, u32)>,
 }
+
+/// The `dst` value that names this host rather than an address.
+pub const LOCAL_DESTINATION: &str = "local";
 
 /// This host's resolved overlay endpoint. The underlay MAC and egress ifindex
 /// are resolved from the OS at load time by the control plane (like
@@ -2016,7 +2024,14 @@ fn resolve_firewall(
             ),
             None => (None, None),
         };
+        // `dst = "local"` is this host, whatever its addresses are when the
+        // rule is written to the maps (see `ResolvedRule::dst_local`). An
+        // emitter that resolved it from static configuration instead could
+        // not see a DHCP lease or a VRRP address, and widened to "any" when
+        // there was nothing static to see.
+        let dst_local = rule.dst.as_deref() == Some(LOCAL_DESTINATION);
         let (dst, dst6) = match &rule.dst {
+            Some(_) if dst_local => (None, None),
             Some(cidr) if cidr.contains(':') => (
                 None,
                 Some(parse_cidr_v6(cidr).map_err(|e| {
@@ -2077,6 +2092,7 @@ fn resolve_firewall(
             dst,
             src6,
             dst6,
+            dst_local,
             action: rule.action.into(),
             log: rule.log,
             limit,
@@ -3397,6 +3413,7 @@ mod tests {
                 dst6: None,
                 src: None,
                 dst: None,
+                dst_local: false,
                 action: Action::Pass,
                 log: false,
                 limit: None,
@@ -3415,6 +3432,7 @@ mod tests {
                 dst6: None,
                 src: None,
                 dst: None,
+                dst_local: false,
                 action: Action::Drop,
                 log: false,
                 limit: None,

@@ -337,6 +337,7 @@ pub fn translate(spec: &str, actions: &[String], floor: u8) -> Result<Enforced, 
             dst: parsed.dst,
             src6: None,
             dst6: None,
+            dst_local: false,
             action,
             // Logged: a packet dropped because of something a peer said is
             // exactly the drop somebody will need to account for later.
@@ -461,6 +462,7 @@ pub fn merge_into(cfg: &RuntimeConfig, rules: &[ResolvedRule]) -> RuntimeConfig 
                 existing.key == rule.key
                     && existing.src == rule.src
                     && existing.dst == rule.dst
+                    && existing.dst_local == rule.dst_local
                     && existing.icmp_type == rule.icmp_type
                     && existing.in_interface == rule.in_interface
             }) {
@@ -763,6 +765,7 @@ mod tests {
             dst: parse_cidr_v4("10.50.0.0/24").ok(),
             src6: None,
             dst6: None,
+            dst_local: false,
             action: Action::Pass,
             log: false,
             limit: None,
@@ -801,6 +804,7 @@ mod tests {
             dst: parse_cidr_v4("10.50.0.0/24").ok(),
             src6: None,
             dst6: None,
+            dst_local: false,
             action: Action::Reject,
             log: false,
             limit: None,

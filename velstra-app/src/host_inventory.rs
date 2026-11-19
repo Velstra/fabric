@@ -42,6 +42,17 @@ pub(crate) struct Interface {
     pub(crate) mac: Option<Vec<u8>>,
     /// Preserve kernel order: the first address is implicit masquerade's source.
     pub(crate) addresses: Vec<Prefix>,
+    /// The link's IPv6 addresses, in kernel order. Only "is this one of the
+    /// host's own addresses" is asked of them (`dst = "local"` rules), so no
+    /// prefix length is kept.
+    pub(crate) addresses6: Vec<[u8; 16]>,
+}
+
+/// What one address dump said about one link, per family.
+#[derive(Debug, Default)]
+pub(crate) struct Addresses {
+    v4: Vec<Prefix>,
+    v6: Vec<[u8; 16]>,
 }
 
 /// Existing libc is sufficient; no subprocess or fixed polling sleep. Kernel
@@ -68,7 +79,7 @@ pub(crate) fn read() -> Result<Vec<Interface>> {
 fn finish(
     first: BTreeMap<u32, Link>,
     second: BTreeMap<u32, Link>,
-    mut addresses: BTreeMap<u32, Vec<Prefix>>,
+    mut addresses: BTreeMap<u32, Addresses>,
 ) -> Result<Vec<Interface>> {
     ensure!(
         first == second,
@@ -76,11 +87,15 @@ fn finish(
     );
     Ok(first
         .into_iter()
-        .map(|(index, link)| Interface {
-            name: link.name,
-            index,
-            mac: link.mac,
-            addresses: addresses.remove(&index).unwrap_or_default(),
+        .map(|(index, link)| {
+            let observed = addresses.remove(&index).unwrap_or_default();
+            Interface {
+                name: link.name,
+                index,
+                mac: link.mac,
+                addresses: observed.v4,
+                addresses6: observed.v6,
+            }
         })
         .collect())
 }
@@ -155,7 +170,7 @@ fn add_link(links: &mut BTreeMap<u32, Link>, payload: &[u8]) -> Result<()> {
 }
 
 fn add_address(
-    addresses: &mut BTreeMap<u32, Vec<Prefix>>,
+    addresses: &mut BTreeMap<u32, Addresses>,
     links: &BTreeMap<u32, Link>,
     payload: &[u8],
 ) -> Result<()> {
@@ -207,14 +222,20 @@ fn add_address(
         Ok(())
     })?;
     let local = local.or(address).context("address has no local value")?;
+    let observed = addresses.entry(index).or_default();
     if family == libc::AF_INET {
         let mask = u32::MAX
             .checked_shl(u32::from(32 - payload[1]))
             .unwrap_or(0);
-        addresses
-            .entry(index)
-            .or_default()
-            .push((local.try_into().unwrap(), mask.to_be_bytes()));
+        let local: [u8; 4] = local
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("malformed IPv4 address"))?;
+        observed.v4.push((local, mask.to_be_bytes()));
+    } else {
+        let local: [u8; 16] = local
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("malformed IPv6 address"))?;
+        observed.v6.push(local);
     }
     Ok(())
 }
