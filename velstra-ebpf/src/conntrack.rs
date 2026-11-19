@@ -543,11 +543,17 @@ pub(super) fn ct_seed_reply(flow: &FlowKey, control: u8) -> StatePublication {
     };
     unsafe {
         scratch_key4(&mut (*scratch).key, flow);
-        if FW_FLOWS.get(&(*scratch).key).is_some() {
+        if let Some(old) = FW_FLOWS.get(&(*scratch).key)
+            && !old.expired(flow.proto, bpf_ktime_get_ns(), timeouts())
+        {
             // This is not proof that the reverse key exists. Preserve the
             // existing seed semantics without claiming paired publication.
             return StatePublication::NoChange;
         }
+        // An EXPIRED entry for this reply tuple is a previous connection on a
+        // reused public port (bindings now expire with their connection). It
+        // must not suppress the new connection's seed: its reply would meet
+        // dead state and the zone's default drop.
         (*scratch).reverse = (*scratch).key.reverse();
         (*scratch).state = FirewallState {
             last_seen_ns: bpf_ktime_get_ns(),
