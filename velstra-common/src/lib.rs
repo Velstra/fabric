@@ -101,10 +101,11 @@ pub use overlay::{
 };
 pub use packet::{
     ETHERTYPE_IPV4, ETHERTYPE_IPV6, PORT_ENFORCE_MAC, PORT_ENFORCE_V4, PORT_ENFORCE_V6, PacketMeta,
-    PolicyId, PortAddr4, PortAddr6, PortBinding, PortKey, ScopedAddr, ScopedAddr6,
+    PolicyId, PortAddr4, PortAddr6, PortBinding, PortKey, RawFraming, ScopedAddr, ScopedAddr6,
     ScopedDstPortKey, ScopedDstPortKey6, ScopedMac, ScopedPortKey, ScopedSrcPortKey,
-    ScopedSrcPortKey6, icmp_reply_probe, icmp_type_key, icmp_type_probe, ip_proto, ipv6_ext_len,
-    is_ipv6_ext, lpm_key_addr,
+    ScopedSrcPortKey6, ethertype_passes_unfiltered, icmp_reply_probe, icmp_type_key,
+    icmp_type_probe, ip_proto, ipv4_options_refused, ipv6_ext_len, is_ipv6_ext, lpm_key_addr,
+    raw_ip_framing,
 };
 pub use parse::{ParseResult, parse_frame};
 pub use policy::{

@@ -101,10 +101,11 @@ use velstra_common::{
     Srv6FloodSet, Srv6IrbEndpoint, Srv6LocalSid, Srv6SidKey, StateFacts, SynFlow, SynProxyCfg,
     SynProxyKey, TcpSynth, TunnelEndpoint, TunnelKey, Verdict, admit_established_egress_reply,
     build_encap, build_srv6_encap, check_cookie, csum_replace_u32, decide, decide_egress,
-    decode_vni, epoch_of, gate_admits_unauthenticated, icmp, icmp_checksum, icmp_type_probe,
-    icmpv6_link_control, ip_proto, ipv6_ext_len, is_ipv6_ext, is_overlay_dport, legacy_napt_seed,
-    lpm_key_addr, make_cookie, masquerade_commit, mss_clamp_csum_operands, napt_binding_matches,
-    napt_claim, napt_find_existing, napt_port, napt_seed, napt_slot, plan_arp_reply, plan_forward,
+    decode_vni, epoch_of, ethertype_passes_unfiltered, gate_admits_unauthenticated, icmp,
+    icmp_checksum, icmp_type_probe, icmpv6_link_control, ip_proto, ipv4_options_refused,
+    ipv6_ext_len, is_ipv6_ext, is_overlay_dport, legacy_napt_seed, lpm_key_addr, make_cookie,
+    masquerade_commit, mss_clamp_csum_operands, napt_binding_matches, napt_claim,
+    napt_find_existing, napt_port, napt_seed, napt_slot, plan_arp_reply, plan_forward,
     plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_server_ack, plan_server_syn,
     plan_srv6_irb, plan_syn_ack, plan_tcp_rst, select_backend, session_hash, stateful_verdict,
     tcp_flags, translate_to_client, translate_to_server, unaddressed_uplink_drops,
@@ -2137,6 +2138,10 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
     let eth: *const EthHdr = unsafe { ptr_at_tc(ctx, 0)? };
     let ethertype = u16::from_be(unsafe { (*eth).ether_type });
     if ethertype != ETHERTYPE_IPV4 {
+        // DP-22, the egress half of the ingress rule above.
+        if fail_closed() && !ethertype_passes_unfiltered(ethertype) {
+            return Ok(TC_ACT_SHOT as i32);
+        }
         return Ok(TC_ACT_OK as i32);
     }
     let ipv4: *const Ipv4Hdr = unsafe { ptr_at_tc(ctx, EthHdr::LEN)? };
@@ -3068,6 +3073,12 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
             return try_arp(ctx);
         }
         bump(Counter::NonIpv4);
+        // DP-22: fail-closed means what the filter cannot classify is not
+        // admitted. Link control and encapsulations classified again on their
+        // own interface still pass; see `ethertype_passes_unfiltered`.
+        if fail_closed() && !ethertype_passes_unfiltered(ethertype) {
+            return Ok(xdp_action::XDP_DROP);
+        }
         return Ok(xdp_action::XDP_PASS);
     }
 
@@ -3401,11 +3412,15 @@ fn try_velstra_v4_state(ctx: &XdpContext, s: &V4StateScratch) -> Result<u32, ()>
     // explicit denies, blocklists and rate limits win; `block-icmp` refuses new
     // ICMP but not an echo reply or a RELATED error (DP-10/DP-C07); local
     // bootstrap traffic, established/related flows and port-forwards pass.
+    // DP-34: TCP/UDP with IPv4 options cannot be tracked, proxied or NATed, so
+    // a stateful policy refuses it rather than judging it statelessly.
+    let options_refused =
+        !local_dhcp && ipv4_options_refused(cfg.has_flag(ConfigFlags::STATEFUL), proto, ihl_bytes);
     let final_verdict = stateful_verdict(
         verdict,
         rule as u32,
         StateFacts {
-            invalid: ct == 2,
+            invalid: ct == 2 || options_refused,
             established,
             related,
             blocklisted,
