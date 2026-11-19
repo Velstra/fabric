@@ -982,6 +982,26 @@ async fn receive(
     }
 }
 
+/// Empty the replicated tables of a standby whose state stayed unusable (see
+/// `ha::State::track_usable`). Same lock order as a snapshot install (HA
+/// state, then the store), and readiness is withdrawn before the first map
+/// write, so a partial failure is never advertised as warm or as cold.
+async fn discard_stale_state(ha: &ha::Shared, store: &Mutex<Store>, local: IpAddr) -> Result<()> {
+    let mut ha = ha.lock().await;
+    if !ha.flush_due() {
+        return Ok(());
+    }
+    ha.begin_install();
+    store.lock().await.replace_ha(local, Entries::new()).await?;
+    ha.discarded_stale_state();
+    info!(
+        "conntrack-sync: discarded replicated state that stayed unusable for {} s; \
+         this member is cold until a complete snapshot arrives",
+        ha::STALE_STATE_DISCARD_NS / 1_000_000_000
+    );
+    Ok(())
+}
+
 async fn control_scope(
     ha: &ha::Shared,
     config: &ResolvedConntrackSync,
@@ -1072,6 +1092,9 @@ pub async fn run(
                     });
                 }
                 _ = ticker.tick() => {
+                    if let Err(error) = discard_stale_state(&ha, &store, config.listen.ip()).await {
+                        warn!("conntrack-sync: discarding unusable standby state failed: {error:#}; retrying");
+                    }
                     // Batch dumps can be large. Do not hold the configuration
                     // or lease-heartbeat lock while scanning kernel maps. The
                     // epoch and authority are rechecked after the bounded dump.
