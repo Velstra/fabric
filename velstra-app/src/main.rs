@@ -16,7 +16,6 @@ mod btf;
 mod capacity;
 mod conntrack_sync;
 mod controller_client;
-mod expiry;
 mod firewall;
 mod flows;
 mod flowspec;
@@ -26,9 +25,13 @@ mod ipfix;
 mod local_destination;
 mod mapping;
 mod packet_events;
+mod persist;
+mod policy_tries;
 mod portal;
 mod query;
+mod reclaim;
 mod routes;
+mod state_tables;
 mod wren;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -65,6 +68,9 @@ enum Command {
     Validate(ValidateArgs),
     /// Load every program into the kernel verifier without attaching to a NIC.
     VerifyEbpf(VerifyEbpfArgs),
+    /// Detach every hook and drop all connection state a persisting agent
+    /// (`[state] persist = true`) left pinned. Run only with the agent stopped.
+    ReleaseDatapath,
 }
 
 #[derive(Debug, Args)]
@@ -266,6 +272,11 @@ async fn main() -> Result<()> {
             Firewall::verify_object(object.as_deref())
         }
         Command::Run(args) => run(args).await,
+        Command::ReleaseDatapath => {
+            persist::Persist::release(std::path::Path::new(persist::ROOT))?;
+            println!("released {}", persist::ROOT);
+            Ok(())
+        }
     }
 }
 
@@ -375,6 +386,11 @@ async fn run(args: RunArgs) -> Result<()> {
         // real rather than something only honoured when someone asks.
         tokio::spawn(query::expire_blocks_loop(firewall.clone()));
     }
+
+    // DP-07: reclaim expired connection state in the background, so the LRU
+    // never has to choose which live connection to evict while dead ones sit
+    // in the tables. Never touches the datapath gate.
+    tokio::spawn(reclaim::run(firewall.clone()));
 
     // C20: the captive-portal socket, where a portal admits a device it has
     // authenticated. Every session it opens carries a deadline, and the sweep is
@@ -584,7 +600,11 @@ async fn run(args: RunArgs) -> Result<()> {
         None
     };
 
-    serve(&firewall, args.stats_interval, reporter).await?;
+    let served = serve(&firewall, args.stats_interval, reporter).await;
+    // Whatever ended the serve loop, a persisting agent leaves its pinned
+    // hooks enforcing for the next one rather than detaching them (DP-12).
+    firewall.lock().await.keep_attached_for_restart();
+    served?;
 
     match firewall.lock().await.read_stats() {
         Ok(stats) => {

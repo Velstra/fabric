@@ -85,6 +85,28 @@ jobs:
       - name: shellcheck
         run: git ls-files -z '*.sh' | xargs -0 shellcheck --severity=error
 
+  # Supply chain: published advisories, yanked crates, licences and sources,
+  # judged on the lockfile the agent is actually built from. Also runs on the
+  # nightly schedule, because an advisory is published against an unchanged
+  # lockfile far more often than a change introduces one. `deny.toml` holds
+  # the policy and the reason for every exception.
+  supply-chain:
+    name: supply chain — cargo-deny, cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
+      # A second, independent reader of the RustSec database. It fails on a
+      # vulnerability; unmaintained/yanked policy is cargo-deny's job above.
+      # The one ignore mirrors the documented exception in deny.toml.
+      - name: cargo audit
+        run: |
+          set -euo pipefail
+          cargo install --locked cargo-audit --version 0.23.0
+          cargo audit --ignore RUSTSEC-2025-0134
+
   # Full lane: builds the eBPF data plane (needs nightly rust-src + bpf-linker)
   # and the control plane, then runs the control-plane tests.
   build:

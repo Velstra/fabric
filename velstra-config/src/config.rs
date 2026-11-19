@@ -890,6 +890,51 @@ impl ConntrackConfig {
     }
 }
 
+/// Datapath connection-state tables (`[state]`): how large they are and whether
+/// they outlive the agent process.
+///
+/// Both are load-time properties. Changing either takes an agent restart, which
+/// [`RuntimeConfig::state`] makes the reload path report rather than ignore.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StateCfg {
+    /// Concurrent connections the state tables are sized for. Absent: derived
+    /// from the host's memory by the agent (about a twelfth of it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connections: Option<u32>,
+    /// Pin the attached programs and the connection-state maps in bpffs, so a
+    /// crashed or restarted agent leaves the last policy enforcing and the next
+    /// one adopts the established connections instead of dropping them.
+    pub persist: bool,
+}
+
+impl StateCfg {
+    /// The smallest and largest connection counts the tables can be sized for.
+    pub const CONNECTIONS: std::ops::RangeInclusive<u32> = 1024..=4_194_304;
+
+    pub fn resolve(self) -> Result<StateTables> {
+        if let Some(connections) = self.connections {
+            anyhow::ensure!(
+                Self::CONNECTIONS.contains(&connections),
+                "state.connections must be {}..={} (got {connections})",
+                Self::CONNECTIONS.start(),
+                Self::CONNECTIONS.end()
+            );
+        }
+        Ok(StateTables {
+            connections: self.connections,
+            persist: self.persist,
+        })
+    }
+}
+
+/// The validated `[state]` section. See [`StateCfg`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StateTables {
+    pub connections: Option<u32>,
+    pub persist: bool,
+}
+
 /// The raw, deserialised TOML document. The top-level firewall fields define
 /// policy `0` (the default); `[[policy]]`/`[[interface]]` add tenant policies.
 #[derive(Debug, Default, Deserialize)]
@@ -898,6 +943,8 @@ pub struct FileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ha: Option<HaConfig>,
     pub conntrack: ConntrackConfig,
+    /// Connection-state table size and persistence. Spelled `[state]`.
+    pub state: StateCfg,
     /// Verdict for traffic that matches no rule. Defaults to `pass`.
     pub default_action: ActionName,
     /// Refuse new inbound ICMP/ICMPv6 — an unsolicited ping. The answer to a
@@ -1122,7 +1169,7 @@ impl ResolvedConntrackSync {
 }
 
 /// A resolved load-balancer service: a service key and its (validated) backends.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedService {
     /// The `(VIP, port, proto)` lookup key.
     pub key: ServiceKey,
@@ -1257,7 +1304,7 @@ pub struct ResolvedPortForward {
 }
 
 /// A resolved tenant policy: the firewall map contents for one `policy_id`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PolicyConfig {
     /// Policy id (`0` is the default).
     pub id: PolicyId,
@@ -1326,7 +1373,7 @@ pub struct ResolvedRule {
 /// This host's resolved overlay endpoint. The underlay MAC and egress ifindex
 /// are resolved from the OS at load time by the control plane (like
 /// [`ResolvedRoute`]), so only the names/overrides are kept here.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedOverlay {
     /// This host's VTEP underlay IPv4 (outer source address).
     pub local_vtep_ip: [u8; 4],
@@ -1428,7 +1475,7 @@ pub struct ResolvedInterface {
 /// A resolved overlay forwarding entry: the tenant segment, the inner-destination
 /// **prefix** it matches, and the remote endpoint it points at. The egress
 /// interface stays a name (resolved to an ifindex at load time).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedTunnel {
     /// Tenant VNI this entry belongs to (matched exactly in the LPM trie).
     pub vni: u32,
@@ -1446,7 +1493,7 @@ pub struct ResolvedTunnel {
 /// A resolved L2 forwarding entry (B1): the tenant segment, the inner
 /// destination MAC it matches exactly, and the remote endpoint it points at.
 /// The egress interface stays a name (resolved to an ifindex at load time).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedMacRoute {
     /// Tenant VNI this entry belongs to (matched exactly in the MAC-FDB).
     pub vni: u32,
@@ -1502,7 +1549,7 @@ pub struct ResolvedFloodVtep {
 /// This host's resolved SRv6 endpoint (B9). The egress interface stays a name
 /// (resolved to an ifindex at load time). The SRv6 analogue of
 /// [`ResolvedOverlay`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedSrv6 {
     /// This host's SRv6 source address (outer IPv6 source, network-order octets).
     pub local_src: [u8; 16],
@@ -1523,7 +1570,7 @@ pub struct ResolvedSrv6 {
 /// destination MAC it matches exactly, and the remote service SID it points at.
 /// The egress interface stays a name (resolved to an ifindex at load time). The
 /// SRv6 analogue of [`ResolvedMacRoute`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedSrv6Route {
     /// Tenant VNI this entry belongs to (matched exactly in the SRv6 FDB).
     pub vni: u32,
@@ -1539,7 +1586,7 @@ pub struct ResolvedSrv6Route {
 
 /// A resolved SRv6 local-SID (B9): the parsed 128-bit SID, the tenant it
 /// terminates into, and its endpoint-behaviour code ([`velstra_common::srv6::behavior`]).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedSrv6LocalSid {
     /// The instantiated service SID (network-order octets, IPv6 wire form).
     pub sid: [u8; 16],
@@ -1679,7 +1726,7 @@ impl HaConfig {
 }
 
 /// Fully-resolved, validated configuration ready to be written into BPF maps.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {
     pub ha: Option<HaConfig>,
     pub conntrack: velstra_common::ConntrackTimeouts,
@@ -1732,6 +1779,8 @@ pub struct RuntimeConfig {
     /// data plane cannot parse instead of passing it. `false` (the default) keeps
     /// the historical fail-open behaviour.
     pub fail_closed: bool,
+    /// Connection-state table size and persistence (`[state]`). Load-time only.
+    pub state: StateTables,
 }
 
 impl RuntimeConfig {
@@ -1846,6 +1895,7 @@ impl RuntimeConfig {
             // passed too, matching this config's whole premise.
             conntrack: velstra_common::ConntrackTimeouts::DEFAULT,
             fail_closed: false,
+            state: StateTables::default(),
             policies: vec![PolicyConfig {
                 mac_rules: Vec::new(),
                 id: 0,
@@ -2834,6 +2884,7 @@ impl FileConfig {
         let config = RuntimeConfig {
             conntrack: self.conntrack.resolve()?,
             fail_closed: self.fail_closed,
+            state: self.state.resolve()?,
             policies,
             interfaces,
             routes,
@@ -4867,5 +4918,27 @@ mod activation_tests {
         .unwrap();
         assert!(cfg.interfaces[0].activate);
         assert!(!cfg.interfaces[1].activate, "only a held link is activated");
+    }
+
+    /// DP-06/DP-27: the state tables are sized and persisted from `[state]`;
+    /// absent, the agent derives the size and nothing is pinned.
+    #[test]
+    fn state_section_is_optional_bounded_and_strict() {
+        let resolve = |toml: &str| toml::from_str::<super::FileConfig>(toml)?.resolve();
+        let absent = resolve("").unwrap();
+        assert_eq!(absent.state, super::StateTables::default());
+
+        let sized = resolve("[state]\nconnections = 262144\npersist = true\n").unwrap();
+        assert_eq!(sized.state.connections, Some(262_144));
+        assert!(sized.state.persist);
+
+        for bad in [0, 1023, 4_194_305, u32::MAX] {
+            let error = resolve(&format!("[state]\nconnections = {bad}\n")).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("state.connections"),
+                "{error:#}"
+            );
+        }
+        assert!(toml::from_str::<super::FileConfig>("[state]\nflows = 1\n").is_err());
     }
 }

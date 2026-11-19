@@ -1,39 +1,67 @@
-# Explicit expiry maintenance
+# Connection-state reclamation and capacity
 
-The privileged local query socket accepts:
+## Background reclamation
+
+The datapath treats an expired connection entry as absent but never deletes
+it. The agent therefore runs a background collector over `FW_FLOWS` and
+`CONNTRACK`: every second it walks a bounded slice (65,536 entries) of each
+table, resuming where the previous tick stopped, and deletes entries that are
+expired by the applied `[conntrack]` timeouts.
+
+The collector **never closes the datapath gate**. Deleting an entry the
+datapath already ignores changes no verdict, so there is no pause and no
+failure mode that blocks traffic. Each candidate is re-read immediately before
+its delete, so an entry refreshed since the walk is kept. What remains is a
+window of microseconds in which a new connection that reuses an expired tuple
+could lose its first entry; it recovers with one retransmission.
+
+`SYN_FLOWS` carries no timestamp. It is counted, and left to its LRU.
+
+## On demand
+
+The privileged local query socket also accepts:
 
 ```text
-expire-state firewall 1024
-expire-state nat 1024
+expire-state firewall 65536
+expire-state nat 65536
 ```
 
-The second argument is the maximum entries examined (1–65,536), not a deletion
-count. There is no timer. Do not grant untrusted processes access to this socket.
+The second argument is the maximum entries examined (1–65,536). The call runs
+one immediate pass of the same collector on its own map handles and reports
+`examined`, `removed`, `scan_complete` and `elapsed_ns` as JSON. `pause_ns` is
+always 0: nothing is paused. Do not grant untrusted processes access to this
+socket.
 
-Maintenance requires a ready standalone agent with current applied intent and
-no HA or conntrack replication. It holds the firewall writer lock, closes
-`APPLY_STATE`, drains existing kernel packet readers and samples monotonic time.
-Candidates are collected before deletion and individually rechecked against the
-applied timeouts. An expired direction does not authorize removing its reverse.
-NAT maintenance also excludes other users of the shared NAT handle.
+## Capacity
 
-The JSON result reports `examined`, `removed`, `scan_complete`,
-`budget_exhausted`, `pause_ns` and the completed configuration `generation`.
-Scanning/deletion stops at a 250-ms work budget; kernel calls and the preceding
-reader drain can overrun it. `pause_ns` reports actual elapsed time, not an SLA.
+The state maps are sized when the agent loads, from `[state] connections`, or
+from the host's memory when that is absent (about a twelfth of RAM; never
+fewer than 16,384 connections). One connection is budgeted six `FW_FLOWS`
+entries and two `CONNTRACK` entries, which covers a port-forward.
 
-`scan_complete=false` is a partial prefix of the hash-map walk. There is no
-persistent scan cursor: repeated bounded calls are not guaranteed to cover the
-whole table. This command is not a background collector or zero-loss operation;
-traffic arriving while the gate is closed is rejected.
+```toml
+[state]
+connections = 262144   # optional; default derived from RAM
+persist = true         # keep hooks and state across an agent restart
+```
 
-Any failure after attempting closure tries to leave the datapath failed and
-reports the error. If the failed-state write also fails, status explicitly
-reports uncertain forwarding, not healthy success. Another maintenance call
-cannot clear this condition; successful configuration reconciliation is needed.
-Precondition failures do not reopen an existing failed transaction.
+`capacity` on the query socket reports each table's size and its occupancy
+from the collector's last complete walk, and a table at or above 80 % is
+`warning`; the agent also logs a warning when a table crosses that mark. A
+table not walked within two minutes is `unknown`, never healthy.
 
-This does **not** prevent LRU eviction, admit more live flows, reclaim SYN-proxy
-state, provide atomic pair publication or support HA. The 20,000-flow release
-gate remains failed. Qualification evidence for this new operation must be
-recorded separately from the previously qualified packet-object baseline.
+Changing `[state]` requires an agent restart (`reload` answers
+`restart-required`).
+
+## Persistence
+
+With `persist = true` the agent pins its XDP and TC egress attachments and the
+connection-state maps under `/sys/fs/bpf/velstra`. A crashed or stopped agent
+leaves the last policy enforcing; the next agent swaps its programs into the
+pinned attachments atomically and adopts the established connections, if the
+state layout, the table sizes and the interface-to-policy assignment are
+unchanged. Otherwise it starts with empty tables and logs why.
+
+`velstra release-datapath` detaches everything a persisting agent left pinned.
+Run it only with the agent stopped. Starting an agent with `persist = false`
+does the same.

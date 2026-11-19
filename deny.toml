@@ -1,0 +1,103 @@
+# What this repository will and will not carry.
+#
+# Two questions, and they are different: **advisories** ask whether a crate we
+# depend on has a published vulnerability, and **licences** ask whether we are
+# allowed to ship it. Both are answered in CI on every change (and nightly, so
+# an advisory published against an unchanged lockfile still turns the build
+# red). The agent built from this lockfile is what an appliance runs, so a
+# vulnerable lockfile here is a vulnerable product, whatever the consumer's
+# own lockfile says.
+#
+# The lists below are deliberately short. Each entry is a decision somebody
+# made once, on purpose, and the reason is written next to it.
+
+[graph]
+# The platforms this is actually built for. Without this the graph includes
+# every target's dependencies (`r-efi` for UEFI, the `windows-*` crates), which
+# are never linked into anything this repository ships.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+[advisories]
+# A published vulnerability against anything we ship fails the build; that is
+# the default and it is not softened here.
+#
+# `unmaintained` and `unsound` are looked for in the crates this workspace
+# names itself: those are the ones a change here can act on.
+yanked = "deny"
+unmaintained = "workspace"
+unsound = "workspace"
+ignore = [
+    # rustls-pemfile is unmaintained (its parser moved into rustls-pki-types).
+    # velstra-controller calls it directly, and tonic 0.12 / axum-server 0.7
+    # depend on it too, so dropping it means a tonic major upgrade plus a code
+    # change in the controller's TLS loader. No vulnerability is published
+    # against it. The controller is not part of the Sentinel appliance image.
+    # Remove this entry together with that migration.
+    { id = "RUSTSEC-2025-0134", reason = "unmaintained, no vulnerability; direct use in velstra-controller and via tonic 0.12 needs a tonic major upgrade" },
+]
+
+[licenses]
+# Permissive only for third-party code. Anything else stops the build and gets
+# a decision rather than an exception. The list holds nothing that matches
+# nothing: cargo-deny warns about an entry no crate uses, and it is removed.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    # The Mozilla root store (webpki-roots), under the Community Data License
+    # Agreement's permissive variant: a data licence, which is what a list of
+    # certificate authorities is.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+# The workspace's own crates, named one by one rather than allowing their
+# licences globally: an AGPL or GPL crate that came from *outside* this
+# repository should still stop the build. See LICENSING.md for why each
+# component carries the licence it does.
+[[licenses.exceptions]]
+name = "velstra"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "velstra-cni"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "velstra-config"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "velstra-controller"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "velstra-orchestrator"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "velstra-raft"
+allow = ["AGPL-3.0-or-later"]
+# The eBPF object is dual-licensed so the kernel accepts GPL-only helpers.
+[[licenses.exceptions]]
+name = "velstra-ebpf"
+allow = ["GPL-2.0-or-later"]
+
+[bans]
+# Two copies of the same crate is a bigger build, occasionally two copies of a
+# lock. A warning, not an error: the workspace does not control its transitive
+# graph.
+multiple-versions = "warn"
+
+[sources]
+# crates.io, plus exactly one git repository: aya, pinned by `rev` in the
+# workspace Cargo.toml. Any other git dependency, or a floating one, is a
+# version nobody can audit.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = ["https://github.com/aya-rs/aya"]

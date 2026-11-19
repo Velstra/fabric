@@ -118,6 +118,7 @@ pub(crate) fn concrete<'a>(
 /// Refuse to write a symbolic rule into a map. Written as-is it would carry
 /// no address and land in the address-less trie — "to any destination" — so
 /// a missed [`concrete`] must fail the apply, not widen the rule.
+#[cfg(test)]
 pub(crate) fn ensure_concrete(cfg: &RuntimeConfig) -> anyhow::Result<()> {
     ensure_concrete_policies(&cfg.policies)
 }

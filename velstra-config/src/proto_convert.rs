@@ -395,6 +395,10 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
         // node.
         portal: None,
         source_validation: rpf_from_proto(cfg.source_validation()),
+        // Table sizing and persistence are properties of the host the agent
+        // runs on, not of the policy a controller pushes: the agent's own
+        // defaults apply.
+        state: crate::StateCfg::default(),
         conntrack: cfg
             .conntrack
             .as_ref()
