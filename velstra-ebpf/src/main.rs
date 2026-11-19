@@ -2829,10 +2829,22 @@ fn masquerade_egress(
     // DP-08: only a connection opener may allocate. A non-SYN TCP segment with
     // no binding (an ACK/XMAS/NULL flood, or a flow whose binding is gone)
     // must not evict other clients' bindings from the shared LRU map.
+    // The complete-domain allocator may have placed the binding outside the
+    // seed's candidate window searched above, so look it up read-only first.
     if wan_port == 0 && proto == ip_proto::TCP && !FirewallState::is_opener(proto, control) {
-        bump(Counter::NatOpenerRequired);
-        bump(Counter::EgressDropped);
-        return Ok(TC_ACT_SHOT as i32);
+        let found = if napt_domain::enabled() {
+            napt_domain::existing(&flow, wan_ip, &layout)
+        } else {
+            0
+        };
+        let key = FlowKey::new(policy_id, dst_addr, wan_ip, dst_port, found, proto);
+        if found == 0 || !account_masquerade_binding(&key, reply_target, src_port, bytes) {
+            bump(Counter::NatOpenerRequired);
+            bump(Counter::EgressDropped);
+            return Ok(TC_ACT_SHOT as i32);
+        }
+        wan_port = found;
+        existing = true;
     }
     if wan_port == 0 {
         let result = if napt_domain::enabled() {
