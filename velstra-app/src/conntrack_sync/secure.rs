@@ -37,7 +37,7 @@ use tokio::{
     time::timeout,
 };
 use velstra_common::{FirewallKey, FirewallState, FlowKey, FlowState, SynFlow};
-use velstra_config::{ResolvedConntrackSync, RuntimeConfig};
+use velstra_config::{ResolvedConntrackSync, ResolvedRule, RuntimeConfig};
 
 use super::{
     Datagram, decode_datagram, decode_key, encode_firewall_batch, encode_key, encode_nat_batch,
@@ -824,6 +824,34 @@ fn decode_authority(bytes: &[u8], policy: [u8; 32]) -> Result<Option<Authority>>
     }))
 }
 
+/// How often a standby says it is refusing its peer's state because the two
+/// policies differ. The sender reconnects every interval, so one line per
+/// session would flood the journal; none at all (the old debug-only path)
+/// left an unsynchronized pair looking healthy (T4.8-ct).
+const POLICY_REFUSAL_WARN_EVERY: Duration = Duration::from_secs(60);
+
+fn policy_refusal_due(last: &mut Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    let due = last.is_none_or(|at| now.saturating_duration_since(at) >= POLICY_REFUSAL_WARN_EVERY);
+    if due {
+        *last = Some(now);
+    }
+    due
+}
+
+fn warn_policy_refusal(peer: IpAddr, now: std::time::Instant) {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let due = LAST
+        .lock()
+        .map(|mut last| policy_refusal_due(&mut last, now))
+        .unwrap_or(true);
+    if due {
+        warn!(
+            "conntrack-sync: refusing state from {peer}: its firewall policy differs from ours; \
+             no connection state is replicated until both members hold the same policy"
+        );
+    }
+}
+
 struct Receiver {
     firewall: Arc<Mutex<Firewall>>,
     store: Arc<Mutex<Store>>,
@@ -866,10 +894,10 @@ async fn receive(
             initialized || kind == BEGIN,
             "state session requires an initial snapshot"
         );
-        ensure!(
-            fw.sync_policy()? == policy,
-            "peer firewall policy differs; refusing state"
-        );
+        if fw.sync_policy()? != policy {
+            warn_policy_refusal(peer, std::time::Instant::now());
+            bail!("peer firewall policy differs; refusing state");
+        }
         let mut ha = ha.lock().await;
         if kind == BEGIN {
             authority = decode_authority(payload, policy)?;
@@ -952,6 +980,26 @@ async fn receive(
             _ => bail!("unknown state frame operation"),
         }
     }
+}
+
+/// Empty the replicated tables of a standby whose state stayed unusable (see
+/// `ha::State::track_usable`). Same lock order as a snapshot install (HA
+/// state, then the store), and readiness is withdrawn before the first map
+/// write, so a partial failure is never advertised as warm or as cold.
+async fn discard_stale_state(ha: &ha::Shared, store: &Mutex<Store>, local: IpAddr) -> Result<()> {
+    let mut ha = ha.lock().await;
+    if !ha.flush_due() {
+        return Ok(());
+    }
+    ha.begin_install();
+    store.lock().await.replace_ha(local, Entries::new()).await?;
+    ha.discarded_stale_state();
+    info!(
+        "conntrack-sync: discarded replicated state that stayed unusable for {} s; \
+         this member is cold until a complete snapshot arrives",
+        ha::STALE_STATE_DISCARD_NS / 1_000_000_000
+    );
+    Ok(())
 }
 
 async fn control_scope(
@@ -1044,6 +1092,9 @@ pub async fn run(
                     });
                 }
                 _ = ticker.tick() => {
+                    if let Err(error) = discard_stale_state(&ha, &store, config.listen.ip()).await {
+                        warn!("conntrack-sync: discarding unusable standby state failed: {error:#}; retrying");
+                    }
                     // Batch dumps can be large. Do not hold the configuration
                     // or lease-heartbeat lock while scanning kernel maps. The
                     // epoch and authority are rechecked after the bounded dump.
@@ -1081,32 +1132,72 @@ pub async fn run(
     }
 }
 
+/// One rule's digest record, in the field order the digest has always used.
+/// A `dst-local` rule names no address (the loader refuses one that does), so
+/// nothing member-specific can enter through it.
+fn rule_record(r: &ResolvedRule) -> serde_json::Value {
+    use serde_json::json;
+    json!([
+        r.name,
+        r.key.proto,
+        r.key.port,
+        r.icmp_type,
+        r.in_interface,
+        r.scope,
+        r.src.map(|c| (c.octets, c.prefix)),
+        r.dst.map(|c| (c.octets, c.prefix)),
+        r.src6.map(|c| (c.octets, c.prefix)),
+        r.dst6.map(|c| (c.octets, c.prefix)),
+        r.action.as_u32(),
+        r.log,
+        r.limit
+    ])
+}
+
+/// One policy's digest record (HA-02). Rules toward this host (`dst-local`,
+/// expanded per member by the agent) are kept apart from the ordered rule list
+/// and hashed as a set, marked as local so they never hash like a rule to any
+/// destination. The portal gate is always this member's own
+/// address in the zone, so only its families are hashed. A policy with neither
+/// hashes exactly as it always has, so a pair whose policy never had a
+/// member-local field keeps the digest an older member computes.
+fn policy_record(p: &velstra_config::PolicyConfig) -> serde_json::Value {
+    use serde_json::json;
+    let mut record = json!({
+        "id":p.id, "global":[p.global.default_action,p.global.flags],
+        "block4":p.blocklist.iter().map(|c| (c.octets,c.prefix)).collect::<Vec<_>>(),
+        "block6":p.blocklist6.iter().map(|c| (c.octets,c.prefix)).collect::<Vec<_>>(),
+        "mac":p.mac_rules.iter().map(|(m,a)| (*m,a.as_u32())).collect::<Vec<_>>(),
+        "portal":p.portal.map(|g| (g.portal4,g.portal6)),
+        "rules":p.port_rules.iter().filter(|r| !r.dst_local).map(rule_record).collect::<Vec<_>>()
+    });
+    let local: BTreeSet<String> = p
+        .port_rules
+        .iter()
+        .filter(|r| r.dst_local)
+        .map(|r| rule_record(r).to_string())
+        .collect();
+    if !local.is_empty() {
+        record["local_rules"] = json!(local);
+    }
+    if let Some(gate) = p.portal {
+        record["portal"] = json!({"local": [gate.portal4 != [0; 4], gate.portal6 != [0; 16]]});
+    }
+    record
+}
+
 /// Canonical, versioned JSON of the shared dataplane policy. Local addresses,
 /// MACs, routes and sync endpoints are excluded; policy IDs, interface bindings,
 /// state lifetimes, filtering and NAT semantics must agree before state applies.
+/// A member's own addresses inside the policy are excluded too, by
+/// [`policy_record`].
 pub(crate) fn policy_fingerprint(cfg: &RuntimeConfig) -> Result<[u8; 32]> {
     use serde_json::json;
     let control = match cfg.ha.as_ref() {
         Some(ha) => ha.validated_control_interfaces(&cfg.interfaces)?,
         None => BTreeSet::new(),
     };
-    let policies: Vec<_> = cfg.policies.iter().map(|p| json!({
-        "id":p.id, "global":[p.global.default_action,p.global.flags],
-        "block4":p.blocklist.iter().map(|c| (c.octets,c.prefix)).collect::<Vec<_>>(),
-        "block6":p.blocklist6.iter().map(|c| (c.octets,c.prefix)).collect::<Vec<_>>(),
-        "mac":p.mac_rules.iter().map(|(m,a)| (*m,a.as_u32())).collect::<Vec<_>>(),
-        "portal":p.portal.map(|g| (g.portal4,g.portal6)),
-        "rules":p.port_rules.iter().map(|r| {
-            let mut rule = json!([r.name,r.key.proto,r.key.port,r.icmp_type,r.in_interface,r.scope,
-            r.src.map(|c|(c.octets,c.prefix)),r.dst.map(|c|(c.octets,c.prefix)),r.src6.map(|c|(c.octets,c.prefix)),r.dst6.map(|c|(c.octets,c.prefix)),r.action.as_u32(),r.log,r.limit]);
-            // Symbolic and member-independent; appended only when set, so the
-            // fingerprint of every configuration without one is unchanged.
-            if r.dst_local && let Some(fields) = rule.as_array_mut() {
-                fields.push(json!("dst-local"));
-            }
-            rule
-        }).collect::<Vec<_>>()
-    })).collect();
+    let policies: Vec<_> = cfg.policies.iter().map(policy_record).collect();
     let mut interfaces: Vec<_> = cfg
         .interfaces
         .iter()
@@ -2086,6 +2177,137 @@ mod tests {
             "1b44c3c7fa77a9a3092934f444ae00c27033e48fd67bbb1fd12a938024d4d55f"
         );
     }
+    /// One member of a witness pair as Sentinel compiles it: a `to firewall`
+    /// rule is emitted symbolically (`dst-local`, no address) and the agent
+    /// expands it from the live host inventory, so a member's own addresses
+    /// never appear in the policy (HA-02, DP-16). `portal` is the member's own
+    /// captive-portal gate address, which does.
+    fn member_policy(node: u8, portal: Option<&str>) -> RuntimeConfig {
+        let rules = vec![
+            serde_json::json!({"name":"web","proto":"tcp","port":443,"action":"pass","dst":"10.2.0.0/24"}),
+            serde_json::json!({"name":"mgmt-ssh","proto":"tcp","port":22,"action":"pass","dst-local":true}),
+            serde_json::json!({"name":"mgmt-dns","proto":"udp","port":53,"action":"pass","dst-local":true,"family":"ipv6"}),
+        ];
+        let mut policy = serde_json::json!({"id":1,"default_action":"drop","port_rule":rules});
+        if let Some(address) = portal {
+            let family = if address.contains(':') {
+                "address6"
+            } else {
+                "address"
+            };
+            policy["portal"] = serde_json::json!({ family: address });
+        }
+        serde_json::from_value::<velstra_config::FileConfig>(serde_json::json!({
+            "ha":{"enabled":true,"cluster":"test-cluster-0123456789","node":node,"interfaces":["data0"],"control_interfaces":["ctrl"]},
+            "conntrack_sync":{"listen":format!("10.3.0.{node}:5429"),"peer":[format!("10.3.0.{}:5429", 3 - node)],"secret":"fixture-state-secret-at-least-32bytes"},
+            "interface":[{"name":"data0","policy":1,"vni":10},{"name":"ctrl","policy":2,"vni":0}],
+            "policy":[policy,{"id":2,"default_action":"pass"}]
+        })).unwrap().resolve().unwrap()
+    }
+
+    #[test]
+    fn policy_fingerprint_is_member_independent_for_rules_to_the_appliance_itself() {
+        // HA-02: the live pair differed ONLY in `node` and the members' own
+        // addresses, and the standby stayed "policy differs from the owner's"
+        // forever.
+        assert_eq!(
+            policy_fingerprint(&member_policy(1, None)).unwrap(),
+            policy_fingerprint(&member_policy(2, None)).unwrap()
+        );
+        // The captive-portal gate is the member's own address in the zone.
+        assert_eq!(
+            policy_fingerprint(&member_policy(1, Some("10.2.0.1"))).unwrap(),
+            policy_fingerprint(&member_policy(2, Some("10.2.0.2"))).unwrap()
+        );
+    }
+
+    #[test]
+    fn policy_fingerprint_still_separates_every_member_local_rule_semantic() {
+        let first = member_policy(1, None);
+        let expected = policy_fingerprint(&first).unwrap();
+        // The guarded data policy, whatever position resolution gave it.
+        fn rules(cfg: &mut RuntimeConfig) -> &mut Vec<ResolvedRule> {
+            &mut cfg
+                .policies
+                .iter_mut()
+                .find(|p| p.id == 1)
+                .expect("data policy")
+                .port_rules
+        }
+        let mut mutations: Vec<(&str, RuntimeConfig)> = Vec::new();
+        let mut c = first.clone();
+        assert_eq!(rules(&mut c).iter().filter(|r| r.dst_local).count(), 2);
+        for r in rules(&mut c).iter_mut().filter(|r| r.dst_local) {
+            r.key = velstra_common::PortKey::new(6, 2222);
+        }
+        mutations.push(("local port", c));
+        let mut c = first.clone();
+        for r in rules(&mut c).iter_mut().filter(|r| r.dst_local) {
+            r.action = velstra_common::Action::Drop;
+        }
+        mutations.push(("local action", c));
+        let mut c = first.clone();
+        rules(&mut c).retain(|r| !r.dst_local);
+        mutations.push(("no rule to the appliance", c));
+        let mut c = first.clone();
+        rules(&mut c).retain(|r| !(r.dst_local && r.scope != 0));
+        mutations.push(("no family-scoped rule to the appliance", c));
+        let mut c = first.clone();
+        for r in rules(&mut c).iter_mut() {
+            // A symbolic rule must not hash like a rule to any destination.
+            r.dst_local = false;
+        }
+        mutations.push(("the local mark dropped (any destination)", c));
+        let mut c = first.clone();
+        for r in rules(&mut c).iter_mut().filter(|r| !r.dst_local) {
+            r.dst = velstra_common::parse_cidr_v4("10.2.1.0/24").ok();
+        }
+        mutations.push(("shared destination", c));
+        mutations.push(("portal present", member_policy(1, Some("10.2.0.1"))));
+        for (label, changed) in mutations {
+            assert_ne!(expected, policy_fingerprint(&changed).unwrap(), "{label}");
+        }
+        assert_ne!(
+            policy_fingerprint(&member_policy(1, Some("10.2.0.1"))).unwrap(),
+            policy_fingerprint(&member_policy(1, Some("fd42:2::1"))).unwrap(),
+            "portal family"
+        );
+    }
+
+    #[test]
+    fn a_policy_refusal_is_reported_once_per_interval() {
+        let start = std::time::Instant::now();
+        let mut last = None;
+        assert!(policy_refusal_due(&mut last, start));
+        assert!(!policy_refusal_due(
+            &mut last,
+            start + Duration::from_secs(59)
+        ));
+        assert!(policy_refusal_due(
+            &mut last,
+            start + POLICY_REFUSAL_WARN_EVERY
+        ));
+        assert!(!policy_refusal_due(
+            &mut last,
+            start + Duration::from_secs(61)
+        ));
+    }
+
+    /// `dst-local` is the destination by itself: a rule that also names an
+    /// address is refused at load, so no member-specific address can reach
+    /// the digest through a local rule.
+    #[test]
+    fn a_local_destination_rule_names_no_address() {
+        let error = serde_json::from_value::<velstra_config::FileConfig>(serde_json::json!({
+            "policy":[{"id":1,"default_action":"drop","port_rule":[
+                {"name":"bad","proto":"tcp","port":22,"action":"pass","dst":"10.1.0.1/32","dst-local":true}]}]
+        }))
+        .unwrap()
+        .resolve()
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("dst-local"), "{error:#}");
+    }
+
     #[tokio::test]
     async fn tcp_sender_retires_session_when_snapshot_becomes_unavailable() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
