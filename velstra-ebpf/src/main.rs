@@ -98,15 +98,17 @@ use velstra_common::{
     PortalSeenKey, RateBucket, Rewrite, RouteEntry, SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6,
     ScopedDstPortKey, ScopedDstPortKey6, ScopedMac, ScopedPortKey, ScopedSrcPortKey,
     ScopedSrcPortKey6, ServiceKey, ServiceValue, SourceValidation, Srv6Config, Srv6Endpoint,
-    Srv6FloodSet, Srv6IrbEndpoint, Srv6LocalSid, Srv6SidKey, SynFlow, SynProxyCfg, SynProxyKey,
-    TcpSynth, TunnelEndpoint, TunnelKey, admit_established_egress_reply, build_encap,
-    build_srv6_encap, check_cookie, csum_replace_u32, decide, decide_egress, decode_vni, epoch_of,
-    gate_admits_unauthenticated, icmp, icmp_checksum, icmp_type_probe, ip_proto, ipv6_ext_len,
-    is_ipv6_ext, is_overlay_dport, legacy_napt_seed, lpm_key_addr, make_cookie, masquerade_commit,
-    napt_binding_matches, napt_claim, napt_find_existing, napt_port, napt_seed, napt_slot,
-    plan_arp_reply, plan_forward, plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat,
-    plan_server_ack, plan_server_syn, plan_srv6_irb, plan_syn_ack, plan_tcp_rst, select_backend,
-    session_hash, tcp_flags, translate_to_client, translate_to_server, unaddressed_uplink_drops,
+    Srv6FloodSet, Srv6IrbEndpoint, Srv6LocalSid, Srv6SidKey, StateFacts, SynFlow, SynProxyCfg,
+    SynProxyKey, TcpSynth, TunnelEndpoint, TunnelKey, Verdict, admit_established_egress_reply,
+    build_encap, build_srv6_encap, check_cookie, csum_replace_u32, decide, decide_egress,
+    decode_vni, epoch_of, ethertype_passes_unfiltered, gate_admits_unauthenticated, icmp,
+    icmp_checksum, icmp_type_probe, icmpv6_link_control, ip_proto, ipv4_options_refused,
+    ipv6_ext_len, is_ipv6_ext, is_overlay_dport, legacy_napt_seed, lpm_key_addr, make_cookie,
+    masquerade_commit, mss_clamp_csum_operands, napt_binding_matches, napt_claim,
+    napt_find_existing, napt_port, napt_seed, napt_slot, plan_arp_reply, plan_forward,
+    plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_server_ack, plan_server_syn,
+    plan_srv6_irb, plan_syn_ack, plan_tcp_rst, select_backend, session_hash, stateful_verdict,
+    tcp_flags, translate_to_client, translate_to_server, unaddressed_uplink_drops,
     v6_source_is_v4_mapped, write_encap, write_srv6_encap,
 };
 
@@ -615,6 +617,8 @@ struct V6EgressDecision {
     counter: u32,
     control: u32,
     flags: u32,
+    /// The walked upper-layer offset, for the RELATED check of an ICMPv6 error.
+    off: u32,
 }
 const V6_EGRESS_STATEFUL: u32 = 1;
 const V6_EGRESS_PASS: u32 = 2;
@@ -2134,6 +2138,10 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
     let eth: *const EthHdr = unsafe { ptr_at_tc(ctx, 0)? };
     let ethertype = u16::from_be(unsafe { (*eth).ether_type });
     if ethertype != ETHERTYPE_IPV4 {
+        // DP-22, the egress half of the ingress rule above.
+        if fail_closed() && !ethertype_passes_unfiltered(ethertype) {
+            return Ok(TC_ACT_SHOT as i32);
+        }
         return Ok(TC_ACT_OK as i32);
     }
     let ipv4: *const Ipv4Hdr = unsafe { ptr_at_tc(ctx, EthHdr::LEN)? };
@@ -3065,6 +3073,12 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
             return try_arp(ctx);
         }
         bump(Counter::NonIpv4);
+        // DP-22: fail-closed means what the filter cannot classify is not
+        // admitted. Link control and encapsulations classified again on their
+        // own interface still pass; see `ethertype_passes_unfiltered`.
+        if fail_closed() && !ethertype_passes_unfiltered(ethertype) {
+            return Ok(xdp_action::XDP_DROP);
+        }
         return Ok(xdp_action::XDP_PASS);
     }
 
@@ -3393,33 +3407,30 @@ fn try_velstra_v4_state(ctx: &XdpContext, s: &V4StateScratch) -> Result<u32, ()>
         && verdict.action == Action::Pass
         && !rate_limits_allow(limit_slot);
 
-    // The firewall's final action, and the counter explaining it.
-    let (action, fw_counter) = if ct == 2 {
-        (Action::Drop, Counter::DroppedRule)
-    } else if blocklisted {
-        (Action::Drop, Counter::DroppedBlocklist)
-    } else if rate_limited {
-        // Over its rule's budget. Dropped rather than rejected: a reject answers
-        // every excess packet with one of our own, which turns a flood aimed at us
-        // into a flood aimed at whoever the source claims to be.
-        (Action::Drop, Counter::DroppedRateLimit)
-    } else if (port_rule_present(rule) && verdict.action != Action::Pass)
-        || (cfg.has_flag(ConfigFlags::DROP_ICMP) && proto == ip_proto::ICMP)
-    {
-        (verdict.action, verdict.counter)
-    } else if local_dhcp {
-        // Explicit denies, blocklists and rate limits above still win. This is
-        // local bootstrap traffic, not a new forwarded or established flow.
-        (Action::Pass, Counter::PassedRule)
-    } else if established || related {
-        (Action::Pass, Counter::EstablishedAllowed)
-    } else if has_port_forward {
-        // The blocklist still wins (checked first); otherwise a port-forward
-        // destination port is allowed inbound.
-        (Action::Pass, Counter::PassedRule)
-    } else {
-        (verdict.action, verdict.counter)
-    };
+    // The firewall's final action, and the counter explaining it. The order is
+    // `stateful_verdict`'s, shared with IPv6 and unit-tested on the host:
+    // explicit denies, blocklists and rate limits win; `block-icmp` refuses new
+    // ICMP but not an echo reply or a RELATED error (DP-10/DP-C07); local
+    // bootstrap traffic, established/related flows and port-forwards pass.
+    // DP-34: TCP/UDP with IPv4 options cannot be tracked, proxied or NATed, so
+    // a stateful policy refuses it rather than judging it statelessly.
+    let options_refused =
+        !local_dhcp && ipv4_options_refused(cfg.has_flag(ConfigFlags::STATEFUL), proto, ihl_bytes);
+    let final_verdict = stateful_verdict(
+        verdict,
+        rule as u32,
+        StateFacts {
+            invalid: ct == 2 || options_refused,
+            established,
+            related,
+            blocklisted,
+            rate_limited,
+            local_bootstrap: local_dhcp,
+            port_forward: has_port_forward,
+            icmp_blocked: cfg.has_flag(ConfigFlags::DROP_ICMP) && proto == ip_proto::ICMP,
+        },
+    );
+    let (action, fw_counter) = (final_verdict.action, final_verdict.counter);
 
     let (action, fw_counter) = if action == Action::Pass
         && !local_dhcp
@@ -3477,9 +3488,18 @@ fn try_velstra_v4_state(ctx: &XdpContext, s: &V4StateScratch) -> Result<u32, ()>
                 dst_port,
             );
         }
-        return reject_packet(
+        // A segment too short to answer still matched a reject rule: refuse it
+        // anyway. Letting the parse failure reach the fail-open default turned a
+        // reject rule into a pass for a truncated TCP header (DP-33).
+        return match reject_packet(
             ctx, ihl_bytes, src_addr, dst_addr, src_port, dst_port, proto,
-        );
+        ) {
+            Ok(action) => Ok(action),
+            Err(()) => {
+                bump(Counter::Malformed);
+                Ok(xdp_action::XDP_DROP)
+            }
+        };
     }
 
     if local_dhcp {
@@ -3883,6 +3903,10 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
     // reason, and `l4_present` is what says the chain ended in a real header
     // rather than in a fragment.
     let mut icmp_type = 0u8;
+    // Neighbour Discovery / MLD: admitted ahead of every policy stage below
+    // the source check (DP-10). Decided here, while the type and code are in
+    // hand; acted on once source validation has run.
+    let mut link_control = false;
     if upper.l4_present && (proto == ip_proto::TCP || proto == ip_proto::UDP) {
         if let Ok(ports) = unsafe { ptr_at::<[u8; 4]>(ctx, upper.off) } {
             let ports = unsafe { *ports };
@@ -3894,10 +3918,12 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
         // offset is walked, so its `var_off` is wide, and a one-byte read there
         // is exactly what the verifier refused.
         if let Ok(head) = unsafe { ptr_at::<[u8; 4]>(ctx, upper.off) } {
+            let head = unsafe { *head };
             // Biased to match how a rule's type constraint is stored: key 0 is
             // reserved for "any type", so echo-reply (type 0) needs a slot of
             // its own. See `icmp_type_key`.
-            icmp_type = icmp_type_probe(unsafe { *head }[0]);
+            icmp_type = icmp_type_probe(head[0]);
+            link_control = icmpv6_link_control(head[0], head[1], hdr[7], &src_addr);
         }
     }
 
@@ -3925,6 +3951,15 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_DROP);
     }
 
+    // DP-10: IPv6's ARP. Ahead of the portal (an unadmitted guest still has to
+    // resolve the gateway that serves the portal), the blocklist, the rules,
+    // `block-icmp` and state, and without creating any — see
+    // `icmpv6_link_control` for the exact shapes and why they are safe.
+    if link_control {
+        bump(Counter::PassedRule);
+        return Ok(xdp_action::XDP_PASS);
+    }
+
     // C20: the same gate and the same session as the IPv4 path. Without this a
     // dual-stacked guest zone would hand every unadmitted device a working IPv6
     // path around the portal, which is not a gap in the feature — it is the
@@ -3943,34 +3978,36 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
             ScopedAddr6::new(policy_id, src_addr),
         ))
         .is_some();
-    // Both address dimensions in the v6 tries, with the packet's real addresses
-    // — and the v4 tries too, looked up with the address as `0`, so a rule that
-    // names a protocol and a port but no address still applies to both families
-    // exactly as it reads.
-    let rule = port_rule_winner(
-        rule_winner_v6(
-            policy_id,
-            proto,
-            icmp_type,
-            dst_port,
-            ifindex,
-            &hdr,
-            PORT_RULE_OUT_ONLY | PORT_RULE_V4_ONLY,
-        ),
-        // The v4 tries with no address, for a rule that names a protocol and a
-        // port but no address — which applies to both families unless it says
-        // otherwise, and `PORT_RULE_V4_ONLY` is how it says otherwise.
-        rule_winner_v4(
-            policy_id,
-            proto,
-            icmp_type,
-            dst_port,
-            ifindex,
-            0,
-            0,
-            PORT_RULE_OUT_ONLY | PORT_RULE_V4_ONLY,
-        ),
+    // Both address dimensions, in the v6 tries only (DP-11). A rule that names
+    // no address is programmed into these tries as `::/0` as well as into the
+    // v4 tries as `0.0.0.0/0`, so it applies to both families as it reads.
+    // Asking the v4 tries with an address of `0` instead made every v4 prefix
+    // containing 0.0.0.0 — the `0.0.0.0/8` bogon, a `0.0.0.0/1` accept — apply
+    // to all IPv6 as well, and it out-ranked the IPv6 rules by prefix length.
+    let rule = rule_winner_v6(
+        policy_id,
+        proto,
+        icmp_type,
+        dst_port,
+        ifindex,
+        hdr,
+        PORT_RULE_OUT_ONLY | PORT_RULE_V4_ONLY,
     );
+    // DP-19: a MAC verdict names the device, which outranks a port rule — the
+    // same order the IPv4 path keeps, so a device blocked by MAC is not let
+    // back in over SLAAC.
+    let mac_rule = match unsafe { ptr_at::<[u8; 6]>(ctx, 6) } {
+        Ok(mac) => {
+            let key = ScopedMac::new(policy_id, unsafe { *mac });
+            unsafe { MAC_RULES.get(&key) }.copied().unwrap_or(0)
+        }
+        Err(_) => 0,
+    };
+    let rule = if port_rule_present(mac_rule) {
+        mac_rule
+    } else {
+        rule
+    };
     let rule_action = if port_rule_present(rule) {
         Some(port_rule_action(rule))
     } else {
@@ -4009,12 +4046,11 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
         (*decision).counter = verdict.counter.index();
         (*decision).ifindex = ifindex;
         (*decision).off = upper.off as u32;
-        let explicit = blocklisted
-            || (port_rule_present(rule) && verdict.action != Action::Pass)
-            || (cfg.has_flag(ConfigFlags::DROP_ICMP) && proto == ip_proto::ICMPV6);
+        let icmp_blocked = cfg.has_flag(ConfigFlags::DROP_ICMP) && proto == ip_proto::ICMPV6;
         (*decision).flags = stateful as u32
-            | ((explicit as u32) << 1)
-            | (((cfg.has_flag(ConfigFlags::LOG) || port_rule_logs(rule)) as u32) << 2);
+            | ((blocklisted as u32) << 1)
+            | (((cfg.has_flag(ConfigFlags::LOG) || port_rule_logs(rule)) as u32) << 2)
+            | ((icmp_blocked as u32) << 3);
     }
     let _ = unsafe { VELSTRA_PROGS.tail_call(ctx, 4) };
     Ok(xdp_action::XDP_DROP)
@@ -4048,8 +4084,9 @@ fn try_velstra_v6_state(ctx: &XdpContext) -> Result<u32, ()> {
     let off = decision.off as usize;
     let ifindex = decision.ifindex;
     let stateful = decision.flags & 1 != 0;
-    let explicit = decision.flags & 2 != 0;
+    let blocklisted = decision.flags & 2 != 0;
     let want_log = decision.flags & 4 != 0;
+    let icmp_blocked = decision.flags & 8 != 0;
     let base_action = Action::from_u32(decision.action);
     let base_counter = Counter::from_u32(decision.counter).unwrap_or(Counter::DroppedDefault);
     let proto = fwkey.proto;
@@ -4070,15 +4107,39 @@ fn try_velstra_v6_state(ctx: &XdpContext) -> Result<u32, ()> {
     } else {
         0
     };
-    let (action, counter) = if ct == 2 {
-        (Action::Drop, Counter::DroppedRule)
-    } else if ct == 1 && !explicit {
-        (Action::Pass, Counter::EstablishedAllowed)
-    } else {
-        (base_action, base_counter)
-    };
+    // DP-21: an ICMPv6 error about a tracked connection — Packet Too Big above
+    // all — is RELATED. `dst_port` holds the ICMPv6 type here (`ct_key6`), so
+    // only the four error types pay for the check.
+    let related = stateful
+        && proto == ip_proto::ICMPV6
+        && (1..=4).contains(&fwkey.dst_port)
+        && icmp_related::related_v6_xdp(ctx, fwkey.policy, off as u32);
+    // DP-20: the per-rule rate limit, for a new flow only — as on IPv4.
+    let limit_slot = port_rule_limit(rule);
+    let rate_limited = limit_slot != 0
+        && ct != 1
+        && !blocklisted
+        && base_action == Action::Pass
+        && !rate_limits_allow(limit_slot);
+    let verdict = stateful_verdict(
+        Verdict {
+            action: base_action,
+            counter: base_counter,
+        },
+        rule as u32,
+        StateFacts {
+            invalid: ct == 2,
+            established: ct == 1,
+            related,
+            blocklisted,
+            rate_limited,
+            icmp_blocked,
+            ..StateFacts::default()
+        },
+    );
+    let (action, counter) = (verdict.action, verdict.counter);
     let (action, counter) =
-        if action == Action::Pass && stateful && ct_record(fwkey, control).failed() {
+        if action == Action::Pass && stateful && !related && ct_record(fwkey, control).failed() {
             bump(Counter::DroppedRule);
             (Action::Drop, Counter::FirewallStateWriteFailed)
         } else {
@@ -4091,8 +4152,13 @@ fn try_velstra_v6_state(ctx: &XdpContext) -> Result<u32, ()> {
         action.as_u32() as u64 | (((want_log) as u64) << 8) | ((counter as u64) << 16),
     );
     bump(counter);
-    if action == Action::Reject && proto == ip_proto::TCP && !link_layer::raw_ip(ifindex) {
-        return Ok(reject_v6::tcp(ctx, off));
+    if action == Action::Reject && !link_layer::raw_ip(ifindex) {
+        if proto == ip_proto::TCP {
+            return Ok(reject_v6::tcp(ctx, off));
+        }
+        if proto == ip_proto::UDP {
+            return Ok(reject_v6::udp(ctx, off));
+        }
     }
     if action != Action::Pass {
         if want_log {
@@ -4143,6 +4209,13 @@ fn try_egress_v6_inner(ctx: &TcContext) -> Result<i32, ()> {
         if head == u64::MAX {
             return Err(());
         }
+        // DP-10: the box's own neighbour discovery and MLD leave whatever the
+        // zone's egress rules say. The source is viewed in place in the header
+        // copy rather than copied onto this frame.
+        let src = unsafe { &*(hdr.as_ptr().add(8) as *const [u8; 16]) };
+        if icmpv6_link_control(head as u8, (head >> 8) as u8, hdr[7], src) {
+            return Ok(TC_ACT_OK as i32);
+        }
         icmp_type = icmp_type_probe(head as u8);
     }
     let ifindex = unsafe { (*ctx.skb.skb).ifindex };
@@ -4160,26 +4233,16 @@ fn try_egress_v6_inner(ctx: &TcContext) -> Result<i32, ()> {
             ScopedAddr6::new(policy_id, destination),
         ))
         .is_some();
-    let rule = port_rule_winner(
-        rule_winner_v6(
-            policy_id,
-            proto,
-            icmp_type,
-            dst_port,
-            ifindex,
-            &hdr,
-            PORT_RULE_IN_ONLY | PORT_RULE_V4_ONLY,
-        ),
-        rule_winner_v4(
-            policy_id,
-            proto,
-            icmp_type,
-            dst_port,
-            ifindex,
-            0,
-            0,
-            PORT_RULE_IN_ONLY | PORT_RULE_V4_ONLY,
-        ),
+    // The v6 tries only; see the ingress path for why the v4 tries must not be
+    // asked about an IPv6 packet (DP-11).
+    let rule = rule_winner_v6(
+        policy_id,
+        proto,
+        icmp_type,
+        dst_port,
+        ifindex,
+        hdr,
+        PORT_RULE_IN_ONLY | PORT_RULE_V4_ONLY,
     );
     let rule_action = if port_rule_present(rule) {
         Some(port_rule_action(rule))
@@ -4223,6 +4286,7 @@ fn try_egress_v6_inner(ctx: &TcContext) -> Result<i32, ()> {
         (*decision_slot).ifindex = ifindex;
         (*decision_slot).counter = verdict.counter as u32;
         (*decision_slot).control = control as u32;
+        (*decision_slot).off = upper.off as u32;
         (*decision_slot).flags = V6_EGRESS_READY
             | if stateful { V6_EGRESS_STATEFUL } else { 0 }
             | if verdict.action == Action::Pass {
@@ -4268,9 +4332,22 @@ fn try_egress_v6_state(ctx: &TcContext) -> Result<i32, ()> {
     } else {
         0
     };
+    // A guest-bound ICMPv6 error about the guest's own connection overrides the
+    // tap's default drop exactly as its established traffic does — the IPv6
+    // twin of the IPv4 egress RELATED path (DP-21). Only asked where it could
+    // change the answer.
+    let default_dropped = flags & V6_EGRESS_PASS == 0 && flags & V6_EGRESS_DEFAULT_DROP != 0;
+    let related = default_dropped
+        && stateful
+        && ct != 1
+        && fwkey.proto == ip_proto::ICMPV6
+        && (1..=4).contains(&fwkey.dst_port)
+        && icmp_related::related_v6_tc(ctx, fwkey.policy, decision.off);
     let allowed = ct != 2
-        && (flags & V6_EGRESS_PASS != 0 || (ct == 1 && flags & V6_EGRESS_DEFAULT_DROP != 0));
-    let publication_failed = allowed && stateful && ct_record(fwkey, control).failed();
+        && (flags & V6_EGRESS_PASS != 0
+            || (ct == 1 && flags & V6_EGRESS_DEFAULT_DROP != 0)
+            || related);
+    let publication_failed = allowed && stateful && !related && ct_record(fwkey, control).failed();
     let allowed = allowed && !publication_failed;
     let reason = if publication_failed {
         bump(Counter::FirewallStateWriteFailed);
@@ -6535,9 +6612,13 @@ fn clamp_mss_egress(ctx: &TcContext, ihl_bytes: usize, proto: u8, ifindex: u32) 
                     return;
                 }
                 // The option is part of the TCP payload for checksum purposes,
-                // so this is an L4 replace with the old and new values as
-                // native-endian integers — the same shape the NAT path uses.
-                let _ = ctx.l4_csum_replace(O_L4 + 16, current as u64, limit as u64, 2);
+                // so this is an L4 replace. The helper takes the two values as
+                // the bytes sit in the packet (`__be16`), not as MSS numbers:
+                // passing those wrote a wrong checksum on every clamped SYN
+                // (DP-09). `mss_clamp_csum_operands` is the one place that
+                // conversion lives, and it is model-tested on the host.
+                let (from, to) = mss_clamp_csum_operands(current, limit);
+                let _ = ctx.l4_csum_replace(O_L4 + 16, from, to, 2);
                 bump(Counter::MssClamped);
                 return;
             }

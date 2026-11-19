@@ -215,6 +215,16 @@ pub const fn port_rule_logs(value: u32) -> bool {
     value & PORT_RULE_LOG != 0
 }
 
+/// Whether a packed rule value is a rule that **refuses** the packet — the
+/// operator's own statement against it, which connection state may not
+/// override. Judged on the rule's action, not on the combined verdict: a pass
+/// rule for ICMP under `block-icmp` is not a refusal, so an echo reply to a
+/// ping the box sent still finds its connection.
+#[inline]
+pub const fn port_rule_denies(value: u32) -> bool {
+    port_rule_present(value) && !matches!(port_rule_action(value), Action::Pass)
+}
+
 /// Statistics counters, one per slot in the per-CPU `STATS` array map.
 ///
 /// The discriminant is the array index, so the order is part of the map ABI.
@@ -645,6 +655,7 @@ pub fn decide_egress(
     blocklisted: bool,
     rule: Option<Action>,
 ) -> Verdict {
+    let cfg = &egress_posture(cfg);
     match rule {
         // An explicit egress verdict, and the two prohibitions, are the operator
         // speaking about outbound traffic; those keep their meaning verbatim.
@@ -661,6 +672,101 @@ pub fn decide_egress(
                 Verdict::new(Action::Pass, Counter::PassedDefault)
             }
         }
+    }
+}
+
+/// The policy as it applies to a packet **leaving** an interface.
+///
+/// `block-icmp` ([`ConfigFlags::DROP_ICMP`]) is a statement about what a zone
+/// *accepts* — "do not answer pings on the WAN" — exactly like its default
+/// action, and for the same reason it must not silence the box: applied at the
+/// egress hook it dropped every echo request a LAN host sent out through the
+/// WAN, every ICMP error the box generated, and the box's own neighbour
+/// solicitations, so IPv6 on a dual-stack WAN died once the neighbour cache
+/// expired (audit DP-C07/DP-10).
+///
+/// The one interface whose accepting face *is* the egress hook is a tenant tap
+/// ([`ConfigFlags::EGRESS_DEFAULT_DROP`]): what leaves the hook there enters the
+/// guest. That is the only place the flag keeps its egress meaning.
+///
+/// Branch-free on purpose: the IPv4 egress program sits close to the
+/// verifier's one-million-instruction limit on 6.18, and an `if` here became a
+/// branch on an unknown map value that doubled the paths behind it (measured:
+/// `velstra_egress_v4` went from passing to `processed 1000001 insns`).
+#[inline(always)]
+pub const fn egress_posture(cfg: &GlobalConfig) -> GlobalConfig {
+    // DROP_ICMP survives only where EGRESS_DEFAULT_DROP is also set.
+    let tap = (cfg.flags / ConfigFlags::EGRESS_DEFAULT_DROP) & 1;
+    let keep = ConfigFlags::DROP_ICMP * tap;
+    GlobalConfig {
+        default_action: cfg.default_action,
+        flags: cfg.flags & (!ConfigFlags::DROP_ICMP | keep),
+    }
+}
+
+/// What the stateful stages found out about a packet, for [`stateful_verdict`].
+///
+/// Each field is a fact the data plane established before the verdict; none is
+/// a decision. Every field defaults to `false`, which is "nothing special".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StateFacts {
+    /// Connection tracking found the packet impossible for its flow.
+    pub invalid: bool,
+    /// The packet belongs to a tracked connection.
+    pub established: bool,
+    /// The packet is an ICMP error about a tracked connection.
+    pub related: bool,
+    /// The source (ingress) is on the blocklist.
+    pub blocklisted: bool,
+    /// The matching rule's rate limit refused a new flow.
+    pub rate_limited: bool,
+    /// Local bootstrap traffic the box itself asked for (its own DHCP reply).
+    pub local_bootstrap: bool,
+    /// A port-forward targets this destination port.
+    pub port_forward: bool,
+    /// `block-icmp` covers this packet's protocol.
+    pub icmp_blocked: bool,
+}
+
+/// The final ingress verdict once connection state is known.
+///
+/// `policy` is [`decide`]'s verdict and `rule` the packed winning rule (`0` for
+/// none). Precedence, highest first:
+///
+/// 1. an **invalid** packet for its connection is dropped;
+/// 2. the **blocklist**, then an exhausted **rate limit**, drop;
+/// 3. a **rule that refuses** the packet keeps its verdict — state never
+///    overrides what the operator said about it;
+/// 4. **`block-icmp`** drops new ICMP — but not the answer to something the
+///    box or a host behind it asked for (an echo reply, a RELATED error): that
+///    is not "answering pings", it is receiving answers, and dropping errors is
+///    what turns `block-icmp` into a path-MTU black hole (audit DP-10/DP-C07);
+/// 5. the box's own bootstrap traffic, then **established/related** traffic,
+///    then a **port-forward**, pass;
+/// 6. otherwise the policy verdict stands.
+#[inline]
+pub const fn stateful_verdict(policy: Verdict, rule: u32, facts: StateFacts) -> Verdict {
+    if facts.invalid {
+        Verdict::new(Action::Drop, Counter::DroppedRule)
+    } else if facts.blocklisted {
+        Verdict::new(Action::Drop, Counter::DroppedBlocklist)
+    } else if facts.rate_limited {
+        // Dropped rather than rejected: a reject answers every excess packet
+        // with one of our own, which turns a flood aimed at us into a flood
+        // aimed at whoever the source claims to be.
+        Verdict::new(Action::Drop, Counter::DroppedRateLimit)
+    } else if port_rule_denies(rule) {
+        policy
+    } else if facts.icmp_blocked && !facts.established && !facts.related {
+        Verdict::new(Action::Drop, Counter::DroppedIcmp)
+    } else if facts.local_bootstrap {
+        Verdict::new(Action::Pass, Counter::PassedRule)
+    } else if facts.established || facts.related {
+        Verdict::new(Action::Pass, Counter::EstablishedAllowed)
+    } else if facts.port_forward {
+        Verdict::new(Action::Pass, Counter::PassedRule)
+    } else {
+        policy
     }
 }
 
@@ -714,7 +820,8 @@ mod tests {
         );
         assert_eq!(decide_egress(&meta, &deny, true, None).action, Action::Drop);
 
-        // And a prohibition that names a protocol still applies with no rule.
+        // `block-icmp` is about what a zone accepts, like its default: it does
+        // not stop the box, or a host behind it, from sending ICMP out (DP-C07).
         let no_icmp = GlobalConfig {
             default_action: Action::Drop.as_u32(),
             flags: ConfigFlags::DROP_ICMP,
@@ -722,8 +829,186 @@ mod tests {
         let ping = PacketMeta::new([10, 0, 0, 1], [10, 0, 0, 2], ip_proto::ICMP, 0, 0, 60);
         assert_eq!(
             decide_egress(&ping, &no_icmp, false, None).action,
+            Action::Pass
+        );
+        let ping6 = PacketMeta::new([0; 4], [0; 4], ip_proto::ICMPV6, 0, 0, 60);
+        assert_eq!(
+            decide_egress(&ping6, &no_icmp, false, None).action,
+            Action::Pass
+        );
+        // Nor does it override an explicit pass rule on the way out.
+        assert_eq!(
+            decide_egress(&ping, &no_icmp, false, Some(Action::Pass)).action,
+            Action::Pass
+        );
+        // An explicit egress drop rule still drops.
+        assert_eq!(
+            decide_egress(&ping, &no_icmp, false, Some(Action::Drop)).action,
             Action::Drop
         );
+        // On a tenant tap the egress hook is the guest's inbound side, and
+        // there the prohibition keeps its meaning.
+        let tap_no_icmp = GlobalConfig::new(
+            Action::Pass,
+            ConfigFlags::EGRESS_DEFAULT_DROP | ConfigFlags::DROP_ICMP,
+        );
+        assert_eq!(
+            decide_egress(&ping, &tap_no_icmp, false, None).counter,
+            Counter::DroppedIcmp
+        );
+        // Ingress is unchanged: block-icmp still refuses a new ping.
+        assert_eq!(
+            decide(&ping, &no_icmp, false, None).counter,
+            Counter::DroppedIcmp
+        );
+    }
+
+    fn facts() -> StateFacts {
+        StateFacts::default()
+    }
+
+    /// The DP-10/DP-C07 core: under `block-icmp` an unsolicited ping is still
+    /// refused, but the answer to one the box (or a host behind it) sent, and an
+    /// error about a tracked connection, are delivered.
+    #[test]
+    fn block_icmp_refuses_new_icmp_but_not_answers_or_related_errors() {
+        let cfg = GlobalConfig::new(Action::Drop, ConfigFlags::STATEFUL | ConfigFlags::DROP_ICMP);
+        let icmp = PacketMeta::new([0; 4], [0; 4], ip_proto::ICMP, 0, 0, 84);
+        let policy = decide(&icmp, &cfg, false, None);
+        assert_eq!(policy.counter, Counter::DroppedIcmp);
+        let blocked = StateFacts {
+            icmp_blocked: true,
+            ..facts()
+        };
+        // A new echo request: refused by block-icmp.
+        assert_eq!(
+            stateful_verdict(policy, 0, blocked),
+            Verdict::new(Action::Drop, Counter::DroppedIcmp)
+        );
+        // The echo reply to the box's own ping.
+        let reply = StateFacts {
+            established: true,
+            ..blocked
+        };
+        assert_eq!(
+            stateful_verdict(policy, 0, reply),
+            Verdict::new(Action::Pass, Counter::EstablishedAllowed)
+        );
+        // Fragmentation-needed / Packet Too Big about a tracked flow.
+        let related = StateFacts {
+            related: true,
+            ..blocked
+        };
+        assert_eq!(stateful_verdict(policy, 0, related).action, Action::Pass);
+        // A pass rule for ICMP is not a refusal: the reply still passes...
+        let pass_rule = port_rule_value(Action::Pass, false, 0);
+        let with_rule = decide(&icmp, &cfg, false, Some(Action::Pass));
+        assert_eq!(
+            stateful_verdict(with_rule, pass_rule, reply).action,
+            Action::Pass
+        );
+        // ...and a new ping under that rule is still governed by block-icmp,
+        // which outranks rules in `decide`.
+        assert_eq!(
+            stateful_verdict(with_rule, pass_rule, blocked).counter,
+            Counter::DroppedIcmp
+        );
+    }
+
+    /// What the operator said against a packet, state never overrides.
+    #[test]
+    fn explicit_refusals_beat_connection_state() {
+        let cfg = GlobalConfig::new(Action::Pass, ConfigFlags::STATEFUL);
+        let tcp = PacketMeta::new([0; 4], [0; 4], ip_proto::TCP, 1, 22, 60);
+        let established = StateFacts {
+            established: true,
+            ..facts()
+        };
+        for action in [Action::Drop, Action::Reject] {
+            let rule = port_rule_value(action, false, 0);
+            let policy = decide(&tcp, &cfg, false, Some(action));
+            assert_eq!(stateful_verdict(policy, rule, established).action, action);
+        }
+        let policy = decide(&tcp, &cfg, true, None);
+        let blocklisted = StateFacts {
+            blocklisted: true,
+            ..established
+        };
+        assert_eq!(
+            stateful_verdict(policy, 0, blocklisted).counter,
+            Counter::DroppedBlocklist
+        );
+        let invalid = StateFacts {
+            invalid: true,
+            ..established
+        };
+        assert_eq!(
+            stateful_verdict(policy, 0, invalid).counter,
+            Counter::DroppedRule
+        );
+    }
+
+    #[test]
+    fn state_admits_what_the_default_would_refuse() {
+        let cfg = GlobalConfig::new(Action::Drop, ConfigFlags::STATEFUL);
+        let udp = PacketMeta::new([0; 4], [0; 4], ip_proto::UDP, 53, 40000, 60);
+        let policy = decide(&udp, &cfg, false, None);
+        assert_eq!(policy.counter, Counter::DroppedDefault);
+        assert_eq!(stateful_verdict(policy, 0, facts()), policy);
+        for (facts, counter) in [
+            (
+                StateFacts {
+                    established: true,
+                    ..facts()
+                },
+                Counter::EstablishedAllowed,
+            ),
+            (
+                StateFacts {
+                    related: true,
+                    ..facts()
+                },
+                Counter::EstablishedAllowed,
+            ),
+            (
+                StateFacts {
+                    port_forward: true,
+                    ..facts()
+                },
+                Counter::PassedRule,
+            ),
+            (
+                StateFacts {
+                    local_bootstrap: true,
+                    ..facts()
+                },
+                Counter::PassedRule,
+            ),
+        ] {
+            assert_eq!(
+                stateful_verdict(policy, 0, facts),
+                Verdict::new(Action::Pass, counter)
+            );
+        }
+        // A rate limit refuses a new flow the rule would admit.
+        let rule = port_rule_value(Action::Pass, false, 0);
+        let pass = decide(&udp, &cfg, false, Some(Action::Pass));
+        let limited = StateFacts {
+            rate_limited: true,
+            ..facts()
+        };
+        assert_eq!(
+            stateful_verdict(pass, rule, limited).counter,
+            Counter::DroppedRateLimit
+        );
+    }
+
+    #[test]
+    fn only_a_present_refusing_rule_denies() {
+        assert!(!port_rule_denies(0));
+        assert!(!port_rule_denies(port_rule_value(Action::Pass, true, 24)));
+        assert!(port_rule_denies(port_rule_value(Action::Drop, false, 0)));
+        assert!(port_rule_denies(port_rule_value(Action::Reject, false, 8)));
     }
 
     #[test]

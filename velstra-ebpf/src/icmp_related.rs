@@ -10,9 +10,10 @@ use aya_ebpf::{
     programs::{TcContext, XdpContext},
 };
 use velstra_common::{
-    CgnatLayout, FirewallKey, FirewallState, FlowKey, RelatedChecksums, csum_replace_u16, ip_proto,
-    legacy_napt_seed, napt_binding_matches, napt_port, napt_seed, related_checksum_copy_length,
-    related_checksums, related_hairpin_firewall_candidate, related_icmp_error,
+    CgnatLayout, FirewallKey, FirewallState, FlowKey, ICMPV6_ERROR_QUOTE, RelatedChecksums,
+    csum_replace_u16, ip_proto, legacy_napt_seed, napt_binding_matches, napt_port, napt_seed,
+    related_checksum_copy_length, related_checksums, related_hairpin_firewall_candidate,
+    related_icmp_error, related_icmpv6_error, related_icmpv6_key,
 };
 
 use super::{
@@ -70,6 +71,77 @@ static RELATED_TC_RECEIPT: PerCpuArray<Receipt> = PerCpuArray::with_max_entries(
 
 pub(super) const CLASSIFIED: u8 = 1;
 pub(super) const ADMITTED: u8 = 2;
+
+/// Working set for an ICMPv6 RELATED check. A map slot, not the stack: the
+/// IPv6 state stage already carries a full-width tuple.
+#[repr(C)]
+struct Scratch6 {
+    key: FirewallKey,
+    outer_dst: [u8; 16],
+    quoted: [u8; 40],
+    transport: [u8; 8],
+    header: [u8; 8],
+}
+
+#[map]
+static RELATED6_SCRATCH: PerCpuArray<Scratch6> = PerCpuArray::with_max_entries(1, 0);
+
+/// Whether the ICMPv6 message at `off` (the walked upper-layer offset) is an
+/// error about a connection live under `policy` (audit DP-21: without this a
+/// Packet Too Big never reached a sender behind a deny-by-default zone, and
+/// IPv6 path-MTU discovery black-holed).
+///
+/// Admission only: the error is not translated, creates no state and refreshes
+/// none. IPv6 has no NAT here; NPTv6 rewrites the envelope and leaves the quote
+/// external, so an error about an NPTv6 flow is not recognised (see
+/// `related_icmpv6_key` for what else is refused). Helper loads only, so the
+/// walked offset never becomes a packet pointer the verifier must bound.
+#[inline(never)]
+pub(super) fn related_v6_xdp(ctx: &XdpContext, policy: u32, off: u32) -> bool {
+    related_v6::<false>(ctx.ctx.cast(), policy, off)
+}
+
+/// The TC-egress form of [`related_v6_xdp`], for a guest-bound error on a
+/// tenant tap whose egress face is its deny-by-default inbound side.
+#[inline(never)]
+pub(super) fn related_v6_tc(ctx: &TcContext, policy: u32, off: u32) -> bool {
+    related_v6::<true>(ctx.skb.skb.cast(), policy, off)
+}
+
+#[inline(always)]
+fn related_v6<const TC: bool>(context: *mut c_void, policy: u32, off: u32) -> bool {
+    let Some(s) = RELATED6_SCRATCH.get_ptr_mut(0) else {
+        return false;
+    };
+    let s = unsafe { &mut *s };
+    if read::<TC, 8>(context, off, &mut s.header).is_err()
+        || !related_icmpv6_error(s.header[0], s.header[1])
+        || read::<TC, 16>(context, 14 + 24, &mut s.outer_dst).is_err()
+        || read::<TC, 40>(context, off + ICMPV6_ERROR_QUOTE as u32, &mut s.quoted).is_err()
+        || read::<TC, 8>(
+            context,
+            off + ICMPV6_ERROR_QUOTE as u32 + 40,
+            &mut s.transport,
+        )
+        .is_err()
+        || !related_icmpv6_key(policy, &s.outer_dst, &s.quoted, &s.transport, &mut s.key)
+    {
+        return false;
+    }
+    let now = unsafe { bpf_ktime_get_ns() };
+    let timeouts = timeouts();
+    let proto = s.key.proto;
+    if let Some(state) = unsafe { FW_FLOWS.get(&s.key) }
+        && state.phase != FirewallState::RESET
+        && !state.expired(proto, now, timeouts)
+    {
+        return true;
+    }
+    s.key = s.key.reverse();
+    unsafe { FW_FLOWS.get(&s.key) }.is_some_and(|state| {
+        state.phase != FirewallState::RESET && !state.expired(proto, now, timeouts)
+    })
+}
 
 #[inline(always)]
 pub(super) fn reset_xdp() {

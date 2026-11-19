@@ -29,18 +29,20 @@ use velstra_common::{
     Action, ArpEntry, ArpKey, Backend, CONFIG_FAILED, CONFIG_READY, CONFIG_UPDATING, CgnatLayout,
     Cidr4, Cidr6, ConfigFlags, Counter, FirewallKey, FirewallState, FloodSet, FlowKey, FlowState,
     GlobalConfig, IrbEndpoint, LocalMac, LocalMacKey, MAX_RULE_LIMITS, MacFdbKey, NdKey, Npt66,
-    OverlayConfig, PORT_RULE_OUT_ONLY, PolicyId, PortAddr4, PortAddr6, PortBinding, PortFwd,
-    PortalClientKey, PortalGate, PortalSeenKey, RateBucket, RouteEntry, ScopedAddr, ScopedAddr6,
-    ScopedDstPortKey, ScopedDstPortKey6, ScopedMac, ScopedPortKey, ScopedSrcPortKey,
-    ScopedSrcPortKey6, ServiceKey, ServiceValue, Srv6Config, Srv6Endpoint, Srv6FloodSet,
-    Srv6IrbEndpoint, Srv6LocalSid, Srv6SidKey, SynFlow, SynProxyCfg, SynProxyKey, TunnelEndpoint,
-    TunnelKey, parse_cidr_v4, parse_cidr_v6, parse_mac, port_rule_value, port_rule_with_limit,
+    OverlayConfig, PORT_RULE_OUT_ONLY, PORT_RULE_V4_ONLY, PORT_RULE_V6_ONLY, PolicyId, PortAddr4,
+    PortAddr6, PortBinding, PortFwd, PortalClientKey, PortalGate, PortalSeenKey, RateBucket,
+    RouteEntry, ScopedAddr, ScopedAddr6, ScopedDstPortKey, ScopedDstPortKey6, ScopedMac,
+    ScopedPortKey, ScopedSrcPortKey, ScopedSrcPortKey6, ServiceKey, ServiceValue, Srv6Config,
+    Srv6Endpoint, Srv6FloodSet, Srv6IrbEndpoint, Srv6LocalSid, Srv6SidKey, SynFlow, SynProxyCfg,
+    SynProxyKey, TunnelEndpoint, TunnelKey, parse_cidr_v4, parse_cidr_v6, parse_mac,
+    port_rule_value, port_rule_with_limit,
 };
 use velstra_config::{
     PolicyConfig, PortIdentity, ResolvedFloodVtep, ResolvedInterface, ResolvedIrbRoute,
     ResolvedMacRoute, ResolvedNd6, ResolvedNeighbor, ResolvedNpt66, ResolvedPortForward,
-    ResolvedRoute, ResolvedService, ResolvedSrv6, ResolvedSrv6Flood, ResolvedSrv6IrbRoute,
-    ResolvedSrv6LocalSid, ResolvedSrv6Route, ResolvedSynProxy, ResolvedTunnel, RuntimeConfig,
+    ResolvedRoute, ResolvedRule, ResolvedService, ResolvedSrv6, ResolvedSrv6Flood,
+    ResolvedSrv6IrbRoute, ResolvedSrv6LocalSid, ResolvedSrv6Route, ResolvedSynProxy,
+    ResolvedTunnel, RuntimeConfig,
 };
 
 /// Bounded diagnostics only: no timing sample participates in readiness,
@@ -819,7 +821,10 @@ impl Firewall {
                 .ok_or_else(|| anyhow!("missing {name}"))?
                 .try_into()?;
             match program.load() {
-                Ok(()) => println!("verified {name}"),
+                Ok(()) => {
+                    println!("verified {name}");
+                    report_verified_insns(name, program.info());
+                }
                 Err(error) => rejected.push(format!("verifying {name}: {error:#}")),
             }
         }
@@ -841,7 +846,10 @@ impl Firewall {
                 .ok_or_else(|| anyhow!("missing {name}"))?
                 .try_into()?;
             match program.load() {
-                Ok(()) => println!("verified {name}"),
+                Ok(()) => {
+                    println!("verified {name}");
+                    report_verified_insns(name, program.info());
+                }
                 Err(error) => rejected.push(format!("verifying {name}: {error:#}")),
             }
         }
@@ -2947,6 +2955,49 @@ impl Firewall {
     }
 }
 
+/// Whether a rule names no address at all, in either family or at either end.
+fn addressless(rule: &ResolvedRule) -> bool {
+    rule.src.is_none() && rule.dst.is_none() && rule.src6.is_none() && rule.dst6.is_none()
+}
+
+/// Whether a rule belongs in `PORT_RULES`, the IPv4 source trie: one that
+/// constrains the IPv4 source, or one that names no address and is not scoped to
+/// IPv6 only (stored as `0.0.0.0/0`).
+fn in_v4_source_trie(rule: &ResolvedRule) -> bool {
+    if addressless(rule) {
+        rule.scope & PORT_RULE_V6_ONLY == 0
+    } else {
+        rule.dst.is_none() && rule.src6.is_none() && rule.dst6.is_none()
+    }
+}
+
+/// Whether a rule belongs in `PORT_RULES6`, the IPv6 source trie: one that
+/// constrains the IPv6 source, or one that names no address and is not scoped to
+/// IPv4 only (stored as `::/0`).
+///
+/// The second half is audit DP-11. An address-less rule used to live only in the
+/// IPv4 trie, and the IPv6 datapath found it by asking that trie with address
+/// `0` — which also matched every IPv4 prefix containing 0.0.0.0, so a
+/// `0.0.0.0/8` bogon drop killed all IPv6 and a `0.0.0.0/1 accept` opened it.
+/// The cost is one more trie entry per address-less rule.
+fn in_v6_source_trie(rule: &ResolvedRule) -> bool {
+    rule.src6.is_some() || (addressless(rule) && rule.scope & PORT_RULE_V4_ONLY == 0)
+}
+
+/// How much of the verifier's one-million-instruction complexity budget a loaded
+/// program used, on its own line so the `verified <name>` lines stay exact.
+/// Headroom is what a datapath change spends, and it differs per kernel, so the
+/// verifier checks record it rather than only pass or fail.
+fn report_verified_insns(
+    name: &str,
+    info: std::result::Result<aya::programs::ProgramInfo, aya::programs::ProgramError>,
+) {
+    match info.map(|info| info.verified_instruction_count()) {
+        Ok(Some(count)) => println!("verifier-insns {name} {count}"),
+        Ok(None) | Err(_) => println!("verifier-insns {name} unknown"),
+    }
+}
+
 /// Raise the locked-memory rlimit so map allocation succeeds on older kernels
 /// that still account BPF memory against `RLIMIT_MEMLOCK`.
 /// LPM `(prefix_len, addr)` for a port rule's optional source constraint. `None`
@@ -3130,11 +3181,8 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
                 .ok_or_else(|| anyhow!("PORT_RULES map missing"))?,
         )?;
         for policy in &old.policies {
-            for rule in policy
-                .port_rules
-                .iter()
-                .filter(|r| r.dst.is_none() && r.src6.is_none() && r.dst6.is_none())
-            {
+            // The same predicate that placed the rule, or a deleted rule stays.
+            for rule in policy.port_rules.iter().filter(|r| in_v4_source_trie(r)) {
                 let (prefix, addr) = port_rule_src_lpm(&rule.src);
                 let _ = rules.remove(&Key::new(
                     prefix,
@@ -3163,7 +3211,11 @@ fn remove_stale(ebpf: &mut Ebpf, old: &RuntimeConfig) -> Result<()> {
                 .ok_or_else(|| anyhow!("PORT_RULES6 map missing"))?,
         )?;
         for policy in &old.policies {
-            for rule in policy.port_rules.iter().filter(|r| r.src6.is_some()) {
+            // `in_v6_source_trie`, not `src6.is_some()`: an address-less rule
+            // lives here too (DP-11), and sweeping only the rules that name an
+            // IPv6 source left a deleted address-less rule enforced on IPv6
+            // after a live reconfigure.
+            for rule in policy.port_rules.iter().filter(|r| in_v6_source_trie(r)) {
                 let (prefix, addr) = port_rule_src6_lpm(&rule.src6);
                 let _ = rules.remove(&Key::new(
                     prefix,
@@ -3982,7 +4034,7 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
                 .port_rules
                 .iter()
                 .enumerate()
-                .filter(|(_, r)| r.dst.is_none() && r.src6.is_none() && r.dst6.is_none())
+                .filter(|(_, r)| in_v4_source_trie(r))
             {
                 let (prefix, addr) = port_rule_src_lpm(&rule.src);
                 let slot = limit_slots.get(&(policy.id, index)).copied().unwrap_or(0);
@@ -4016,9 +4068,10 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
         }
     }
     {
-        // The IPv6 source trie. A rule lands in exactly one of the four tries —
-        // the family follows from what the operator wrote, and a rule that named
-        // a v6 prefix used to land in none of them at all.
+        // The IPv6 source trie. A rule that names an address lands in exactly
+        // one of the four tries — the family follows from what the operator
+        // wrote. One that names none lands in BOTH source tries (see
+        // `in_v6_source_trie`): the IPv6 datapath never asks the IPv4 tries.
         let mut rules: LpmTrie<_, ScopedSrcPortKey6, u64> = LpmTrie::try_from(
             ebpf.map_mut("PORT_RULES6")
                 .ok_or_else(|| anyhow!("PORT_RULES6 map missing"))?,
@@ -4028,7 +4081,7 @@ fn program_policies(ebpf: &mut Ebpf, policies: &[PolicyConfig]) -> Result<()> {
                 .port_rules
                 .iter()
                 .enumerate()
-                .filter(|(_, r)| r.src6.is_some())
+                .filter(|(_, r)| in_v6_source_trie(r))
             {
                 let (prefix, addr) = port_rule_src6_lpm(&rule.src6);
                 let slot = limit_slots.get(&(policy.id, index)).copied().unwrap_or(0);
@@ -6243,6 +6296,76 @@ fn is_drop_counter(counter: Counter) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resolved_rules(rules: serde_json::Value) -> Vec<ResolvedRule> {
+        let cfg = serde_json::from_value::<velstra_config::FileConfig>(serde_json::json!({
+            "default_action": "drop",
+            "policy": [{ "id": 1, "name": "wan", "default_action": "drop", "port_rule": rules }]
+        }))
+        .unwrap()
+        .resolve()
+        .unwrap();
+        cfg.policies
+            .into_iter()
+            .find(|p| p.id == 1)
+            .unwrap()
+            .port_rules
+    }
+
+    /// DP-11: the IPv6 datapath consults only the IPv6 tries, so a rule naming
+    /// no address must be in them — and an IPv4 prefix, `0.0.0.0/8` included,
+    /// must never be.
+    #[test]
+    fn each_family_finds_its_rules_in_its_own_source_trie() {
+        let rules = resolved_rules(serde_json::json!([
+            { "proto": "tcp", "port": 22, "action": "pass" },
+            { "proto": "tcp", "port": 22, "action": "drop", "src": "0.0.0.0/8" },
+            { "proto": "tcp", "port": 23, "action": "pass", "src": "0.0.0.0/1" },
+            { "proto": "tcp", "port": 24, "action": "pass", "family": "ipv4" },
+            { "proto": "tcp", "port": 25, "action": "pass", "family": "ipv6" },
+            { "proto": "tcp", "port": 26, "action": "pass", "src": "2001:db8::/32" },
+            { "proto": "tcp", "port": 27, "action": "pass", "dst": "198.51.100.0/24" },
+            { "proto": "tcp", "port": 28, "action": "pass", "dst": "2001:db8::/48" },
+        ]));
+        let placed: Vec<(u16, bool, bool)> = rules
+            .iter()
+            .map(|r| (r.key.port, in_v4_source_trie(r), in_v6_source_trie(r)))
+            .collect();
+        assert_eq!(
+            placed,
+            vec![
+                // No address: both families, as it reads.
+                (22, true, true),
+                // IPv4 prefixes: IPv4 only, whatever they contain.
+                (22, true, false),
+                (23, true, false),
+                // Scoped by family: that family only.
+                (24, true, false),
+                (25, false, true),
+                // An IPv6 source: the IPv6 source trie.
+                (26, false, true),
+                // Destination rules live in the destination tries.
+                (27, false, false),
+                (28, false, false),
+            ]
+        );
+    }
+
+    /// Programming and the stale-entry sweep must agree on where a rule
+    /// lives. They disagreed once: address-less rules moved into the IPv6 trie
+    /// and the sweep kept looking only for rules that name an IPv6 source, so a
+    /// rule deleted by a live reconfigure kept dropping IPv6 (found by
+    /// checks.icmptype and checks.phase2-dataplane).
+    #[test]
+    fn rule_programming_and_the_stale_sweep_use_one_placement() {
+        let source = include_str!("firewall.rs");
+        let code = &source[..source.find("#[cfg(test)]\nmod tests").unwrap()];
+        for predicate in ["in_v4_source_trie(r)", "in_v6_source_trie(r)"] {
+            assert_eq!(code.matches(predicate).count(), 2, "{predicate}");
+        }
+        assert!(!code.contains("filter(|r| r.src6.is_some())"));
+        assert!(!code.contains("filter(|(_, r)| r.src6.is_some())"));
+    }
 
     #[test]
     fn complete_napt_domain_requires_absence_of_both_ha_and_sync() {

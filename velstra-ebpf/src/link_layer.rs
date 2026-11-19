@@ -11,6 +11,7 @@ use aya_ebpf::{
     maps::{HashMap, PerCpuArray},
     programs::{TcContext, XdpContext},
 };
+use velstra_common::{RawFraming, raw_ip_framing};
 
 #[map]
 static IFACE_L3: HashMap<u32, u32> = HashMap::with_max_entries(4096, 0);
@@ -32,30 +33,23 @@ fn header(data: usize, end: usize) -> Option<[u8; 14]> {
     }
 }
 
-/// Whether the frame at `data` already starts with an Ethernet-shaped header
-/// for the IP packet behind it: an EtherType of IPv4/IPv6 at bytes 12..14, the
-/// matching version at byte 14, and an IP length that accounts for exactly the
-/// rest of the frame — the last is what tells a real header from a bare packet
-/// whose source address happens to read like one.
+/// How the frame at `data` is laid out — see `velstra_common::raw_ip_framing`.
 ///
 /// A raw-IP link can still hand generic XDP a MAC header: a packet decrypted
 /// by IPsec tunnel mode and delivered on an XFRM interface keeps the Ethernet
 /// header of the frame the ESP arrived in (`skb_mac_header_rebuild`), and
 /// generic XDP starts the packet at the MAC header. That frame is already what
 /// the classifier expects; pushing another header in front of it parsed MAC
-/// bytes as an IP version and dropped every packet the tunnel delivered.
+/// bytes as an IP version and dropped every packet the tunnel delivered. Both
+/// readings are checked for self-consistency, so a bare packet that merely
+/// looks framed at bytes 12..34 is no longer taken for one (DP-36).
 #[inline(always)]
-fn carries_ethernet(data: usize, end: usize) -> bool {
+fn framing_of(data: usize, end: usize) -> Option<RawFraming> {
     if data + 34 > end {
-        return false;
+        return None;
     }
-    let head = unsafe { core::ptr::read_volatile(data as *const [u8; 20]) };
-    let ip_len = match (head[12], head[13], head[14] >> 4) {
-        (0x08, 0x00, 4) => u16::from_be_bytes([head[16], head[17]]) as usize,
-        (0x86, 0xdd, 6) => u16::from_be_bytes([head[18], head[19]]) as usize + 40,
-        _ => return false,
-    };
-    ip_len == end - data - 14
+    let head = unsafe { core::ptr::read_volatile(data as *const [u8; 34]) };
+    Some(raw_ip_framing(&head, end - data))
 }
 
 /// How the packet this CPU is classifying entered: [`ETHERNET`] (an Ethernet
@@ -87,10 +81,12 @@ pub fn enter_xdp(ctx: &XdpContext) -> bool {
     if !raw_ip(ctx.ingress_ifindex() as u32) {
         return set_framing(ETHERNET);
     }
-    // A frame that arrived Ethernet-shaped (see `carries_ethernet`) is left
-    // as it is.
-    if carries_ethernet(ctx.data(), ctx.data_end()) {
-        return set_framing(RAW_FRAMED);
+    // A frame that arrived Ethernet-shaped (see `framing_of`) is left as it
+    // is; one that reads consistently both ways is refused.
+    match framing_of(ctx.data(), ctx.data_end()) {
+        Some(RawFraming::Framed) => return set_framing(RAW_FRAMED),
+        Some(RawFraming::Ambiguous) => return false,
+        Some(RawFraming::Bare) | None => {}
     }
     let Some(header) = header(ctx.data(), ctx.data_end()) else {
         return false;

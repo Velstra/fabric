@@ -285,9 +285,186 @@ pub fn icmp_checksum(message: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+/// Bytes of the rejected datagram an IPv6 port-unreachable quotes: its fixed
+/// IPv6 header and the 8-byte UDP header — what the sender needs to find the
+/// socket the error is for. RFC 4443 allows any amount up to the minimum MTU.
+pub const ICMPV6_UNREACH_QUOTE: usize = 48;
+/// Bytes the data plane prepends to turn the rejected datagram into that error:
+/// a fresh IPv6 header (40) and the ICMPv6 header (8). The datagram's own IPv6
+/// header then sits exactly where the quote belongs.
+pub const ICMPV6_UNREACH_PREPEND: usize = 48;
+/// Whole frame of the error: Ethernet (14) + IPv6 (40) + ICMPv6 (8) + quote.
+pub const ICMPV6_UNREACH_FRAME: usize = 14 + 40 + 8 + ICMPV6_UNREACH_QUOTE;
+
+/// The headers of an ICMPv6 destination-unreachable / port-unreachable (type 1,
+/// code 4) answering a rejected UDP datagram (audit DP-35: IPv6 reject used to
+/// answer TCP only and drop everything else, so a rejected UDP port timed out).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Icmpv6Unreach {
+    /// The reply's IPv6 header: addresses swapped, hop limit 64.
+    pub ip: [u8; 40],
+    /// The ICMPv6 header, checksum included.
+    pub icmp: [u8; 8],
+}
+
+/// Whether RFC 4443 §2.4(e) lets us answer this packet with an ICMPv6 error at
+/// all. `quote` is the rejected packet's first 48 bytes from its IPv6 header,
+/// `eth_dst0` the first byte of its Ethernet destination. Never in reply to a
+/// packet sent to a multicast address or a link-layer group address, nor to a
+/// source that does not name exactly one host (`::`, `::1`, multicast).
+#[inline(always)]
+pub fn icmpv6_error_allowed(quote: &[u8; ICMPV6_UNREACH_QUOTE], eth_dst0: u8) -> bool {
+    let mut unspecified_or_loopback = true;
+    let mut i = 8;
+    while i < 23 {
+        if quote[i] != 0 {
+            unspecified_or_loopback = false;
+        }
+        i += 1;
+    }
+    unspecified_or_loopback = unspecified_or_loopback && quote[23] <= 1;
+    quote[0] >> 4 == 6
+        && eth_dst0 & 1 == 0
+        && quote[8] != 0xff
+        && quote[24] != 0xff
+        && !unspecified_or_loopback
+}
+
+/// The ICMPv6 checksum of the port-unreachable answering a rejected UDP
+/// datagram whose first 48 bytes are `quote`: over the pseudo-header, the
+/// ICMPv6 header (type 1, code 4) and the quote.
+///
+/// Takes the quote by reference and builds nothing: the data plane passes a
+/// reference straight into the frame, where the quote already sits. A version
+/// that copied the message and headers onto the stack was refused under the
+/// IPv6 state stage ("combined stack size of 2 calls is 608", 6.18).
+#[inline(always)]
+pub fn icmpv6_port_unreachable_checksum(quote: &[u8; ICMPV6_UNREACH_QUOTE]) -> u16 {
+    // Pseudo-header length and next header, the type/code word (1, 4), then
+    // every word of the quote. Its bytes 8..40 are the two addresses, which is
+    // also exactly the pseudo-header's address part: the sum does not care
+    // which is which, so they are added a second time from the same bytes.
+    let mut sum =
+        (8 + ICMPV6_UNREACH_QUOTE) as u32 + crate::packet::ip_proto::ICMPV6 as u32 + 0x0104;
+    let mut i = 0;
+    while i < ICMPV6_UNREACH_QUOTE {
+        sum += u16::from_be_bytes([quote[i], quote[i + 1]]) as u32;
+        i += 2;
+    }
+    let mut i = 8;
+    while i < 40 {
+        sum += u16::from_be_bytes([quote[i], quote[i + 1]]) as u32;
+        i += 2;
+    }
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
+    !(sum as u16)
+}
+
+/// The full headers of that port-unreachable, for hosts and tests; the data
+/// plane writes the same bytes field by field.
+pub fn plan_icmpv6_port_unreachable(quote: &[u8; ICMPV6_UNREACH_QUOTE]) -> Icmpv6Unreach {
+    let mut ip = [0u8; 40];
+    ip[0] = 0x60;
+    ip[5] = (8 + ICMPV6_UNREACH_QUOTE) as u8;
+    ip[6] = crate::packet::ip_proto::ICMPV6;
+    ip[7] = 64;
+    // The reply comes from where the datagram was going, back to its sender.
+    ip[8..24].copy_from_slice(&quote[24..40]);
+    ip[24..40].copy_from_slice(&quote[8..24]);
+    let mut icmp = [0u8; 8];
+    icmp[0] = 1; // destination unreachable
+    icmp[1] = 4; // port unreachable
+    icmp[2..4].copy_from_slice(&icmpv6_port_unreachable_checksum(quote).to_be_bytes());
+    Icmpv6Unreach { ip, icmp }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn udp_quote(src: [u8; 16], dst: [u8; 16]) -> [u8; ICMPV6_UNREACH_QUOTE] {
+        let mut q = [0u8; ICMPV6_UNREACH_QUOTE];
+        q[0] = 0x60;
+        q[4..6].copy_from_slice(&8u16.to_be_bytes());
+        q[6] = crate::packet::ip_proto::UDP;
+        q[7] = 64;
+        q[8..24].copy_from_slice(&src);
+        q[24..40].copy_from_slice(&dst);
+        q[40..42].copy_from_slice(&40000u16.to_be_bytes());
+        q[42..44].copy_from_slice(&18199u16.to_be_bytes());
+        q[44..46].copy_from_slice(&8u16.to_be_bytes());
+        q
+    }
+
+    const SENDER: [u8; 16] = [
+        0x20, 1, 0x0d, 0xb8, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xfe,
+    ];
+    const BOX: [u8; 16] = [0x20, 1, 0x0d, 0xb8, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0];
+
+    /// The reply goes back to the sender from the address it tried, and its
+    /// checksum verifies independently over pseudo-header + message.
+    #[test]
+    fn ipv6_port_unreachable_is_addressed_back_and_checksums() {
+        let quote = udp_quote(SENDER, BOX);
+        let plan = plan_icmpv6_port_unreachable(&quote);
+        assert_eq!(plan.ip[0] >> 4, 6);
+        assert_eq!(u16::from_be_bytes([plan.ip[4], plan.ip[5]]), 56);
+        assert_eq!(plan.ip[6], crate::packet::ip_proto::ICMPV6);
+        assert_eq!(plan.ip[8..24], BOX);
+        assert_eq!(plan.ip[24..40], SENDER);
+        assert_eq!((plan.icmp[0], plan.icmp[1]), (1, 4));
+        // Independent verification: the sum over everything, checksum
+        // included, is all ones.
+        let mut sum = 0u32;
+        for addr in [BOX, SENDER] {
+            for pair in addr.chunks(2) {
+                sum += u16::from_be_bytes([pair[0], pair[1]]) as u32;
+            }
+        }
+        sum += 56 + crate::packet::ip_proto::ICMPV6 as u32;
+        for pair in plan.icmp.chunks(2).chain(quote.chunks(2)) {
+            sum += u16::from_be_bytes([pair[0], pair[1]]) as u32;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        assert_eq!(sum, 0xffff);
+        // And it agrees with the crate's general ICMPv6 checksum.
+        let mut message = [0u8; 56];
+        message[0] = 1;
+        message[1] = 4;
+        message[8..].copy_from_slice(&quote);
+        assert_eq!(
+            u16::from_be_bytes([plan.icmp[2], plan.icmp[3]]),
+            crate::icmpv6_checksum(BOX, SENDER, &message)
+        );
+    }
+
+    #[test]
+    fn ipv6_errors_are_never_sent_where_rfc_4443_forbids() {
+        assert!(icmpv6_error_allowed(&udp_quote(SENDER, BOX), 0x52));
+        // Link-layer group destination.
+        assert!(!icmpv6_error_allowed(&udp_quote(SENDER, BOX), 0x33));
+        // Multicast destination or source.
+        let mut multicast = BOX;
+        multicast[0] = 0xff;
+        assert!(!icmpv6_error_allowed(&udp_quote(SENDER, multicast), 0x52));
+        assert!(!icmpv6_error_allowed(&udp_quote(multicast, BOX), 0x52));
+        // Unspecified and loopback sources name no single host.
+        assert!(!icmpv6_error_allowed(&udp_quote([0; 16], BOX), 0x52));
+        let mut loopback = [0u8; 16];
+        loopback[15] = 1;
+        assert!(!icmpv6_error_allowed(&udp_quote(loopback, BOX), 0x52));
+        // But ::2 is an ordinary (if odd) unicast source.
+        let mut two = [0u8; 16];
+        two[15] = 2;
+        assert!(icmpv6_error_allowed(&udp_quote(two, BOX), 0x52));
+        // Not IPv6 at all.
+        let mut v4 = udp_quote(SENDER, BOX);
+        v4[0] = 0x45;
+        assert!(!icmpv6_error_allowed(&v4, 0x52));
+    }
 
     /// Sum a buffer of 16-bit words including any checksum field; a valid
     /// header/segment folds to zero.
