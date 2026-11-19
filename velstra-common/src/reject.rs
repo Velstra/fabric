@@ -330,29 +330,16 @@ pub fn icmpv6_error_allowed(quote: &[u8; ICMPV6_UNREACH_QUOTE], eth_dst0: u8) ->
         && !unspecified_or_loopback
 }
 
-/// Plan the ICMPv6 port-unreachable for a rejected UDP datagram whose first 48
-/// bytes are `quote`. The checksum covers the pseudo-header, the ICMPv6 header
-/// and the quote — all of it known here, so the data plane only writes bytes.
+/// The ICMPv6 checksum of the port-unreachable answering a rejected UDP
+/// datagram whose first 48 bytes are `quote`: over the pseudo-header, the
+/// ICMPv6 header (type 1, code 4) and the quote.
 ///
-/// Written for the verifier's stack rather than for brevity: no copy of the
-/// message or the addresses is materialised, because this runs as a
-/// sub-program under the IPv6 state stage and kernel 6.6 refused the version
-/// that built a 56-byte message to checksum ("combined stack size of 3 calls
-/// is 544").
+/// Takes the quote by reference and builds nothing: the data plane passes a
+/// reference straight into the frame, where the quote already sits. A version
+/// that copied the message and headers onto the stack was refused under the
+/// IPv6 state stage ("combined stack size of 2 calls is 608", 6.18).
 #[inline(always)]
-pub fn plan_icmpv6_port_unreachable(quote: &[u8; ICMPV6_UNREACH_QUOTE]) -> Icmpv6Unreach {
-    let mut ip = [0u8; 40];
-    ip[0] = 0x60;
-    ip[5] = (8 + ICMPV6_UNREACH_QUOTE) as u8;
-    ip[6] = crate::packet::ip_proto::ICMPV6;
-    ip[7] = 64;
-    // The reply comes from where the datagram was going, back to its sender.
-    let mut i = 0;
-    while i < 16 {
-        ip[8 + i] = quote[24 + i];
-        ip[24 + i] = quote[8 + i];
-        i += 1;
-    }
+pub fn icmpv6_port_unreachable_checksum(quote: &[u8; ICMPV6_UNREACH_QUOTE]) -> u16 {
     // Pseudo-header length and next header, the type/code word (1, 4), then
     // every word of the quote. Its bytes 8..40 are the two addresses, which is
     // also exactly the pseudo-header's address part: the sum does not care
@@ -371,11 +358,24 @@ pub fn plan_icmpv6_port_unreachable(quote: &[u8; ICMPV6_UNREACH_QUOTE]) -> Icmpv
     }
     sum = (sum & 0xffff) + (sum >> 16);
     sum = (sum & 0xffff) + (sum >> 16);
-    let checksum = !(sum as u16);
+    !(sum as u16)
+}
+
+/// The full headers of that port-unreachable, for hosts and tests; the data
+/// plane writes the same bytes field by field.
+pub fn plan_icmpv6_port_unreachable(quote: &[u8; ICMPV6_UNREACH_QUOTE]) -> Icmpv6Unreach {
+    let mut ip = [0u8; 40];
+    ip[0] = 0x60;
+    ip[5] = (8 + ICMPV6_UNREACH_QUOTE) as u8;
+    ip[6] = crate::packet::ip_proto::ICMPV6;
+    ip[7] = 64;
+    // The reply comes from where the datagram was going, back to its sender.
+    ip[8..24].copy_from_slice(&quote[24..40]);
+    ip[24..40].copy_from_slice(&quote[8..24]);
     let mut icmp = [0u8; 8];
     icmp[0] = 1; // destination unreachable
     icmp[1] = 4; // port unreachable
-    icmp[2..4].copy_from_slice(&checksum.to_be_bytes());
+    icmp[2..4].copy_from_slice(&icmpv6_port_unreachable_checksum(quote).to_be_bytes());
     Icmpv6Unreach { ip, icmp }
 }
 

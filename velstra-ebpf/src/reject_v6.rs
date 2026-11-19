@@ -8,7 +8,7 @@ use aya_ebpf::{
 };
 use velstra_common::{
     Counter, ICMPV6_UNREACH_FRAME, ICMPV6_UNREACH_PREPEND, ICMPV6_UNREACH_QUOTE,
-    icmpv6_error_allowed, ip_proto, plan_icmpv6_port_unreachable, plan_tcp_rst_v6, tcp_flags,
+    icmpv6_error_allowed, icmpv6_port_unreachable_checksum, ip_proto, plan_tcp_rst_v6, tcp_flags,
 };
 
 use super::{bump, ptr_at};
@@ -111,13 +111,15 @@ fn try_udp(ctx: &XdpContext, off: usize) -> Result<u32, ()> {
     if off != 54 {
         return Ok(xdp_action::XDP_DROP);
     }
-    let quote = unsafe { *ptr_at::<[u8; ICMPV6_UNREACH_QUOTE]>(ctx, 14)? };
-    let eth = unsafe { *ptr_at::<[u8; 14]>(ctx, 0)? };
+    // A reference into the frame, not a copy: the quote is already where the
+    // error needs it, and this sub-program runs on the IPv6 state stage's stack.
+    let quote = unsafe { &*ptr_at::<[u8; ICMPV6_UNREACH_QUOTE]>(ctx, 14)? };
+    let eth_dst0 = unsafe { *ptr_at::<u8>(ctx, 0)? };
     let frame_len = ctx.data_end() - ctx.data();
-    if quote[6] != ip_proto::UDP || !icmpv6_error_allowed(&quote, eth[0]) || frame_len > 65535 {
+    if quote[6] != ip_proto::UDP || !icmpv6_error_allowed(quote, eth_dst0) || frame_len > 65535 {
         return Ok(xdp_action::XDP_DROP);
     }
-    let plan = plan_icmpv6_port_unreachable(&quote);
+    let checksum = icmpv6_port_unreachable_checksum(quote);
     if unsafe { bpf_xdp_adjust_head(ctx.ctx, -(ICMPV6_UNREACH_PREPEND as i32)) } != 0 {
         return Err(());
     }
@@ -128,18 +130,30 @@ fn try_udp(ctx: &XdpContext, off: usize) -> Result<u32, ()> {
         return Err(());
     }
     // Both helpers invalidated packet pointers: prove the whole reply again
-    // before any write.
+    // before any access. The datagram's Ethernet header now sits at 48..62 and
+    // its IPv6 + UDP headers — the quote — at 62..110.
     let data = ctx.data();
     if data + ICMPV6_UNREACH_FRAME > ctx.data_end() {
         return Err(());
     }
+    const OLD_ETH: usize = ICMPV6_UNREACH_PREPEND;
+    const QUOTE: usize = 14 + 40 + 8;
     unsafe {
-        *((data) as *mut [u8; 6]) = eth[6..12].try_into().map_err(|_| ())?;
-        *((data + 6) as *mut [u8; 6]) = eth[..6].try_into().map_err(|_| ())?;
+        // The MACs first: the new IPv6 header overwrites the old Ethernet one.
+        let old_dst = *((data + OLD_ETH) as *const [u8; 6]);
+        let old_src = *((data + OLD_ETH + 6) as *const [u8; 6]);
+        *(data as *mut [u8; 6]) = old_src;
+        *((data + 6) as *mut [u8; 6]) = old_dst;
         *((data + 12) as *mut [u8; 2]) = [0x86, 0xdd];
-        *((data + 14) as *mut [u8; 40]) = plan.ip;
-        *((data + 54) as *mut [u8; 8]) = plan.icmp;
-        *((data + 62) as *mut [u8; ICMPV6_UNREACH_QUOTE]) = quote;
+        // IPv6: version 6, payload 56, ICMPv6, hop limit 64; from where the
+        // datagram was going, back to its sender.
+        *((data + 14) as *mut [u8; 8]) =
+            [0x60, 0, 0, 0, 0, (8 + ICMPV6_UNREACH_QUOTE) as u8, 58, 64];
+        *((data + 22) as *mut [u8; 16]) = *((data + QUOTE + 24) as *const [u8; 16]);
+        *((data + 38) as *mut [u8; 16]) = *((data + QUOTE + 8) as *const [u8; 16]);
+        // ICMPv6 destination-unreachable / port-unreachable.
+        let csum = checksum.to_be_bytes();
+        *((data + 54) as *mut [u8; 8]) = [1, 4, csum[0], csum[1], 0, 0, 0, 0];
     }
     bump(Counter::Rejected);
     Ok(xdp_action::XDP_TX)
