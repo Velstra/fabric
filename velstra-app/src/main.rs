@@ -236,6 +236,10 @@ struct ValidateArgs {
 struct VerifyEbpfArgs {
     /// ELF object to verify; omit to verify the embedded release object.
     object: Option<PathBuf>,
+    /// Refuse a program that verifies but uses more verifier instructions than
+    /// this. The default keeps 30 % of the kernel's 1,000,000 in reserve.
+    #[arg(long, default_value_t = firewall::VERIFIER_INSN_BUDGET)]
+    max_insns: u32,
 }
 
 /// Encapsulation advertised when the agent self-registers its host.
@@ -269,7 +273,7 @@ async fn main() -> Result<()> {
         Command::HaGuard(args) => ha::prepare_guard(&velstra_config::load_file(&args.config)?),
         Command::VerifyEbpf(args) => {
             let object = args.object.map(std::fs::read).transpose()?;
-            Firewall::verify_object(object.as_deref())
+            Firewall::verify_object(object.as_deref(), args.max_insns)
         }
         Command::Run(args) => run(args).await,
         Command::ReleaseDatapath => {

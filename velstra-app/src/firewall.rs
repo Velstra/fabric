@@ -861,7 +861,7 @@ const MAX_RUNTIME_MAPPINGS: usize = 256;
 impl Firewall {
     /// Exercise the real kernel verifier for every shipped XDP/TC entry point.
     /// No packet hook is attached and dropping the object releases all maps.
-    pub fn verify_object(object: Option<&[u8]>) -> Result<()> {
+    pub fn verify_object(object: Option<&[u8]>, max_insns: u32) -> Result<()> {
         bump_memlock_rlimit();
         let object = crate::btf::kernel_object(object.unwrap_or(aya::include_bytes_aligned!(
             concat!(env!("OUT_DIR"), "/velstra")
@@ -888,7 +888,8 @@ impl Firewall {
             match program.load() {
                 Ok(()) => {
                     println!("verified {name}");
-                    report_verified_insns(name, program.info());
+                    let count = report_verified_insns(name, program.info());
+                    rejected.extend(over_budget(name, count, max_insns));
                 }
                 Err(error) => rejected.push(format!("verifying {name}: {error:#}")),
             }
@@ -914,7 +915,8 @@ impl Firewall {
             match program.load() {
                 Ok(()) => {
                     println!("verified {name}");
-                    report_verified_insns(name, program.info());
+                    let count = report_verified_insns(name, program.info());
+                    rejected.extend(over_budget(name, count, max_insns));
                 }
                 Err(error) => rejected.push(format!("verifying {name}: {error:#}")),
             }
@@ -3182,11 +3184,43 @@ impl Firewall {
 fn report_verified_insns(
     name: &str,
     info: std::result::Result<aya::programs::ProgramInfo, aya::programs::ProgramError>,
-) {
+) -> Option<u32> {
     match info.map(|info| info.verified_instruction_count()) {
-        Ok(Some(count)) => println!("verifier-insns {name} {count}"),
-        Ok(None) | Err(_) => println!("verifier-insns {name} unknown"),
+        Ok(Some(count)) => {
+            println!("verifier-insns {name} {count}");
+            Some(count)
+        }
+        Ok(None) | Err(_) => {
+            println!("verifier-insns {name} unknown");
+            None
+        }
     }
+}
+
+/// The verifier-instruction ceiling `velstra verify-ebpf` holds every program
+/// to unless told otherwise: 70 % of the kernel's 1,000,000-instruction limit.
+///
+/// A program that verifies at 950,000 passes today and fails after the next
+/// unrelated change, or on the next kernel, whose verifier explores the same
+/// code differently: the counts for one object differ by up to a factor of four
+/// between 6.6, 6.12, 6.18 and 7.0. Passing is not enough; the margin is what
+/// a datapath change spends, so it is checked, not only printed.
+pub const VERIFIER_INSN_BUDGET: u32 = 700_000;
+// At least 30 % of the kernel's 1,000,000-instruction limit stays in reserve.
+const _: () = assert!(VERIFIER_INSN_BUDGET <= 1_000_000 / 10 * 7);
+
+/// The refusal for a program that verified but used more of the verifier's
+/// budget than `max_insns`, or `None` when it is within it. A count the kernel
+/// did not report is not a violation: a kernel without the field cannot be
+/// measured, and refusing every program on it would make the check useless.
+fn over_budget(name: &str, count: Option<u32>, max_insns: u32) -> Option<String> {
+    let count = count?;
+    (count > max_insns).then(|| {
+        format!(
+            "verifying {name}: {count} verifier instructions exceeds the budget of \
+             {max_insns} (the kernel limit is 1,000,000; the budget keeps headroom)"
+        )
+    })
 }
 
 /// Hand the memory a large transaction freed back to the kernel (PERF-04).
@@ -6368,6 +6402,25 @@ fn is_drop_counter(counter: Counter) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_program_over_the_verifier_budget_is_refused_by_name() {
+        let refusal = over_budget("velstra_egress_v4_state", Some(700_001), 700_000)
+            .expect("one instruction over the budget is a refusal");
+        assert!(refusal.contains("velstra_egress_v4_state"), "{refusal}");
+        assert!(refusal.contains("700001"), "{refusal}");
+    }
+
+    #[test]
+    fn a_program_at_or_under_the_budget_passes() {
+        assert_eq!(over_budget("velstra", Some(700_000), 700_000), None);
+        assert_eq!(over_budget("velstra", Some(12), 700_000), None);
+    }
+
+    #[test]
+    fn an_unreported_count_is_not_a_refusal() {
+        assert_eq!(over_budget("velstra", None, 1), None);
+    }
 
     #[test]
     fn complete_napt_domain_requires_absence_of_both_ha_and_sync() {
