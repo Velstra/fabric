@@ -4,6 +4,21 @@
 
 ### Fixed
 
+- **Source-only blocklists (DP-15).** `blocklist_ingress_only = true` on a
+  `[[policy]]` (or at the top level) makes its blocklist name sources only:
+  the egress hook no longer matches it against destinations, and a listed
+  address may still answer a connection opened towards it. What a listed
+  address starts is refused as before. Without the key nothing changes.
+- **The SYN proxy is scoped per policy (DP-31).** `[[synproxy]]` takes an
+  optional `policy`; the proxy then answers only SYNs arriving under it.
+  Without one the port is protected on every policy, as before. The
+  `SYNPROXY` key grows to 8 bytes; it is a configuration map, not pinned
+  state, so an upgrade needs no migration.
+- **ICMPv6 RELATED behind NPTv6 and through extension headers.** An error
+  about an NPTv6 flow is recognised by its internal address, and its quote is
+  translated with the envelope in both directions, so the host's stack acts
+  on it; a quote whose packet carried extension headers is walked to its
+  transport header (up to four).
 - **TCP resets are validated before they end a connection (DP-03).** A reset
   tears down firewall state only when its sequence number equals the
   receiver's last ACK and, at XDP ingress, its TCP checksum is correct. An
@@ -42,6 +57,11 @@
 
 ### Added
 
+- **IPv6 MSS clamping.** An interface's MSS ceiling also clamps IPv6 SYNs,
+  to the ceiling less the 20 extra bytes of the IPv6 header.
+- **A verifier budget in `verify-ebpf`.** A program that verifies above
+  `--max-insns` (default 700,000, i.e. 30 % of the kernel limit in reserve)
+  is refused by name.
 - **Wren's forwarding table into `ROUTES`, FPM-style.** `--wren-routes` (with
   `--wren-socket`) subscribes the agent to Wren's `monitor routes` feed and
   programs what it hears: each learned route's next hop is resolved to a MAC
