@@ -82,8 +82,8 @@ pub use icmp_related::{
     related_hairpin_firewall_candidate, related_icmp_error,
 };
 pub use icmpv6::{
-    ICMPV6_ERROR_QUOTE, MLD_HOP_LIMIT, ND_HOP_LIMIT, icmpv6_link_control, icmpv6_type,
-    related_icmpv6_error, related_icmpv6_key,
+    ICMPV6_ERROR_QUOTE, MLD_HOP_LIMIT, ND_HOP_LIMIT, QUOTE_EXT_MAX, QuoteStep, icmpv6_link_control,
+    icmpv6_type, quote_ext_step, related_icmpv6_error, related_icmpv6_key,
 };
 pub use lb::{
     Backend, FlowKey, FlowState, Nat, PortFwd, ServiceKey, ServiceValue, plan_dnat,

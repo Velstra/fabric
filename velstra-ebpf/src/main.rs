@@ -93,16 +93,16 @@ use velstra_common::{
     ARP_REPLY, ARP_REQUEST, Action, ArpEntry, ArpKey, Backend, CgnatLayout, ConfigFlags, Counter,
     ETHERTYPE_ARP, ETHERTYPE_IPV4, ETHERTYPE_IPV6, FirewallKey, FirewallState, FloodSet, FlowKey,
     FlowState, ForwardOutcome, FragmentPosition, GlobalConfig, ICMP_UNREACH_PREPEND,
-    ICMP_UNREACH_TOTAL_LEN, ICMPV6_NEIGHBOR_SOLICIT, IrbEndpoint, IrbRewrite, LocalMac,
-    LocalMacKey, MAX_BLOCKLIST, MAX_FLOOD_VTEPS, MAX_RULE_LIMITS, MacFdbKey, ND_NA_MSG_LEN, Nat,
-    NdKey, Npt66, OVERLAY_OUTER_LEN, OverlayConfig, PORT_ENFORCE_MAC, PORT_ENFORCE_V4,
-    PORT_ENFORCE_V6, PORT_RULE_IN_ONLY, PORT_RULE_OUT_ONLY, PORT_RULE_V4_ONLY, PORT_RULE_V6_ONLY,
-    PacketMeta, PolicyId, PortAddr4, PortAddr6, PortBinding, PortFwd, PortalClientKey, PortalGate,
-    PortalSeenKey, RateBucket, Rewrite, RouteEntry, SRV6_L2_OUTER_LEN, ScopedAddr, ScopedAddr6,
-    ScopedDstPortKey, ScopedDstPortKey6, ScopedMac, ScopedPortKey, ScopedSrcPortKey,
-    ScopedSrcPortKey6, ServiceKey, ServiceValue, SourceValidation, Srv6Config, Srv6Endpoint,
-    Srv6FloodSet, Srv6IrbEndpoint, Srv6LocalSid, Srv6SidKey, StateFacts, SynFlow, SynProxyCfg,
-    SynProxyKey, TcpSynth, TunnelEndpoint, TunnelKey, VERDICT_REASONS, Verdict,
+    ICMP_UNREACH_TOTAL_LEN, ICMPV6_ERROR_QUOTE, ICMPV6_NEIGHBOR_SOLICIT, IrbEndpoint, IrbRewrite,
+    LocalMac, LocalMacKey, MAX_BLOCKLIST, MAX_FLOOD_VTEPS, MAX_RULE_LIMITS, MacFdbKey,
+    ND_NA_MSG_LEN, Nat, NdKey, Npt66, OVERLAY_OUTER_LEN, OverlayConfig, PORT_ENFORCE_MAC,
+    PORT_ENFORCE_V4, PORT_ENFORCE_V6, PORT_RULE_IN_ONLY, PORT_RULE_OUT_ONLY, PORT_RULE_V4_ONLY,
+    PORT_RULE_V6_ONLY, PacketMeta, PolicyId, PortAddr4, PortAddr6, PortBinding, PortFwd,
+    PortalClientKey, PortalGate, PortalSeenKey, RateBucket, Rewrite, RouteEntry, SRV6_L2_OUTER_LEN,
+    ScopedAddr, ScopedAddr6, ScopedDstPortKey, ScopedDstPortKey6, ScopedMac, ScopedPortKey,
+    ScopedSrcPortKey, ScopedSrcPortKey6, ServiceKey, ServiceValue, SourceValidation, Srv6Config,
+    Srv6Endpoint, Srv6FloodSet, Srv6IrbEndpoint, Srv6LocalSid, Srv6SidKey, StateFacts, SynFlow,
+    SynProxyCfg, SynProxyKey, TcpSynth, TunnelEndpoint, TunnelKey, VERDICT_REASONS, Verdict,
     admit_established_egress_reply, blocklist_refuses_egress, blocklist_refuses_ingress,
     build_encap, build_srv6_encap, check_cookie, csum_replace_u32, decide, decide_egress,
     decode_vni, epoch_of, ethertype_passes_unfiltered, gate_admits_unauthenticated, icmp,
@@ -3204,7 +3204,35 @@ fn npt66_egress_v6(ctx: &TcContext) -> Result<i32, ()> {
     if ctx.store(src_off, &new_src, 0).is_err() {
         return Ok(TC_ACT_OK as i32);
     }
+    npt66_related_quote_out(ctx, &rule);
     Ok(TC_ACT_OK as i32)
+}
+
+/// The egress twin of [`npt66_related_quote_in`]: an ICMPv6 error the inside
+/// host sends out quotes the packet it received, addressed to its INTERNAL
+/// address; the outside sent that packet to the external one and would not
+/// recognise the quote. Checksum-neutral, constant offsets, and only for an
+/// error directly behind the fixed IPv6 header.
+#[inline(always)]
+fn npt66_related_quote_out(ctx: &TcContext, rule: &Npt66) {
+    const NEXT_HEADER: usize = EthHdr::LEN + 6;
+    const ICMP: usize = EthHdr::LEN + Ipv6Hdr::LEN;
+    const QUOTED_DST: usize = ICMP + ICMPV6_ERROR_QUOTE + 24;
+    let Ok(next) = ctx.load::<u8>(NEXT_HEADER) else {
+        return;
+    };
+    let Ok(kind) = ctx.load::<u8>(ICMP) else {
+        return;
+    };
+    if next != ip_proto::ICMPV6 || !(1..=4).contains(&kind) {
+        return;
+    }
+    let Ok(quoted) = ctx.load::<[u8; 16]>(QUOTED_DST) else {
+        return;
+    };
+    if rule.matches_internal(&quoted) {
+        let _ = ctx.store(QUOTED_DST, &rule.translate_out(quoted), 0);
+    }
 }
 
 /// Rewrite the IPv4 **source** address to `new_src` in the skb and repair the
@@ -4876,7 +4904,7 @@ fn try_velstra_v6_state(ctx: &XdpContext) -> Result<u32, ()> {
     let related = stateful
         && proto == ip_proto::ICMPV6
         && (1..=4).contains(&fwkey.dst_port)
-        && icmp_related::related_v6_xdp(ctx, fwkey.policy, off as u32);
+        && icmp_related::related_v6_xdp(ctx, fwkey.policy, off as u32, ifindex);
     // DP-15: an ingress-only blocklist lets a listed source answer (see IPv4).
     // The policy verdict from the rule stage already says "blocklisted"; the
     // state facts below are what decide, and an answer passes as established.
@@ -4946,6 +4974,9 @@ fn try_velstra_v6_state(ctx: &XdpContext) -> Result<u32, ()> {
     // prefix (checksum-neutral). A no-op when this interface has no rule or the
     // destination doesn't match.
     npt66_ingress_v6(ctx, ifindex)?;
+    if related {
+        npt66_related_quote_in(ctx, ifindex, off);
+    }
     Ok(xdp_action::XDP_PASS)
 }
 
@@ -5119,7 +5150,7 @@ fn try_egress_v6_state(ctx: &TcContext) -> Result<i32, ()> {
         && ct != 1
         && fwkey.proto == ip_proto::ICMPV6
         && (1..=4).contains(&fwkey.dst_port)
-        && icmp_related::related_v6_tc(ctx, fwkey.policy, decision.off);
+        && icmp_related::related_v6_tc(ctx, fwkey.policy, decision.off, ifindex);
     let allowed = ct != 2
         && (flags & V6_EGRESS_PASS != 0
             || (ct == 1 && flags & V6_EGRESS_DEFAULT_DROP != 0)
@@ -5176,6 +5207,37 @@ fn npt66_ingress_v6(ctx: &XdpContext, ifindex: u32) -> Result<(), ()> {
         *((data + off) as *mut [u8; 16]) = new_dst;
     }
     Ok(())
+}
+
+/// The quoted packet inside an admitted ICMPv6 error, translated back the way
+/// [`npt66_ingress_v6`] translates the envelope: the inside host sent it from
+/// its internal address, the error quotes the external one, and a quote naming
+/// an address the host does not hold matches none of its sockets — so a Packet
+/// Too Big was delivered and then ignored, and path-MTU discovery still
+/// black-holed behind NPTv6. Checksum-neutral like every NPTv6 rewrite: the
+/// quoted address is part of the ICMPv6 checksum, and the translation keeps
+/// the one's-complement sum of an address unchanged.
+///
+/// Only an error directly behind the fixed IPv6 header (`off` 54) is
+/// rewritten, at constant offsets; one carried behind extension headers is
+/// admitted but left as it arrived.
+#[inline(never)]
+fn npt66_related_quote_in(ctx: &XdpContext, ifindex: u32, off: usize) {
+    const QUOTED_SRC: usize = EthHdr::LEN + Ipv6Hdr::LEN + ICMPV6_ERROR_QUOTE + 8;
+    if off != EthHdr::LEN + Ipv6Hdr::LEN {
+        return;
+    }
+    let Some(rule) = (unsafe { NPTV6.get(&ifindex) }) else {
+        return;
+    };
+    let data = ctx.data();
+    if data + QUOTED_SRC + 16 > ctx.data_end() {
+        return;
+    }
+    let quoted = unsafe { *((data + QUOTED_SRC) as *const [u8; 16]) };
+    if rule.matches_external(&quoted) {
+        unsafe { *((data + QUOTED_SRC) as *mut [u8; 16]) = rule.translate_in(quoted) };
+    }
 }
 
 /// Rewrite a conntrack key's destination from the external to the internal

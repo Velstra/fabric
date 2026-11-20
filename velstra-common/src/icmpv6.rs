@@ -18,7 +18,7 @@
 //!   because IPv6 routers never fragment: Packet Too Big is the only way a
 //!   sender learns the path is narrower.
 
-use crate::{FirewallKey, PolicyId, ip_proto};
+use crate::{FirewallKey, PolicyId, ip_proto, ipv6_ext_len, is_ipv6_ext};
 
 /// ICMPv6 message types this module classifies (RFC 4443, 4861, 2710, 3810).
 pub mod icmpv6_type {
@@ -148,8 +148,9 @@ pub const ICMPV6_ERROR_QUOTE: usize = 8;
 /// data plane builds the key in a map slot instead of on its 512-byte stack.
 ///
 /// `outer_dst` is the error's own IPv6 destination; `quoted` the first 40 bytes
-/// of the invoking packet (its IPv6 header) and `transport` the 8 bytes after
-/// it. The key is built in exactly the convention the state machine records
+/// of the invoking packet (its IPv6 header), `upper` the protocol its
+/// extension-header chain ends in (walked with [`quote_ext_step`]; `quoted[6]`
+/// when there is none) and `transport` the 8 bytes where that protocol starts. The key is built in exactly the convention the state machine records
 /// flows in — host-order ports for TCP/UDP; for echo, the identifier in
 /// `src_port` and the type in `dst_port` — so the caller looks it up as it
 /// stands and, failing that, its [`FirewallKey::reverse`].
@@ -159,14 +160,14 @@ pub const ICMPV6_ERROR_QUOTE: usize = 8;
 ///   an error goes back to the sender of the packet it quotes, and one aimed
 ///   anywhere else is somebody using a live flow as a pass;
 /// * a quoted protocol other than TCP, UDP or ICMPv6 echo — in particular an
-///   error about an error, which would loop;
-/// * a quote whose next header is an extension header. Unsupported rather than
-///   walked: the quote is truncated by design and such packets are rare.
+///   error about an error, which would loop, and an extension header the walk
+///   did not get past.
 #[inline(always)]
 pub fn related_icmpv6_key(
     policy: PolicyId,
     outer_dst: &[u8; 16],
     quoted: &[u8; 40],
+    upper: u8,
     transport: &[u8; 8],
     key: &mut FirewallKey,
 ) -> bool {
@@ -182,7 +183,7 @@ pub fn related_icmpv6_key(
         key.dst[i] = quoted[24 + i];
         i += 1;
     }
-    let proto = quoted[6];
+    let proto = upper;
     let (src_port, dst_port) = match proto {
         ip_proto::TCP | ip_proto::UDP => (
             u16::from_be_bytes([transport[0], transport[1]]),
@@ -206,6 +207,49 @@ pub fn related_icmpv6_key(
     key.family = 6;
     key._pad = [0; 2];
     true
+}
+
+/// How many extension headers of a quoted packet the data plane walks to find
+/// the transport header an ICMPv6 error is about. Four covers what a real
+/// sender emits (hop-by-hop, destination options, routing, fragment).
+pub const QUOTE_EXT_MAX: usize = 4;
+
+/// One step through the extension headers of the packet an ICMPv6 error quotes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuoteStep {
+    /// `proto` is not an extension header: the transport header starts here.
+    Upper,
+    /// Skip `len` bytes; the next header is `proto`.
+    Next {
+        /// The header that follows.
+        proto: u8,
+        /// The length of the header being skipped.
+        len: u32,
+    },
+    /// The quote cannot be about a tracked connection: it is a later fragment,
+    /// which carries no transport header to name one.
+    Refuse,
+}
+
+/// The step past the extension header `proto` whose first four bytes are
+/// `head` (next header, length, and for a fragment its offset field).
+///
+/// Before this, any quote whose next header was an extension header was
+/// refused outright (audit follow-up to DP-21): a Packet Too Big about a
+/// connection that carried a hop-by-hop or destination-options header never
+/// reached its sender behind a deny-by-default zone.
+#[inline(always)]
+pub const fn quote_ext_step(proto: u8, head: &[u8; 4]) -> QuoteStep {
+    if !is_ipv6_ext(proto) {
+        return QuoteStep::Upper;
+    }
+    if proto == ip_proto::FRAGMENT && u16::from_be_bytes([head[2], head[3]]) & 0xFFF8 != 0 {
+        return QuoteStep::Refuse;
+    }
+    QuoteStep::Next {
+        proto: head[0],
+        len: ipv6_ext_len(proto, head[1]) as u32,
+    }
 }
 
 #[cfg(test)]
@@ -335,7 +379,7 @@ mod tests {
             family: 0xaa,
             _pad: [0xaa; 2],
         };
-        related_icmpv6_key(7, outer_dst, quoted, transport, &mut key).then_some(key)
+        related_icmpv6_key(7, outer_dst, quoted, quoted[6], transport, &mut key).then_some(key)
     }
 
     fn quote(src: [u8; 16], dst: [u8; 16], next: u8) -> [u8; 40] {
@@ -403,10 +447,89 @@ mod tests {
             let t = [kind, 0, 0, 0, 0, 0, 0, 0];
             assert!(related(&CLIENT, &icmp, &t).is_none(), "{kind}");
         }
-        // Extension headers and other protocols.
+        // An extension header the walk did not get past, and other protocols.
         for next in [0u8, 43, 44, 50, 132] {
             let q = quote(CLIENT, SERVER, next);
             assert!(related(&CLIENT, &q, &transport).is_none(), "{next}");
         }
+    }
+
+    /// The walked protocol, not the quote's first next-header byte, names the
+    /// transport: a UDP datagram behind a destination-options header.
+    #[test]
+    fn a_quote_behind_extension_headers_names_its_flow() {
+        let quoted = quote(CLIENT, SERVER, ip_proto::DSTOPTS);
+        let transport = [0x47, 0x6c, 0x46, 0xa1, 0, 0, 0, 0];
+        assert!(related(&CLIENT, &quoted, &transport).is_none(), "unwalked");
+        let mut key = FirewallKey {
+            policy: 0,
+            src: [0; 16],
+            dst: [0; 16],
+            src_port: 0,
+            dst_port: 0,
+            proto: 0,
+            family: 0,
+            _pad: [0; 2],
+        };
+        assert!(related_icmpv6_key(
+            7,
+            &CLIENT,
+            &quoted,
+            ip_proto::UDP,
+            &transport,
+            &mut key
+        ));
+        assert_eq!(
+            (key.src_port, key.dst_port, key.proto),
+            (18284, 18081, ip_proto::UDP)
+        );
+    }
+
+    #[test]
+    fn the_quote_walk_skips_each_extension_header_by_its_own_length() {
+        // Destination options, one 8-byte unit beyond the first: 16 bytes.
+        assert_eq!(
+            quote_ext_step(ip_proto::DSTOPTS, &[ip_proto::UDP, 1, 0, 0]),
+            QuoteStep::Next {
+                proto: ip_proto::UDP,
+                len: 16
+            }
+        );
+        // Hop-by-hop then routing.
+        assert_eq!(
+            quote_ext_step(ip_proto::HOPOPT, &[ip_proto::ROUTING, 0, 0, 0]),
+            QuoteStep::Next {
+                proto: ip_proto::ROUTING,
+                len: 8
+            }
+        );
+        // AH counts 4-byte units beyond the first eight (RFC 4302).
+        assert_eq!(
+            quote_ext_step(ip_proto::AH, &[ip_proto::TCP, 4, 0, 0]),
+            QuoteStep::Next {
+                proto: ip_proto::TCP,
+                len: 24
+            }
+        );
+        // A first fragment is walked past; it still carries the transport.
+        assert_eq!(
+            quote_ext_step(ip_proto::FRAGMENT, &[ip_proto::TCP, 0, 0, 1]),
+            QuoteStep::Next {
+                proto: ip_proto::TCP,
+                len: 8
+            }
+        );
+    }
+
+    #[test]
+    fn the_quote_walk_stops_at_the_transport_and_refuses_later_fragments() {
+        for proto in [ip_proto::TCP, ip_proto::UDP, ip_proto::ICMPV6, 50] {
+            assert_eq!(quote_ext_step(proto, &[0; 4]), QuoteStep::Upper, "{proto}");
+        }
+        // Offset 8 bytes: a later fragment, no transport header in it.
+        assert_eq!(
+            quote_ext_step(ip_proto::FRAGMENT, &[ip_proto::UDP, 0, 0, 8]),
+            QuoteStep::Refuse
+        );
     }
 }
