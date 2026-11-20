@@ -2378,6 +2378,34 @@ unsafe fn ptr_at_tc<T>(ctx: &TcContext, offset: usize) -> Result<*const T, ()> {
     Ok((start + offset) as *const T)
 }
 
+/// Dispatch a counter index to `$line(label)` for every verdict reason, so
+/// the label each call logs is a constant (see [`log_v4_drop`]). The list of
+/// reasons is checked against [`VERDICT_REASONS`] at compile time, at every use.
+macro_rules! for_each_verdict_reason {
+    ($index:expr, $line:expr, $fallback:ident) => {
+        for_each_verdict_reason!(@arms $index, $line, $fallback;
+            PassedDefault, PassedRule, DroppedDefault, DroppedBlocklist, DroppedRule,
+            DroppedIcmp, DroppedRateLimit, Rejected, EstablishedAllowed,
+            FirewallStateWriteFailed)
+    };
+    (@arms $index:expr, $line:expr, $fallback:ident; $($reason:ident),*) => {{
+        const _: () = {
+            let listed = [$(Counter::$reason),*];
+            assert!(listed.len() == VERDICT_REASONS.len());
+            let mut i = 0;
+            while i < listed.len() {
+                assert!(listed[i].index() == VERDICT_REASONS[i].index());
+                i += 1;
+            }
+        };
+        let line = $line;
+        match $index {
+            $(i if i == Counter::$reason.index() => line(Counter::$reason.label()),)*
+            _ => line(Counter::$fallback.label()),
+        }
+    }};
+}
+
 /// Phase B egress firewall. Mirrors the Phase 1 ingress firewall in
 /// [`try_velstra`], but runs at TC **egress** and matches on the **destination**
 /// (the source is always "us" on the way out): the per-policy CIDR blocklist is
@@ -2658,7 +2686,7 @@ fn try_egress_v4_state(ctx: &TcContext) -> Result<i32, ()> {
         // The policy-wide log flag, or this rule's own per-rule log bit.
         let want_log = cfg.has_flag(ConfigFlags::LOG) || port_rule_logs(rule);
         if want_log {
-            log_egress_drop(ctx, dst_addr, proto, dst_port, reason);
+            log_egress_drop(ctx, dst_addr, proto, dst_port, reason.index());
         }
         return Ok(TC_ACT_SHOT as i32);
     }
@@ -2712,8 +2740,29 @@ fn try_egress_v4_state(ctx: &TcContext) -> Result<i32, ()> {
 /// per verifier path reaching the drop, i.e. for every combination of the
 /// policy, state and NAT branches above it. As a sub-program it is verified
 /// once per distinct caller state at the call.
+///
+/// The reason is dispatched to one constant label per verdict reason, as on
+/// ingress ([`log_v4_drop`]): a computed `&str` is copied byte by byte, and
+/// that one argument cost the verifier more than the rest of the line.
 #[inline(never)]
-fn log_egress_drop(ctx: &TcContext, dst_addr: [u8; 4], proto: u8, dst_port: u16, reason: Counter) {
+fn log_egress_drop(ctx: &TcContext, dst_addr: [u8; 4], proto: u8, dst_port: u16, reason: u32) {
+    for_each_verdict_reason!(
+        reason,
+        |label| egress_drop_line(ctx, dst_addr, proto, dst_port, label),
+        DroppedRule
+    );
+}
+
+/// One EGRESS DROP line; always inlined, so `reason` is the constant each arm
+/// of `for_each_verdict_reason` passes.
+#[inline(always)]
+fn egress_drop_line(
+    ctx: &TcContext,
+    dst_addr: [u8; 4],
+    proto: u8,
+    dst_port: u16,
+    reason: &'static str,
+) {
     info!(
         ctx,
         "EGRESS DROP -> {}.{}.{}.{} proto={} dport={} reason={}",
@@ -2723,7 +2772,7 @@ fn log_egress_drop(ctx: &TcContext, dst_addr: [u8; 4], proto: u8, dst_port: u16,
         dst_addr[3],
         proto,
         dst_port,
-        reason.label(),
+        reason,
     );
 }
 
@@ -3790,34 +3839,6 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     reset_v4_state();
     bump(Counter::Malformed);
     Ok(xdp_action::XDP_DROP)
-}
-
-/// Dispatch a counter index to `$line(label)` for every verdict reason, so
-/// the label each call logs is a constant (see [`log_v4_drop`]). The list of
-/// reasons is checked against [`VERDICT_REASONS`] at compile time, at every use.
-macro_rules! for_each_verdict_reason {
-    ($index:expr, $line:expr, $fallback:ident) => {
-        for_each_verdict_reason!(@arms $index, $line, $fallback;
-            PassedDefault, PassedRule, DroppedDefault, DroppedBlocklist, DroppedRule,
-            DroppedIcmp, DroppedRateLimit, Rejected, EstablishedAllowed,
-            FirewallStateWriteFailed)
-    };
-    (@arms $index:expr, $line:expr, $fallback:ident; $($reason:ident),*) => {{
-        const _: () = {
-            let listed = [$(Counter::$reason),*];
-            assert!(listed.len() == VERDICT_REASONS.len());
-            let mut i = 0;
-            while i < listed.len() {
-                assert!(listed[i].index() == VERDICT_REASONS[i].index());
-                i += 1;
-            }
-        };
-        let line = $line;
-        match $index {
-            $(i if i == Counter::$reason.index() => line(Counter::$reason.label()),)*
-            _ => line(Counter::$fallback.label()),
-        }
-    }};
 }
 
 /// The IPv4 firewall's log lines, each in a frame of its own (see
