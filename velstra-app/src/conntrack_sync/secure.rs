@@ -1265,7 +1265,12 @@ pub(crate) fn policy_fingerprint(cfg: &RuntimeConfig) -> Result<[u8; 32]> {
         .collect();
     let bytes = json!({"version":if control.is_empty(){5}else{6},"ha":cfg.ha.as_ref().map(|h|json!([h.cluster,h.interfaces,h.wireguard_ports,h.wireguard,h.wireguard_policy])),"policies":policies,"interfaces":interfaces,"forwards":forwards,"services":services,
         "timeouts":[cfg.conntrack.tcp_syn,cfg.conntrack.tcp_established,cfg.conntrack.tcp_closing,cfg.conntrack.udp,cfg.conntrack.udp_stream,cfg.conntrack.icmp],
-        "synproxy":cfg.synproxy.iter().map(|s|(s.port,s.mss)).collect::<Vec<_>>(),"fail_closed":cfg.fail_closed}).to_string();
+        "synproxy":cfg.synproxy.iter().map(|s| match s.policy {
+            // A port proxied on every policy keeps its earlier record, so the
+            // digest of an unscoped configuration does not move (DP-31).
+            None => json!([s.port, s.mss]),
+            Some(policy) => json!([s.port, s.mss, policy]),
+        }).collect::<Vec<_>>(),"fail_closed":cfg.fail_closed}).to_string();
     Ok(digest::digest(&digest::SHA256, bytes.as_bytes())
         .as_ref()
         .try_into()

@@ -3909,7 +3909,8 @@ fn apply_config_quiesced(
     program_routes(ebpf, &cfg.routes)?;
     program_services(ebpf, &cfg.services, &cfg.interfaces, &prepared.ipv4)?;
     program_port_forwards(ebpf, &cfg.port_forwards, &cfg.interfaces, &prepared.ipv4)?;
-    program_synproxy(ebpf, &cfg.synproxy)?;
+    let policy_ids: Vec<PolicyId> = cfg.policies.iter().map(|p| p.id).collect();
+    program_synproxy(ebpf, &synproxy_entries(&cfg.synproxy, &policy_ids))?;
     program_masquerade(ebpf, &cfg.interfaces, &prepared.ipv4)?;
     program_mss_clamp(ebpf, &cfg.interfaces)?;
     program_port_bindings(ebpf, &cfg.interfaces)?;
@@ -4412,7 +4413,7 @@ fn program_port_forwards(
 /// Rotating it on every reconfigure would be worse than useless: every client
 /// mid-handshake would have its ACK rejected. So it is written once, when it is
 /// still zero.
-fn program_synproxy(ebpf: &mut Ebpf, ports: &[ResolvedSynProxy]) -> Result<()> {
+fn program_synproxy(ebpf: &mut Ebpf, ports: &[(SynProxyKey, SynProxyCfg)]) -> Result<()> {
     // The cookie key is drawn only when a port actually uses it; the port map is
     // reconciled either way, so unprotecting the last port takes effect.
     if !ports.is_empty() {
@@ -4439,17 +4440,49 @@ fn program_synproxy(ebpf: &mut Ebpf, ports: &[ResolvedSynProxy]) -> Result<()> {
         }
     }
 
-    let keep: HashSet<SynProxyKey> = ports.iter().map(|p| SynProxyKey::tcp(p.port)).collect();
+    let keep: HashSet<SynProxyKey> = ports.iter().map(|(key, _)| *key).collect();
     let mut map: HashMap<_, SynProxyKey, SynProxyCfg> = HashMap::try_from(
         ebpf.map_mut("SYNPROXY")
             .ok_or_else(|| anyhow!("SYNPROXY map missing"))?,
     )?;
     drop_unlisted(&mut map, &keep)?;
-    for port in ports {
-        map.insert(SynProxyKey::tcp(port.port), SynProxyCfg::new(port.mss), 0)
-            .context("inserting a synproxy port")?;
+    for (key, value) in ports {
+        map.insert(*key, *value, 0).with_context(|| {
+            format!(
+                "inserting synproxy port {} for policy {:#x}",
+                key.port, key.policy
+            )
+        })?;
     }
     Ok(())
+}
+
+/// The `SYNPROXY` entries a configuration asks for (DP-31): one per policy a
+/// protected port shields its clients on — every policy in `policies` when the
+/// entry names none — plus the one [`SynProxyKey::server_side`] entry per port
+/// the server's half of a proxied connection looks up.
+fn synproxy_entries(
+    ports: &[ResolvedSynProxy],
+    policies: &[PolicyId],
+) -> Vec<(SynProxyKey, SynProxyCfg)> {
+    let mut out: Vec<(SynProxyKey, SynProxyCfg)> = Vec::new();
+    for port in ports {
+        let value = SynProxyCfg::new(port.mss);
+        let scoped = match port.policy {
+            Some(policy) => vec![policy],
+            None => policies.to_vec(),
+        };
+        out.extend(
+            scoped
+                .into_iter()
+                .map(|policy| (SynProxyKey::tcp(policy, port.port), value)),
+        );
+        let server = SynProxyKey::server_side(port.port);
+        if !out.iter().any(|(key, _)| *key == server) {
+            out.push((server, value));
+        }
+    }
+    out
 }
 
 /// Resolve live masquerade targets. Explicit SNAT/HA VIP addresses always win
@@ -6402,6 +6435,51 @@ fn is_drop_counter(counter: Counter) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn proxied(port: u16, mss: u16, policy: Option<PolicyId>) -> ResolvedSynProxy {
+        ResolvedSynProxy { port, mss, policy }
+    }
+
+    /// DP-31: a port scoped to a policy is proxied for that policy's clients
+    /// only; the server's half has its own policy-independent entry.
+    #[test]
+    fn a_scoped_synproxy_port_is_written_for_its_policy_and_the_server_side() {
+        let entries = synproxy_entries(&[proxied(443, 1400, Some(7))], &[0, 7, 8]);
+        let keys: HashSet<SynProxyKey> = entries.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            keys,
+            HashSet::from([SynProxyKey::tcp(7, 443), SynProxyKey::server_side(443)])
+        );
+        assert!(entries.iter().all(|(_, v)| v.mss == 1400));
+    }
+
+    #[test]
+    fn an_unscoped_synproxy_port_is_written_for_every_policy() {
+        let entries = synproxy_entries(&[proxied(443, 1460, None)], &[0, 7]);
+        let keys: HashSet<SynProxyKey> = entries.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            keys,
+            HashSet::from([
+                SynProxyKey::tcp(0, 443),
+                SynProxyKey::tcp(7, 443),
+                SynProxyKey::server_side(443),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_port_proxied_for_two_policies_has_one_server_side_entry() {
+        let entries = synproxy_entries(
+            &[proxied(443, 1460, Some(7)), proxied(443, 1460, Some(8))],
+            &[0, 7, 8],
+        );
+        assert_eq!(entries.len(), 3);
+        let servers = entries
+            .iter()
+            .filter(|(k, _)| *k == SynProxyKey::server_side(443))
+            .count();
+        assert_eq!(servers, 1);
+    }
 
     #[test]
     fn a_program_over_the_verifier_budget_is_refused_by_name() {

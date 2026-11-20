@@ -431,7 +431,7 @@ const ROUTER_NAT_POLICY: PolicyId = 0;
 /// C15 **SYN proxy**: the TCP ports a proxy stands in front of, and what it
 /// offers. Small on purpose — this names services, not connections.
 #[map]
-static SYNPROXY: HashMap<SynProxyKey, SynProxyCfg> = HashMap::with_max_entries(256, 0);
+static SYNPROXY: HashMap<SynProxyKey, SynProxyCfg> = HashMap::with_max_entries(1024, 0);
 
 /// Per-connection SYN-proxy state, created only once a client has proved itself.
 /// An LRU, so a client that vanishes between its ACK and the server's answer
@@ -3978,8 +3978,9 @@ fn try_velstra_v4_state(ctx: &XdpContext, s: &V4StateScratch) -> Result<u32, ()>
     // A cookie-protected ACK is authenticated downstream by the SYN proxy.
     // Requiring a SYN-ACK in FW_FLOWS here would drop it before verification:
     // the proxy answered that SYN with XDP_TX, outside the ordinary hooks.
-    let cookie_ack =
-        proto == ip_proto::TCP && control & tcp_flags::ACK != 0 && synproxy_cfg(dst_port).is_some();
+    let cookie_ack = proto == ip_proto::TCP
+        && control & tcp_flags::ACK != 0
+        && synproxy_cfg(policy_id, dst_port).is_some();
     let ct = if stateful && !cookie_ack {
         ct_classify(&fwkey, control)
     } else {
@@ -4414,7 +4415,14 @@ fn try_velstra_forward(ctx: &XdpContext) -> Result<u32, ()> {
     // port-forward and routing phases below then treat as any other new flow.
     if !link_layer::raw_ip(ctx.ingress_ifindex() as u32)
         && let Some(action) = try_synproxy(
-            ctx, ihl_bytes, s.src_addr, s.dst_addr, s.src_port, s.dst_port, s.proto,
+            ctx,
+            ihl_bytes,
+            s.policy_id,
+            s.src_addr,
+            s.dst_addr,
+            s.src_port,
+            s.dst_port,
+            s.proto,
         )?
     {
         return Ok(action);
@@ -6809,6 +6817,7 @@ fn write_tcp_u32(ctx: &XdpContext, offset: usize, old: u32, new: u32) -> Result<
 fn try_synproxy(
     ctx: &XdpContext,
     ihl_bytes: usize,
+    policy_id: PolicyId,
     src_addr: [u8; 4],
     dst_addr: [u8; 4],
     src_port: u16,
@@ -6830,7 +6839,10 @@ fn try_synproxy(
     // folds into a bitwise-OR on a map-value pointer — which the verifier
     // rejects outright (`R7 pointer |= pointer prohibited`). The same trap is
     // documented on `port_forward_exists`, and the same discipline answers it.
-    if let Some(cfg) = synproxy_cfg(dst_port) {
+    // The client's half is scoped to the policy its SYN arrives under (DP-31);
+    // the server's half arrives under the server's policy, so it asks whether
+    // any policy proxies the port.
+    if let Some(cfg) = synproxy_cfg(policy_id, dst_port) {
         let flags = unsafe { *ptr_at::<u8>(ctx, O_TCP_FLAGS)? };
         let seq = u32::from_be_bytes(unsafe { *ptr_at::<[u8; 4]>(ctx, O_TCP_SEQ)? });
         let ack = u32::from_be_bytes(unsafe { *ptr_at::<[u8; 4]>(ctx, O_TCP_ACK)? });
@@ -6846,18 +6858,19 @@ fn try_synproxy(
     synproxy_server(ctx, src_addr, dst_addr, src_port, dst_port, flags, seq)
 }
 
-/// The proxy configured for a port, copied out of the map immediately.
+/// The proxy configured for a port for clients arriving under `policy`,
+/// copied out of the map immediately.
 #[inline(always)]
-fn synproxy_cfg(port: u16) -> Option<SynProxyCfg> {
-    unsafe { SYNPROXY.get(&SynProxyKey::tcp(port)) }.copied()
+fn synproxy_cfg(policy: PolicyId, port: u16) -> Option<SynProxyCfg> {
+    unsafe { SYNPROXY.get(&SynProxyKey::tcp(policy, port)) }.copied()
 }
 
-/// Whether a port is proxied at all — a plain bool from the lookup
-/// discriminant, so no map-value pointer outlives the call. See the note in
-/// [`try_synproxy`] for why that matters.
+/// Whether any policy proxies a port — the server's half. A plain bool from
+/// the lookup discriminant, so no map-value pointer outlives the call. See the
+/// note in [`try_synproxy`] for why that matters.
 #[inline(always)]
 fn synproxy_protects(port: u16) -> bool {
-    unsafe { SYNPROXY.get(&SynProxyKey::tcp(port)) }.is_some()
+    unsafe { SYNPROXY.get(&SynProxyKey::server_side(port)) }.is_some()
 }
 
 /// The client-facing half: answer a SYN with a cookie, admit an ACK that

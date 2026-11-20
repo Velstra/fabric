@@ -461,16 +461,22 @@ pub const fn csum_replace_u32(check: u16, old: u32, new: u32) -> u16 {
     crate::forward::csum_replace_u16(c, old as u16, new as u16)
 }
 
-/// Key of the map naming the ports a SYN proxy stands in front of.
+/// Key of the map naming the ports a SYN proxy stands in front of, per policy.
 ///
-/// A port, not a zone-scoped rule: what is being protected is *a service*, and
-/// a service answers on a port regardless of which zone a client arrives from.
-/// Scoping this by zone as well would mean a flood arriving on a zone nobody
-/// thought to list reaches the server — the failure the feature exists to
-/// prevent, reintroduced as a configuration mistake.
+/// What is protected is a service on a port, but *from whom* is a question of
+/// where the SYN arrives: keyed by port alone, `syn-protect 443` also answered
+/// every outbound HTTPS SYN a LAN client sent, so each of those connections
+/// lost window scaling, SACK and timestamps for nothing (audit DP-31). The
+/// policy is the one the client's SYN arrives under.
+///
+/// The server's half of a proxied connection arrives under the *server's*
+/// policy, which is unrelated to the client's, so it looks up the one
+/// policy-independent entry per port, [`SynProxyKey::server_side`].
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct SynProxyKey {
+    /// The policy a client's SYN arrives under, or [`SynProxyKey::SERVER_SIDE`].
+    pub policy: u32,
     /// The protected TCP port, host order.
     pub port: u16,
     /// IP protocol; only TCP is meaningful, but it keeps the key honest.
@@ -480,14 +486,26 @@ pub struct SynProxyKey {
 }
 
 impl SynProxyKey {
-    /// A key for a protected TCP port.
+    /// The policy of the entry the server's half looks up: "some policy
+    /// proxies this port". Outside the 24-bit policy id space, so no client
+    /// policy can ever look it up.
+    pub const SERVER_SIDE: u32 = u32::MAX;
+
+    /// A key for a TCP port protected for clients arriving under `policy`.
     #[inline]
-    pub const fn tcp(port: u16) -> Self {
+    pub const fn tcp(policy: u32, port: u16) -> Self {
         Self {
+            policy,
             port,
             proto: crate::ip_proto::TCP,
             _pad: 0,
         }
+    }
+
+    /// The key the server's half of a proxied connection looks up.
+    #[inline]
+    pub const fn server_side(port: u16) -> Self {
+        Self::tcp(Self::SERVER_SIDE, port)
     }
 }
 
@@ -835,7 +853,7 @@ mod tests {
     /// what the kernel stores.
     #[test]
     fn the_map_types_are_pod_sized() {
-        assert_eq!(core::mem::size_of::<SynProxyKey>(), 4);
+        assert_eq!(core::mem::size_of::<SynProxyKey>(), 8);
         assert_eq!(core::mem::size_of::<SynProxyCfg>(), 8);
         assert_eq!(core::mem::size_of::<SynFlow>(), 16);
     }

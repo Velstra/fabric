@@ -1216,20 +1216,25 @@ pub struct ResolvedRoute {
 
 /// A TCP port a SYN proxy stands in front of (TOML `[[synproxy]]`).
 ///
-/// Named by port rather than by zone: what is protected is a *service*, and a
-/// service answers on its port whichever zone a client reaches it from. Scoping
-/// this by zone would mean a flood arriving on a zone nobody listed reaches the
-/// server — the failure the feature exists to prevent, reintroduced as a
-/// configuration mistake.
+/// Without `policy` the port is protected for clients arriving under every
+/// policy: what is protected is a *service*, and a flood arriving on a policy
+/// nobody listed would reach the server. With `policy` only SYNs arriving under
+/// that policy are proxied, so a port can be shielded from the outside without
+/// the proxy also answering every connection the inside opens to that port
+/// elsewhere (audit DP-31). One entry per `(policy, port)`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SynProxyPortCfg {
-    /// TCP port to protect. The proxy answers every SYN to it.
+    /// TCP port to protect. The proxy answers every SYN to it arriving under
+    /// [`Self::policy`].
     pub port: u16,
     /// MSS the synthesised SYN-ACK advertises to clients. Defaults to the
     /// largest value an untunnelled Ethernet path carries.
     #[serde(default = "default_synproxy_mss")]
     pub mss: u16,
+    /// The policy whose arriving SYNs are proxied; absent means every policy.
+    #[serde(default)]
+    pub policy: Option<PolicyId>,
 }
 
 /// The MSS a proxy advertises when the config does not say: a 1500-byte
@@ -1245,6 +1250,8 @@ pub struct ResolvedSynProxy {
     pub port: u16,
     /// MSS advertised to clients.
     pub mss: u16,
+    /// The one policy whose clients are proxied, or `None` for every policy.
+    pub policy: Option<PolicyId>,
 }
 
 /// A 1:1 inbound DNAT port-forward (TOML `[[port_forward]]`): rewrite a
@@ -2462,15 +2469,24 @@ impl FileConfig {
                     sp.mss
                 );
             }
-            if synproxy
-                .iter()
-                .any(|s: &ResolvedSynProxy| s.port == sp.port)
+            if let Some(policy) = sp.policy
+                && !policies.iter().any(|p| p.id == policy)
             {
+                bail!("synproxy port {} names unknown policy id {policy}", sp.port);
+            }
+            // Two entries overlap when they share the port and either covers
+            // every policy or both name the same one: the data plane would hold
+            // one of them, silently.
+            if synproxy.iter().any(|s: &ResolvedSynProxy| {
+                s.port == sp.port
+                    && (s.policy.is_none() || sp.policy.is_none() || s.policy == sp.policy)
+            }) {
                 bail!("synproxy port {} is configured twice", sp.port);
             }
             synproxy.push(ResolvedSynProxy {
                 port: sp.port,
                 mss: sp.mss,
+                policy: sp.policy,
             });
         }
 
@@ -3487,6 +3503,49 @@ mod tests {
         assert!(flag(0));
         assert!(flag(7));
         assert!(!flag(8), "a policy that does not ask keeps both directions");
+    }
+
+    fn synproxy(text: &str) -> Result<Vec<ResolvedSynProxy>> {
+        let base = "[[policy]]\nid = 7\n[[policy]]\nid = 8\n";
+        Ok(toml::from_str::<FileConfig>(&format!("{text}{base}"))?
+            .resolve()?
+            .synproxy)
+    }
+
+    /// DP-31: a protected port can name the policy whose clients it shields.
+    #[test]
+    fn a_synproxy_port_may_be_scoped_to_one_policy() {
+        let ports = synproxy("[[synproxy]]\nport = 443\npolicy = 7\n").unwrap();
+        assert_eq!(ports[0].policy, Some(7));
+        let ports = synproxy("[[synproxy]]\nport = 443\n").unwrap();
+        assert_eq!(ports[0].policy, None, "absent keeps every policy");
+    }
+
+    #[test]
+    fn one_port_may_be_proxied_for_several_policies() {
+        let ports = synproxy(
+            "[[synproxy]]\nport = 443\npolicy = 7\n[[synproxy]]\nport = 443\npolicy = 8\nmss = 1400\n",
+        )
+        .unwrap();
+        assert_eq!(ports.len(), 2);
+    }
+
+    #[test]
+    fn overlapping_synproxy_entries_are_refused() {
+        for text in [
+            "[[synproxy]]\nport = 443\npolicy = 7\n[[synproxy]]\nport = 443\npolicy = 7\n",
+            "[[synproxy]]\nport = 443\n[[synproxy]]\nport = 443\npolicy = 7\n",
+            "[[synproxy]]\nport = 443\npolicy = 7\n[[synproxy]]\nport = 443\n",
+        ] {
+            let err = synproxy(text).expect_err(text);
+            assert!(format!("{err:#}").contains("twice"), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn a_synproxy_policy_must_exist() {
+        let err = synproxy("[[synproxy]]\nport = 443\npolicy = 9\n").expect_err("no policy 9");
+        assert!(format!("{err:#}").contains("unknown policy"), "{err:#}");
     }
 
     #[test]
