@@ -810,6 +810,26 @@ pub const fn stateful_verdict(policy: Verdict, rule: u32, facts: StateFacts) -> 
     }
 }
 
+/// Every counter an ingress firewall verdict can carry: what [`decide`] and
+/// [`stateful_verdict`] return, and the failed state write that replaces a pass.
+///
+/// The data plane decodes a verdict's reason for its log lines against this
+/// short list. A full [`Counter::from_u32`] there forked the eBPF verifier once
+/// per counter for each string aya-log serialises, about 250,000 verified
+/// instructions per log line.
+pub const VERDICT_REASONS: [Counter; 10] = [
+    Counter::PassedDefault,
+    Counter::PassedRule,
+    Counter::DroppedDefault,
+    Counter::DroppedBlocklist,
+    Counter::DroppedRule,
+    Counter::DroppedIcmp,
+    Counter::DroppedRateLimit,
+    Counter::Rejected,
+    Counter::EstablishedAllowed,
+    Counter::FirewallStateWriteFailed,
+];
+
 /// Whether a guest-bound packet may leave TC egress after the policy verdict.
 /// A flow started by the guest overrides only the absence of an ingress rule;
 /// it never overrides an explicit deny or a protocol-wide prohibition.
@@ -821,6 +841,68 @@ pub fn admit_established_egress_reply(verdict: Verdict, established: bool) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The data plane logs a verdict's reason by decoding it against
+    /// `VERDICT_REASONS`; a counter missing there would be logged as the
+    /// fallback reason. Walk every input `decide` and `stateful_verdict` take.
+    #[test]
+    fn verdict_reasons_cover_every_counter_a_verdict_can_carry() {
+        let mut seen = Vec::new();
+        let rules = [
+            0,
+            port_rule_value(Action::Pass, false, 0),
+            port_rule_value(Action::Drop, false, 0),
+            port_rule_value(Action::Reject, false, 0),
+        ];
+        for proto in [
+            ip_proto::TCP,
+            ip_proto::UDP,
+            ip_proto::ICMP,
+            ip_proto::ICMPV6,
+        ] {
+            let meta = PacketMeta::new([10, 0, 0, 1], [10, 0, 0, 2], proto, 1000, 22, 60);
+            for default in [Action::Pass, Action::Drop, Action::Reject] {
+                for flags in [0, ConfigFlags::DROP_ICMP] {
+                    let cfg = GlobalConfig::new(default, flags);
+                    for blocklisted in [false, true] {
+                        for rule in rules {
+                            let action = port_rule_present(rule).then(|| port_rule_action(rule));
+                            let policy = decide(&meta, &cfg, blocklisted, action);
+                            seen.push(policy.counter);
+                            for bits in 0u8..=255 {
+                                let facts = StateFacts {
+                                    invalid: bits & 1 != 0,
+                                    established: bits & 2 != 0,
+                                    related: bits & 4 != 0,
+                                    blocklisted: bits & 8 != 0,
+                                    rate_limited: bits & 16 != 0,
+                                    local_bootstrap: bits & 32 != 0,
+                                    port_forward: bits & 64 != 0,
+                                    icmp_blocked: bits & 128 != 0,
+                                };
+                                seen.push(stateful_verdict(policy, rule, facts).counter);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        seen.push(Counter::FirewallStateWriteFailed);
+        for counter in seen {
+            assert!(
+                VERDICT_REASONS.contains(&counter),
+                "{counter:?} missing from VERDICT_REASONS"
+            );
+        }
+        let mut indices: Vec<u32> = VERDICT_REASONS.iter().map(|c| c.index()).collect();
+        indices.sort_unstable();
+        indices.dedup();
+        assert_eq!(
+            indices.len(),
+            VERDICT_REASONS.len(),
+            "VERDICT_REASONS has a duplicate"
+        );
+    }
 
     /// Deny-by-default is a statement about what the box accepts, not a gag
     /// order. A packet leaving with no egress rule to its name has to pass, or

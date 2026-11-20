@@ -101,13 +101,13 @@ use velstra_common::{
     ScopedDstPortKey, ScopedDstPortKey6, ScopedMac, ScopedPortKey, ScopedSrcPortKey,
     ScopedSrcPortKey6, ServiceKey, ServiceValue, SourceValidation, Srv6Config, Srv6Endpoint,
     Srv6FloodSet, Srv6IrbEndpoint, Srv6LocalSid, Srv6SidKey, StateFacts, SynFlow, SynProxyCfg,
-    SynProxyKey, TcpSynth, TunnelEndpoint, TunnelKey, Verdict, admit_established_egress_reply,
-    build_encap, build_srv6_encap, check_cookie, csum_replace_u32, decide, decide_egress,
-    decode_vni, epoch_of, ethertype_passes_unfiltered, gate_admits_unauthenticated, icmp,
-    icmp_checksum, icmp_type_probe, icmpv6_link_control, ip_proto, ipv4_options_refused,
-    ipv6_ext_len, is_ipv6_ext, is_overlay_dport, legacy_napt_seed, lpm_key_addr, make_cookie,
-    masquerade_commit, mss_clamp_csum_operands, napt_binding_matches, napt_claim,
-    napt_find_existing, napt_port, napt_seed, napt_slot, nat_lifetime, plan_arp_reply,
+    SynProxyKey, TcpSynth, TunnelEndpoint, TunnelKey, VERDICT_REASONS, Verdict,
+    admit_established_egress_reply, build_encap, build_srv6_encap, check_cookie, csum_replace_u32,
+    decide, decide_egress, decode_vni, epoch_of, ethertype_passes_unfiltered,
+    gate_admits_unauthenticated, icmp, icmp_checksum, icmp_type_probe, icmpv6_link_control,
+    ip_proto, ipv4_options_refused, ipv6_ext_len, is_ipv6_ext, is_overlay_dport, legacy_napt_seed,
+    lpm_key_addr, make_cookie, masquerade_commit, mss_clamp_csum_operands, napt_binding_matches,
+    napt_claim, napt_find_existing, napt_port, napt_seed, napt_slot, nat_lifetime, plan_arp_reply,
     plan_forward, plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_server_ack,
     plan_server_syn, plan_srv6_irb, plan_syn_ack, plan_tcp_rst, select_backend, session_hash,
     stateful_verdict, tcp_flags, translate_to_client, translate_to_server,
@@ -1506,8 +1506,13 @@ struct V4StateScratch {
 static V4_STATE_SCRATCH: PerCpuArray<V4StateScratch> = PerCpuArray::with_max_entries(1, 0);
 
 /// Separate from the full eight-slot transform table; no flow-map limit changes.
+/// Slot 0: the state stage ([`velstra_v4_state`]); slot 1: its verdict stage
+/// ([`velstra_v4_verdict`]).
 #[map]
-static V4_STATE_PROGS: ProgramArray = ProgramArray::with_max_entries(1, 0);
+static V4_STATE_PROGS: ProgramArray = ProgramArray::with_max_entries(2, 0);
+
+/// [`V4_STATE_PROGS`] slot of the verdict stage.
+const V4_VERDICT_SLOT: u32 = 1;
 
 #[inline(always)]
 fn reset_v4_state() {
@@ -2320,6 +2325,17 @@ fn bum_srv6(ctx: &TcContext, scfg: &Srv6Config, vni: u32, dst_mac: [u8; 6]) -> R
 #[inline(always)]
 fn bump(counter: Counter) {
     add(counter, 1);
+}
+
+/// Bump a counter given by its index ([`Counter::index`]), for a counter that
+/// crossed a tail call as a number: decoding it back into a `Counter` would
+/// fork the verifier once per variant. An index out of range bumps nothing.
+#[inline(always)]
+fn bump_index(index: u32) {
+    if let Some(slot) = STATS.get_ptr_mut(index) {
+        // SAFETY: as in `add`.
+        unsafe { *slot += 1 };
+    }
 }
 
 /// Add `n` to a per-CPU counter.
@@ -3776,12 +3792,56 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
     Ok(xdp_action::XDP_DROP)
 }
 
+/// Dispatch a counter index to `$line(label)` for every verdict reason, so
+/// the label each call logs is a constant (see [`log_v4_drop`]). The list of
+/// reasons is checked against [`VERDICT_REASONS`] at compile time, at every use.
+macro_rules! for_each_verdict_reason {
+    ($index:expr, $line:expr, $fallback:ident) => {
+        for_each_verdict_reason!(@arms $index, $line, $fallback;
+            PassedDefault, PassedRule, DroppedDefault, DroppedBlocklist, DroppedRule,
+            DroppedIcmp, DroppedRateLimit, Rejected, EstablishedAllowed,
+            FirewallStateWriteFailed)
+    };
+    (@arms $index:expr, $line:expr, $fallback:ident; $($reason:ident),*) => {{
+        const _: () = {
+            let listed = [$(Counter::$reason),*];
+            assert!(listed.len() == VERDICT_REASONS.len());
+            let mut i = 0;
+            while i < listed.len() {
+                assert!(listed[i].index() == VERDICT_REASONS[i].index());
+                i += 1;
+            }
+        };
+        let line = $line;
+        match $index {
+            $(i if i == Counter::$reason.index() => line(Counter::$reason.label()),)*
+            _ => line(Counter::$fallback.label()),
+        }
+    }};
+}
+
 /// The IPv4 firewall's log lines, each in a frame of its own (see
 /// `log_egress_drop`): inlined, aya-log's per-argument serialisation was
 /// explored once per verifier path reaching it, and the ALLOW line sits on the
 /// path every admitted packet continues along.
+///
+/// The reason arrives as its counter index. Each reason a verdict can carry
+/// ([`VERDICT_REASONS`]) has its own `info!` call naming a constant label:
+/// aya-log copies a `&str` of unknown length byte by byte, and one line with a
+/// computed label cost the verifier about 210,000 instructions.
 #[inline(never)]
-fn log_v4_drop(ctx: &XdpContext, src_addr: [u8; 4], proto: u8, dst_port: u16, reason: Counter) {
+fn log_v4_drop(ctx: &XdpContext, src_addr: [u8; 4], proto: u8, dst_port: u16, reason: u32) {
+    for_each_verdict_reason!(
+        reason,
+        |label| drop_line(ctx, src_addr, proto, dst_port, label),
+        DroppedRule
+    );
+}
+
+/// One DROP line; always inlined, so `reason` is the constant each arm of
+/// `for_each_verdict_reason` passes.
+#[inline(always)]
+fn drop_line(ctx: &XdpContext, src_addr: [u8; 4], proto: u8, dst_port: u16, reason: &'static str) {
     info!(
         ctx,
         "DROP {}.{}.{}.{} proto={} dport={} reason={}",
@@ -3791,7 +3851,7 @@ fn log_v4_drop(ctx: &XdpContext, src_addr: [u8; 4], proto: u8, dst_port: u16, re
         src_addr[3],
         proto,
         dst_port,
-        reason.label(),
+        reason,
     );
 }
 
@@ -3809,8 +3869,20 @@ fn log_v4_reject(ctx: &XdpContext, src_addr: [u8; 4], proto: u8, dst_port: u16) 
     );
 }
 
+/// The ALLOW line; the reason is decoded as for [`log_v4_drop`].
 #[inline(never)]
-fn log_v4_allow(ctx: &XdpContext, src_addr: [u8; 4], proto: u8, dst_port: u16, reason: Counter) {
+fn log_v4_allow(ctx: &XdpContext, src_addr: [u8; 4], proto: u8, dst_port: u16, reason: u32) {
+    for_each_verdict_reason!(
+        reason,
+        |label| allow_line(ctx, src_addr, proto, dst_port, label),
+        PassedRule
+    );
+}
+
+/// One ALLOW line; always inlined, so `reason` is the constant each arm of
+/// `for_each_verdict_reason` passes.
+#[inline(always)]
+fn allow_line(ctx: &XdpContext, src_addr: [u8; 4], proto: u8, dst_port: u16, reason: &'static str) {
     info!(
         ctx,
         "ALLOW {}.{}.{}.{} proto={} dport={} reason={}",
@@ -3820,7 +3892,7 @@ fn log_v4_allow(ctx: &XdpContext, src_addr: [u8; 4], proto: u8, dst_port: u16, r
         src_addr[3],
         proto,
         dst_port,
-        reason.label(),
+        reason,
     );
 }
 
@@ -3969,9 +4041,170 @@ fn try_velstra_v4_state(ctx: &XdpContext, s: &V4StateScratch) -> Result<u32, ()>
         action.as_u32() as u64 | ((want_log as u64) << 8) | ((fw_counter as u64) << 16),
     );
 
+    // The verdict is final here. Everything after it — the drop or reject, the
+    // allow log, MAC learning and the forwarding hand-off — runs in the verdict
+    // stage: a program of its own, so the verifier explores it once instead of
+    // once per path through the classification above (see `velstra_v4_verdict`).
+    let Some(slot) = V4_VERDICT.get_ptr_mut(0) else {
+        bump(Counter::Malformed);
+        return Ok(xdp_action::XDP_DROP);
+    };
+    // SAFETY: this CPU's own slot. Written in full, `ready` last; the verdict
+    // stage consumes it before using any field.
+    unsafe {
+        *slot = V4Verdict {
+            epoch: s.epoch,
+            frame_len: s.frame_len,
+            ifindex,
+            policy_id,
+            vni,
+            flags: cfg.flags,
+            action: action.as_u32(),
+            counter: fw_counter.index(),
+            src_addr,
+            dst_addr,
+            checksum,
+            src_port,
+            dst_port,
+            ihl_bytes: ihl_bytes as u16,
+            proto,
+            ttl,
+            icmp_type,
+            want_log: want_log as u8,
+            rule_log: rule_log as u8,
+            established: established as u8,
+            local_dhcp: local_dhcp as u8,
+            has_port_forward: has_port_forward as u8,
+            ready: 0,
+        };
+        core::ptr::write_volatile(&raw mut (*slot).ready, 1);
+        V4_STATE_PROGS.tail_call(ctx, V4_VERDICT_SLOT);
+    }
+    // An unregistered verdict stage is a broken firewall, never a bypass.
+    bump(Counter::Malformed);
+    Ok(xdp_action::XDP_DROP)
+}
+
+/// The IPv4 ingress verdict, handed from [`try_velstra_v4_state`] to
+/// [`velstra_v4_verdict`] across a tail call. Single-use and tied to the epoch,
+/// the ingress interface and the frame length it was decided for.
+#[repr(C)]
+struct V4Verdict {
+    epoch: u64,
+    frame_len: u64,
+    ifindex: u32,
+    policy_id: PolicyId,
+    vni: u32,
+    flags: u32,
+    action: u32,
+    counter: u32,
+    src_addr: [u8; 4],
+    dst_addr: [u8; 4],
+    checksum: u16,
+    src_port: u16,
+    dst_port: u16,
+    ihl_bytes: u16,
+    proto: u8,
+    ttl: u8,
+    icmp_type: u8,
+    want_log: u8,
+    rule_log: u8,
+    established: u8,
+    local_dhcp: u8,
+    has_port_forward: u8,
+    ready: u8,
+}
+
+// The layout `tests/v4_state_handoff_probe.py` reads (size and `ready`).
+const _: () =
+    assert!(size_of::<V4Verdict>() == 72 && core::mem::offset_of!(V4Verdict, ready) == 64);
+
+#[map]
+static V4_VERDICT: PerCpuArray<V4Verdict> = PerCpuArray::with_max_entries(1, 0);
+
+/// The IPv4 ingress verdict stage: the drop or reject, the allow log, MAC
+/// learning and the hand-off to the forwarding transforms, once
+/// [`velstra_v4_state`] has decided and recorded the verdict.
+///
+/// A separate program for the verifier, the split IPv4 egress already has. In
+/// one program every path through rule selection, connection state, rate
+/// limits and the verdict carried this tail with it: `velstra_v4_state`
+/// exceeded the 1,000,000-instruction limit on Linux 7.0, while the
+/// classification alone verifies in about 53,000. Behaviour is unchanged; a
+/// missing stage, or a stale or foreign verdict, fails closed.
+#[xdp]
+pub fn velstra_v4_verdict(ctx: XdpContext) -> u32 {
+    let Some(slot) = V4_VERDICT.get_ptr_mut(0) else {
+        return xdp_action::XDP_DROP;
+    };
+    // Consume before any verdict, accounting, packet write or forwarding.
+    let ready = unsafe { core::ptr::read_volatile(&raw const (*slot).ready) };
+    unsafe { core::ptr::write_volatile(&raw mut (*slot).ready, 0) };
+    let v = unsafe { &*slot };
+    let before = v.epoch;
+    if ready != 1
+        || before != epoch::snapshot()
+        || !epoch::unchanged(before)
+        || !configuration_ready()
+        || !ha_permits(ctx.ingress_ifindex() as u32)
+        || v.ifindex != ctx.ingress_ifindex() as u32
+        || v.frame_len != (ctx.data_end() - ctx.data()) as u64
+        || !(Ipv4Hdr::LEN as u16..=60).contains(&v.ihl_bytes)
+        || v.ihl_bytes & 3 != 0
+        || v.counter >= Counter::COUNT
+        || ctx.data() + EthHdr::LEN + v.ihl_bytes as usize > ctx.data_end()
+    {
+        return xdp_action::XDP_DROP;
+    }
+    let action = match try_velstra_v4_verdict(&ctx, v) {
+        Ok(action) => action,
+        Err(()) => {
+            bump(Counter::Malformed);
+            if fail_closed() {
+                xdp_action::XDP_DROP
+            } else {
+                xdp_action::XDP_PASS
+            }
+        }
+    };
+    if epoch::unchanged(before) {
+        link_layer::finish_xdp(&ctx, action)
+    } else {
+        xdp_action::XDP_DROP
+    }
+}
+
+/// Everything after the IPv4 ingress verdict; see [`velstra_v4_verdict`].
+#[inline(always)]
+fn try_velstra_v4_verdict(ctx: &XdpContext, v: &V4Verdict) -> Result<u32, ()> {
+    let action = Action::from_u32(v.action);
+    // The counter stays an index (validated by the caller): see `bump_index`.
+    let fw_counter = v.counter;
+    let cfg = GlobalConfig {
+        default_action: 0,
+        flags: v.flags,
+    };
+    let want_log = v.want_log != 0;
+    let rule_log = v.rule_log != 0;
+    let established = v.established != 0;
+    let local_dhcp = v.local_dhcp != 0;
+    let has_port_forward = v.has_port_forward != 0;
+    let ifindex = v.ifindex;
+    let policy_id = v.policy_id;
+    let vni = v.vni;
+    let src_addr = v.src_addr;
+    let dst_addr = v.dst_addr;
+    let checksum = v.checksum;
+    let src_port = v.src_port;
+    let dst_port = v.dst_port;
+    let ihl_bytes = v.ihl_bytes as usize;
+    let proto = v.proto;
+    let ttl = v.ttl;
+    let icmp_type = v.icmp_type;
+
     // Phase 1: a firewall drop is final.
     if action == Action::Drop {
-        bump(fw_counter);
+        bump_index(fw_counter);
         if want_log {
             log_v4_drop(ctx, src_addr, proto, dst_port, fw_counter);
         }
@@ -3999,7 +4232,7 @@ fn try_velstra_v4_state(ctx: &XdpContext, s: &V4StateScratch) -> Result<u32, ()>
     }
 
     if local_dhcp {
-        bump(fw_counter);
+        bump_index(fw_counter);
         // No NAT/overlay forwarding or conntrack entry for the broadcast tuple.
         // The persistent HA TC guard still fences the local stack when needed.
         return Ok(xdp_action::XDP_PASS);
@@ -4057,7 +4290,7 @@ fn try_velstra_v4_state(ctx: &XdpContext, s: &V4StateScratch) -> Result<u32, ()>
         ihl_bytes: ihl_bytes as u16,
         policy_id,
         vni,
-        fw_counter: fw_counter.index(),
+        fw_counter,
         icmp_type,
         proto,
         ttl,

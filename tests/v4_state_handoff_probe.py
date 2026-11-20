@@ -24,6 +24,10 @@ import time
 # size_of::<FirewallState>(), pinned by a velstra-common test; the values are
 # compared as opaque bytes, so only the size is part of this probe's ABI.
 FIREWALL_STATE_BYTES = 40
+# The IPv4 verdict handed from velstra_v4_state to velstra_v4_verdict
+# (`V4Verdict`, 72 bytes); its single-use `ready` byte is at offset 64.
+VERDICT_BYTES = 72
+VERDICT_READY = 64
 
 def need(condition, message):
     if not condition:
@@ -211,11 +215,15 @@ def exercise(pid, interface):
         packet_epoch = map_fd("PACKET_EPOCH", 8, "percpu_array")
         ready = map_fd("APPLY_STATE", 4, "array")
         programs = map_fd("V4_STATE_PROGS", 4, "prog_array")
+        verdict = map_fd("V4_VERDICT", VERDICT_BYTES, "percpu_array")
         ha = map_fd("HA_IFACES", 1, "hash")
         ingress = kernel.fd(13, objects["prog"]["velstra"]["id"])
         stage_info = objects["prog"].get("velstra_v4_state", objects["prog"].get("velstra_v4_stat"))
         need(stage_info is not None, "missing child-owned IPv4 state stage")
         stage = kernel.fd(13, stage_info["id"])
+        verdict_info = objects["prog"].get("velstra_v4_verdict", objects["prog"].get("velstra_v4_verd"))
+        need(verdict_info is not None, "missing child-owned IPv4 verdict stage")
+        verdict_stage = kernel.fd(13, verdict_info["id"])
         packet = udp_packet()
         ifindex = socket.if_nametoindex(interface)
         results = []
@@ -302,6 +310,22 @@ def exercise(pid, interface):
         finally:
             kernel.value(programs, 4, struct.pack("<I", stage))
         check("restored tail stage recovers", kernel.packet(ingress, packet, ifindex) == (2, packet))
+
+        # The verdict stage (slot 1) is a separate program too: without it the
+        # state stage must refuse, not fall through to a pass, and the verdict
+        # it wrote must be consumed by its own stage only.
+        def verdict_consumed():
+            width = VERDICT_BYTES * kernel.cpus
+            return kernel.value(verdict, width)[kernel.cpu * VERDICT_BYTES + VERDICT_READY] == 0
+
+        try:
+            kernel.value(programs, 4, delete=True, key=1)
+            check("missing verdict stage drops", kernel.packet(ingress, packet, ifindex)[0] == 1)
+        finally:
+            kernel.value(programs, 4, struct.pack("<I", verdict_stage), key=1)
+        check("restored verdict stage recovers", kernel.packet(ingress, packet, ifindex) == (2, packet))
+        check("verdict handoff consumed", verdict_consumed())
+        check("verdict stage alone refuses without a handoff", kernel.packet(verdict_stage, packet, ifindex)[0] == 1)
 
         # Exercise real state transitions through the full ingress chain, not
         # just synthesized handoff metadata. Only this child-owned policy map

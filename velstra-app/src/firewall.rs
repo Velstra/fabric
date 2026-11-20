@@ -872,6 +872,7 @@ impl Firewall {
             "velstra",
             "velstra_main",
             "velstra_v4_state",
+            "velstra_v4_verdict",
             "velstra_guest_delivery",
             "velstra_forward",
             "velstra_v6",
@@ -1145,25 +1146,27 @@ impl Firewall {
             programs.set(slot, &fd, 0)?;
         }
 
-        // Register the state-admission continuation before attaching ingress.
-        // A missing stage is fatal: skipping it would bypass the final verdict
-        // and conntrack publication rather than merely an optional transform.
-        {
+        // Register the state-admission continuation and its verdict stage
+        // before attaching ingress. A missing stage is fatal: skipping it would
+        // bypass the final verdict and conntrack publication rather than merely
+        // an optional transform.
+        for (slot, name, what) in [
+            (0, "velstra_v4_state", "IPv4 state-admission stage"),
+            (1, "velstra_v4_verdict", "IPv4 verdict stage"),
+        ] {
             let fd = {
                 let program: &mut Xdp = ebpf
-                    .program_mut("velstra_v4_state")
-                    .ok_or_else(|| anyhow!("missing velstra_v4_state"))?
+                    .program_mut(name)
+                    .ok_or_else(|| anyhow!("missing {name}"))?
                     .try_into()?;
-                program
-                    .load()
-                    .context("loading IPv4 state-admission stage")?;
+                program.load().with_context(|| format!("loading {what}"))?;
                 program.fd()?.try_clone()?
             };
             let mut programs = ProgramArray::try_from(
                 ebpf.map_mut("V4_STATE_PROGS")
                     .ok_or_else(|| anyhow!("V4_STATE_PROGS missing"))?,
             )?;
-            programs.set(0, &fd, 0)?;
+            programs.set(slot, &fd, 0)?;
         }
 
         // Before anything is attached: from here on a dead agent's links must
