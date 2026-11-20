@@ -20,9 +20,26 @@ pub const fn mss_clamp_csum_operands(current: u16, limit: u16) -> (u64, u64) {
     )
 }
 
+/// The MSS ceiling for an IPv6 SYN on a link whose configured ceiling is
+/// `ipv4_mss`. An interface's `mss` is stated the way it is everywhere — for
+/// IPv4, the MTU less 40 bytes of IPv4 and TCP header — and the IPv6 header is
+/// 20 bytes longer than IPv4's, so the same MTU carries 20 bytes less segment.
+#[inline(always)]
+pub const fn ipv6_mss_ceiling(ipv4_mss: u16) -> u16 {
+    ipv4_mss.saturating_sub(20)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PPPoE: MTU 1492 → IPv4 MSS 1452 → IPv6 MSS 1432 (1492 − 40 − 20).
+    #[test]
+    fn the_ipv6_ceiling_is_twenty_bytes_below_the_ipv4_one() {
+        assert_eq!(ipv6_mss_ceiling(1452), 1432);
+        assert_eq!(ipv6_mss_ceiling(1460), 1440);
+        assert_eq!(ipv6_mss_ceiling(10), 0, "never wraps");
+    }
 
     /// `csum16_add` from the kernel (`include/net/checksum.h`): a 16-bit
     /// one's-complement add with end-around carry.

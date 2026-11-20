@@ -107,8 +107,8 @@ use velstra_common::{
     build_encap, build_srv6_encap, check_cookie, csum_replace_u32, decide, decide_egress,
     decode_vni, epoch_of, ethertype_passes_unfiltered, gate_admits_unauthenticated, icmp,
     icmp_checksum, icmp_type_probe, icmpv6_link_control, ip_proto, ipv4_options_refused,
-    ipv6_ext_len, is_ipv6_ext, is_overlay_dport, legacy_napt_seed, lpm_key_addr, make_cookie,
-    masquerade_commit, mss_clamp_csum_operands, napt_binding_matches, napt_claim,
+    ipv6_ext_len, ipv6_mss_ceiling, is_ipv6_ext, is_overlay_dport, legacy_napt_seed, lpm_key_addr,
+    make_cookie, masquerade_commit, mss_clamp_csum_operands, napt_binding_matches, napt_claim,
     napt_find_existing, napt_port, napt_seed, napt_slot, nat_lifetime, plan_arp_reply,
     plan_forward, plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_server_ack,
     plan_server_syn, plan_srv6_irb, plan_syn_ack, plan_tcp_rst, select_backend, session_hash,
@@ -4988,6 +4988,10 @@ fn try_egress_v6_inner(ctx: &TcContext) -> Result<i32, ()> {
         icmp_type = icmp_type_probe(head as u8);
     }
     let ifindex = unsafe { (*ctx.skb.skb).ifindex };
+    // A departing SYN advertises the link's MSS ceiling, as on IPv4. It may
+    // rewrite the packet, so it runs after every packet read above; the rest of
+    // this function reads the header copy and re-derives packet offsets.
+    clamp_mss_egress_v6(ctx, hdr[6], ifindex);
     let policy_id = unsafe { IFACE_POLICY.get(&ifindex) }.copied().unwrap_or(0);
     let cfg = unsafe { CONFIG.get(&policy_id) }
         .copied()
@@ -7389,22 +7393,50 @@ fn clamp_mss_egress(ctx: &TcContext, ihl_bytes: usize, proto: u8, ifindex: u32) 
     let Some(limit) = (unsafe { MSS_CLAMP.get(&ifindex) }).copied() else {
         return;
     };
-    // Byte 13 of the TCP header holds the flags; byte 12's top nibble is the data
-    // offset in 32-bit words, which is where the options end.
-    let Ok(head) = (unsafe { ptr_at_tc::<[u8; 2]>(ctx, O_L4 + 12) }) else {
+    clamp_mss_at(ctx, O_L4, limit);
+}
+
+/// The IPv6 form of [`clamp_mss_egress`]: a SYN leaving on an interface with
+/// an MSS ceiling advertises at most that ceiling less the 20 bytes the IPv6
+/// header is longer than IPv4's ([`ipv6_mss_ceiling`]). Before this a PPPoE
+/// uplink clamped IPv4 and left every IPv6 connection to discover the smaller
+/// MTU by path-MTU discovery — the failure clamping exists to avoid.
+///
+/// Only a TCP header directly behind the fixed IPv6 header is clamped; a SYN
+/// carrying extension headers is left as it is, the way an IPv4 SYN with
+/// options is.
+#[inline(never)]
+fn clamp_mss_egress_v6(ctx: &TcContext, next_header: u8, ifindex: u32) {
+    if next_header != ip_proto::TCP {
+        return;
+    }
+    let Some(limit) = (unsafe { MSS_CLAMP.get(&ifindex) }).copied() else {
         return;
     };
-    let head = unsafe { *head };
+    clamp_mss_at(ctx, EthHdr::LEN + Ipv6Hdr::LEN, ipv6_mss_ceiling(limit));
+}
+
+/// Lower the MSS option of the TCP SYN whose header starts at `l4` to `limit`.
+/// Shared by both families; every read and write is a helper call taking the
+/// offset as a value, so the walk never holds a packet pointer.
+#[inline(never)]
+fn clamp_mss_at(ctx: &TcContext, l4: usize, limit: u16) {
+    // Byte 13 of the TCP header holds the flags; byte 12's top nibble is the data
+    // offset in 32-bit words, which is where the options end.
+    let Ok(head) = ctx.load::<[u8; 2]>(l4 + 12) else {
+        return;
+    };
     const TCP_SYN: u8 = 0x02;
     if head[1] & TCP_SYN == 0 {
         return;
     }
     let doff = (head[0] >> 4) as usize * 4;
-    if doff <= Ipv4Hdr::LEN {
+    // 20: the fixed TCP header; anything beyond it is options.
+    if doff <= 20 {
         return; // no options at all
     }
-    let opts_end = O_L4 + doff;
-    let mut off = O_L4 + 20;
+    let opts_end = l4 + doff;
+    let mut off = l4 + 20;
     for _ in 0..MAX_TCP_OPTS {
         if off + 1 > opts_end {
             return;
@@ -7460,7 +7492,7 @@ fn clamp_mss_egress(ctx: &TcContext, ihl_bytes: usize, proto: u8, ifindex: u32) 
                 // (DP-09). `mss_clamp_csum_operands` is the one place that
                 // conversion lives, and it is model-tested on the host.
                 let (from, to) = mss_clamp_csum_operands(current, limit);
-                let _ = ctx.l4_csum_replace(O_L4 + 16, from, to, 2);
+                let _ = ctx.l4_csum_replace(l4 + 16, from, to, 2);
                 bump(Counter::MssClamped);
                 return;
             }
