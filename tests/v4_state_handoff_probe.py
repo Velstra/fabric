@@ -21,6 +21,10 @@ import tempfile
 import time
 
 
+# size_of::<FirewallState>(), pinned by a velstra-common test; the values are
+# compared as opaque bytes, so only the size is part of this probe's ABI.
+FIREWALL_STATE_BYTES = 40
+
 def need(condition, message):
     if not condition:
         raise RuntimeError(message)
@@ -303,7 +307,7 @@ def exercise(pid, interface):
         # just synthesized handoff metadata. Only this child-owned policy map
         # changes, and both directions traverse the actual packet program.
         config = map_fd("CONFIG", 8, "hash")
-        flows = map_fd("FW_FLOWS", 24, "lru_hash")
+        flows = map_fd("FW_FLOWS", FIREWALL_STATE_BYTES, "lru_hash")
         need(objects["map"]["FW_FLOWS"]["bytes_key"] == 44, "unexpected firewall key ABI")
         previous = kernel.value(config, 8)
         _, original_flags = struct.unpack("<II", previous)
@@ -330,7 +334,7 @@ def exercise(pid, interface):
             values = []
             for flow_key in (key(local, peer, source_port, 443), key(peer, local, 443, source_port)):
                 try:
-                    values.append(kernel.value(flows, 24, key=flow_key))
+                    values.append(kernel.value(flows, FIREWALL_STATE_BYTES, key=flow_key))
                 except OSError as error:
                     if error.errno != errno.ENOENT:
                         raise
@@ -344,11 +348,17 @@ def exercise(pid, interface):
             datagram = transport_packet(17, local, peer, 42000, 7777)
             for name, frame in (
                 ("valid Ethernet padding retained", ipv4_variant(datagram, padding=bytes(18))),
-                ("valid IPv4 options retained", ipv4_variant(datagram, options=bytes(4))),
                 ("valid first fragment retained", ipv4_variant(datagram, fragment=0x2000)),
                 ("valid later fragment retained", ipv4_variant(datagram, fragment=1)),
             ):
                 packet_check(name, frame)
+            # DP-34: connection tracking, the SYN proxy and NAT need the fixed
+            # header, so a stateful policy refuses TCP/UDP carrying IPv4
+            # options; ICMP keeps its options and passes unchanged.
+            packet_check("valid IPv4 options retained on ICMP",
+                         ipv4_variant(transport_packet(1, local, peer), options=bytes(4)))
+            packet_check("UDP with IPv4 options refused by a stateful policy",
+                         ipv4_variant(datagram, options=bytes(4)), 1)
             for name, frame in (
                 ("truncated IPv4 header dropped", ipv4_variant(datagram, ihl=15)),
                 ("IPv4 total length below IHL dropped", ipv4_variant(datagram, total_length=19)),
@@ -364,14 +374,15 @@ def exercise(pid, interface):
             packet_check("untracked TCP ACK denied",
                          transport_packet(6, local, peer, 41001, 443, 16, 101, 201), 1)
             policy(0)
-            # An invalid *opener* does not create tracked state. An untracked
-            # packet still faces ordinary policy; this is not a universal
-            # drop-invalid policy. Invalid transitions of existing flows are
-            # independently required to drop without refreshing either key.
+            # An invalid *opener* does not create tracked state. A flag
+            # combination no connection can carry (SYN+FIN, XMAS, NULL) is a
+            # scan and is refused on a stateful policy even under default allow
+            # (DP-37). Invalid transitions of existing flows are independently
+            # required to drop without refreshing either key.
             check("invalid TCP opener starts without either state key", flow_pair(41002) == (None, None))
-            packet_check("untracked SYN FIN follows default allow without packet mutation",
-                         transport_packet(6, local, peer, 41002, 443, 3, 100))
-            check("allowed invalid TCP opener creates no state", flow_pair(41002) == (None, None))
+            packet_check("untracked SYN FIN refused as a scan under default allow",
+                         transport_packet(6, local, peer, 41002, 443, 3, 100), 1)
+            check("refused invalid TCP opener creates no state", flow_pair(41002) == (None, None))
             policy(1)
             packet_check("untracked SYN FIN follows default deny",
                          transport_packet(6, local, peer, 41002, 443, 3, 100), 1)
@@ -392,9 +403,14 @@ def exercise(pid, interface):
             policy(1)
             packet_check("stateful ICMP echo reply admitted under default deny",
                          transport_packet(1, peer, local, icmp_type=0))
+            # DP-10: block-icmp refuses new ICMP, never the answer to what a
+            # host asked for; dropping replies and errors black-holes PMTU.
             policy(1, 1)
-            packet_check("explicit ICMP deny overrides tracked echo reply",
-                         transport_packet(1, peer, local, icmp_type=0), 1)
+            packet_check("block-icmp keeps a tracked echo reply",
+                         transport_packet(1, peer, local, icmp_type=0))
+            policy(0, 1)
+            packet_check("block-icmp drops a new echo request under default allow",
+                         transport_packet(1, peer, local, icmp_type=8), 1)
         finally:
             kernel.value(config, 8, previous)
         need(not packet_failures, "packet conformance failures: " + ", ".join(packet_failures))
