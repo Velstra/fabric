@@ -744,6 +744,28 @@ pub const fn egress_posture(cfg: &GlobalConfig) -> GlobalConfig {
     }
 }
 
+/// Whether the blocklist refuses a packet **arriving** from a listed source.
+///
+/// `listed` is the blocklist lookup on the packet's source; `answer` that the
+/// packet travels in the responder's direction of a live connection (the
+/// connection was opened *towards* the listed address) or is an ICMP error
+/// about a tracked connection. A plain policy refuses every listed packet —
+/// the blocklist outranks connection state. Under
+/// [`ConfigFlags::BLOCKLIST_INGRESS_ONLY`] the blocklist is a statement about
+/// what listed addresses may *start*, so their answers pass (audit DP-15).
+#[inline(always)]
+pub const fn blocklist_refuses_ingress(cfg: &GlobalConfig, listed: bool, answer: bool) -> bool {
+    listed && !(answer && cfg.has_flag(ConfigFlags::BLOCKLIST_INGRESS_ONLY))
+}
+
+/// Whether the blocklist refuses a packet **leaving** towards a listed
+/// destination: always, unless the blocklist is ingress-only
+/// ([`ConfigFlags::BLOCKLIST_INGRESS_ONLY`], audit DP-15).
+#[inline(always)]
+pub const fn blocklist_refuses_egress(cfg: &GlobalConfig, listed: bool) -> bool {
+    listed && !cfg.has_flag(ConfigFlags::BLOCKLIST_INGRESS_ONLY)
+}
+
 /// What the stateful stages found out about a packet, for [`stateful_verdict`].
 ///
 /// Each field is a fact the data plane established before the verdict; none is
@@ -902,6 +924,44 @@ mod tests {
             VERDICT_REASONS.len(),
             "VERDICT_REASONS has a duplicate"
         );
+    }
+
+    fn flags(flags: u32) -> GlobalConfig {
+        GlobalConfig::new(Action::Drop, flags)
+    }
+
+    /// DP-15: a plain blocklist refuses a listed source even when it answers —
+    /// the blocklist outranks connection state — and blocks the destination on
+    /// egress. That second half is what stopped a LAN reaching a country the
+    /// WAN zone blocked.
+    #[test]
+    fn a_plain_blocklist_refuses_answers_and_outbound_destinations() {
+        let plain = flags(ConfigFlags::STATEFUL);
+        assert!(blocklist_refuses_ingress(&plain, true, false));
+        assert!(blocklist_refuses_ingress(&plain, true, true));
+        assert!(blocklist_refuses_egress(&plain, true));
+    }
+
+    #[test]
+    fn an_ingress_only_blocklist_refuses_what_a_listed_source_starts() {
+        let inbound = flags(ConfigFlags::STATEFUL | ConfigFlags::BLOCKLIST_INGRESS_ONLY);
+        assert!(blocklist_refuses_ingress(&inbound, true, false));
+    }
+
+    #[test]
+    fn an_ingress_only_blocklist_lets_a_listed_address_answer_and_be_reached() {
+        let inbound = flags(ConfigFlags::STATEFUL | ConfigFlags::BLOCKLIST_INGRESS_ONLY);
+        assert!(!blocklist_refuses_ingress(&inbound, true, true));
+        assert!(!blocklist_refuses_egress(&inbound, true));
+    }
+
+    #[test]
+    fn an_unlisted_address_is_never_refused_by_the_blocklist() {
+        for f in [0, ConfigFlags::BLOCKLIST_INGRESS_ONLY] {
+            assert!(!blocklist_refuses_ingress(&flags(f), false, false));
+            assert!(!blocklist_refuses_ingress(&flags(f), false, true));
+            assert!(!blocklist_refuses_egress(&flags(f), false));
+        }
     }
 
     /// Deny-by-default is a statement about what the box accepts, not a gag

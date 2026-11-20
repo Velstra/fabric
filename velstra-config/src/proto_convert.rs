@@ -413,6 +413,10 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
             .unwrap_or_default(),
         fail_closed: cfg.fail_closed,
         blocklist: cfg.blocklist.clone(),
+        // An appliance setting (Sentinel's source-only blocklists, DP-15), like
+        // the portal: a controller-driven node keeps the blocklist's original
+        // meaning, both directions.
+        blocklist_ingress_only: false,
         port_rules: cfg.port_rules.iter().map(port_rule_from_proto).collect(),
         policies: cfg
             .policies
@@ -431,6 +435,7 @@ pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
                 stateful: p.stateful,
                 source_validation: rpf_from_proto(p.source_validation()),
                 blocklist: p.blocklist.clone(),
+                blocklist_ingress_only: false,
                 port_rules: p.port_rules.iter().map(port_rule_from_proto).collect(),
                 portal: None,
             })

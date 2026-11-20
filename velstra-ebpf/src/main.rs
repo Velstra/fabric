@@ -77,8 +77,9 @@ mod reject_v6;
 mod telemetry;
 use aya_log_ebpf::info;
 use conntrack::{
-    ct_classify, ct_control, ct_cookie_admitted, ct_is_routed_reply, ct_key4, ct_key6, ct_record,
-    ct_record_wire4, ct_router_normalize, ct_router_open, ct_seed_reply, ct_verify_reset,
+    ct_classify, ct_control, ct_cookie_admitted, ct_is_answer, ct_is_routed_reply, ct_key4,
+    ct_key6, ct_record, ct_record_wire4, ct_router_normalize, ct_router_open, ct_seed_reply,
+    ct_verify_reset,
 };
 use network_types::{
     eth::EthHdr,
@@ -102,12 +103,13 @@ use velstra_common::{
     ScopedSrcPortKey6, ServiceKey, ServiceValue, SourceValidation, Srv6Config, Srv6Endpoint,
     Srv6FloodSet, Srv6IrbEndpoint, Srv6LocalSid, Srv6SidKey, StateFacts, SynFlow, SynProxyCfg,
     SynProxyKey, TcpSynth, TunnelEndpoint, TunnelKey, VERDICT_REASONS, Verdict,
-    admit_established_egress_reply, build_encap, build_srv6_encap, check_cookie, csum_replace_u32,
-    decide, decide_egress, decode_vni, epoch_of, ethertype_passes_unfiltered,
-    gate_admits_unauthenticated, icmp, icmp_checksum, icmp_type_probe, icmpv6_link_control,
-    ip_proto, ipv4_options_refused, ipv6_ext_len, is_ipv6_ext, is_overlay_dport, legacy_napt_seed,
-    lpm_key_addr, make_cookie, masquerade_commit, mss_clamp_csum_operands, napt_binding_matches,
-    napt_claim, napt_find_existing, napt_port, napt_seed, napt_slot, nat_lifetime, plan_arp_reply,
+    admit_established_egress_reply, blocklist_refuses_egress, blocklist_refuses_ingress,
+    build_encap, build_srv6_encap, check_cookie, csum_replace_u32, decide, decide_egress,
+    decode_vni, epoch_of, ethertype_passes_unfiltered, gate_admits_unauthenticated, icmp,
+    icmp_checksum, icmp_type_probe, icmpv6_link_control, ip_proto, ipv4_options_refused,
+    ipv6_ext_len, is_ipv6_ext, is_overlay_dport, legacy_napt_seed, lpm_key_addr, make_cookie,
+    masquerade_commit, mss_clamp_csum_operands, napt_binding_matches, napt_claim,
+    napt_find_existing, napt_port, napt_seed, napt_slot, nat_lifetime, plan_arp_reply,
     plan_forward, plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_server_ack,
     plan_server_syn, plan_srv6_irb, plan_syn_ack, plan_tcp_rst, select_backend, session_hash,
     stateful_verdict, tcp_flags, translate_to_client, translate_to_server,
@@ -2494,13 +2496,17 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
         .copied()
         .unwrap_or(GlobalConfig::DEFAULT);
 
-    // Blocklist matches the DESTINATION on egress ("don't talk to these").
-    let blocklisted = BLOCKLIST
-        .get(Key::new(
-            ScopedAddr::FULL_PREFIX,
-            ScopedAddr::new(policy_id, lpm_key_addr(dst_addr)),
-        ))
-        .is_some();
+    // Blocklist matches the DESTINATION on egress ("don't talk to these"),
+    // unless it is ingress-only and names sources alone (DP-15).
+    let blocklisted = blocklist_refuses_egress(
+        &cfg,
+        BLOCKLIST
+            .get(Key::new(
+                ScopedAddr::FULL_PREFIX,
+                ScopedAddr::new(policy_id, lpm_key_addr(dst_addr)),
+            ))
+            .is_some(),
+    );
     // Both address dimensions, each collapsed to a scalar at the call — see
     // `lookup_port_rule` for why an `Option` must not survive to this merge.
     // The egress hook: a rule scoped to arriving traffic does not apply here, and
@@ -3932,7 +3938,7 @@ fn try_velstra_v4_state(ctx: &XdpContext, s: &V4StateScratch) -> Result<u32, ()>
     let policy_id = s.policy_id;
     let vni = s.vni;
     let cfg = s.cfg;
-    let blocklisted = s.blocklisted != 0;
+    let listed = s.blocklisted != 0;
     let local_dhcp = s.local_dhcp != 0;
     let rule = s.rule;
     let total_len = s.total_len;
@@ -3984,6 +3990,13 @@ fn try_velstra_v4_state(ctx: &XdpContext, s: &V4StateScratch) -> Result<u32, ()>
         && proto == ip_proto::ICMP
         && icmp_related::error_probe(icmp_type)
         && icmp_related::take_xdp(ctx, epoch::snapshot());
+    // DP-15: under an ingress-only blocklist a listed source may still answer.
+    // The responder-direction lookup runs only for a listed packet of such a
+    // policy, so the blocklist costs nothing more for every other packet.
+    let answer = listed
+        && cfg.has_flag(ConfigFlags::BLOCKLIST_INGRESS_ONLY)
+        && (related || established && ct_is_answer(&fwkey, control));
+    let blocklisted = blocklist_refuses_ingress(&cfg, listed, answer);
 
     // Decode the pure policy verdict after state classification. All operands
     // were copied from this handoff before map reads; no packet/map/helper
@@ -4790,7 +4803,8 @@ fn try_velstra_v6(ctx: &XdpContext) -> Result<u32, ()> {
         (*decision).flags = stateful as u32
             | ((blocklisted as u32) << 1)
             | (((cfg.has_flag(ConfigFlags::LOG) || port_rule_logs(rule)) as u32) << 2)
-            | ((icmp_blocked as u32) << 3);
+            | ((icmp_blocked as u32) << 3)
+            | ((cfg.has_flag(ConfigFlags::BLOCKLIST_INGRESS_ONLY) as u32) << 4);
     }
     let _ = unsafe { VELSTRA_PROGS.tail_call(ctx, 4) };
     Ok(xdp_action::XDP_DROP)
@@ -4824,9 +4838,10 @@ fn try_velstra_v6_state(ctx: &XdpContext) -> Result<u32, ()> {
     let off = decision.off as usize;
     let ifindex = decision.ifindex;
     let stateful = decision.flags & 1 != 0;
-    let blocklisted = decision.flags & 2 != 0;
+    let listed = decision.flags & 2 != 0;
     let want_log = decision.flags & 4 != 0;
     let icmp_blocked = decision.flags & 8 != 0;
+    let blocklist_ingress_only = decision.flags & 16 != 0;
     let base_action = Action::from_u32(decision.action);
     let base_counter = Counter::from_u32(decision.counter).unwrap_or(Counter::DroppedDefault);
     let proto = fwkey.proto;
@@ -4854,6 +4869,12 @@ fn try_velstra_v6_state(ctx: &XdpContext) -> Result<u32, ()> {
         && proto == ip_proto::ICMPV6
         && (1..=4).contains(&fwkey.dst_port)
         && icmp_related::related_v6_xdp(ctx, fwkey.policy, off as u32);
+    // DP-15: an ingress-only blocklist lets a listed source answer (see IPv4).
+    // The policy verdict from the rule stage already says "blocklisted"; the
+    // state facts below are what decide, and an answer passes as established.
+    let answer =
+        listed && blocklist_ingress_only && (related || ct == 1 && ct_is_answer(fwkey, control));
+    let blocklisted = listed && !answer;
     // DP-20: the per-rule rate limit, for a new flow only — as on IPv4.
     let limit_slot = port_rule_limit(rule);
     let rate_limited = limit_slot != 0
@@ -4967,12 +4988,16 @@ fn try_egress_v6_inner(ctx: &TcContext) -> Result<i32, ()> {
         hdr[24], hdr[25], hdr[26], hdr[27], hdr[28], hdr[29], hdr[30], hdr[31], hdr[32], hdr[33],
         hdr[34], hdr[35], hdr[36], hdr[37], hdr[38], hdr[39],
     ];
-    let blocklisted = BLOCKLIST6
-        .get(Key::new(
-            ScopedAddr6::FULL_PREFIX,
-            ScopedAddr6::new(policy_id, destination),
-        ))
-        .is_some();
+    // DP-15: an ingress-only blocklist names sources, never destinations.
+    let blocklisted = blocklist_refuses_egress(
+        &cfg,
+        BLOCKLIST6
+            .get(Key::new(
+                ScopedAddr6::FULL_PREFIX,
+                ScopedAddr6::new(policy_id, destination),
+            ))
+            .is_some(),
+    );
     // The v6 tries only; see the ingress path for why the v4 tries must not be
     // asked about an IPv6 packet (DP-11).
     let rule = rule_winner_v6(

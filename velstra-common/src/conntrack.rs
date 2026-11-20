@@ -353,8 +353,15 @@ impl FirewallState {
         timeouts: ConntrackTimeouts,
     ) -> bool {
         matches!(proto, ip_proto::TCP | ip_proto::UDP)
-            && self.reply == 1
-            && self.classify(proto, control, now, timeouts) == 1
+            && self.is_answer(proto, control, now, timeouts)
+    }
+
+    /// The packet is valid live traffic in the **responder's** direction: the
+    /// connection was opened by the other side, towards the packet's source.
+    /// What an ingress-only blocklist lets a listed address send (DP-15).
+    #[inline(always)]
+    pub fn is_answer(&self, proto: u8, control: u8, now: u64, timeouts: ConntrackTimeouts) -> bool {
+        self.reply == 1 && self.classify(proto, control, now, timeouts) == 1
     }
 
     /// Validate a protocol transition without materializing a second full
@@ -794,6 +801,26 @@ mod tests {
             assert!(state.is_routed_reply(6, tcp_flags::ACK, 2, T));
             assert!(!state.is_routed_reply(6, tcp_flags::SYN, 2, T));
         }
+    }
+
+    /// DP-15: what an ingress-only blocklist lets a listed address send — its
+    /// side of a connection opened towards it, for any tracked protocol (the
+    /// echo reply to a ping included), and never the side that opened it.
+    #[test]
+    fn only_the_responders_direction_of_a_live_flow_is_an_answer() {
+        let state = FirewallState {
+            phase: FirewallState::ESTABLISHED,
+            reply: 1,
+            ..closing()
+        };
+        assert!(state.is_answer(6, tcp_flags::ACK, 2, T));
+        assert!(state.is_answer(17, 0, 2, T));
+        assert!(state.is_answer(1, 0, 2, T), "echo reply");
+        let opener = FirewallState { reply: 0, ..state };
+        assert!(!opener.is_answer(6, tcp_flags::ACK, 2, T));
+        assert!(!opener.is_answer(1, 8, 2, T), "echo request");
+        let expired = 1 + T.tcp_established as u64 * 1_000_000_000;
+        assert!(!state.is_answer(6, tcp_flags::ACK, expired, T));
     }
 
     #[test]

@@ -723,6 +723,11 @@ pub struct PolicyFile {
     pub source_validation: SourceValidationName,
     #[serde(default)]
     pub blocklist: Vec<String>,
+    /// The blocklist names sources only: never matched against a packet's
+    /// destination at egress, and a listed address may still answer a
+    /// connection opened towards it. See [`ConfigFlags::BLOCKLIST_INGRESS_ONLY`].
+    #[serde(default)]
+    pub blocklist_ingress_only: bool,
     #[serde(default, rename = "port_rule")]
     pub port_rules: Vec<PortRule>,
 }
@@ -972,6 +977,9 @@ pub struct FileConfig {
     pub fail_closed: bool,
     /// Source-IP CIDR blocks to drop unconditionally.
     pub blocklist: Vec<String>,
+    /// The default policy's blocklist names sources only. See
+    /// [`PolicyFile::blocklist_ingress_only`].
+    pub blocklist_ingress_only: bool,
     /// Per-`(proto, port)` rules. Spelled `[[port_rule]]` in TOML.
     #[serde(rename = "port_rule")]
     pub port_rules: Vec<PortRule>,
@@ -1972,10 +1980,14 @@ fn resolve_firewall(
     stateful: bool,
     source_validation: SourceValidationName,
     blocklist: &[String],
+    blocklist_ingress_only: bool,
     port_rules: &[PortRule],
     portal: Option<&PortalCfg>,
 ) -> Result<PolicyConfig> {
     let mut flags = source_validation.flags();
+    if blocklist_ingress_only {
+        flags |= ConfigFlags::BLOCKLIST_INGRESS_ONLY;
+    }
     if drop_icmp {
         flags |= ConfigFlags::DROP_ICMP;
     }
@@ -2244,6 +2256,7 @@ impl FileConfig {
             self.stateful,
             self.source_validation,
             &self.blocklist,
+            self.blocklist_ingress_only,
             &self.port_rules,
             self.portal.as_ref(),
         )?];
@@ -2263,6 +2276,7 @@ impl FileConfig {
                 policy.stateful,
                 policy.source_validation,
                 &policy.blocklist,
+                policy.blocklist_ingress_only,
                 &policy.port_rules,
                 policy.portal.as_ref(),
             )?);
@@ -3440,6 +3454,39 @@ mod tests {
             .resolve()
             .unwrap();
         assert!(cfg.conntrack_sync.is_none());
+    }
+
+    /// DP-15: the source-only blocklist is opt-in per policy and for the
+    /// default policy; nothing else changes meaning.
+    #[test]
+    fn blocklist_ingress_only_sets_its_flag_where_it_is_written() {
+        let cfg = toml::from_str::<FileConfig>(
+            r#"
+            blocklist = ["203.0.113.0/24"]
+            blocklist_ingress_only = true
+            [[policy]]
+            id = 7
+            blocklist = ["198.51.100.0/24"]
+            blocklist_ingress_only = true
+            [[policy]]
+            id = 8
+            blocklist = ["192.0.2.0/24"]
+            "#,
+        )
+        .unwrap()
+        .resolve()
+        .unwrap();
+        let flag = |id| {
+            cfg.policies
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap()
+                .global
+                .has_flag(ConfigFlags::BLOCKLIST_INGRESS_ONLY)
+        };
+        assert!(flag(0));
+        assert!(flag(7));
+        assert!(!flag(8), "a policy that does not ask keeps both directions");
     }
 
     #[test]

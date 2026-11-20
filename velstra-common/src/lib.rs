@@ -118,9 +118,10 @@ pub use policy::{
     Action, CONFIG_FAILED, CONFIG_READY, CONFIG_UPDATING, Counter, MAX_BLOCKLIST, MAX_RULE_LIMITS,
     PORT_RULE_IN_ONLY, PORT_RULE_LOG, PORT_RULE_OUT_ONLY, PORT_RULE_PRESENT, PORT_RULE_V4_ONLY,
     PORT_RULE_V6_ONLY, StateFacts, VERDICT_REASONS, Verdict, admit_established_egress_reply,
-    decide, decide_egress, egress_posture, port_rule_action, port_rule_bits, port_rule_denies,
-    port_rule_excluded, port_rule_limit, port_rule_logs, port_rule_present, port_rule_value,
-    port_rule_winner, port_rule_with_limit, stateful_verdict,
+    blocklist_refuses_egress, blocklist_refuses_ingress, decide, decide_egress, egress_posture,
+    port_rule_action, port_rule_bits, port_rule_denies, port_rule_excluded, port_rule_limit,
+    port_rule_logs, port_rule_present, port_rule_value, port_rule_winner, port_rule_with_limit,
+    stateful_verdict,
 };
 pub use portal::{
     PortalClientKey, PortalGate, PortalSeenKey, gate_admits_unauthenticated, v6_source_is_v4_mapped,

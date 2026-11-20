@@ -434,6 +434,22 @@ pub(super) fn ct_is_routed_reply(key: &FirewallKey, control: u8) -> bool {
     )
 }
 
+/// Whether the packet is live traffic in the responder's direction of its
+/// connection, i.e. one opened towards its source (DP-15: what an ingress-only
+/// blocklist lets a listed address send). Read-only, like [`ct_classify`].
+#[inline(never)]
+pub(super) fn ct_is_answer(key: &FirewallKey, control: u8) -> bool {
+    let Some(state) = (unsafe { FW_FLOWS.get(key) }) else {
+        return false;
+    };
+    state.is_answer(
+        key.proto,
+        control,
+        unsafe { bpf_ktime_get_ns() },
+        timeouts(),
+    )
+}
+
 #[inline(never)]
 pub(super) fn ct_record(key: &FirewallKey, control: u8) -> StatePublication {
     let Some(scratch) = CT_SCRATCH.get_ptr_mut(0) else {

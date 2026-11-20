@@ -45,6 +45,18 @@ impl ConfigFlags {
     /// Deny traffic leaving an interface when no rule matches. Used by tenant
     /// taps, where interface egress is traffic entering the guest.
     pub const EGRESS_DEFAULT_DROP: u32 = 1 << 6;
+    /// The blocklist names **sources**: it refuses what a listed address sends
+    /// in, and nothing else (audit DP-15). Without it a policy's blocklist also
+    /// matches the destination of every packet *leaving* its interfaces, so a
+    /// country blocked on the WAN could not be reached from the LAN either.
+    ///
+    /// With it, the egress hook never consults the blocklist, and at ingress a
+    /// listed source still gets through where it is *answering*: a packet in the
+    /// responder's direction of a connection this side opened, or an ICMP error
+    /// about one (see [`crate::blocklist_refuses_ingress`]). Everything a listed
+    /// address starts — and every packet of a connection it started before it
+    /// was listed — is refused as before.
+    pub const BLOCKLIST_INGRESS_ONLY: u32 = 1 << 7;
 
     /// Mask of all defined flags; used to reject unknown bits.
     pub const ALL: u32 = Self::DROP_ICMP
@@ -53,7 +65,8 @@ impl ConfigFlags {
         | Self::RPF_LOOSE
         | Self::RPF_STRICT
         | Self::PORTAL
-        | Self::EGRESS_DEFAULT_DROP;
+        | Self::EGRESS_DEFAULT_DROP
+        | Self::BLOCKLIST_INGRESS_ONLY;
 }
 
 /// Global firewall configuration shared kernel <-> user space.
