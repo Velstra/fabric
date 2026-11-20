@@ -687,6 +687,7 @@ mod tests {
                     age_ns: 0,
                     phase: 3,
                     reply: 0,
+                    ..FirewallState::UNTRACKED
                 },
             )],
             1,

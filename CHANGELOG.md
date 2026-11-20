@@ -4,6 +4,38 @@
 
 ### Fixed
 
+- **TCP resets are validated before they end a connection (DP-03).** A reset
+  tears down firewall state only when its sequence number equals the
+  receiver's last ACK and, at XDP ingress, its TCP checksum is correct. An
+  in-window but inexact reset is forwarded unchanged so the endpoint answers
+  with a challenge ACK (RFC 5961); an out-of-window or bad-checksum reset is
+  dropped (`tcp_invalid_reset`). `FW_FLOWS` values grow to 40 bytes; the HA
+  wire format is unchanged and imported state starts "sequence unknown".
+- **TCP strictness (DP-25).** A retransmitted SYN-ACK after ESTABLISHED is
+  accepted; a SYN reusing a silently dead tuple is forwarded and becomes a new
+  connection when the responder answers SYN-ACK; half-closed connections idle
+  for at least 120 s.
+- **Fragments through NAT are translated (DP-05).** The first fragment is
+  translated with its L4 header and records the address rewrite; later
+  fragments get the same rewrite (`fragment_nat_translated`). A later fragment
+  without a record is refused on a masquerade uplink, never leaked.
+- **Masquerade never leaks an inside source (DP-04).** TCP/UDP with IPv4
+  options are translated; GRE, ESP, SCTP, 6in4 and other portless protocols,
+  ICMP other than echo request or a related error, and ICMP with options are
+  refused from inside sources (`egress_nat_unsupported_dropped`).
+- **Only openers allocate NAT state (DP-08, DP-37).** A TCP segment without SYN
+  that finds no binding no longer allocates one, on masquerade and on port
+  forwards (`nat_opener_required`); NULL/XMAS/SYN+FIN segments without state
+  are refused on stateful hooks (`tcp_invalid_flags`).
+- **NAT bindings expire with their connection (DP-07).** Embryonic TCP
+  bindings use `tcp_syn`, a FIN `max(tcp_closing, 120 s)`, a reset
+  `tcp_closing`; previously every binding held its public port for
+  `tcp_established`.
+- **Hairpin flows claim a unique source port (DP-23, DP-24).** Two LAN clients
+  using the same source port toward the same reflected service no longer share
+  a server-side tuple; the reverse entry is published with `BPF_NOEXIST`.
+- **UDP NAT writes a zero checksum as 0xFFFF (DP-42).**
+
 - Masquerade targets now follow DHCP acquisition, renewal and address withdrawal
   during normal interface reconciliation, without a configuration resend or
   conntrack reset. Explicit static SNAT and HA VIP targets retain precedence.

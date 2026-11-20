@@ -32,11 +32,16 @@ rust-version = "1.85"
 repository = "https://github.com/Velstra/fabric"
 
 [workspace.dependencies]
-aya = { git = "https://github.com/aya-rs/aya", default-features = false }
-aya-build = { git = "https://github.com/aya-rs/aya", default-features = false }
-aya-ebpf = { git = "https://github.com/aya-rs/aya", default-features = false }
-aya-log = { git = "https://github.com/aya-rs/aya", default-features = false }
-aya-log-ebpf = { git = "https://github.com/aya-rs/aya", default-features = false }
+# aya is not released often enough to track from crates.io, so it comes from
+# git. Pinned to an exact revision: without `rev`, the only thing holding the
+# version is Cargo.lock, and any `cargo update` silently moves the eBPF loader
+# and the in-kernel helpers to whatever the default branch says that day. Move
+# all five together, on purpose, and re-run the verifier checks when you do.
+aya = { git = "https://github.com/aya-rs/aya", rev = "6f6859fbc0857b792f78fe4a128c6808267cbfcf", default-features = false }
+aya-build = { git = "https://github.com/aya-rs/aya", rev = "6f6859fbc0857b792f78fe4a128c6808267cbfcf", default-features = false }
+aya-ebpf = { git = "https://github.com/aya-rs/aya", rev = "6f6859fbc0857b792f78fe4a128c6808267cbfcf", default-features = false }
+aya-log = { git = "https://github.com/aya-rs/aya", rev = "6f6859fbc0857b792f78fe4a128c6808267cbfcf", default-features = false }
+aya-log-ebpf = { git = "https://github.com/aya-rs/aya", rev = "6f6859fbc0857b792f78fe4a128c6808267cbfcf", default-features = false }
 
 anyhow = { version = "1", default-features = false }
 cargo_metadata = { version = "0.23.0", default-features = false }

@@ -259,3 +259,79 @@ pub fn allocate(flow: &FlowKey, public: [u8; 4], layout: &CgnatLayout, bytes: u6
     }
     s.result
 }
+
+/// Candidates an HA (replicated) allocator examines (DP-26). Replicas cannot
+/// share the standalone displacement bound, so they search a fixed window of
+/// the same cyclic domain instead: its first eight candidates are exactly the
+/// legacy eight, so an older peer still finds every binding it could have
+/// made, and a binding beyond them is one the older allocator would have
+/// refused outright.
+pub const HA_WINDOW: u32 = 64;
+
+/// Existing live binding of `flow` within the first `window` candidates.
+#[inline(never)]
+pub fn existing_window(flow: &FlowKey, public: [u8; 4], layout: &CgnatLayout, window: u32) -> u16 {
+    let mut s = Search::new(flow, public, layout, 0);
+    let count = if window < s.domain.count {
+        window
+    } else {
+        s.domain.count
+    };
+    let ok = unsafe {
+        bpf_loop(
+            count,
+            find_owned as *mut c_void,
+            (&mut s as *mut Search).cast(),
+            0,
+        ) >= 0
+    };
+    if ok { s.result as u16 } else { 0 }
+}
+
+/// `allocate` restricted to the first `window` candidates: reuse this flow's
+/// live binding there, else claim the first free candidate. Same frame shape
+/// as `allocate`, so the masquerade tail's cumulative stack is unchanged.
+#[inline(never)]
+pub fn allocate_window(
+    flow: &FlowKey,
+    public: [u8; 4],
+    layout: &CgnatLayout,
+    bytes: u64,
+    window: u32,
+) -> u32 {
+    let mut s = Search::new(flow, public, layout, bytes);
+    let count = if window < s.domain.count {
+        window
+    } else {
+        s.domain.count
+    };
+    if unsafe {
+        bpf_loop(
+            count,
+            find_owned as *mut c_void,
+            (&mut s as *mut Search).cast(),
+            0,
+        )
+    } < 0
+    {
+        return FAILED;
+    }
+    if s.result != 0 {
+        if account_masquerade_binding(&s.reverse, s.origin, s.private_port, bytes) {
+            return s.result;
+        }
+        return FAILED;
+    }
+    if unsafe {
+        bpf_loop(
+            count,
+            reserve as *mut c_void,
+            (&mut s as *mut Search).cast(),
+            0,
+        )
+    } < 0
+    {
+        return FAILED;
+    }
+    s.result
+}

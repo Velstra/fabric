@@ -94,6 +94,114 @@ pub const ETHERTYPE_IPV4: u16 = 0x0800;
 /// EtherType for IPv6, in host byte order.
 pub const ETHERTYPE_IPV6: u16 = 0x86DD;
 
+/// Whether a frame of this (host-order) EtherType, which the firewall does not
+/// parse, may still reach the kernel on a fail-closed host.
+///
+/// `FAIL_CLOSED` means "a packet the filter cannot classify is not admitted",
+/// and a non-IP EtherType used to pass regardless of it (audit DP-22). What
+/// remains is link control a link needs in order to work at all, and the
+/// encapsulations whose payload is classified again on its own interface:
+/// ARP, 802.1Q / 802.1ad VLAN tags, PPPoE discovery and session, LLDP, 802.1X
+/// (EAPOL — some WANs authenticate the port with it), the slow protocols (LACP)
+/// and MACsec. Everything else — MPLS, legacy protocols, anything unknown — is
+/// dropped when the operator asked for fail-closed, and passes as before when
+/// they did not.
+#[inline(always)]
+pub const fn ethertype_passes_unfiltered(ethertype: u16) -> bool {
+    matches!(
+        ethertype,
+        0x0806 // ARP
+            | 0x8100 // 802.1Q
+            | 0x88a8 // 802.1ad
+            | 0x8863 // PPPoE discovery
+            | 0x8864 // PPPoE session
+            | 0x88cc // LLDP
+            | 0x888e // EAPOL
+            | 0x8809 // slow protocols (LACP, marker)
+            | 0x88e5 // MACsec
+    )
+}
+
+/// Whether a stateful policy refuses a TCP or UDP datagram because it carries
+/// IPv4 options (`ihl_bytes > 20`).
+///
+/// Connection tracking, the SYN proxy and NAT all require the fixed 20-byte
+/// header, so such a datagram used to be handled statelessly — admitted by a
+/// rule alone, past the SYN proxy and per-rule state (audit DP-34). No ordinary
+/// TCP or UDP traffic carries IPv4 options (RFC 7126 recommends dropping
+/// nearly all of them); IGMP's Router Alert and ICMP are not affected.
+#[inline(always)]
+pub const fn ipv4_options_refused(stateful: bool, proto: u8, ihl_bytes: usize) -> bool {
+    stateful && (proto == ip_proto::TCP || proto == ip_proto::UDP) && ihl_bytes != 20
+}
+
+/// How a frame on a raw-IP link (WireGuard, PPP, an IP tunnel or XFRM) is laid
+/// out, from its first 34 bytes and its length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawFraming {
+    /// A bare IP packet: the classifier needs a temporary Ethernet header.
+    Bare,
+    /// The packet still carries a MAC header (XFRM keeps the one the ESP
+    /// arrived in).
+    Framed,
+    /// Self-consistent read both ways. Only a crafted packet does this; it is
+    /// refused rather than classified as one thing while the kernel sees the
+    /// other.
+    Ambiguous,
+}
+
+#[inline(always)]
+fn ipv4_header_checksum_ok(h: &[u8; 34], at: usize) -> bool {
+    let mut sum = 0u32;
+    let mut i = 0;
+    while i < 10 {
+        sum += u16::from_be_bytes([h[at + 2 * i], h[at + 2 * i + 1]]) as u32;
+        i += 1;
+    }
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum == 0xffff
+}
+
+/// Classify a raw-IP link's frame (audit DP-36).
+///
+/// `head` is the first 34 bytes of the frame and `len` its length. Each reading
+/// must be self-consistent to count: a bare IPv4 packet's total length is the
+/// frame's and its header checksum verifies; a bare IPv6 packet's payload
+/// length plus 40 is the frame's; a framed packet has an IP EtherType at
+/// 12..14, the matching version at 14 and an IP length that accounts for the
+/// rest of the frame (and, for IPv4, a valid header checksum). Reading only the
+/// framed shape — what this replaced — took a bare IPv4 packet from
+/// 8.0.64.0/12 whose destination's first two octets equal `len - 14` for a
+/// framed one, and parsed a shifted header the kernel never saw.
+#[inline(always)]
+pub fn raw_ip_framing(head: &[u8; 34], len: usize) -> RawFraming {
+    let bare = match head[0] >> 4 {
+        4 => {
+            head[0] & 0x0f == 5
+                && u16::from_be_bytes([head[2], head[3]]) as usize == len
+                && ipv4_header_checksum_ok(head, 0)
+                || head[0] & 0x0f > 5 && u16::from_be_bytes([head[2], head[3]]) as usize == len
+        }
+        6 => u16::from_be_bytes([head[4], head[5]]) as usize + 40 == len,
+        _ => false,
+    };
+    let framed = len >= 14
+        && match (head[12], head[13], head[14] >> 4) {
+            (0x08, 0x00, 4) => {
+                u16::from_be_bytes([head[16], head[17]]) as usize == len - 14
+                    && (head[14] & 0x0f != 5 || ipv4_header_checksum_ok(head, 14))
+            }
+            (0x86, 0xdd, 6) => u16::from_be_bytes([head[18], head[19]]) as usize + 40 == len - 14,
+            _ => false,
+        };
+    match (bare, framed) {
+        (_, false) => RawFraming::Bare,
+        (false, true) => RawFraming::Framed,
+        (true, true) => RawFraming::Ambiguous,
+    }
+}
+
 /// Key for the `PORT_RULES` hash map: a `(protocol, destination port)` pair.
 ///
 /// `#[repr(C)]` with an explicit padding byte makes the 4-byte layout identical
@@ -946,6 +1054,103 @@ unsafe impl aya::Pod for PortAddr6 {}
 
 #[cfg(test)]
 mod tests {
+    use super::{RawFraming, ethertype_passes_unfiltered, ipv4_options_refused, raw_ip_framing};
+
+    fn ipv4(src: [u8; 4], dst: [u8; 4], total: u16) -> [u8; 20] {
+        let mut h = [0u8; 20];
+        h[0] = 0x45;
+        h[2..4].copy_from_slice(&total.to_be_bytes());
+        h[8] = 64;
+        h[9] = 17;
+        h[12..16].copy_from_slice(&src);
+        h[16..20].copy_from_slice(&dst);
+        let csum = crate::ipv4_checksum(&h);
+        h[10..12].copy_from_slice(&csum.to_be_bytes());
+        h
+    }
+
+    fn head_of(frame: &[u8]) -> [u8; 34] {
+        let mut head = [0u8; 34];
+        head.copy_from_slice(&frame[..34]);
+        head
+    }
+
+    /// The DP-36 case: a bare IPv4 packet from 8.0.64.0/12 whose destination's
+    /// first two octets equal `len - 14` read as a framed one before.
+    #[test]
+    fn a_bare_packet_shaped_like_a_framed_one_is_still_bare() {
+        let len = 1500usize;
+        let dst = [((len - 14) >> 8) as u8, (len - 14) as u8, 1, 2];
+        let mut frame = vec![0u8; len];
+        frame[..20].copy_from_slice(&ipv4([8, 0, 0x45, 9], dst, len as u16));
+        assert_eq!(raw_ip_framing(&head_of(&frame), len), RawFraming::Bare);
+    }
+
+    #[test]
+    fn an_xfrm_frame_with_its_mac_header_is_framed() {
+        let len = 14 + 84;
+        let mut frame = vec![0u8; len];
+        frame[..6].copy_from_slice(&[0x52, 0x54, 0, 0x12, 0x34, 0x56]);
+        frame[12..14].copy_from_slice(&[0x08, 0x00]);
+        frame[14..34].copy_from_slice(&ipv4([10, 1, 0, 2], [10, 2, 0, 1], 84));
+        assert_eq!(raw_ip_framing(&head_of(&frame), len), RawFraming::Framed);
+        let mut v6 = vec![0u8; 14 + 40 + 16];
+        v6[12..14].copy_from_slice(&[0x86, 0xdd]);
+        v6[14] = 0x60;
+        v6[18..20].copy_from_slice(&16u16.to_be_bytes());
+        assert_eq!(raw_ip_framing(&head_of(&v6), v6.len()), RawFraming::Framed);
+    }
+
+    #[test]
+    fn bare_packets_of_both_families_are_bare() {
+        let mut v4 = vec![0u8; 60];
+        v4[..20].copy_from_slice(&ipv4([192, 0, 2, 1], [198, 51, 100, 7], 60));
+        assert_eq!(raw_ip_framing(&head_of(&v4), 60), RawFraming::Bare);
+        let mut v6 = vec![0u8; 40 + 20];
+        v6[0] = 0x60;
+        v6[4..6].copy_from_slice(&20u16.to_be_bytes());
+        assert_eq!(raw_ip_framing(&head_of(&v6), 60), RawFraming::Bare);
+    }
+
+    /// Both readings self-consistent: only a crafted packet manages it, and it
+    /// is refused rather than guessed at.
+    #[test]
+    fn a_packet_consistent_both_ways_is_ambiguous() {
+        let len = 14 + 40;
+        let mut frame = vec![0u8; len];
+        // Bare IPv6 header whose source bytes also spell a framed IPv6 one.
+        frame[0] = 0x60;
+        frame[4..6].copy_from_slice(&((len - 40) as u16).to_be_bytes());
+        frame[12..14].copy_from_slice(&[0x86, 0xdd]);
+        frame[14] = 0x60;
+        frame[18..20].copy_from_slice(&((len - 14 - 40) as u16).to_be_bytes());
+        assert_eq!(raw_ip_framing(&head_of(&frame), len), RawFraming::Ambiguous);
+    }
+
+    #[test]
+    fn fail_closed_admits_only_link_control_ethertypes() {
+        for kept in [
+            0x0806u16, 0x8100, 0x88a8, 0x8863, 0x8864, 0x88cc, 0x888e, 0x8809, 0x88e5,
+        ] {
+            assert!(ethertype_passes_unfiltered(kept), "{kept:#06x}");
+        }
+        for refused in [0x8847u16, 0x8848, 0x8137, 0x809b, 0x88f7, 0x0000, 0xffff] {
+            assert!(!ethertype_passes_unfiltered(refused), "{refused:#06x}");
+        }
+    }
+
+    #[test]
+    fn stateful_policies_refuse_tcp_and_udp_with_ipv4_options() {
+        assert!(ipv4_options_refused(true, 6, 24));
+        assert!(ipv4_options_refused(true, 17, 60));
+        assert!(!ipv4_options_refused(true, 6, 20));
+        // Not stateful: nothing depends on the fixed header.
+        assert!(!ipv4_options_refused(false, 6, 24));
+        // ICMP (ping -R) and IGMP (Router Alert) keep their options.
+        assert!(!ipv4_options_refused(true, 1, 24));
+        assert!(!ipv4_options_refused(true, 2, 24));
+    }
+
     /// An ICMP conntrack entry has to name the answer it is waiting for.
     ///
     /// With the type left out of the key, a host this box pinged could ping it

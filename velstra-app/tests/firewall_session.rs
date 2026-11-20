@@ -76,6 +76,7 @@ fn record(index: u32, policy: u32, generation: u64) -> (FirewallSessionKey, Fire
         age_ns: 0,
         phase: FirewallState::ESTABLISHED,
         reply: 0,
+        ..FirewallState::UNTRACKED
     };
     // Asymmetric age must survive storage; it must not be replaced with a
     // shared newest timestamp or broaden the older direction's permission.

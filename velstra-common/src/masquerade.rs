@@ -273,6 +273,28 @@ pub fn napt_port(seed: u32, i: u16) -> u16 {
     32768 + (seed.wrapping_add(i as u32) % 32768) as u16
 }
 
+/// Whether a NAT entry may be written over what a key already holds (DP-24).
+/// A destination-NAT or load-balancer reverse entry is published with
+/// `BPF_NOEXIST`; when that finds an entry, only an expired one or one that
+/// already carries exactly this rewrite (the same flow, re-admitted or claimed
+/// concurrently by another CPU) may be replaced. A live entry with a different
+/// rewrite belongs to another flow and is never overwritten.
+#[inline(always)]
+pub fn nat_entry_replaceable(
+    existing: &crate::FlowState,
+    candidate: &crate::FlowState,
+    proto: u8,
+    now: u64,
+    timeouts: crate::ConntrackTimeouts,
+) -> bool {
+    existing.expired(proto, now, timeouts)
+        || (existing.flags == candidate.flags
+            && existing.nat_ip == candidate.nat_ip
+            && existing.nat_port == candidate.nat_port
+            && existing.nat2_ip == candidate.nat2_ip
+            && existing.nat2_port == candidate.nat2_port)
+}
+
 /// What the egress masquerade path may do after the port probe.
 ///
 /// A translated packet and its reverse conntrack entry are one publication.
@@ -760,5 +782,45 @@ mod tests {
             masquerade_commit(true, false, true),
             MasqueradeCommit::Translated
         );
+    }
+
+    #[test]
+    fn a_live_foreign_reverse_entry_is_never_overwritten() {
+        let t = crate::ConntrackTimeouts::DEFAULT;
+        let mine = crate::FlowState {
+            last_seen_ns: 100,
+            ..crate::FlowState::reverse([198, 51, 100, 1], 8080)
+        };
+        let foreign = crate::FlowState {
+            last_seen_ns: 100,
+            ..crate::FlowState::reverse2([198, 51, 100, 1], 8080, [10, 1, 0, 3], 40000)
+        };
+        assert!(!nat_entry_replaceable(&foreign, &mine, 6, 200, t));
+        // The same rewrite (a concurrent claim of the same flow) is replaceable.
+        assert!(nat_entry_replaceable(&mine, &mine, 6, 200, t));
+        // An expired entry no longer protects anything.
+        let late = 100 + t.tcp_established as u64 * 1_000_000_000;
+        assert!(nat_entry_replaceable(&foreign, &mine, 6, late, t));
+        // Lifetime bits and counters do not make an entry foreign.
+        let busy = crate::FlowState {
+            packets: 9,
+            _pad: 1,
+            ..mine
+        };
+        assert!(nat_entry_replaceable(&busy, &mine, 17, 200, t));
+    }
+
+    #[test]
+    fn the_ha_window_starts_with_exactly_the_legacy_eight_candidates() {
+        // DP-26: an older peer searches only these eight; the HA window must
+        // extend them, not reorder them.
+        let src = [192, 168, 50, 100];
+        let layout = crate::CgnatLayout::default();
+        for seed in [0u32, 1, 7, 32_767, 32_768, 1 << 20, u32::MAX - 100] {
+            let domain = NaptDomain::new(src, seed, &layout);
+            for i in 0..8u16 {
+                assert_eq!(domain.candidate(i as u32), napt_port(seed, i), "{seed} {i}");
+            }
+        }
     }
 }

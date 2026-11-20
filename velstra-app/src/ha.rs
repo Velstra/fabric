@@ -34,6 +34,11 @@ pub const DEADLINE_PIN: &str = "/sys/fs/bpf/velstra-ha/deadline";
 pub const OWNER_PIN: &str = "/sys/fs/bpf/velstra-ha/owner";
 const EXIT_PIN: &str = "/sys/fs/bpf/velstra-ha/exit";
 const GUARD_PIN: &str = "/sys/fs/bpf/velstra-ha/guard";
+/// How long a standby's replicated state may stay unusable before it is
+/// discarded and the member becomes cold (see [`State::track_usable`]). Well
+/// past the 1.5 s replica freshness and an ordinary config-sync delivery, far
+/// short of the outage an operator would otherwise have to end by hand.
+pub const STALE_STATE_DISCARD_NS: u64 = 5_000_000_000;
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Authority {
@@ -84,6 +89,13 @@ pub struct State {
     /// A standby that is merely "Backup" while the witness would refuse it is
     /// the failure an operator otherwise discovers during the outage.
     not_ready: Option<&'static str>,
+    /// When this member's replicated state was last seen unusable without a
+    /// break, or 0 while it is usable.
+    unusable_since: u64,
+    /// The unusable state has outlasted [`STALE_STATE_DISCARD_NS`].
+    discard_due: bool,
+    /// Cold because stale state was discarded, not because the agent is new.
+    discarded: bool,
 }
 pub type Shared = Arc<Mutex<State>>;
 impl State {
@@ -103,6 +115,9 @@ impl State {
             active_term: 0,
             agent_boot: boot,
             not_ready: Some("fresh agent has no state snapshot yet"),
+            unusable_since: 0,
+            discard_due: false,
+            discarded: false,
         })))
     }
     /// Revalidate the captured report after acquiring the state lock. A valid
@@ -163,6 +178,8 @@ impl State {
             // A commit on the owner changes its fingerprint at once; this
             // member stays ineligible until configuration sync delivers it.
             Some("policy differs from the owner's; awaiting configuration sync")
+        } else if self.ready_term == 0 && self.cold && self.discarded {
+            Some("stale state discarded; awaiting a state snapshot")
         } else if self.ready_term == 0 && self.cold {
             Some("fresh agent has no state snapshot yet")
         } else if self.ready_term == 0 {
@@ -255,6 +272,7 @@ impl State {
     /// partial replacement must never be advertised as a complete warm state.
     pub fn begin_install(&mut self) {
         self.cold = false;
+        self.discarded = false;
         self.ready_term = 0;
         self.ready_policy = [0; 32];
         self.ready_at = 0;
@@ -262,9 +280,49 @@ impl State {
     }
     pub fn snapshot_ready(&mut self, authority: &Authority) {
         self.cold = false;
+        self.discarded = false;
         self.ready_term = authority.term;
         self.ready_policy = authority.policy;
         self.ready_at = now_ns();
+    }
+    /// Record whether this member's replicated state can serve a takeover.
+    ///
+    /// A standby whose state is stale, or was imported under a policy it no
+    /// longer holds, is not eligible, and it cannot become eligible until an
+    /// owner exports to it. If the owner's agent died meanwhile, that owner
+    /// restarts cold — and a cold member is granted only with a second cold
+    /// vote (or a long-silent peer). Neither ever arrives: the pair stays dark
+    /// until somebody restarts an agent by hand (HA-04). Once the state has
+    /// been unusable for [`STALE_STATE_DISCARD_NS`], [`State::flush_due`]
+    /// asks for it to be discarded, which makes this member an honest cold
+    /// voter. Nothing usable is lost: the witness would never have granted it.
+    pub fn track_usable(&mut self, now: u64, usable: bool) {
+        if usable {
+            self.unusable_since = 0;
+            self.discard_due = false;
+            return;
+        }
+        if self.unusable_since == 0 {
+            self.unusable_since = now.max(1);
+        }
+        if now.saturating_sub(self.unusable_since) >= STALE_STATE_DISCARD_NS {
+            self.discard_due = true;
+        }
+    }
+    /// Whether replicated state should be discarded now. Never on a member
+    /// that is forwarding, nor on one that is already cold (nothing to
+    /// discard, and a fresh agent must keep its "fresh" identity).
+    pub fn flush_due(&self) -> bool {
+        self.discard_due && !self.cold && self.active_term == 0
+    }
+    /// The replicated tables were emptied: this member is cold again, exactly
+    /// like a freshly started agent, until a complete snapshot arrives.
+    pub fn discarded_stale_state(&mut self) {
+        self.begin_install();
+        self.cold = true;
+        self.discarded = true;
+        self.unusable_since = 0;
+        self.discard_due = false;
     }
     pub fn heartbeat(&mut self, authority: &Authority) {
         if self.ready_term == authority.term && self.ready_policy == authority.policy {
@@ -759,6 +817,13 @@ pub async fn monitor(firewall: Arc<Mutex<Firewall>>, shared: Shared, config: HaC
         let ready = state.is_ready(&config, policy, now);
         let active = state.forwarding_allowed(&config, policy, links_ready, now);
         state.observe(&config, policy, links_ready, coordinator_live, now);
+        // Only a member that could otherwise take part counts as stuck: a
+        // missing coordinator or link is its own, reported, reason.
+        let cold = state.cold;
+        state.track_usable(
+            now,
+            ready || active || cold || !coordinator_live || !links_ready,
+        );
         // A genuinely cold election has a complete empty baseline. Publish
         // that fact before acknowledging forwarding: Wren may already have
         // renewed the initial claim by the time its VPN task starts. Warm
@@ -975,6 +1040,59 @@ mod tests {
             state.telemetry(now)["not_ready"],
             "coordinator is not reporting"
         );
+    }
+    /// HA-04 class: a standby whose replicated state became unusable (stale,
+    /// or for a policy it no longer holds) is ineligible, and a restarted owner
+    /// is cold. Neither may be granted, so the pair stays dark until somebody
+    /// restarts an agent. After a bounded wait the stale standby discards its
+    /// replicated state and becomes an honest cold member, which the witness's
+    /// two-cold-members rule can open a new epoch with.
+    #[tokio::test]
+    async fn a_standby_with_unusable_state_becomes_cold_after_the_bound() {
+        let cfg = config();
+        let shared = State::new(Some(cfg.clone())).unwrap();
+        let mut state = shared.lock().await;
+        let start = 50_000_000_000;
+        state.snapshot_ready(&Authority {
+            term: 4,
+            owner: 2,
+            policy: [3; 32],
+            boot: [2; 16],
+        });
+        assert!(!state.cold);
+        // Fresh state, or a member that is forwarding, is never discarded.
+        state.track_usable(start, true);
+        assert!(!state.flush_due());
+        state.track_usable(start + STALE_STATE_DISCARD_NS * 2, true);
+        assert!(!state.flush_due());
+        // Unusable, but not yet for the whole bound.
+        state.track_usable(start, false);
+        state.track_usable(start + STALE_STATE_DISCARD_NS - 1, false);
+        assert!(!state.flush_due());
+        // Usable again in between restarts the wait.
+        state.track_usable(start + STALE_STATE_DISCARD_NS - 1, true);
+        state.track_usable(start + STALE_STATE_DISCARD_NS, false);
+        assert!(!state.flush_due());
+        state.track_usable(start + 2 * STALE_STATE_DISCARD_NS, false);
+        assert!(state.flush_due());
+        // A forwarding member must never discard its tables.
+        state.active_term = 4;
+        assert!(!state.flush_due());
+        state.active_term = 0;
+        // A genuinely cold agent has nothing to discard.
+        state.cold = true;
+        assert!(!state.flush_due());
+        state.cold = false;
+        state.discarded_stale_state();
+        assert!(state.cold && state.ready_term == 0 && !state.flush_due());
+        state.observe(&cfg, [3; 32], true, true, start);
+        assert_eq!(
+            state.not_ready,
+            Some("stale state discarded; awaiting a state snapshot")
+        );
+        // A later complete snapshot makes it an ordinary warm standby again.
+        state.begin_install();
+        assert!(!state.cold);
     }
     #[test]
     fn role_freshness_follows_the_configured_witness_budget() {

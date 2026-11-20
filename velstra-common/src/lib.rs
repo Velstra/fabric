@@ -39,9 +39,11 @@ mod firewall_session;
 mod forward;
 mod fragment_guard;
 mod icmp_related;
+mod icmpv6;
 mod lb;
 mod mac;
 mod masquerade;
+mod mss;
 mod npt;
 mod overlay;
 mod packet;
@@ -61,17 +63,27 @@ mod telemetry;
 pub use cgnat::CgnatLayout;
 pub use cidr::{Cidr4, Cidr6, CidrError, mask_v4, mask_v6, parse_cidr_v4, parse_cidr_v6};
 pub use config::{ConfigFlags, GlobalConfig, SourceValidation};
-pub use conntrack::{ConntrackTimeouts, FirewallKey, FirewallState};
+pub use conntrack::{
+    ConntrackTimeouts, FirewallKey, FirewallState, HALF_CLOSE_MIN_S, RESET_WINDOW_MAX, ResetCheck,
+    nat_lifetime,
+};
 pub use dhcp::{DHCP_FIB_NOT_FORWARDED, dhcp_fib_is_local, dhcpv4_reply_matches};
 pub use firewall_session::{FirewallSession, FirewallSessionKey, SessionDirection, SessionError};
 pub use forward::{
     ForwardOutcome, Rewrite, RouteEntry, csum_replace_u16, decrement_ttl, ipv4_checksum,
     plan_forward,
 };
-pub use fragment_guard::forwarded_masquerade_fragment_drops;
+pub use fragment_guard::{
+    FRAGMENT_HOOK_EGRESS, FRAGMENT_HOOK_INGRESS, FRAGMENT_NAT_TIMEOUT_NS, FragmentKey, FragmentNat,
+    FragmentPosition, forwarded_masquerade_fragment_drops,
+};
 pub use icmp_related::{
     RelatedChecksums, related_checksum_copy_length, related_checksums,
     related_hairpin_firewall_candidate, related_icmp_error,
+};
+pub use icmpv6::{
+    ICMPV6_ERROR_QUOTE, MLD_HOP_LIMIT, ND_HOP_LIMIT, icmpv6_link_control, icmpv6_type,
+    related_icmpv6_error, related_icmpv6_key,
 };
 pub use lb::{
     Backend, FlowKey, FlowState, Nat, PortFwd, ServiceKey, ServiceValue, plan_dnat,
@@ -81,8 +93,9 @@ pub use mac::{MacError, parse_mac};
 pub use masquerade::{
     MasqueradeCommit, NaptClaim, NaptDomain, NaptSlot, UNADDRESSED, legacy_napt_seed,
     masquerade_commit, napt_binding_matches, napt_claim, napt_find_existing, napt_port,
-    napt_search_count, napt_seed, napt_slot, unaddressed_uplink_drops,
+    napt_search_count, napt_seed, napt_slot, nat_entry_replaceable, unaddressed_uplink_drops,
 };
+pub use mss::mss_clamp_csum_operands;
 pub use npt::{Npt66, npt66_rewrite, oc_add};
 pub use overlay::{
     ARP_REPLY, ARP_REQUEST, ArpEntry, ArpKey, ArpReply, ETHERTYPE_ARP, Encap, FloodSet,
@@ -94,26 +107,30 @@ pub use overlay::{
 };
 pub use packet::{
     ETHERTYPE_IPV4, ETHERTYPE_IPV6, PORT_ENFORCE_MAC, PORT_ENFORCE_V4, PORT_ENFORCE_V6, PacketMeta,
-    PolicyId, PortAddr4, PortAddr6, PortBinding, PortKey, ScopedAddr, ScopedAddr6,
+    PolicyId, PortAddr4, PortAddr6, PortBinding, PortKey, RawFraming, ScopedAddr, ScopedAddr6,
     ScopedDstPortKey, ScopedDstPortKey6, ScopedMac, ScopedPortKey, ScopedSrcPortKey,
-    ScopedSrcPortKey6, icmp_reply_probe, icmp_type_key, icmp_type_probe, ip_proto, ipv6_ext_len,
-    is_ipv6_ext, lpm_key_addr,
+    ScopedSrcPortKey6, ethertype_passes_unfiltered, icmp_reply_probe, icmp_type_key,
+    icmp_type_probe, ip_proto, ipv4_options_refused, ipv6_ext_len, is_ipv6_ext, lpm_key_addr,
+    raw_ip_framing,
 };
 pub use parse::{ParseResult, parse_frame};
 pub use policy::{
     Action, CONFIG_FAILED, CONFIG_READY, CONFIG_UPDATING, Counter, MAX_BLOCKLIST, MAX_RULE_LIMITS,
     PORT_RULE_IN_ONLY, PORT_RULE_LOG, PORT_RULE_OUT_ONLY, PORT_RULE_PRESENT, PORT_RULE_V4_ONLY,
-    PORT_RULE_V6_ONLY, Verdict, admit_established_egress_reply, decide, decide_egress,
-    port_rule_action, port_rule_bits, port_rule_excluded, port_rule_limit, port_rule_logs,
-    port_rule_present, port_rule_value, port_rule_winner, port_rule_with_limit,
+    PORT_RULE_V6_ONLY, StateFacts, VERDICT_REASONS, Verdict, admit_established_egress_reply,
+    decide, decide_egress, egress_posture, port_rule_action, port_rule_bits, port_rule_denies,
+    port_rule_excluded, port_rule_limit, port_rule_logs, port_rule_present, port_rule_value,
+    port_rule_winner, port_rule_with_limit, stateful_verdict,
 };
 pub use portal::{
     PortalClientKey, PortalGate, PortalSeenKey, gate_admits_unauthenticated, v6_source_is_v4_mapped,
 };
 pub use ratelimit::RateBucket;
 pub use reject::{
-    ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, IcmpUnreach, TcpRst, icmp, icmp_checksum,
-    plan_icmp_unreachable, plan_tcp_rst, plan_tcp_rst_v6, tcp_flags,
+    ICMP_UNREACH_PREPEND, ICMP_UNREACH_TOTAL_LEN, ICMPV6_UNREACH_FRAME, ICMPV6_UNREACH_PREPEND,
+    ICMPV6_UNREACH_QUOTE, IcmpUnreach, Icmpv6Unreach, TcpRst, icmp, icmp_checksum,
+    icmpv6_error_allowed, icmpv6_port_unreachable_checksum, plan_icmp_unreachable,
+    plan_icmpv6_port_unreachable, plan_tcp_rst, plan_tcp_rst_v6, tcp_flags,
 };
 pub use srv6::{
     SRV6_L2_OUTER_LEN, Srv6Config, Srv6Encap, Srv6Endpoint, Srv6FloodSet, Srv6IrbEndpoint,

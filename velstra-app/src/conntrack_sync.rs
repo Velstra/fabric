@@ -337,6 +337,9 @@ fn decode_firewall(buf: &[u8], count: usize) -> Option<Datagram> {
             age_ns: u64::from_le_bytes(r[44..52].try_into().ok()?),
             phase: u32::from_le_bytes(r[52..56].try_into().ok()?),
             reply: u32::from_le_bytes(r[56..60].try_into().ok()?),
+            // Sequence tracking is node-local and never on the wire: an
+            // imported entry starts "sequence unknown" (historical resets).
+            ..FirewallState::UNTRACKED
         };
         if !matches!(k.family, 4 | 6)
             || !matches!(k.proto, 1 | 6 | 17 | 58)
@@ -364,6 +367,7 @@ mod tests {
             age_ns: 2_000_000_000,
             phase: FirewallState::ESTABLISHED,
             reply: 1,
+            ..FirewallState::UNTRACKED
         };
         let packets = encode_firewall_batch(&[(key, state)], 13_000_000_000);
         assert_eq!(packets[0].len(), 68);
@@ -412,6 +416,7 @@ mod tests {
             age_ns: 0,
             phase: 3,
             reply: 0,
+            ..FirewallState::UNTRACKED
         };
         assert_eq!(
             encode_firewall_batch(&vec![(FirewallKey::ipv4(key), live); 41], live.last_seen_ns)

@@ -202,6 +202,7 @@ mod tests {
             reply,
             last_seen_ns,
             age_ns,
+            ..FirewallState::UNTRACKED
         }
     }
 
@@ -210,15 +211,15 @@ mod tests {
         use core::mem::{align_of, size_of};
         assert_eq!(size_of::<FirewallSessionKey>(), 44);
         assert_eq!(align_of::<FirewallSessionKey>(), 4);
-        assert_eq!(size_of::<FirewallSession>(), 48);
+        assert_eq!(size_of::<FirewallSession>(), 80);
         assert_eq!(align_of::<FirewallSession>(), 8);
         assert_eq!(
             2 * (size_of::<FirewallKey>() + size_of::<FirewallState>()),
-            136
+            168
         );
         assert_eq!(
             size_of::<FirewallSessionKey>() + size_of::<FirewallSession>(),
-            92
+            124
         );
     }
 

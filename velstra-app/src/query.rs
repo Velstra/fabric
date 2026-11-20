@@ -31,7 +31,7 @@
 //! unblock <cidr>    → lift one early (`all` lifts every one)
 //! reload            → reconcile the validated local configuration in place
 //! reload-reset      → also invalidate the previous policy namespace's state
-//! expire-state <nat|firewall> <scan-limit> → bounded standalone expiry maintenance
+//! expire-state <nat|firewall> <scan-limit> → reclaim expired state now (never gates traffic)
 //! reconcile-links   → hook what appeared; `ok`, or `held-down: <link>…` naming
 //!                     the held links still down because their hooks are not
 //!                     in place (everything else reconciled)
@@ -168,16 +168,13 @@ async fn respond(
     match verb {
         "expire-state" => {
             let Some((table, limit)) = expiry_request(&args) else {
-                return format!(
-                    "usage: expire-state <nat|firewall> <1..={}>\n",
-                    crate::expiry::MAX_SCAN
-                );
+                return format!("usage: expire-state <nat|firewall> <1..={MAX_EXPIRY_SCAN}>\n");
             };
-            match firewall.lock().await.expire_state(table, limit) {
-                Ok(report) => format!(
-                    "{}\n",
-                    serde_json::to_string(&report).expect("expiry report is serializable")
-                ),
+            // One immediate pass of the background collector: it never closes
+            // the datapath gate, so it can neither stall nor block traffic
+            // (DP-41).
+            match crate::reclaim::expire_now(firewall, table, limit).await {
+                Ok(report) => format!("{report}\n"),
                 Err(error) => format!("error: expiry maintenance: {error:#}\n"),
             }
         }
@@ -438,12 +435,15 @@ async fn respond(
     }
 }
 
+/// The most entries one `expire-state` call walks.
+const MAX_EXPIRY_SCAN: usize = 65_536;
+
 fn expiry_request<'a>(args: &[&'a str]) -> Option<(&'a str, usize)> {
     let [table @ ("nat" | "firewall"), limit] = args else {
         return None;
     };
     let limit = limit.parse::<usize>().ok()?;
-    (1..=crate::expiry::MAX_SCAN)
+    (1..=MAX_EXPIRY_SCAN)
         .contains(&limit)
         .then_some((*table, limit))
 }

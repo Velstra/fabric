@@ -2,6 +2,7 @@
 //! processing within the kernel's per-call-chain stack limit.
 use aya_ebpf::{
     bindings::{TC_ACT_OK, TC_ACT_SHOT, xdp_action},
+    helpers::bpf_ktime_get_ns,
     macros::{classifier, xdp},
     programs::{TcContext, XdpContext},
 };
@@ -11,10 +12,10 @@ use velstra_common::{
 };
 
 use super::{
-    CONNTRACK, IFACE_POLICY, MASQUERADE, O_IP_CSUM, O_IP_DST, O_IP_SRC, SCRATCH, VELSTRA_PROGS,
-    account_flow, account_masquerade_binding, bump, claim_masquerade_nat,
-    conntrack::{ct_control, ct_key4, ct_record},
-    epoch, existing_napt_port, link_layer, ptr_at,
+    CONNTRACK, FW_FLOWS, IFACE_POLICY, MASQUERADE, O_IP_CSUM, O_IP_DST, O_IP_ID, O_IP_SRC, SCRATCH,
+    VELSTRA_PROGS, account_flow, account_masquerade_binding, bump, claim_masquerade_nat,
+    conntrack::{ct_control, ct_key4, ct_record, timeouts},
+    epoch, existing_napt_port, frag_nat, link_layer, masquerade_source_exempt, ptr_at,
 };
 
 const ICMP: usize = 34;
@@ -64,9 +65,11 @@ fn reply(ctx: &XdpContext) -> Result<u32, ()> {
         id,
         ip_proto::ICMP,
     );
-    let Some(state) = account_flow(&key, (ctx.data_end() - ctx.data()) as u64) else {
+    let Some(state) = account_flow(&key, (ctx.data_end() - ctx.data()) as u64, 0) else {
         return forward(ctx);
     };
+    // Identification and fragment word of a fragmented echo reply (DP-05).
+    let ident = unsafe { *ptr_at::<[u8; 4]>(ctx, O_IP_ID)? };
     let nat = plan_icmp_echo_nat(
         scratch.dst_addr,
         state.nat_ip,
@@ -85,6 +88,19 @@ fn reply(ctx: &XdpContext) -> Result<u32, ()> {
         *((data + CHECK) as *mut [u8; 2]) = nat.new_l4_checksum.to_be_bytes();
         *((data + ID) as *mut [u8; 2]) = nat.new_port.to_be_bytes();
     }
+    frag_nat::note_first(
+        u32::from_ne_bytes(scratch.src_addr),
+        u32::from_ne_bytes(scratch.dst_addr),
+        frag_nat::meta(
+            ip_proto::ICMP,
+            frag_nat::HOOK_INGRESS,
+            u16::from_be_bytes([ident[2], ident[3]]),
+            u16::from_be_bytes([ident[0], ident[1]]),
+            0,
+        ),
+        u32::from_ne_bytes(scratch.src_addr),
+        u32::from_ne_bytes(nat.new_ip),
+    );
     bump(Counter::from_u32(scratch.fw_counter).unwrap_or(Counter::PassedRule));
     Ok(xdp_action::XDP_PASS)
 }
@@ -111,15 +127,53 @@ pub fn velstra_egress_icmp(ctx: TcContext) -> i32 {
     }
 }
 
+/// A non-echo-request ICMP message on a masquerade uplink: true when it may
+/// leave untranslated. Only the box's own sources, and the reply to a routed,
+/// WAN-initiated echo that policy admitted, may; anything else would leak an
+/// inside source (DP-04). Its own frame keeps the firewall key off the
+/// translation path's stack.
+#[inline(never)]
+fn untranslated_icmp_allowed(ctx: &TcContext, index: u32, policy: u32, icmp: usize) -> bool {
+    let Ok(ip) = ctx.load::<[u8; 20]>(14) else {
+        return false;
+    };
+    let Some(public) = (unsafe { MASQUERADE.get(&index) }).copied() else {
+        return false;
+    };
+    let source = [ip[12], ip[13], ip[14], ip[15]];
+    if masquerade_source_exempt(index, source, public) {
+        return true;
+    }
+    let Ok(head) = ctx.load::<[u8; 1]>(icmp) else {
+        return false;
+    };
+    if head[0] != 0 {
+        return false;
+    }
+    let key = ct_key4(
+        FlowKey::new(
+            policy,
+            source,
+            [ip[16], ip[17], ip[18], ip[19]],
+            0,
+            0,
+            ip_proto::ICMP,
+        ),
+        ctx.data(),
+        ctx.data_end(),
+        icmp,
+    );
+    let Some(state) = (unsafe { FW_FLOWS.get(&key) }) else {
+        return false;
+    };
+    state.reply == 1
+        && state.classify(ip_proto::ICMP, 0, unsafe { bpf_ktime_get_ns() }, timeouts()) == 1
+}
+
 #[inline(always)]
 fn request(ctx: &TcContext) -> Result<i32, ()> {
     let ip: [u8; 20] = ctx.load(14).map_err(|_| ())?;
-    if ip[0] != 0x45 || ip[9] != ip_proto::ICMP || u16::from_be_bytes([ip[6], ip[7]]) & 0x3fff != 0
-    {
-        return Ok(TC_ACT_OK as i32);
-    }
-    let echo: [u8; 8] = ctx.load(ICMP).map_err(|_| ())?;
-    if echo[0] != 8 || echo[1] != 0 {
+    if ip[0] >> 4 != 4 || ip[9] != ip_proto::ICMP {
         return Ok(TC_ACT_OK as i32);
     }
     let index = unsafe { (*ctx.skb.skb).ifindex };
@@ -129,6 +183,26 @@ fn request(ctx: &TcContext) -> Result<i32, ()> {
     };
     let source = [ip[12], ip[13], ip[14], ip[15]];
     let remote = [ip[16], ip[17], ip[18], ip[19]];
+    if ip[0] != 0x45 || u16::from_be_bytes([ip[6], ip[7]]) & 0x1fff != 0 {
+        // IPv4 options (the echo translation below needs constant offsets
+        // within this tail's stack budget) and later fragments (translated or
+        // refused before this tail) leave only from the box's own sources:
+        // refused, never leaked with an inside source (DP-04, DP-05).
+        if masquerade_source_exempt(index, source, public) {
+            return Ok(TC_ACT_OK as i32);
+        }
+        bump(Counter::EgressNatUnsupportedDropped);
+        return Err(());
+    }
+    let echo: [u8; 8] = ctx.load(ICMP).map_err(|_| ())?;
+    if echo[0] != 8 || echo[1] != 0 {
+        // Only echo requests have an identifier to translate.
+        if untranslated_icmp_allowed(ctx, index, policy, ICMP) {
+            return Ok(TC_ACT_OK as i32);
+        }
+        bump(Counter::EgressNatUnsupportedDropped);
+        return Err(());
+    }
     let original_id = u16::from_be_bytes([echo[4], echo[5]]);
     if source != public {
         let seed = napt_seed(source, remote, original_id, 0);
@@ -198,6 +272,19 @@ fn request(ctx: &TcContext) -> Result<i32, ()> {
         .map_err(|_| ())?;
         ctx.store(O_IP_SRC, &public, 0).map_err(|_| ())?;
         ctx.store(ID, &mapped.to_be_bytes(), 0).map_err(|_| ())?;
+        frag_nat::note_first(
+            u32::from_ne_bytes(source),
+            u32::from_ne_bytes(remote),
+            frag_nat::meta(
+                ip_proto::ICMP,
+                frag_nat::HOOK_EGRESS,
+                u16::from_be_bytes([ip[6], ip[7]]),
+                u16::from_be_bytes([ip[4], ip[5]]),
+                0,
+            ),
+            u32::from_ne_bytes(public),
+            u32::from_ne_bytes(remote),
+        );
     }
     let key = ct_key4(
         FlowKey::new(policy, public, remote, 0, 0, ip_proto::ICMP),
