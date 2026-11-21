@@ -4,6 +4,15 @@
 
 ### Fixed
 
+- **IS-IS and the spanning tree work on fail-closed interfaces.** DP-22 drops
+  every frame whose EtherType is not link control, and an IEEE 802.3 length
+  frame (a type/length value of at most 1500) has no EtherType at all, so IS-IS
+  — which rides 802.2 LLC with the OSI SAP `FE` — was dropped at XDP ingress
+  and shot at TC egress (the daemon saw `ENOBUFS` sending its hellos), and no
+  adjacency ever formed on a zoned interface. A length frame is now judged by
+  its LLC header: `FE FE 03` (IS-IS, ES-IS) and `42 42 03` (spanning-tree
+  BPDUs) pass; SNAP, which can carry IP, and every other LLC frame stay
+  dropped. Neither admitted protocol carries IP.
 - **GRE tunnels are classified as raw-IP links.** The agent decides from the
   kernel link type whether a frame starts at an Ethernet header, and its list
   lacked `gre` (ARPHRD 778) and `ip6gre` (823). A packet on a GRE tunnel was

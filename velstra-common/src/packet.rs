@@ -103,9 +103,12 @@ pub const ETHERTYPE_IPV6: u16 = 0x86DD;
 /// encapsulations whose payload is classified again on its own interface:
 /// ARP, 802.1Q / 802.1ad VLAN tags, PPPoE discovery and session, LLDP, 802.1X
 /// (EAPOL — some WANs authenticate the port with it), the slow protocols (LACP)
-/// and MACsec. Everything else — MPLS, legacy protocols, anything unknown — is
-/// dropped when the operator asked for fail-closed, and passes as before when
-/// they did not.
+/// and MACsec. An 802.3 length frame (a value of at most 1500) has no
+/// EtherType and is judged by its LLC header instead — see
+/// [`llc_passes_unfiltered`], which admits IS-IS and the spanning tree.
+/// Everything else — MPLS, legacy protocols, anything unknown — is dropped
+/// when the operator asked for fail-closed, and passes as before when they
+/// did not.
 #[inline(always)]
 pub const fn ethertype_passes_unfiltered(ethertype: u16) -> bool {
     matches!(
@@ -120,6 +123,43 @@ pub const fn ethertype_passes_unfiltered(ethertype: u16) -> bool {
             | 0x8809 // slow protocols (LACP, marker)
             | 0x88e5 // MACsec
     )
+}
+
+/// The largest value of the Ethernet type/length field that is a **length**
+/// (IEEE 802.3 §3.2.6): a frame whose field is at most this carries an 802.2
+/// LLC header after it instead of an EtherType payload.
+pub const IEEE_8023_MAX_LENGTH: u16 = 1500;
+
+/// Whether an IEEE 802.3 length frame whose 802.2 LLC header is `llc`
+/// (DSAP, SSAP, control — the three bytes after the length field) may reach
+/// the kernel on a fail-closed host. The LLC half of
+/// [`ethertype_passes_unfiltered`].
+///
+/// Two link-local control protocols ride LLC rather than an EtherType, and a
+/// link that runs them stops working without them:
+///
+/// - `FE FE 03` — the OSI network layer: IS-IS hellos, LSPs and SNPs (ISO
+///   10589 §8.4.8), and ES-IS. IS-IS adjacencies never form when these drop,
+///   and the IS-IS daemon's own hellos are refused on the way out
+///   (`ENOBUFS`).
+/// - `42 42 03` — the spanning tree (802.1D/w/s BPDUs). A bridge that loses
+///   its BPDUs stops detecting loops.
+///
+/// Neither carries IP, so admitting them opens no path around the IP policy:
+/// Linux has no OSI network stack, so an `FE` frame reaches only packet
+/// sockets (the routing daemon) and, on a bridge port, the bridge. Every other LLC frame — SNAP (`AA AA`,
+/// which can encapsulate any EtherType, IP included), NetBIOS, IPX, raw
+/// 802.3 — is still dropped, as is a field between 1501 and 1535, which is
+/// neither a length nor a type.
+#[inline(always)]
+pub const fn llc_passes_unfiltered(length: u16, llc: [u8; 3]) -> bool {
+    const LLC_UI: u8 = 0x03;
+    const SAP_OSI: u8 = 0xfe;
+    const SAP_STP: u8 = 0x42;
+    length <= IEEE_8023_MAX_LENGTH
+        && llc[2] == LLC_UI
+        && llc[0] == llc[1]
+        && (llc[0] == SAP_OSI || llc[0] == SAP_STP)
 }
 
 /// Whether a stateful policy refuses a TCP or UDP datagram because it carries
@@ -1054,7 +1094,10 @@ unsafe impl aya::Pod for PortAddr6 {}
 
 #[cfg(test)]
 mod tests {
-    use super::{RawFraming, ethertype_passes_unfiltered, ipv4_options_refused, raw_ip_framing};
+    use super::{
+        RawFraming, ethertype_passes_unfiltered, ipv4_options_refused, llc_passes_unfiltered,
+        raw_ip_framing,
+    };
 
     fn ipv4(src: [u8; 4], dst: [u8; 4], total: u16) -> [u8; 20] {
         let mut h = [0u8; 20];
@@ -1136,6 +1179,37 @@ mod tests {
         }
         for refused in [0x8847u16, 0x8848, 0x8137, 0x809b, 0x88f7, 0x0000, 0xffff] {
             assert!(!ethertype_passes_unfiltered(refused), "{refused:#06x}");
+        }
+    }
+
+    /// IS-IS (OSI LLC) and the spanning tree pass a fail-closed host; nothing
+    /// else carried in an 802.3 length frame does.
+    #[test]
+    fn fail_closed_admits_only_link_control_llc_frames() {
+        // An IS-IS hello as wren sends it: length 1500 (padded), FE FE 03.
+        assert!(llc_passes_unfiltered(1500, [0xfe, 0xfe, 0x03]));
+        assert!(llc_passes_unfiltered(0x0027, [0xfe, 0xfe, 0x03]));
+        // An RSTP BPDU: length 39, 42 42 03.
+        assert!(llc_passes_unfiltered(39, [0x42, 0x42, 0x03]));
+        for refused in [
+            [0xaa, 0xaa, 0x03], // SNAP: may encapsulate IP
+            [0xf0, 0xf0, 0x03], // NetBIOS
+            [0xe0, 0xe0, 0x03], // IPX over 802.2
+            [0xff, 0xff, 0x00], // Novell raw 802.3
+            [0xfe, 0x42, 0x03], // mismatched SAPs
+            [0xfe, 0xfe, 0xf3], // OSI SAP, not an unnumbered-information PDU
+            [0x00, 0x00, 0x03], // null SAP
+        ] {
+            assert!(!llc_passes_unfiltered(100, refused), "{refused:02x?}");
+        }
+        // Not a length: neither an EtherType 1501..=1535 nor a real type is an
+        // LLC frame, however its next bytes read.
+        for not_length in [1501u16, 0x05ff, 0x0600, 0x0800, 0x86dd] {
+            assert!(!llc_passes_unfiltered(not_length, [0xfe, 0xfe, 0x03]));
+        }
+        // The EtherType rule alone never admits a length.
+        for length in [0u16, 39, 1500] {
+            assert!(!ethertype_passes_unfiltered(length));
         }
     }
 

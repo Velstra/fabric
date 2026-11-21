@@ -2357,6 +2357,27 @@ unsafe fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
     Ok((start + offset) as *const T)
 }
 
+/// DP-22 for a frame the IP classifier does not parse (`data..end` is the
+/// frame, `type_or_len` its host-order type/length field): whether a
+/// fail-closed host still admits it. A field above 1500 is an EtherType,
+/// judged by [`ethertype_passes_unfiltered`]; one of at most 1500 is an IEEE
+/// 802.3 length, and the 802.2 LLC header after it is judged by
+/// [`velstra_common::llc_passes_unfiltered`] — that is how IS-IS and the spanning tree pass.
+/// A length frame too short to hold an LLC header is refused.
+#[inline(always)]
+fn unparsed_frame_passes(data: usize, end: usize, type_or_len: u16) -> bool {
+    if type_or_len > velstra_common::IEEE_8023_MAX_LENGTH {
+        return ethertype_passes_unfiltered(type_or_len);
+    }
+    let llc_at = data + EthHdr::LEN;
+    if llc_at + 3 > end {
+        return false;
+    }
+    // SAFETY: the three bytes at `llc_at` lie inside the frame (checked above).
+    let llc = unsafe { core::ptr::read_unaligned(llc_at as *const [u8; 3]) };
+    velstra_common::llc_passes_unfiltered(type_or_len, llc)
+}
+
 /// [`ptr_at`] for the TC (skb) context. The same bounds-check pattern, against
 /// the linear portion of the socket buffer (`data..data_end`) — which always
 /// holds the small headers the firewall reads.
@@ -2418,7 +2439,7 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
     let ethertype = u16::from_be(unsafe { (*eth).ether_type });
     if ethertype != ETHERTYPE_IPV4 {
         // DP-22, the egress half of the ingress rule above.
-        if fail_closed() && !ethertype_passes_unfiltered(ethertype) {
+        if fail_closed() && !unparsed_frame_passes(ctx.data(), ctx.data_end(), ethertype) {
             return Ok(TC_ACT_SHOT as i32);
         }
         return Ok(TC_ACT_OK as i32);
@@ -3614,8 +3635,8 @@ fn try_velstra(ctx: &XdpContext) -> Result<u32, ()> {
         bump(Counter::NonIpv4);
         // DP-22: fail-closed means what the filter cannot classify is not
         // admitted. Link control and encapsulations classified again on their
-        // own interface still pass; see `ethertype_passes_unfiltered`.
-        if fail_closed() && !ethertype_passes_unfiltered(ethertype) {
+        // own interface still pass; see `unparsed_frame_passes`.
+        if fail_closed() && !unparsed_frame_passes(ctx.data(), ctx.data_end(), ethertype) {
             return Ok(xdp_action::XDP_DROP);
         }
         return Ok(xdp_action::XDP_PASS);
