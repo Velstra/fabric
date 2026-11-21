@@ -1,7 +1,5 @@
 #![no_std]
 #![no_main]
-#![cfg_attr(target_arch = "bpf", feature(core_intrinsics))]
-#![cfg_attr(target_arch = "bpf", allow(internal_features))]
 
 //! # Velstra data plane (XDP)
 //!
@@ -617,9 +615,6 @@ static NAT_INSERT_SCRATCH: PerCpuArray<FlowState> = PerCpuArray::with_max_entrie
 /// | lifetime bits << 16 | accounted bytes << 32 (one packet when nonzero).
 #[inline(never)]
 fn publish_nat(key: &FlowKey, nat_ip: u32, ports: u32, nat2_ip: u32, meta: u64) -> bool {
-    if !napt_domain::unbounded() {
-        return false;
-    }
     let Some(state) = NAT_INSERT_SCRATCH.get_ptr_mut(0) else {
         return false;
     };
@@ -678,16 +673,14 @@ fn nat_meta(flags: u16, lifetime: u16, bytes: u64) -> u64 {
 /// must never replace the endpoint that won a concurrent allocation race.
 #[inline(never)]
 fn claim_masquerade_nat(key: &FlowKey, original: &FlowState, bytes: u64) -> i32 {
-    if !napt_domain::unbounded() {
-        return -12;
-    }
-    claim_marked_masquerade_nat(key, original, bytes)
+    insert_masquerade_binding(key, original, bytes)
 }
 
-/// Only the complete-domain allocator may call this after publishing its
-/// displacement bound. Other writers must invalidate the bound first.
+/// The NOEXIST insert behind `claim_masquerade_nat`, inlined into the
+/// standalone allocator's loop callback; other claimants use the
+/// out-of-line wrapper.
 #[inline(always)]
-fn claim_marked_masquerade_nat(key: &FlowKey, original: &FlowState, bytes: u64) -> i32 {
+fn insert_masquerade_binding(key: &FlowKey, original: &FlowState, bytes: u64) -> i32 {
     let Some(state) = NAT_INSERT_SCRATCH.get_ptr_mut(0) else {
         return -12;
     };
@@ -738,9 +731,6 @@ const HAIRPIN_PROBES: u16 = 4;
 /// `flow` is the router-NAT forward key of the client's first packet.
 #[inline(never)]
 fn claim_hairpin_port(flow: &FlowKey, target: &PortFwd, control: u8) -> u16 {
-    if !napt_domain::unbounded() {
-        return 0;
-    }
     let Some(claim) = HAIRPIN_SCRATCH.get_ptr_mut(0) else {
         return 0;
     };
@@ -3044,7 +3034,18 @@ fn masquerade_egress(
         None => CgnatLayout::default(),
     };
     let flow = FlowKey::new(policy_id, src_addr, dst_addr, src_port, dst_port, proto);
-    let mut wan_port = existing_napt_port(&flow, reply_target, wan_ip, &layout, seed);
+    // Standalone: the flow's own probe window first (PERF-02). An established
+    // flow stops at its binding; a new one has proved there is none, so the
+    // claim below need not search again.
+    let standalone = napt_domain::enabled();
+    let mut wan_port = if standalone {
+        napt_domain::existing(&flow, wan_ip, &layout)
+    } else {
+        0
+    };
+    if wan_port == 0 {
+        wan_port = existing_napt_port(&flow, reply_target, wan_ip, &layout, seed);
+    }
     if wan_port == 0 {
         wan_port = existing_napt_port(
             &flow,
@@ -3068,11 +3069,12 @@ fn masquerade_egress(
     // DP-08: only a connection opener may allocate. A non-SYN TCP segment with
     // no binding (an ACK/XMAS/NULL flood, or a flow whose binding is gone)
     // must not evict other clients' bindings from the shared LRU map.
-    // The complete-domain allocator may have placed the binding outside the
-    // seed's candidate window searched above, so look it up read-only first.
+    // The HA window may have placed the binding beyond the eight candidates
+    // searched above, so look it up read-only first; the standalone window
+    // was searched in full already.
     if wan_port == 0 && proto == ip_proto::TCP && !FirewallState::is_opener(proto, control) {
-        let found = if napt_domain::enabled() {
-            napt_domain::existing(&flow, wan_ip, &layout)
+        let found = if standalone {
+            0
         } else {
             napt_domain::existing_window(&flow, wan_ip, &layout, napt_domain::HA_WINDOW)
         };
@@ -3086,7 +3088,7 @@ fn masquerade_egress(
         existing = true;
     }
     if wan_port == 0 {
-        let result = if napt_domain::enabled() {
+        let result = if standalone {
             napt_domain::allocate(&flow, wan_ip, &layout, bytes)
         } else {
             // DP-26: the exact legacy eight-candidate claim first (identical

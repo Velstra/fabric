@@ -91,9 +91,9 @@ pub use lb::{
 };
 pub use mac::{MacError, parse_mac};
 pub use masquerade::{
-    MasqueradeCommit, NaptClaim, NaptDomain, NaptSlot, UNADDRESSED, legacy_napt_seed,
-    masquerade_commit, napt_binding_matches, napt_claim, napt_find_existing, napt_port,
-    napt_search_count, napt_seed, napt_slot, nat_entry_replaceable, unaddressed_uplink_drops,
+    MasqueradeCommit, NAPT_WINDOW, NaptClaim, NaptDomain, NaptSlot, UNADDRESSED, legacy_napt_seed,
+    masquerade_commit, napt_binding_matches, napt_claim, napt_find_existing, napt_port, napt_seed,
+    napt_slot, nat_entry_replaceable, unaddressed_uplink_drops,
 };
 pub use mss::{ipv6_mss_ceiling, mss_clamp_csum_operands};
 pub use npt::{Npt66, npt66_rewrite, oc_add};

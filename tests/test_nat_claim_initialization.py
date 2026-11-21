@@ -63,7 +63,7 @@ fn unchanged_fields_accounting_padding_and_publication_errors() {
                     expected.age_ns = 0;
                     ERROR.set(error);
                     WRITTEN.replace(None);
-                    assert_eq!(claim_marked_masquerade_nat(&key, &original, increment), error);
+                    assert_eq!(insert_masquerade_binding(&key, &original, increment), error);
                     let actual = WRITTEN.take().expect("claim must attempt publication");
                     assert_eq!(actual.0, key);
                     assert_eq!(actual.1, expected);
@@ -76,7 +76,7 @@ fn unchanged_fields_accounting_padding_and_publication_errors() {
     }
     MISSING.set(true);
     WRITTEN.replace(None);
-    assert_eq!(claim_marked_masquerade_nat(&key, &FlowState::masquerade([0; 4], 0), 1), -12);
+    assert_eq!(insert_masquerade_binding(&key, &FlowState::masquerade([0; 4], 0), 1), -12);
     assert!(WRITTEN.take().is_none());
 }
 '''
@@ -85,8 +85,8 @@ fn unchanged_fields_accounting_padding_and_publication_errors() {
 class NatClaimInitialization(unittest.TestCase):
     def test_actual_rust_function_preserves_old_result(self):
         source = (ROOT / "velstra-ebpf/src/main.rs").read_text()
-        function = "fn claim_marked_masquerade_nat(" + source.split(
-            "fn claim_marked_masquerade_nat(", 1
+        function = "fn insert_masquerade_binding(" + source.split(
+            "fn insert_masquerade_binding(", 1
         )[1].split("\n#[repr(C)]", 1)[0]
         rustc = os.environ.get("RUSTC", "rustc")
         with tempfile.TemporaryDirectory(prefix="fabric-claim-contract-") as temporary:
