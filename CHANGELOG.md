@@ -19,6 +19,16 @@
   one remote ip:port is 0 at 90 % of its 32768-port domain, 0.15 % at 95 %
   and 27 % at 99 %. Flows to different endpoints never compete. Replicated
   (HA) configurations keep their allocator unchanged. No pinned map changes.
+- **A reused client port no longer shortens its masquerade binding's hold.**
+  A binding's lifetime marks (half-open, closed, reset) only accumulated, so
+  after one connection on a client tuple ended in a reset, a later clean
+  close on the same tuple kept the 30 s reset lifetime instead of the 120 s
+  clean-close hold. The public port could then go to another client while
+  the server still held the old connection in TIME_WAIT (60 s), which left
+  the new connection hanging with no SYN-ACK. A bare SYN from the inside
+  client over a closed or reset binding now starts its lifetime afresh, as
+  Linux conntrack does when a SYN reopens a closed entry. A SYN on a live
+  binding, or one arriving from outside, changes nothing.
 - **Source-only blocklists (DP-15).** `blocklist_ingress_only = true` on a
   `[[policy]]` (or at the top level) makes its blocklist name sources only:
   the egress hook no longer matches it against destinations, and a listed
