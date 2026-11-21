@@ -4153,12 +4153,33 @@ fn admitted_vnis(cfg: &RuntimeConfig) -> BTreeSet<u32> {
         .collect()
 }
 
-/// Map each configured interface to its policy id (`IFACE_POLICY`) and overlay
-/// segment (`IFACE_VNI`). The two are independent: a port's firewall ruleset and
-/// its virtual network are separate concerns.
+/// Kernel link types (`/sys/class/net/<dev>/type`, `ARPHRD_*` in
+/// `linux/if_arp.h`) whose frames start at the IP header, with no Ethernet
+/// header in front. Every L3 device Sentinel or the fabric agent attaches to
+/// is one of these:
+///
+/// | type    | value | devices                                          |
+/// |---------|-------|--------------------------------------------------|
+/// | PPP     | 512   | PPPoE (`ppp*`), L2TP/PPP                         |
+/// | RAWIP   | 519   | cellular modems (qmi_wwan, rmnet)                |
+/// | TUNNEL  | 768   | `ipip`, `vti`                                    |
+/// | TUNNEL6 | 769   | `ip6tnl`, `vti6`                                 |
+/// | SIT     | 776   | `sit` (6in4, 6to4, ISATAP)                       |
+/// | IPGRE   | 778   | `gre`                                            |
+/// | IP6GRE  | 823   | `ip6gre`                                         |
+/// | NONE    | 65534 | WireGuard, `tun`, `xfrm` (route-based IPsec)     |
+///
+/// `gretap`, `ip6gretap`, ERSPAN, VXLAN, Geneve, MACsec, L2TPv3 pseudowires,
+/// MACVLAN, VLANs, bridges and bonds are Ethernet (1); the loopback (772)
+/// carries a zeroed Ethernet header. A raw-IP link missing from this list is
+/// classified as Ethernet: its IP source address is read as the EtherType, so
+/// it is either dropped as an unknown EtherType or, without fail-closed,
+/// passed without a policy decision. GRE (778) was missing until this list
+/// was audited, and inner GRE traffic bypassed zone policy that way.
+const RAW_IP_LINK_TYPES: [u32; 8] = [512, 519, 768, 769, 776, 778, 823, 65534];
+
 fn raw_ip_link(kind: u32) -> bool {
-    // Linux ARPHRD_PPP, RAWIP, TUNNEL, TUNNEL6, SIT, NONE (WireGuard/TUN).
-    matches!(kind, 512 | 519 | 768 | 769 | 776 | 65534)
+    RAW_IP_LINK_TYPES.contains(&kind)
 }
 
 fn program_link_layer(ebpf: &mut Ebpf, name: &str) -> Result<bool> {
@@ -4181,6 +4202,9 @@ fn program_link_layer(ebpf: &mut Ebpf, name: &str) -> Result<bool> {
     Ok(raw)
 }
 
+/// Map each configured interface to its policy id (`IFACE_POLICY`) and overlay
+/// segment (`IFACE_VNI`). The two are independent: a port's firewall ruleset and
+/// its virtual network are separate concerns.
 fn program_interfaces(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Result<()> {
     let mut raw_links = HashSet::new();
     for iface in interfaces {
@@ -7410,14 +7434,51 @@ mod tests {
         assert!(!keys.contains(&local_egress_address_key(11, [10, 1, 0, 1])));
     }
 
+    /// Every link kind the datapath attaches to, with the `ARPHRD_*` type the
+    /// kernel gives it (`dev->type`, set in each driver's setup function), and
+    /// whether frames on it start at the IP header. A kind added to the
+    /// appliance belongs here; a raw-IP type missing from `RAW_IP_LINK_TYPES`
+    /// fails this test instead of silently classifying IP bytes as Ethernet.
     #[test]
-    fn raw_ip_kernel_types_do_not_use_ethernet_classification() {
-        for kind in [512, 519, 768, 769, 776, 65534] {
-            assert!(raw_ip_link(kind));
+    fn every_appliance_link_kind_is_classified_by_its_kernel_type() {
+        const ETHER: u32 = 1;
+        let kinds: [(&str, u32, bool); 26] = [
+            ("ethernet", ETHER, false),
+            ("vlan", ETHER, false),
+            ("bridge", ETHER, false),
+            ("bond", ETHER, false),
+            ("dummy", ETHER, false),
+            ("macvlan", ETHER, false),
+            ("macsec", ETHER, false),
+            ("veth", ETHER, false),
+            ("vxlan", ETHER, false),
+            ("geneve", ETHER, false),
+            ("gretap", ETHER, false),
+            ("ip6gretap", ETHER, false),
+            ("erspan", ETHER, false),
+            ("l2tpeth", ETHER, false),
+            ("loopback", 772, false),
+            ("ppp", 512, true),
+            ("rawip", 519, true),
+            ("ipip", 768, true),
+            ("vti", 768, true),
+            ("ip6tnl", 769, true),
+            ("vti6", 769, true),
+            ("sit", 776, true),
+            ("gre", 778, true),
+            ("ip6gre", 823, true),
+            ("wireguard", 65534, true),
+            ("xfrm", 65534, true),
+        ];
+        for (kind, arphrd, raw) in kinds {
+            assert_eq!(raw_ip_link(arphrd), raw, "{kind} (ARPHRD {arphrd})");
         }
-        for kind in [1, 772] {
-            assert!(!raw_ip_link(kind));
-        }
+        // `tun` (L3 mode) is ARPHRD_NONE as well, covered by the 65534 row.
+        assert!(
+            RAW_IP_LINK_TYPES
+                .iter()
+                .all(|t| kinds.iter().any(|k| k.1 == *t && k.2))
+        );
     }
 
     #[test]

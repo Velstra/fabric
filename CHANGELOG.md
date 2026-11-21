@@ -4,6 +4,15 @@
 
 ### Fixed
 
+- **GRE tunnels are classified as raw-IP links.** The agent decides from the
+  kernel link type whether a frame starts at an Ethernet header, and its list
+  lacked `gre` (ARPHRD 778) and `ip6gre` (823). A packet on a GRE tunnel was
+  therefore parsed as Ethernet: its IPv4 source bytes were read as the
+  EtherType. Under fail-closed (DP-22) every such packet was dropped, so a
+  zoned GRE tunnel carried nothing; before DP-22 the same misreading let the
+  tunnel's inner traffic past zone policy unfiltered (fail-open). The list is
+  now named and audited against every link kind the datapath attaches to,
+  with a test that fails when a raw-IP type is missing.
 - **Masquerade new-connection rate no longer collapses (PERF-02).** The
   standalone port allocator claims only within a fixed window of 128 probes
   per flow, scattered over the source's port domain (its CGNAT block, or
