@@ -1177,8 +1177,11 @@ impl Firewall {
             .as_ref()
             .map(|persist| persist.pin_program_arrays(&ebpf))
             .transpose()?;
+        // A primary link that does not exist yet is attached when it appears
+        // (`reconcile_links`, which a commit runs once the network is applied).
+        let present = present_interfaces(ifaces, if_nametoindex)?;
         // Link-layer framing before the first packet can reach the program.
-        for name in ifaces {
+        for name in &present {
             program_link_layer(&mut ebpf, name)?;
         }
         // The policy is programmed and every ingress tail call registered, so
@@ -1201,9 +1204,9 @@ impl Firewall {
             .load()
             .context("loading XDP program into the kernel")?;
 
-        let mut attached = Vec::with_capacity(ifaces.len());
+        let mut attached = Vec::with_capacity(present.len());
         let mut xdp_links = BTreeMap::new();
-        for iface in ifaces {
+        for iface in &present {
             if xdp_links.contains_key(iface) {
                 continue;
             }
@@ -4151,6 +4154,35 @@ fn admitted_vnis(cfg: &RuntimeConfig) -> BTreeSet<u32> {
         .chain(cfg.irb_routes.iter().map(|r| r.l3_vni))
         .filter(|vni| *vni != 0)
         .collect()
+}
+
+/// The primary interfaces that exist right now, in order; `lookup` is
+/// [`if_nametoindex`]. Sentinel names the first zoned link as the agent's
+/// uplink, and in a commit that creates it — a GRE tunnel, a VLAN, a bridge —
+/// the agent restarts before networkd has made the device. Attaching it then
+/// failed start-up outright ("interface \"tun0\" not found"), the readiness
+/// probe failed and the commit rolled back. A missing link is skipped with a
+/// warning and attached by [`Firewall::reconcile_links`] once it appears; any
+/// other lookup failure still refuses to start.
+fn present_interfaces(
+    ifaces: &[String],
+    lookup: impl Fn(&str) -> Result<u32>,
+) -> Result<Vec<String>> {
+    let mut present = Vec::with_capacity(ifaces.len());
+    for name in ifaces {
+        match lookup(name) {
+            Ok(_) => present.push(name.clone()),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(interface_missing) =>
+            {
+                warn!("interface {name} does not exist yet; attaching it when it appears");
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(present)
 }
 
 /// Kernel link types (`/sys/class/net/<dev>/type`, `ARPHRD_*` in
@@ -7432,6 +7464,35 @@ mod tests {
         assert!(keys.contains(&local_egress_address_key(10, [10, 1, 0, 100])));
         assert!(!keys.contains(&local_egress_address_key(10, [10, 2, 0, 10])));
         assert!(!keys.contains(&local_egress_address_key(11, [10, 1, 0, 1])));
+    }
+
+    /// A primary link that does not exist yet is skipped (and attached later by
+    /// `reconcile_links`); one that exists is kept in order; any other lookup
+    /// error still fails start-up.
+    #[test]
+    fn startup_skips_only_primary_interfaces_that_do_not_exist_yet() {
+        let names = ["eth0", "tun0", "eth1"].map(String::from);
+        let lookup = |name: &str| match name {
+            "tun0" => Err(
+                anyhow::Error::from(std::io::Error::from_raw_os_error(libc::ENODEV))
+                    .context("interface \"tun0\" not found"),
+            ),
+            _ => Ok(7),
+        };
+        assert_eq!(
+            present_interfaces(&names, lookup).unwrap(),
+            vec!["eth0".to_string(), "eth1".to_string()]
+        );
+        let broken =
+            |_: &str| -> Result<u32> { Err(std::io::Error::from_raw_os_error(libc::EPERM).into()) };
+        assert!(present_interfaces(&names, broken).is_err());
+        // The real lookup reports a missing link the same way.
+        let absent = ["velstra-absent0".to_string()];
+        assert!(
+            present_interfaces(&absent, if_nametoindex)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// Every link kind the datapath attaches to, with the `ARPHRD_*` type the
