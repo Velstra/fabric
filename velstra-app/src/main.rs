@@ -77,7 +77,12 @@ enum Command {
 struct RunArgs {
     /// Network interface to attach to. Repeat `--iface` to attach to several
     /// (e.g. the client-facing and backend-facing NICs) so bidirectional NAT
-    /// state is shared across them. Required unless `--auto-attach` is set.
+    /// state is shared across them. At least one is required unless
+    /// `--auto-attach` or `--controller` is set. One that does not exist yet at
+    /// start (a VLAN, bridge or tunnel still being created) is not an error:
+    /// the agent warns, attaches it when it appears, warns again every minute
+    /// while it is missing and lists it in the `missing-interfaces` query. Any
+    /// other failure to look an interface up still stops the agent.
     #[arg(short, long, num_args = 1..)]
     iface: Vec<String>,
 
@@ -429,7 +434,9 @@ async fn run(args: RunArgs) -> Result<()> {
     // before the CNI creates it, and a file-config appliance (e.g. a
     // firewall/router) names every zoned NIC + VLAN it must filter and NAT on,
     // which `--iface` alone (one primary) would otherwise miss.
-    if !args.controllers.is_empty() || args.config.is_some() {
+    // The same poll attaches a primary `--iface` that did not exist at start.
+    let primary_waiting = !firewall.lock().await.waiting_primaries().is_empty();
+    if !args.controllers.is_empty() || args.config.is_some() || primary_waiting {
         tokio::spawn(config_attach_loop(firewall.clone(), args.xdp_mode));
     }
 
@@ -768,6 +775,7 @@ async fn config_attach_loop(firewall: Arc<Mutex<Firewall>>, mode: AttachMode) {
         drop(wait);
         let _hold = firewall::timing::Span::start(firewall::timing::Phase::ReconcileLockHold);
         fw.reconcile_config_interfaces(&present, mode);
+        fw.attach_waiting_primaries();
     }
 }
 
