@@ -517,8 +517,9 @@ fn account_flow(key: &FlowKey, bytes: u64, control: u8) -> Option<FlowState> {
     }
 }
 
-/// Advance a masquerade binding's TCP lifetime for one translated segment;
-/// `created` marks the packet that just inserted it (DP-07).
+/// Advance a masquerade binding's TCP lifetime for one segment the inside
+/// client sent; `created` marks the packet that just inserted it (DP-07). A
+/// bare SYN on a reused tuple starts the lifetime afresh (`nat_lifetime::reopen`).
 #[inline(never)]
 fn nat_lifetime_update(key: &FlowKey, control: u8, created: bool) {
     if key.proto != ip_proto::TCP {
@@ -531,7 +532,7 @@ fn nat_lifetime_update(key: &FlowKey, control: u8, created: bool) {
         if created {
             // Only this CPU knows the binding yet: its first segment is a SYN.
             (*entry)._pad = nat_lifetime::opening(key.proto, control);
-        } else if let Some(bits) = nat_lifetime::update((*entry)._pad, key.proto, control) {
+        } else if let Some(bits) = nat_lifetime::reopen((*entry)._pad, key.proto, control) {
             // Write only on change: see `nat_lifetime::update`.
             (*entry)._pad = bits;
         }
