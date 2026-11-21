@@ -77,7 +77,7 @@ use aya_log_ebpf::info;
 use conntrack::{
     ct_classify, ct_control, ct_cookie_admitted, ct_is_answer, ct_is_routed_reply, ct_key4,
     ct_key6, ct_record, ct_record_wire4, ct_router_normalize, ct_router_open, ct_seed_reply,
-    ct_verify_reset,
+    ct_synproxy_acked, ct_verify_reset,
 };
 use network_types::{
     eth::EthHdr,
@@ -463,9 +463,12 @@ fn syn_secret() -> Option<[u64; 2]> {
 /// key is identical on both sides of a destination NAT. A port-forward that
 /// rewrites the address is therefore transparent here, and the same lookup
 /// serves the client's packets (where the protected port is the destination) and
-/// the server's (where it is the source). The namespace is the policy-independent
-/// one for the same reason conntrack's router-NAT entries are — the two
-/// directions arrive through different zones.
+/// the server's (where it is the source). `service_port` is the port the
+/// SERVER uses: a forward that also rewrites the port (8080 -> 80) has the
+/// client's half resolve it before keying (see [`server_port`]), because the
+/// server's half only ever sees the translated one. The namespace is the
+/// policy-independent one for the same reason conntrack's router-NAT entries
+/// are — the two directions arrive through different zones.
 #[inline(always)]
 fn syn_flow_key(client: [u8; 4], client_port: u16, service_port: u16) -> FlowKey {
     FlowKey::new(
@@ -4465,8 +4468,16 @@ fn try_velstra_forward(ctx: &XdpContext) -> Result<u32, ()> {
     // handshake is answered here without the server ever hearing about it, and
     // because the ACK that admits a connection leaves as a SYN which the
     // port-forward and routing phases below then treat as any other new flow.
-    if !link_layer::raw_ip(ctx.ingress_ifindex() as u32)
-        && let Some(action) = try_synproxy(
+    //
+    // The SCRATCH copy of the IP header predates the proxy. When it rewrites the
+    // admitting ACK into a SYN, the header's TTL and checksum are new, and every
+    // stage below that patches the header incrementally must start from the
+    // packet as it now is: a stale base made the port-forward's DNAT emit a SYN
+    // with a wrong header checksum, which the kernel then dropped (DP-31).
+    let mut ttl = s.ttl;
+    let mut ip_checksum = s.checksum;
+    if !link_layer::raw_ip(ctx.ingress_ifindex() as u32) {
+        match try_synproxy(
             ctx,
             ihl_bytes,
             s.policy_id,
@@ -4475,9 +4486,15 @@ fn try_velstra_forward(ctx: &XdpContext) -> Result<u32, ()> {
             s.src_port,
             s.dst_port,
             s.proto,
-        )?
-    {
-        return Ok(action);
+            s.has_port_forward != 0,
+        )? {
+            SynProxyStep::Done(action) => return Ok(action),
+            SynProxyStep::Opened => {
+                ttl = unsafe { *ptr_at::<u8>(ctx, O_IP_TTL)? };
+                ip_checksum = u16::from_be_bytes(unsafe { *ptr_at::<[u8; 2]>(ctx, O_IP_CSUM)? });
+            }
+            SynProxyStep::Continue => {}
+        }
     }
 
     if s.vni != 0 {
@@ -4498,8 +4515,17 @@ fn try_velstra_forward(ctx: &XdpContext) -> Result<u32, ()> {
     // overlay wire format per host); a miss falls through unchanged.
     let scfg = srv6_config();
     if let Some(action) = try_srv6_encap(
-        ctx, &scfg, s.vni, s.src_addr, s.dst_addr, s.src_port, s.dst_port, s.proto, s.ttl,
-        s.checksum, log,
+        ctx,
+        &scfg,
+        s.vni,
+        s.src_addr,
+        s.dst_addr,
+        s.src_port,
+        s.dst_port,
+        s.proto,
+        ttl,
+        ip_checksum,
+        log,
     )? {
         return Ok(action);
     }
@@ -4509,8 +4535,17 @@ fn try_velstra_forward(ctx: &XdpContext) -> Result<u32, ()> {
     // and redirect it onto the underlay. A miss means "local" — fall through to
     // ordinary switching/routing.
     if let Some(action) = try_encap(
-        ctx, &ocfg, s.vni, s.src_addr, s.dst_addr, s.src_port, s.dst_port, s.proto, s.ttl,
-        s.checksum, log,
+        ctx,
+        &ocfg,
+        s.vni,
+        s.src_addr,
+        s.dst_addr,
+        s.src_port,
+        s.dst_port,
+        s.proto,
+        ttl,
+        ip_checksum,
+        log,
     )? {
         return Ok(action);
     }
@@ -4525,7 +4560,14 @@ fn try_velstra_forward(ctx: &XdpContext) -> Result<u32, ()> {
         && let Some(target) = lookup_port_forward(s.policy_id, s.proto, s.dst_port)
     {
         if let Some(action) = try_port_forward(
-            ctx, ihl_bytes, s.src_addr, s.dst_addr, s.src_port, s.dst_port, s.proto, s.checksum,
+            ctx,
+            ihl_bytes,
+            s.src_addr,
+            s.dst_addr,
+            s.src_port,
+            s.dst_port,
+            s.proto,
+            ip_checksum,
             target,
         )? {
             return Ok(action);
@@ -4543,7 +4585,7 @@ fn try_velstra_forward(ctx: &XdpContext) -> Result<u32, ()> {
         s.src_port,
         s.dst_port,
         s.proto,
-        s.checksum,
+        ip_checksum,
         log,
     )? {
         return Ok(action);
@@ -4563,7 +4605,7 @@ fn try_velstra_forward(ctx: &XdpContext) -> Result<u32, ()> {
             ScopedAddr::new(s.policy_id, lpm_key_addr(s.dst_addr)),
         ))
         .copied();
-    match plan_forward(s.ttl, s.checksum, s.proto, route) {
+    match plan_forward(ttl, ip_checksum, s.proto, route) {
         ForwardOutcome::Pass => {}
         ForwardOutcome::TtlExceeded => {
             bump(Counter::ForwardTtlExceeded);
@@ -6895,13 +6937,27 @@ fn write_tcp_u32(ctx: &XdpContext, offset: usize, old: u32, new: u32) -> Result<
     Ok(())
 }
 
-/// C15 **SYN proxy**. Returns `Ok(Some(action))` when the segment was handled
-/// here, or `Ok(None)` to continue through the ordinary forwarding path — the
-/// latter possibly after having rewritten the segment.
+/// What [`try_synproxy`] did with a segment.
+enum SynProxyStep {
+    /// Forward it through the ordinary path: not a proxied segment, or one
+    /// whose TCP sequence fields were translated in place.
+    Continue,
+    /// The ACK that proved the client was rewritten into the SYN that opens
+    /// the server's connection. Its IP header is new — TTL, identification,
+    /// length and checksum — so the stages after the proxy must read it from
+    /// the packet, not from the copy taken before.
+    Opened,
+    /// Answered or dropped here.
+    Done(u32),
+}
+
+/// C15 **SYN proxy**. See [`SynProxyStep`] for the outcomes.
 ///
 /// Both directions of a proxied connection pass through here, distinguished by
 /// which end of the packet carries the protected port. Everything else is
 /// untouched: a port with no proxy configured costs one failed hash lookup.
+/// `forwarded` says a port-forward applies to the packet, so the server answers
+/// from the port it forwards to rather than the one the client dialled.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn try_synproxy(
@@ -6913,14 +6969,15 @@ fn try_synproxy(
     src_port: u16,
     dst_port: u16,
     proto: u8,
-) -> Result<Option<u32>, ()> {
+    forwarded: bool,
+) -> Result<SynProxyStep, ()> {
     // Only TCP over a plain 20-byte IPv4 header: every offset below is a
     // compile-time constant, which is what the verifier accepts.
     if proto != ip_proto::TCP || ihl_bytes != Ipv4Hdr::LEN {
-        return Ok(None);
+        return Ok(SynProxyStep::Continue);
     }
     let Some(secret) = syn_secret() else {
-        return Ok(None);
+        return Ok(SynProxyStep::Continue);
     };
 
     // The two directions are resolved one after the other, never together, and
@@ -6936,16 +6993,51 @@ fn try_synproxy(
         let flags = unsafe { *ptr_at::<u8>(ctx, O_TCP_FLAGS)? };
         let seq = u32::from_be_bytes(unsafe { *ptr_at::<[u8; 4]>(ctx, O_TCP_SEQ)? });
         let ack = u32::from_be_bytes(unsafe { *ptr_at::<[u8; 4]>(ctx, O_TCP_ACK)? });
+        // Both halves key the connection by the port the SERVER uses, the one
+        // its packets carry on the way back: the client's when a forward keeps
+        // it, the forward's target when it remaps one (8080 -> 80).
+        let service_port = if forwarded {
+            server_port(policy_id, dst_port)
+        } else {
+            dst_port
+        };
         return synproxy_client(
-            ctx, secret, cfg, src_addr, dst_addr, src_port, dst_port, flags, seq, ack,
+            ctx,
+            secret,
+            cfg,
+            src_addr,
+            dst_addr,
+            src_port,
+            dst_port,
+            service_port,
+            flags,
+            seq,
+            ack,
         );
     }
     if !synproxy_protects(src_port) {
-        return Ok(None);
+        return Ok(SynProxyStep::Continue);
     }
     let flags = unsafe { *ptr_at::<u8>(ctx, O_TCP_FLAGS)? };
     let seq = u32::from_be_bytes(unsafe { *ptr_at::<[u8; 4]>(ctx, O_TCP_SEQ)? });
-    synproxy_server(ctx, src_addr, dst_addr, src_port, dst_port, flags, seq)
+    synproxy_server(
+        ctx, policy_id, src_addr, dst_addr, src_port, dst_port, flags, seq,
+    )
+}
+
+/// The port a server behind the port-forward for `port` answers from: the
+/// forward's target port, or `port` itself when the forward keeps it. Only the
+/// port is read out of the map value — copying the whole forward would cost
+/// the forwarding tail stack it does not have — and it leaves as a plain
+/// scalar, so no map-value pointer outlives the lookup (see the note in
+/// [`try_synproxy`]).
+#[inline(always)]
+fn server_port(policy: PolicyId, port: u16) -> u16 {
+    let key = ScopedPortKey::new(policy, ip_proto::TCP, port);
+    match unsafe { PORT_FORWARDS.get(key) } {
+        Some(target) if target.port != 0 => target.port,
+        _ => port,
+    }
 }
 
 /// The proxy configured for a port for clients arriving under `policy`,
@@ -6965,7 +7057,9 @@ fn synproxy_protects(port: u16) -> bool {
 
 /// The client-facing half: answer a SYN with a cookie, admit an ACK that
 /// returns a valid one, and translate the acknowledgements of an admitted
-/// connection into the server's sequence space.
+/// connection into the server's sequence space. `service_port` is the port
+/// the server's half will see (see [`server_port`]); the cookie stays bound to
+/// the port the client dialled.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn synproxy_client(
@@ -6976,10 +7070,11 @@ fn synproxy_client(
     dst_addr: [u8; 4],
     src_port: u16,
     dst_port: u16,
+    service_port: u16,
     flags: u8,
     seq: u32,
     ack: u32,
-) -> Result<Option<u32>, ()> {
+) -> Result<SynProxyStep, ()> {
     let epoch = epoch_of(unsafe { bpf_ktime_get_ns() });
 
     // A bare SYN is answered, never forwarded, and costs no state at all. This
@@ -6992,33 +7087,33 @@ fn synproxy_client(
         let plan = plan_syn_ack(src_addr, dst_addr, src_port, dst_port, seq, cookie, cfg.mss);
         write_synth(ctx, plan, dst_addr, src_addr, dst_port, src_port, true)?;
         bump(Counter::SynproxyChallenged);
-        return Ok(Some(xdp_action::XDP_TX));
+        return Ok(SynProxyStep::Done(xdp_action::XDP_TX));
     }
 
-    let key = syn_flow_key(src_addr, src_port, dst_port);
+    let key = syn_flow_key(src_addr, src_port, service_port);
     if let Some(flow) = unsafe { SYN_FLOWS.get(&key) }.copied() {
         if !flow.is_spliced() {
             // The server has not answered yet, so there is no sequence space to
             // translate into. Dropping is right: TCP retransmits, and by then
             // the splice is done. Forwarding untranslated would corrupt it.
-            return Ok(Some(xdp_action::XDP_DROP));
+            return Ok(SynProxyStep::Done(xdp_action::XDP_DROP));
         }
         let translated = translate_to_server(ack, flow.delta);
         write_tcp_u32(ctx, O_TCP_ACK, ack, translated)?;
-        return Ok(None);
+        return Ok(SynProxyStep::Continue);
     }
 
     // No state: this must be the ACK that completes the handshake we faked.
     if flags & tcp_flags::ACK == 0 || flags & tcp_flags::SYN != 0 {
         bump(Counter::SynproxyRejected);
-        return Ok(Some(xdp_action::XDP_DROP));
+        return Ok(SynProxyStep::Done(xdp_action::XDP_DROP));
     }
     let cookie = ack.wrapping_sub(1);
     let Some(mss) = check_cookie(
         secret, src_addr, dst_addr, src_port, dst_port, epoch, cookie,
     ) else {
         bump(Counter::SynproxyRejected);
-        return Ok(Some(xdp_action::XDP_DROP));
+        return Ok(SynProxyStep::Done(xdp_action::XDP_DROP));
     };
 
     // The client is real. Open the connection to the server by turning this very
@@ -7043,33 +7138,35 @@ fn synproxy_client(
         // another packet may already own; transactional recovery is separate.
         bump(Counter::FirewallStateWriteFailed);
         bump(Counter::SynproxyRejected);
-        return Ok(Some(xdp_action::XDP_DROP));
+        return Ok(SynProxyStep::Done(xdp_action::XDP_DROP));
     }
     let plan = plan_server_syn(src_addr, dst_addr, src_port, dst_port, client_isn, mss);
     write_synth(ctx, plan, src_addr, dst_addr, src_port, dst_port, false)?;
     bump(Counter::SynproxyAdmitted);
     // Fall through: the ordinary path forwards this SYN, applying whatever
     // destination NAT and routing the configuration calls for.
-    Ok(None)
+    Ok(SynProxyStep::Opened)
 }
 
 /// The server-facing half: complete the handshake the server thinks it is
 /// having, and translate its sequence numbers back into the space the client
-/// was promised.
+/// was promised. `policy` is the one the server's packet arrived under.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn synproxy_server(
     ctx: &XdpContext,
+    policy: PolicyId,
     src_addr: [u8; 4],
     dst_addr: [u8; 4],
     src_port: u16,
     dst_port: u16,
     flags: u8,
     seq: u32,
-) -> Result<Option<u32>, ()> {
+) -> Result<SynProxyStep, ()> {
     // Here the client is the packet's *destination*.
     let key = syn_flow_key(dst_addr, dst_port, src_port);
     let Some(mut flow) = unsafe { SYN_FLOWS.get(&key) }.copied() else {
-        return Ok(None);
+        return Ok(SynProxyStep::Continue);
     };
 
     if flags & tcp_flags::SYN != 0 && flags & tcp_flags::ACK != 0 {
@@ -7082,16 +7179,34 @@ fn synproxy_server(
             let _ = SYN_FLOWS.insert(&key, &flow, 0);
             bump(Counter::SynproxySpliced);
         }
+        // The ACK below never crosses an egress hook, so the state the
+        // server's own packets are judged by learns of it here. Without this
+        // the connection stays half-open for the firewall until the client
+        // sends something, and a server that speaks first is refused. Fail
+        // closed as the client half does: the server retransmits its SYN-ACK.
+        if ct_synproxy_acked(&FlowKey::new(
+            policy,
+            src_addr,
+            dst_addr,
+            src_port,
+            dst_port,
+            ip_proto::TCP,
+        ))
+        .failed()
+        {
+            bump(Counter::FirewallStateWriteFailed);
+            return Ok(SynProxyStep::Done(xdp_action::XDP_DROP));
+        }
         let plan = plan_server_ack(src_addr, dst_addr, src_port, dst_port, seq, flow.client_isn);
         write_synth(ctx, plan, dst_addr, src_addr, dst_port, src_port, true)?;
-        return Ok(Some(xdp_action::XDP_TX));
+        return Ok(SynProxyStep::Done(xdp_action::XDP_TX));
     }
 
     if flow.is_spliced() {
         let translated = translate_to_client(seq, flow.delta);
         write_tcp_u32(ctx, O_TCP_SEQ, seq, translated)?;
     }
-    Ok(None)
+    Ok(SynProxyStep::Continue)
 }
 
 /// Phase 3 **reject**: actively refuse a packet. For a TCP segment, rewrite the

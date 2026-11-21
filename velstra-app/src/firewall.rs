@@ -3913,7 +3913,10 @@ fn apply_config_quiesced(
     program_services(ebpf, &cfg.services, &cfg.interfaces, &prepared.ipv4)?;
     program_port_forwards(ebpf, &cfg.port_forwards, &cfg.interfaces, &prepared.ipv4)?;
     let policy_ids: Vec<PolicyId> = cfg.policies.iter().map(|p| p.id).collect();
-    program_synproxy(ebpf, &synproxy_entries(&cfg.synproxy, &policy_ids))?;
+    program_synproxy(
+        ebpf,
+        &synproxy_entries(&cfg.synproxy, &cfg.port_forwards, &policy_ids),
+    )?;
     program_masquerade(ebpf, &cfg.interfaces, &prepared.ipv4)?;
     program_mss_clamp(ebpf, &cfg.interfaces)?;
     program_port_bindings(ebpf, &cfg.interfaces)?;
@@ -4515,10 +4518,13 @@ fn program_synproxy(ebpf: &mut Ebpf, ports: &[(SynProxyKey, SynProxyCfg)]) -> Re
 
 /// The `SYNPROXY` entries a configuration asks for (DP-31): one per policy a
 /// protected port shields its clients on — every policy in `policies` when the
-/// entry names none — plus the one [`SynProxyKey::server_side`] entry per port
-/// the server's half of a proxied connection looks up.
+/// entry names none — plus the [`SynProxyKey::server_side`] entries the
+/// server's half of a proxied connection looks up: the protected port itself,
+/// and the target port of every port-forward that remaps it for a shielded
+/// policy, because that server answers from the port it was forwarded to.
 fn synproxy_entries(
     ports: &[ResolvedSynProxy],
+    forwards: &[ResolvedPortForward],
     policies: &[PolicyId],
 ) -> Vec<(SynProxyKey, SynProxyCfg)> {
     let mut out: Vec<(SynProxyKey, SynProxyCfg)> = Vec::new();
@@ -4528,14 +4534,26 @@ fn synproxy_entries(
             Some(policy) => vec![policy],
             None => policies.to_vec(),
         };
+        let remapped: Vec<u16> = forwards
+            .iter()
+            .filter(|f| {
+                f.proto == velstra_common::ip_proto::TCP
+                    && f.port == port.port
+                    && f.dst_port != 0
+                    && scoped.contains(&f.policy)
+            })
+            .map(|f| f.dst_port)
+            .collect();
         out.extend(
             scoped
                 .into_iter()
                 .map(|policy| (SynProxyKey::tcp(policy, port.port), value)),
         );
-        let server = SynProxyKey::server_side(port.port);
-        if !out.iter().any(|(key, _)| *key == server) {
-            out.push((server, value));
+        for server_port in std::iter::once(port.port).chain(remapped) {
+            let server = SynProxyKey::server_side(server_port);
+            if !out.iter().any(|(key, _)| *key == server) {
+                out.push((server, value));
+            }
         }
     }
     out
@@ -6500,7 +6518,7 @@ mod tests {
     /// only; the server's half has its own policy-independent entry.
     #[test]
     fn a_scoped_synproxy_port_is_written_for_its_policy_and_the_server_side() {
-        let entries = synproxy_entries(&[proxied(443, 1400, Some(7))], &[0, 7, 8]);
+        let entries = synproxy_entries(&[proxied(443, 1400, Some(7))], &[], &[0, 7, 8]);
         let keys: HashSet<SynProxyKey> = entries.iter().map(|(k, _)| *k).collect();
         assert_eq!(
             keys,
@@ -6511,7 +6529,7 @@ mod tests {
 
     #[test]
     fn an_unscoped_synproxy_port_is_written_for_every_policy() {
-        let entries = synproxy_entries(&[proxied(443, 1460, None)], &[0, 7]);
+        let entries = synproxy_entries(&[proxied(443, 1460, None)], &[], &[0, 7]);
         let keys: HashSet<SynProxyKey> = entries.iter().map(|(k, _)| *k).collect();
         assert_eq!(
             keys,
@@ -6527,6 +6545,7 @@ mod tests {
     fn a_port_proxied_for_two_policies_has_one_server_side_entry() {
         let entries = synproxy_entries(
             &[proxied(443, 1460, Some(7)), proxied(443, 1460, Some(8))],
+            &[],
             &[0, 7, 8],
         );
         assert_eq!(entries.len(), 3);
@@ -6535,6 +6554,49 @@ mod tests {
             .filter(|(k, _)| *k == SynProxyKey::server_side(443))
             .count();
         assert_eq!(servers, 1);
+    }
+
+    fn forward(policy: PolicyId, port: u16, dst_port: u16) -> ResolvedPortForward {
+        ResolvedPortForward {
+            policy,
+            proto: velstra_common::ip_proto::TCP,
+            port,
+            dst_ip: [10, 0, 0, 9],
+            dst_port,
+            match_dst: [0; 4],
+            local_destination: true,
+            snat_ip: [0; 4],
+            reply_policy: 0,
+        }
+    }
+
+    /// DP-31: a forward that remaps a protected port (8080 -> 80) has its
+    /// server answer from the target port, so the server's half of the proxy
+    /// must be looked up there; a forward that keeps the port, a forward of an
+    /// unprotected port and one outside the proxy's scope add nothing.
+    #[test]
+    fn a_remapping_port_forward_puts_the_server_side_on_its_target_port() {
+        let entries = synproxy_entries(
+            &[proxied(8080, 1460, Some(7)), proxied(443, 1460, Some(7))],
+            &[
+                forward(7, 8080, 80),
+                forward(7, 443, 0),
+                forward(8, 8080, 81),
+                forward(7, 9000, 90),
+            ],
+            &[0, 7, 8],
+        );
+        let keys: HashSet<SynProxyKey> = entries.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            keys,
+            HashSet::from([
+                SynProxyKey::tcp(7, 8080),
+                SynProxyKey::server_side(8080),
+                SynProxyKey::server_side(80),
+                SynProxyKey::tcp(7, 443),
+                SynProxyKey::server_side(443),
+            ])
+        );
     }
 
     #[test]
