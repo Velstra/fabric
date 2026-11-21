@@ -253,18 +253,7 @@ pub(super) fn ct_router_normalize(key: &mut FirewallKey) {
             key.proto,
         );
         let flow = &mut (*scratch).flow;
-        // A retained expired tenant binding must not shadow a live router-NAT
-        // identity. As below, this is only a read, never expiry reclamation.
-        if flow.policy != ROUTER_NAT_POLICY && super::nat_binding_live(flow) {
-            return;
-        }
-        flow.policy = ROUTER_NAT_POLICY;
-        let Some(state) = CONNTRACK.get(&*flow) else {
-            return;
-        };
-        if state.expired(flow.proto, bpf_ktime_get_ns(), timeouts())
-            || !state.router_firewall_flow(flow)
-        {
+        if !router_canonical(flow) {
             return;
         }
         key.policy = ROUTER_NAT_POLICY;
@@ -273,6 +262,24 @@ pub(super) fn ct_router_normalize(key: &mut FirewallKey) {
         key.src_port = flow.src_port;
         key.dst_port = flow.dst_port;
     }
+}
+
+/// Rewrite `flow` to the canonical router-NAT identity the stateful firewall
+/// tracks it under, when a live router-NAT translation names it. `false`
+/// leaves no identity to use; `flow` is then unchanged or scratch.
+#[inline(always)]
+fn router_canonical(flow: &mut FlowKey) -> bool {
+    // A retained expired tenant binding must not shadow a live router-NAT
+    // identity. As below, this is only a read, never expiry reclamation.
+    if flow.policy != ROUTER_NAT_POLICY && super::nat_binding_live(flow) {
+        return false;
+    }
+    flow.policy = ROUTER_NAT_POLICY;
+    let Some(state) = (unsafe { CONNTRACK.get(&*flow) }) else {
+        return false;
+    };
+    !state.expired(flow.proto, unsafe { bpf_ktime_get_ns() }, timeouts())
+        && state.router_firewall_flow(flow)
 }
 
 #[inline(always)]
@@ -627,6 +634,40 @@ pub(super) fn ct_cookie_admitted(flow: &FlowKey) -> StatePublication {
         };
         (*scratch).reverse_state = (*scratch).state.reverse();
         publish_scratch(scratch)
+    }
+}
+
+/// The SYN proxy answered the server's SYN-ACK with the handshake's final ACK
+/// itself (`XDP_TX`, so no egress hook saw it). Advance the server-facing state
+/// exactly as that ACK would have on its way out, or the connection stays
+/// `SYN_RECV` there and every server segment is refused as invalid until the
+/// client happens to send one — which a protocol whose server speaks first
+/// (SMTP, FTP, SSH, POP, IMAP) never does (DP-31). `flow` is the SYN-ACK as it
+/// arrived; its identity is normalised the way the ingress firewall looked it
+/// up ([`ct_router_normalize`]), then reversed into the direction the ACK
+/// travels. The normalisation is inlined rather than called: one more frame
+/// puts the forwarding tail's call chain past the 512-byte stack limit.
+#[inline(never)]
+pub(super) fn ct_synproxy_acked(flow: &FlowKey) -> StatePublication {
+    let Some(scratch) = CT_SCRATCH.get_ptr_mut(0) else {
+        return StatePublication::Failed;
+    };
+    unsafe {
+        (*scratch).flow = *flow;
+        if !router_canonical(&mut (*scratch).flow) {
+            (*scratch).flow = *flow;
+        }
+        scratch_key4(&mut (*scratch).key, &(*scratch).flow);
+        // Reverse in place. An IPv4 TCP key differs from its reverse only in
+        // the first address word and the ports; `FirewallKey::reverse` would
+        // build two whole keys on a stack the forwarding tail cannot spare.
+        let key = &mut (*scratch).key;
+        let src = u32::from_ne_bytes([key.src[0], key.src[1], key.src[2], key.src[3]]);
+        let dst = u32::from_ne_bytes([key.dst[0], key.dst[1], key.dst[2], key.dst[3]]);
+        key.src[..4].copy_from_slice(&dst.to_ne_bytes());
+        key.dst[..4].copy_from_slice(&src.to_ne_bytes());
+        core::mem::swap(&mut key.src_port, &mut key.dst_port);
+        record_scratch(scratch, tcp_flags::ACK)
     }
 }
 
