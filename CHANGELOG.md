@@ -4,6 +4,18 @@
 
 ### Fixed
 
+- **The agent's logging no longer blocks it.** Log records went through
+  `env_logger` to stderr and the periodic statistics table to stdout, both
+  synchronously; under systemd both are streams to journald. When journald
+  stopped reading, a write blocked the runtime worker it ran on — on a small
+  box the whole agent, HA heartbeat included — and the routing daemon gave up
+  ownership although nothing had failed. Both outputs now go through a bounded
+  queue drained by a dedicated thread (4096 records, `VELSTRA_LOG_QUEUE_LINES`
+  1–65536); while the output is blocked new records are dropped and counted
+  instead of waited for, the count is served as `log_lines_dropped` in the
+  `stats` query (and so in `sentinel show firewall statistics`), and the drop
+  is announced on the log once it drains. An exit waits up to 500 ms for the
+  queued records.
 - **The agent starts when its uplink does not exist yet.** Sentinel names the
   first zoned link as the agent's uplink; when a commit creates that link (a
   GRE tunnel, a VLAN, a bridge), the agent could restart before networkd had

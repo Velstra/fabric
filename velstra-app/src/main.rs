@@ -23,6 +23,7 @@ mod ha;
 mod host_inventory;
 mod ipfix;
 mod local_destination;
+mod logwriter;
 mod mapping;
 mod packet_events;
 mod persist;
@@ -269,8 +270,14 @@ impl EncapArg {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // `RUST_LOG=info` (or finer) controls verbosity; default to `info`.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // `RUST_LOG=info` (or finer) controls verbosity; default to `info`. Records
+    // go through a bounded, lossy queue: a journal that stops reading must not
+    // stall the agent (see `logwriter`).
+    let outputs = logwriter::installed();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .target(env_logger::Target::Pipe(Box::new(outputs.log.clone())))
+        .init();
+    let _flush_logs = logwriter::FlushOnExit(vec![outputs.log.clone(), outputs.stats.clone()]);
 
     let cli = Cli::parse();
     match cli.command {
@@ -910,13 +917,16 @@ async fn serve(
 }
 
 /// Statistics output must not unwind the firewall if its log consumer closes.
+/// Print a statistics table, one record on the non-blocking stdout queue so a
+/// stalled journal never holds the agent up.
 fn write_statistics(title: &str, stats: &firewall::Stats) {
     use std::io::Write;
-    if let Err(error) = write!(
-        std::io::stdout().lock(),
-        "\n{title} statistics:\n{}",
-        stats.render()
-    ) {
+    let table = format!("\n{title} statistics:\n{}", stats.render());
+    if let Err(error) = logwriter::installed()
+        .stats
+        .clone()
+        .write_all(table.as_bytes())
+    {
         warn!("could not write datapath statistics: {error}");
     }
 }
