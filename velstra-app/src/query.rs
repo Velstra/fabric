@@ -214,6 +214,15 @@ async fn respond(
                 Err(e) => format!("error: reading statistics: {e:#}\n"),
             }
         }
+        // A primary `--iface` without its hook, one name per line; empty when
+        // every primary is attached.
+        "missing-interfaces" => firewall
+            .lock()
+            .await
+            .waiting_primaries()
+            .into_iter()
+            .map(|name| format!("{name}\n"))
+            .collect(),
         "capacity" => format!("{}\n", crate::capacity::query(firewall.clone()).await),
         "firewall-states" => {
             let fw = firewall.lock().await;

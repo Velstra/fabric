@@ -753,6 +753,9 @@ pub struct Firewall {
     /// Consecutive polls whose host inventory was torn by a concurrent change
     /// even after [`crate::host_inventory::read`]'s own retries (DP-32).
     torn_inventory_polls: u32,
+    /// When the agent last warned that a primary interface is still missing
+    /// (see [`Self::attach_waiting_primaries`]); `None` while none is.
+    missing_primary_warned: Option<std::time::Instant>,
     /// The configuration as it arrived, before the advertised rules were merged
     /// into it.
     ///
@@ -1269,6 +1272,7 @@ impl Firewall {
             explicit_egress_ifaces: if egress { ifaces.to_vec() } else { Vec::new() },
             conntrack: None,
             torn_inventory_polls: 0,
+            missing_primary_warned: None,
             tries,
             sizing,
             state_adopted: state_dir.as_ref().is_some_and(|dir| dir.adopted),
@@ -1382,6 +1386,63 @@ impl Firewall {
             }
         }
         Ok(())
+    }
+
+    /// The primary (`--iface`) interfaces that carry no XDP hook: absent when
+    /// the agent started and not attached since. Served as the
+    /// `missing-interfaces` query.
+    pub fn waiting_primaries(&self) -> Vec<String> {
+        self.primary
+            .iter()
+            .filter(|name| !self.xdp_links.contains_key(*name))
+            .cloned()
+            .collect()
+    }
+
+    /// Attach every waiting primary interface that exists now, and warn about
+    /// those still missing — again every [`MISSING_PRIMARY_WARN_INTERVAL`], so
+    /// a primary that never appears stays visible rather than being one log
+    /// line at start-up. Run by the 2 s config-interface poll after
+    /// [`Self::reconcile_config_interfaces`], which owns (and attaches, with
+    /// their policy) the primaries the configuration also names.
+    pub fn attach_waiting_primaries(&mut self) {
+        let mut missing = Vec::new();
+        for name in self.waiting_primaries() {
+            let configured = self.applied.interfaces.iter().any(|i| i.name == name);
+            match if_nametoindex(&name) {
+                Ok(_) if configured => {}
+                Ok(_) => match self.attach_iface(&name, self.attach_mode, 0) {
+                    Ok(chosen) => {
+                        log::info!("attached primary interface {name} ({chosen:?})");
+                        let desired = self.applied.clone();
+                        if let Err(error) = self.sync_egress_attachments(&desired) {
+                            warn!("egress hooks after attaching {name} failed: {error:#}");
+                        }
+                    }
+                    Err(error) => warn!("attaching primary interface {name} failed: {error:#}"),
+                },
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(interface_missing) =>
+                {
+                    missing.push(name)
+                }
+                Err(error) => warn!("looking up primary interface {name} failed: {error:#}"),
+            }
+        }
+        if missing.is_empty() {
+            self.missing_primary_warned = None;
+            return;
+        }
+        let now = std::time::Instant::now();
+        if missing_primary_warning_due(self.missing_primary_warned, now) {
+            warn!(
+                "primary interface(s) {} still missing; the datapath does not filter them",
+                missing.join(", ")
+            );
+            self.missing_primary_warned = Some(now);
+        }
     }
 
     fn prune_stale_links(&mut self) {
@@ -4156,14 +4217,26 @@ fn admitted_vnis(cfg: &RuntimeConfig) -> BTreeSet<u32> {
         .collect()
 }
 
+/// How often a primary interface that is still missing is warned about again.
+const MISSING_PRIMARY_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether a still-missing primary is due another warning: at once the first
+/// time, then once per [`MISSING_PRIMARY_WARN_INTERVAL`].
+fn missing_primary_warning_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last.is_none_or(|last| now.saturating_duration_since(last) >= MISSING_PRIMARY_WARN_INTERVAL)
+}
+
 /// The primary interfaces that exist right now, in order; `lookup` is
 /// [`if_nametoindex`]. Sentinel names the first zoned link as the agent's
 /// uplink, and in a commit that creates it — a GRE tunnel, a VLAN, a bridge —
 /// the agent restarts before networkd has made the device. Attaching it then
 /// failed start-up outright ("interface \"tun0\" not found"), the readiness
 /// probe failed and the commit rolled back. A missing link is skipped with a
-/// warning and attached by [`Firewall::reconcile_links`] once it appears; any
-/// other lookup failure still refuses to start.
+/// warning and attached once it appears — by [`Firewall::reconcile_links`] (the
+/// commit's link reconciliation) or the 2 s poll
+/// ([`Firewall::attach_waiting_primaries`], which keeps warning while it is
+/// missing; the `missing-interfaces` query lists it). Any other lookup failure
+/// still refuses to start.
 fn present_interfaces(
     ifaces: &[String],
     lookup: impl Fn(&str) -> Result<u32>,
@@ -7487,6 +7560,14 @@ mod tests {
             |_: &str| -> Result<u32> { Err(std::io::Error::from_raw_os_error(libc::EPERM).into()) };
         assert!(present_interfaces(&names, broken).is_err());
         // The real lookup reports a missing link the same way.
+        // A still-missing primary is warned about at once, then once a minute.
+        let now = std::time::Instant::now();
+        assert!(missing_primary_warning_due(None, now));
+        assert!(!missing_primary_warning_due(Some(now), now));
+        assert!(missing_primary_warning_due(
+            Some(now),
+            now + MISSING_PRIMARY_WARN_INTERVAL
+        ));
         let absent = ["velstra-absent0".to_string()];
         assert!(
             present_interfaces(&absent, if_nametoindex)

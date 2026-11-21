@@ -6,13 +6,16 @@
 
 - **The agent starts when its uplink does not exist yet.** Sentinel names the
   first zoned link as the agent's uplink; when a commit creates that link (a
-  GRE tunnel, a VLAN, a bridge), the agent restarts before networkd has made
-  the device, and start-up failed with `interface "tun0" not found`, so the
-  commit's readiness probe failed and the commit rolled back. A primary
-  interface that is missing at start-up is now skipped with a warning and
-  attached by the link reconciliation the commit runs once the network is
-  applied (and by the config-interface poll). Any other lookup failure still
-  refuses to start.
+  GRE tunnel, a VLAN, a bridge), the agent could restart before networkd had
+  made the device, and start-up failed with `interface "tun0" not found`, so
+  the commit's readiness probe failed and the commit rolled back. The
+  `--iface` contract is now: an interface that does not exist at start-up is
+  skipped with a warning and attached when it appears — by the link
+  reconciliation a commit runs once the network is applied, or by the 2 s
+  interface poll; while it is still missing the agent warns again every
+  minute and lists it in the new `missing-interfaces` query (one name per
+  line, empty when every primary is attached). Any other failure to look an
+  interface up still stops the agent.
 - **IS-IS and the spanning tree work on fail-closed interfaces.** DP-22 drops
   every frame whose EtherType is not link control, and an IEEE 802.3 length
   frame (a type/length value of at most 1500) has no EtherType at all, so IS-IS
