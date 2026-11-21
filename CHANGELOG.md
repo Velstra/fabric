@@ -11,9 +11,14 @@
   used to search up to a global "largest displacement ever" bound that any
   ICMP echo, port-forward or hairpin NAT write pinned at the whole domain:
   every new connection then made 32768 conntrack lookups in softirq, about
-  400 connections per second per core, until a reboot. A full window drops
-  the opener and counts `egress_nat_no_candidate`. Replicated (HA)
-  configurations keep their allocator unchanged. No pinned map changes.
+  400 connections per second per core, until a reboot. That bound was also
+  not among the persisted state maps, so with `[state] persist` an agent
+  restart adopted the NAT bindings but restarted the bound at zero, and
+  discovery could miss a displaced binding. A full window drops the opener
+  and counts `egress_nat_no_candidate`; measured refusal per new flow to
+  one remote ip:port is 0 at 90 % of its 32768-port domain, 0.15 % at 95 %
+  and 27 % at 99 %. Flows to different endpoints never compete. Replicated
+  (HA) configurations keep their allocator unchanged. No pinned map changes.
 - **Source-only blocklists (DP-15).** `blocklist_ingress_only = true` on a
   `[[policy]]` (or at the top level) makes its blocklist name sources only:
   the egress hook no longer matches it against destinations, and a listed

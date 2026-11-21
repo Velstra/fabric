@@ -29,11 +29,13 @@ pub const UNADDRESSED: [u8; 4] = [0; 4];
 /// effectively full, and it is counted (`egress_nat_no_candidate`).
 pub const NAPT_WINDOW: u32 = 128;
 
-/// Probe strides: primes above every possible domain size (a domain has at
-/// most 65535 ports), so each is coprime with any domain and a flow's probes
-/// never repeat inside the domain. Several of them, so two flows whose first
-/// probes collide usually part ways at the second one instead of sharing one
-/// probe chain (the clustering that makes linear probing degrade).
+/// Probe strides for a domain whose size is not a power of two: primes above
+/// every possible domain size (a domain has at most 65535 ports), so each is
+/// coprime with any domain and a flow's probes never repeat inside it.
+/// Power-of-two domains (the default 32768 and usual CGNAT blocks) take any
+/// odd stride instead, which gives every flow its own probe chain; sixteen
+/// shared chains measurably cluster (0.33 % instead of 0.14 % refused at
+/// 95 % fill, see `refusal_rate_by_domain_fill`).
 const NAPT_STRIDES: [u32; 16] = [
     0x22e1bd, 0x23e783, 0x10a155, 0x167629, 0x3cd553, 0x5350cd, 0x7e85df, 0x53f2f1, 0x67e485,
     0x28949b, 0x3e460b, 0x53c20f, 0x11f72b, 0xdf0037, 0xe38cf7, 0xce61df,
@@ -66,9 +68,14 @@ impl NaptDomain {
             };
         }
         let count = last as u32 - first as u32 + 1;
-        // The offset uses the seed's low bits; the stride its top four, so
-        // the two are independent for every power-of-two domain.
-        let stride = NAPT_STRIDES[(seed >> 28) as usize & (NAPT_STRIDES.len() - 1)] % count;
+        // The offset uses the seed's low bits (at most 15 of them for a
+        // power-of-two domain); the stride the bits above, so the two are
+        // independent.
+        let stride = if count & (count - 1) == 0 {
+            ((seed >> 15) % count) | 1
+        } else {
+            NAPT_STRIDES[(seed >> 28) as usize & (NAPT_STRIDES.len() - 1)] % count
+        };
         Self {
             first: first as u32,
             count,
@@ -183,6 +190,56 @@ mod window_tests {
         let seed = napt_seed([10, 0, 0, 9], [198, 51, 100, 7], 51515, 80);
         let domain = NaptDomain::new([10, 0, 0, 9], seed, &crate::CgnatLayout::default());
         assert_eq!(domain.probe(0), napt_port(seed, 0));
+    }
+
+    /// The window's refusal rate, measured: one remote endpoint's default
+    /// domain filled to a fraction by the allocator itself (so its own
+    /// clustering counts), then fresh flows that would each need a port.
+    /// Expected about `fill^128`: none at 80 % and 90 %, ~0.14 % at 95 %,
+    /// ~28 % at 99 %. This is the capacity statement for flows to ONE remote
+    /// ip:port from one public address; different endpoints never compete.
+    #[test]
+    fn refusal_rate_by_domain_fill() {
+        let layout = crate::CgnatLayout::default();
+        let flow = |n: u32| {
+            let src = [10, (n >> 16) as u8, (n >> 8) as u8, n as u8];
+            let sport = 1024 + (n % 64000) as u16;
+            (src, napt_seed(src, [203, 0, 113, 5], sport, 443))
+        };
+        let mut occupied = std::collections::HashSet::new();
+        let mut next = 0u32;
+        let trials = 20_000u32;
+        let mut measured = Vec::new();
+        for (fill, ceiling) in [(0.80, 0.0), (0.90, 0.0), (0.95, 0.0025), (0.99, 0.32)] {
+            while (occupied.len() as f64) < 32768.0 * fill {
+                let (src, seed) = flow(next);
+                next += 1;
+                let domain = NaptDomain::new(src, seed, &layout);
+                if let Some(port) = (0..domain.window())
+                    .map(|i| domain.probe(i))
+                    .find(|port| !occupied.contains(port))
+                {
+                    occupied.insert(port);
+                }
+            }
+            let refused = (0..trials)
+                .filter(|t| {
+                    let (src, seed) = flow(1_000_000 + t);
+                    let domain = NaptDomain::new(src, seed, &layout);
+                    (0..domain.window()).all(|i| occupied.contains(&domain.probe(i)))
+                })
+                .count();
+            let rate = refused as f64 / trials as f64;
+            measured.push((fill, rate));
+            assert!(
+                rate <= ceiling,
+                "fill {fill}: refusal {rate} above {ceiling}"
+            );
+        }
+        // 99 % fill refuses often enough to be measured, and less often than
+        // a uniformly random window would allow to be off by much.
+        let (_, at_99) = measured[3];
+        assert!(at_99 > 0.15, "99 % refusal implausibly low: {measured:?}");
     }
 
     /// Model of the allocator over one remote endpoint's domain: claim the
