@@ -57,6 +57,17 @@ const UPSERT: u8 = 1;
 const DELETE: u8 = 2;
 const END: u8 = 3;
 const HEARTBEAT: u8 = 4;
+/// Receiver to sender, once, right after the handshake: the record kinds this
+/// receiver decodes beyond VCS2's original set. An older receiver sends
+/// nothing; an older sender never reads it. Authenticated with a key derived
+/// from the session key ([`features_key`]), so it cannot collide with the
+/// sender's state frames.
+const FEATURES: u8 = 5;
+/// The receiver decodes the owner's clock record (VWC1).
+const FEATURE_CLOCK: u8 = 1;
+/// How long a sender waits for the announcement before treating its receiver
+/// as one that predates it.
+const FEATURE_WAIT: Duration = Duration::from_millis(500);
 type Key = Vec<u8>;
 type Entries = BTreeMap<Key, Record>;
 type NatMap = Arc<Mutex<HashMap<MapData, FlowKey, FlowState>>>;
@@ -612,6 +623,45 @@ struct Session {
     key: hmac::Key,
     sequence: u64,
 }
+
+/// The key of the receiver's feature announcement: distinct from the state
+/// key, so the two directions never share a sequence space.
+fn features_key(state: &hmac::Key) -> hmac::Key {
+    hmac::Key::new(
+        hmac::HMAC_SHA256,
+        hmac::sign(state, b"VCS2 receiver features").as_ref(),
+    )
+}
+
+/// Receiver side: say which optional records this agent decodes.
+async fn announce_features(stream: &mut TcpStream, state: &hmac::Key) -> Result<()> {
+    let mut session = Session {
+        key: features_key(state),
+        sequence: 0,
+    };
+    write_frame(stream, &mut session, [0; 32], FEATURES, &[FEATURE_CLOCK]).await
+}
+
+/// Sender side: the receiver's feature bits, or none from a receiver that
+/// predates the announcement (or sent anything unauthenticated).
+async fn peer_features(stream: &mut TcpStream, state: &hmac::Key) -> u8 {
+    let Ok(Ok(bytes)) = timeout(FEATURE_WAIT, read_frame(stream)).await else {
+        return 0;
+    };
+    let mut session = Session {
+        key: features_key(state),
+        sequence: 0,
+    };
+    match session.verify(&bytes) {
+        Ok((_, FEATURES, [bits])) => *bits,
+        _ => 0,
+    }
+}
+
+/// Whether a record may go to a receiver with these feature bits.
+fn exportable(record: &Record, features: u8) -> bool {
+    !matches!(record, Record::Clock(_)) || features & FEATURE_CLOCK != 0
+}
 impl Session {
     fn frame(&mut self, policy: [u8; 32], kind: u8, payload: &[u8]) -> Result<Vec<u8>> {
         ensure!(payload.len() <= MAX_FRAME, "state frame exceeds limit");
@@ -737,6 +787,7 @@ async fn push_available(
 ) -> Result<()> {
     stream.set_nodelay(true)?;
     let key = timeout(IO_TIMEOUT, handshake(&mut stream, secret.as_bytes(), true)).await??;
+    let features = peer_features(&mut stream, &key).await;
     let mut session = Session { key, sequence: 0 };
     let mut previous: Option<Arc<Snapshot>> = None;
     loop {
@@ -759,7 +810,11 @@ async fn push_available(
                     &mut session,
                     next.policy,
                     UPSERT,
-                    next.entries.values().copied().collect(),
+                    next.entries
+                        .values()
+                        .filter(|r| exportable(r, features))
+                        .copied()
+                        .collect(),
                 )
                 .await?;
                 write_frame(&mut stream, &mut session, next.policy, END, &[]).await?;
@@ -769,12 +824,14 @@ async fn push_available(
                     .iter()
                     .filter(|(key, record)| old.entries.get(*key) != Some(*record))
                     .map(|(_, record)| *record)
+                    .filter(|record| exportable(record, features))
                     .collect();
                 let deleted = old
                     .entries
                     .iter()
                     .filter(|(key, _)| !next.entries.contains_key(*key))
                     .map(|(_, record)| *record)
+                    .filter(|record| exportable(record, features))
                     .collect();
                 send_records(&mut stream, &mut session, next.policy, UPSERT, changed).await?;
                 send_records(&mut stream, &mut session, next.policy, DELETE, deleted).await?;
@@ -903,6 +960,7 @@ async fn receive(
     } = context;
     stream.set_nodelay(true)?;
     let key = timeout(IO_TIMEOUT, handshake(&mut stream, secret.as_bytes(), false)).await??;
+    announce_features(&mut stream, &key).await?;
     // A reconnect supersedes the previous authenticated stream. Its queued
     // frames cannot roll the new snapshot back, even if both sockets survive.
     let ticket = generation.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
@@ -2564,6 +2622,101 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// The records a receiver gets from one owner snapshot, read off the wire.
+    async fn exported_records(announce: bool) -> Vec<Record> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let clock = Record::Clock(ha::wireguard::PeerClock {
+            wall_ns: 7,
+            synchronised: false,
+        });
+        let endpoint = Record::Wireguard(ha::wireguard::Endpoint {
+            interface: *b"wg0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+            public_key: [9; 32],
+            ip: [10, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            port: 51820,
+            family: 4,
+        });
+        let (_snapshots, receiver) = watch::channel(Some(Arc::new(Snapshot {
+            authority: Some(Authority {
+                term: 1,
+                owner: 1,
+                boot: [3; 16],
+                policy: [7; 32],
+            }),
+            policy: [7; 32],
+            entries: [(clock.key(), clock), (endpoint.key(), endpoint)]
+                .into_iter()
+                .collect(),
+        })));
+        let sender = tokio::spawn(send_peer(
+            listener.local_addr().unwrap(),
+            Arc::new("test secret".into()),
+            receiver,
+        ));
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let key = handshake(&mut peer, b"test secret", false).await.unwrap();
+        if announce {
+            announce_features(&mut peer, &key).await.unwrap();
+        }
+        let mut session = Session { key, sequence: 0 };
+        let mut records = Vec::new();
+        for expected in [BEGIN, UPSERT, END] {
+            let bytes = timeout(IO_TIMEOUT, read_frame(&mut peer))
+                .await
+                .unwrap()
+                .unwrap();
+            let (_, kind, payload) = session.verify(&bytes).unwrap();
+            assert_eq!(kind, expected);
+            if kind == UPSERT {
+                records = unpack(payload).unwrap();
+            }
+        }
+        sender.abort();
+        records
+    }
+
+    /// An older standby rejects a VWC1 record as an invalid state record and
+    /// drops the session, so it never warms (rolling upgrade). It announces
+    /// nothing, and must be sent nothing it cannot decode.
+    #[tokio::test]
+    async fn a_receiver_that_announces_nothing_never_gets_the_clock_record() {
+        let records = exported_records(false).await;
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(matches!(records[0], Record::Wireguard(_)));
+    }
+
+    #[tokio::test]
+    async fn a_receiver_that_announces_the_clock_gets_it() {
+        let records = exported_records(true).await;
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert!(records.iter().any(|r| matches!(r, Record::Clock(_))));
+    }
+
+    #[tokio::test]
+    async fn a_feature_announcement_is_authenticated_and_bounded() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let key = handshake(&mut stream, b"test secret", false).await.unwrap();
+            // A frame under the state key, not the feature key, is refused.
+            write_frame(
+                &mut stream,
+                &mut Session { key, sequence: 0 },
+                [0; 32],
+                FEATURES,
+                &[FEATURE_CLOCK],
+            )
+            .await
+            .unwrap();
+            stream
+        });
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let key = handshake(&mut stream, b"test secret", true).await.unwrap();
+        assert_eq!(peer_features(&mut stream, &key).await, 0);
+        drop(server.await.unwrap());
     }
 
     #[tokio::test]
