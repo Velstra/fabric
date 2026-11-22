@@ -714,6 +714,10 @@ pub struct PolicyFile {
     pub egress_default_drop: bool,
     #[serde(default)]
     pub drop_icmp: bool,
+    /// Log every packet this policy drops or rejects, with the reason. Never
+    /// the packets of flows it admitted: forwarding, NAT and encapsulation are
+    /// counted, not logged. Per-rule `log` adds a line for each new flow an
+    /// accepting rule admits.
     #[serde(default)]
     pub log: bool,
     #[serde(default)]

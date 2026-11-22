@@ -16,6 +16,7 @@ mod btf;
 mod capacity;
 mod conntrack_sync;
 mod controller_client;
+mod dplog;
 mod firewall;
 mod flows;
 mod flowspec;

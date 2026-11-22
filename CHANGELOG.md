@@ -4,6 +4,28 @@
 
 ### Fixed
 
+- **Logged drops are rate-limited.** A SYN flood or a scan against a zone with
+  `log = true` offers a log line for every dropped packet; on an appliance's
+  small journal a few hundred a second rotate the security, audit and HA
+  history out within the hour. The agent now passes the data plane's records
+  through a budget — a burst of 100, then 10 a second
+  (`VELSTRA_DATAPATH_LOG_BURST`, `VELSTRA_DATAPATH_LOG_RATE`) — and writes one
+  `suppressed N data-plane log record(s)` warning per 10 s in which it held
+  some back. The per-reason drop counters stay exact; the `stats` query
+  reports the held-back total as `log_lines_suppressed`.
+- **`log` no longer logs every packet of admitted flows.** With a policy's
+  `log = true` the data plane wrote a line for each reverse-NAT packet
+  (`NAT(ct)`), each forwarded one (`FWD`), each encapsulated one (`ENCAP`,
+  `SRV6 ENCAP`) and each new load-balanced flow (`DNAT`). On a busy WAN that
+  flooded the journal until the box stalled (a NAT stress run lost 844 packets
+  and held connections timed out), and it contradicted the documented meaning:
+  the policy flag logs drops and rejects, a rule's own `log` additionally each
+  new flow it accepts. Those fast-path lines are gone — the same events are
+  counted (`lb_established`, `lb_reverse`, `forwarded`, `overlay_encap`,
+  `srv6_encap`, `load_balanced`) — and nothing replaces them. Drop and reject
+  lines are unchanged; their path is lossy end to end (a bounded ring buffer,
+  then the agent's non-blocking writer), so a flood of logged drops loses lines
+  instead of slowing the box.
 - **The agent's logging no longer blocks it.** Log records went through
   `env_logger` to stderr and the periodic statistics table to stdout, both
   synchronously; under systemd both are streams to journald. When journald
