@@ -832,7 +832,7 @@ pub async fn monitor(firewall: Arc<Mutex<Firewall>>, shared: Shared, config: HaC
         if active
             && state.cold
             && !config.wireguard.is_empty()
-            && let Err(error) = wireguard::publish(&state, &state.role.authority, Vec::new())
+            && let Err(error) = wireguard::publish(&state, &state.role.authority, Vec::new(), None)
         {
             let _ = fw.ha_deadline(0);
             state.active_term = 0;

@@ -63,6 +63,64 @@ impl Endpoint {
         .unwrap_or("")
     }
 }
+/// The owner's wall clock, as replicated to its standby. Both members present
+/// one WireGuard identity, so a remote peer keeps one handshake replay floor
+/// for the pair: the newest TAI64N timestamp it has accepted, taken from the
+/// initiator's CLOCK_REALTIME. A successor whose wall clock lags its
+/// predecessor's (a resumed VM: its clock stopped while paused) sends
+/// handshakes the remote peer drops as replays until the lag is passed. Wren
+/// compares this against its own clock before it initiates (wren-ha
+/// `wireguard::promote`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerClock {
+    /// CLOCK_REALTIME in ns when the owner sampled it.
+    pub wall_ns: u64,
+    /// Whether the owner's clock was disciplined by NTP (kernel maxerror under
+    /// 16 s, systemd's own `NTPSynchronized` rule).
+    pub synchronised: bool,
+}
+
+/// The kernel's ceiling for its admitted clock error, and systemd's threshold
+/// for calling a clock synchronised (see Sentinel `clock.rs`).
+const MAX_ERROR_US: libc::c_long = 16_000_000;
+/// How often the owner refreshes the replicated clock. The standby dates each
+/// sample by its own CLOCK_BOOTTIME on receipt, so an unchanged sample stays
+/// exact; refreshing only bounds what a long-lived session carries.
+pub const CLOCK_REFRESH_NS: u64 = 1_000_000_000;
+
+impl PeerClock {
+    /// This member's wall clock now, or `None` when it cannot be read.
+    pub fn sample() -> Option<Self> {
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        let wall_ns = u64::try_from(wall.as_nanos()).ok().filter(|n| *n > 0)?;
+        Some(Self {
+            wall_ns,
+            synchronised: kernel_synchronised(),
+        })
+    }
+}
+
+/// Whether the kernel admits an error bound under 16 s (NTP disciplines it).
+fn kernel_synchronised() -> bool {
+    // SAFETY: modes = 0 makes adjtimex read-only; the struct is fully owned.
+    let mut timex: libc::timex = unsafe { std::mem::zeroed() };
+    let state = unsafe { libc::adjtimex(&mut timex) };
+    state >= 0 && timex.maxerror < MAX_ERROR_US
+}
+
+/// A replicated [`PeerClock`] with the local CLOCK_BOOTTIME of its receipt, so
+/// a reader can project the owner's wall clock to its own present.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClockObservation {
+    pub wall_ns: u64,
+    pub synchronised: bool,
+    pub observed_ns: u64,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Cache {
@@ -71,6 +129,8 @@ pub struct Cache {
     pub policy: String,
     pub authority: Authority,
     pub endpoints: Vec<Endpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_clock: Option<ClockObservation>,
 }
 
 pub async fn scan(interfaces: &[String]) -> Result<Vec<Endpoint>> {
@@ -138,7 +198,12 @@ pub async fn scan(interfaces: &[String]) -> Result<Vec<Endpoint>> {
     Ok(result)
 }
 
-pub fn publish(state: &State, authority: &Authority, endpoints: Vec<Endpoint>) -> Result<()> {
+pub fn publish(
+    state: &State,
+    authority: &Authority,
+    endpoints: Vec<Endpoint>,
+    peer_clock: Option<ClockObservation>,
+) -> Result<()> {
     use std::io::Write;
     let config = state.config.as_ref().context("HA config absent")?;
     for e in &endpoints {
@@ -154,6 +219,7 @@ pub fn publish(state: &State, authority: &Authority, endpoints: Vec<Endpoint>) -
         policy: config.wireguard_policy.clone(),
         authority: authority.clone(),
         endpoints,
+        peer_clock,
     };
     let mut random = [0; 16];
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut random)
@@ -178,4 +244,44 @@ pub fn publish(state: &State, authority: &Authority, endpoints: Vec<Endpoint>) -
     })();
     let _ = std::fs::remove_file(stage);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_local_clock_sample_is_a_present_wall_time() {
+        let clock = PeerClock::sample().expect("the test host has a wall clock");
+        // After 2020-01-01: a sample is a real epoch time, never zero.
+        assert!(clock.wall_ns > 1_577_836_800_000_000_000);
+    }
+
+    #[test]
+    fn a_cache_without_a_peer_clock_still_parses_and_omits_it() {
+        let cache: Cache = serde_json::from_str(
+            r#"{"cluster":"c","node":1,"policy":"p","authority":{"term":1,"owner":1,"boot":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"policy":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]},"endpoints":[]}"#,
+        )
+        .unwrap();
+        assert!(cache.peer_clock.is_none());
+        assert!(
+            !serde_json::to_string(&cache)
+                .unwrap()
+                .contains("peer_clock")
+        );
+        let observed = ClockObservation {
+            wall_ns: 5,
+            synchronised: true,
+            observed_ns: 7,
+        };
+        let with = Cache {
+            peer_clock: Some(observed),
+            ..cache
+        };
+        let text = serde_json::to_string(&with).unwrap();
+        assert!(
+            text.contains(r#""peer_clock":{"wall_ns":5,"synchronised":true,"observed_ns":7}"#),
+            "{text}"
+        );
+    }
 }
