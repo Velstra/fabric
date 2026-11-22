@@ -1461,8 +1461,6 @@ struct ForwardScratch {
     ttl: u8,
     /// A `bool` as `u8` (a plain `bool` across the scratch copy is avoided).
     has_port_forward: u8,
-    /// A `bool` as `u8`.
-    log: u8,
 }
 
 /// Per-CPU scratch carrying [`try_velstra`]'s post-firewall state across the tail
@@ -4270,10 +4268,6 @@ fn try_velstra_v4_verdict(ctx: &XdpContext, v: &V4Verdict) -> Result<u32, ()> {
     let action = Action::from_u32(v.action);
     // The counter stays an index (validated by the caller): see `bump_index`.
     let fw_counter = v.counter;
-    let cfg = GlobalConfig {
-        default_action: 0,
-        flags: v.flags,
-    };
     let want_log = v.want_log != 0;
     let rule_log = v.rule_log != 0;
     let established = v.established != 0;
@@ -4331,11 +4325,12 @@ fn try_velstra_v4_verdict(ctx: &XdpContext, v: &V4Verdict) -> Result<u32, ()> {
     // Per-rule logging of allowed traffic: a rule with `log = true` records each
     // new (non-established) flow it admits. Gated on the rule's own bit so a
     // policy that logs globally still only logs drops/rejects, not every pass.
+    // Nothing past this point logs: the forwarding, NAT and encapsulation fast
+    // paths run once per packet of an admitted flow, and a line per packet on a
+    // busy WAN flooded the journal until the box stalled.
     if rule_log && action == Action::Pass && !established {
         log_v4_allow(ctx, src_addr, proto, dst_port, fw_counter);
     }
-
-    let log = cfg.has_flag(ConfigFlags::LOG);
 
     // B4b: learn this tenant's source MAC → IPv4 on the firewall-allowed path so
     // the agent can advertise it to the local routing daemon (EVPN type-2). Only
@@ -4385,7 +4380,6 @@ fn try_velstra_v4_verdict(ctx: &XdpContext, v: &V4Verdict) -> Result<u32, ()> {
         proto,
         ttl,
         has_port_forward: has_port_forward as u8,
-        log: log as u8,
     };
     if let Some(dst) = SCRATCH.get_ptr_mut(0) {
         // SAFETY: `get_ptr_mut` returned a valid pointer into this CPU's slot;
@@ -4448,6 +4442,59 @@ pub fn velstra_forward(ctx: XdpContext) -> u32 {
     }
 }
 
+/// [`encap_phase`]: no overlay wanted this frame; continue locally.
+const ENCAP_MISS: u32 = u32::MAX;
+/// [`encap_phase`]: a bounds check failed (the caller's `Err(())`).
+const ENCAP_MALFORMED: u32 = u32::MAX - 1;
+
+/// Phase 4, overlay encapsulation, as its own BPF function: the SRv6 path
+/// (B9) when the host runs that wire format — a tenant frame whose inner
+/// destination MAC resolves to a remote End.DT2U service SID is wrapped in
+/// outer Ethernet + IPv6 — and otherwise VXLAN/Geneve when this tenant's inner
+/// destination lives on another host. Either redirects onto the underlay; a
+/// miss means "local" and returns [`ENCAP_MISS`].
+///
+/// Out of line for the verifier's combined-stack limit: inlined, the outer
+/// headers it builds sat in `velstra_forward`'s frame, and that frame plus
+/// the deepest NAT call chain reached 544 bytes, which Linux 6.6 refuses.
+/// A subprogram cannot return a `Result`, hence the two sentinels.
+#[inline(never)]
+fn encap_phase(ctx: &XdpContext, s: &ForwardScratch, ttl: u8, ip_checksum: u16) -> u32 {
+    let srv6 = try_srv6_encap(
+        ctx,
+        &srv6_config(),
+        s.vni,
+        s.src_addr,
+        s.dst_addr,
+        s.src_port,
+        s.dst_port,
+        s.proto,
+        ttl,
+        ip_checksum,
+    );
+    match srv6 {
+        Ok(Some(action)) => return action,
+        Ok(None) => {}
+        Err(()) => return ENCAP_MALFORMED,
+    }
+    match try_encap(
+        ctx,
+        &overlay_config(),
+        s.vni,
+        s.src_addr,
+        s.dst_addr,
+        s.src_port,
+        s.dst_port,
+        s.proto,
+        ttl,
+        ip_checksum,
+    ) {
+        Ok(Some(action)) => action,
+        Ok(None) => ENCAP_MISS,
+        Err(()) => ENCAP_MALFORMED,
+    }
+}
+
 #[inline(always)]
 fn try_velstra_forward(ctx: &XdpContext) -> Result<u32, ()> {
     let s = match SCRATCH.get_ptr(0) {
@@ -4461,8 +4508,6 @@ fn try_velstra_forward(ctx: &XdpContext) -> Result<u32, ()> {
         None => return Ok(xdp_action::XDP_PASS),
     };
     let ihl_bytes = s.ihl_bytes as usize;
-    let ocfg = overlay_config();
-    let log = s.log != 0;
 
     // C15: SYN proxy. Runs before every transform below, because the client's
     // handshake is answered here without the server ever hearing about it, and
@@ -4508,46 +4553,12 @@ fn try_velstra_forward(ctx: &XdpContext) -> Result<u32, ()> {
         }
     }
 
-    // Phase 4 (B9): SRv6 overlay encapsulation. When the host runs the SRv6 wire
-    // format, a tenant frame whose inner destination MAC resolves to a remote
-    // End.DT2U service SID is encapsulated in outer Ethernet + IPv6 and redirected
-    // onto the underlay. Mutually exclusive with the VXLAN/Geneve path below (one
-    // overlay wire format per host); a miss falls through unchanged.
-    let scfg = srv6_config();
-    if let Some(action) = try_srv6_encap(
-        ctx,
-        &scfg,
-        s.vni,
-        s.src_addr,
-        s.dst_addr,
-        s.src_port,
-        s.dst_port,
-        s.proto,
-        ttl,
-        ip_checksum,
-        log,
-    )? {
-        return Ok(action);
-    }
-
-    // Phase 4: overlay encapsulation. If this tenant's (vni == policy) inner
-    // destination lives on another host, wrap the frame in a VXLAN/Geneve tunnel
-    // and redirect it onto the underlay. A miss means "local" — fall through to
-    // ordinary switching/routing.
-    if let Some(action) = try_encap(
-        ctx,
-        &ocfg,
-        s.vni,
-        s.src_addr,
-        s.dst_addr,
-        s.src_port,
-        s.dst_port,
-        s.proto,
-        ttl,
-        ip_checksum,
-        log,
-    )? {
-        return Ok(action);
+    // Phase 4: overlay encapsulation (SRv6, then VXLAN/Geneve), out of line —
+    // see `encap_phase`.
+    match encap_phase(ctx, s, ttl, ip_checksum) {
+        ENCAP_MISS => {}
+        ENCAP_MALFORMED => return Err(()),
+        action => return Ok(action),
     }
 
     // Phase 3a: DNAT port-forward. A new inbound flow to a forwarded port is
@@ -4586,7 +4597,6 @@ fn try_velstra_forward(ctx: &XdpContext) -> Result<u32, ()> {
         s.dst_port,
         s.proto,
         ip_checksum,
-        log,
     )? {
         return Ok(action);
     }
@@ -4611,7 +4621,7 @@ fn try_velstra_forward(ctx: &XdpContext) -> Result<u32, ()> {
             bump(Counter::ForwardTtlExceeded);
             return Ok(xdp_action::XDP_DROP);
         }
-        ForwardOutcome::Redirect(rewrite) => return forward(ctx, rewrite, log),
+        ForwardOutcome::Redirect(rewrite) => return forward(ctx, rewrite),
     }
 
     // Nothing took over: honour the firewall's pass decision. Reconstruct the
@@ -5879,7 +5889,6 @@ fn try_srv6_encap(
     proto: u8,
     ttl: u8,
     ip_checksum: u16,
-    log: bool,
 ) -> Result<Option<u32>, ()> {
     // No SRv6 overlay configured, or the ingress port is not on a tenant segment.
     if !scfg.is_enabled() || vni == 0 {
@@ -6021,9 +6030,6 @@ fn try_srv6_encap(
     }
 
     bump(Counter::Srv6Encap);
-    if log {
-        info!(ctx, "SRV6 ENCAP vni={} -> ifindex {}", vni, out_ifindex);
-    }
     // Redirect onto the underlay; an absent devmap entry aborts (the control
     // plane mirrors every overlay egress ifindex into `TX_PORTS`).
     Ok(Some(ha_redirect(out_ifindex)))
@@ -6119,7 +6125,6 @@ fn try_encap(
     proto: u8,
     ttl: u8,
     ip_checksum: u16,
-    log: bool,
 ) -> Result<Option<u32>, ()> {
     // No overlay configured, or the ingress port is not on a tenant segment.
     if !ocfg.is_enabled() || vni == 0 {
@@ -6269,9 +6274,6 @@ fn try_encap(
     }
 
     bump(Counter::OverlayEncap);
-    if log {
-        info!(ctx, "ENCAP vni={} -> ifindex {}", encap_vni, out_ifindex);
-    }
     // Redirect onto the underlay; an absent devmap entry aborts (the control
     // plane mirrors every overlay egress ifindex into `TX_PORTS`).
     Ok(Some(ha_redirect(out_ifindex)))
@@ -6293,7 +6295,6 @@ fn try_load_balance(
     dst_port: u16,
     proto: u8,
     ip_checksum: u16,
-    log: bool,
 ) -> Result<Option<u32>, ()> {
     // Only L4 protocols with ports are load balanced.
     if proto != ip_proto::TCP && proto != ip_proto::UDP {
@@ -6435,18 +6436,6 @@ fn try_load_balance(
         } else {
             Counter::LbEstablished
         });
-        if log {
-            info!(
-                ctx,
-                "NAT(ct) reverse={} -> {}.{}.{}.{}:{}",
-                reverse as u8,
-                nat.new_ip[0],
-                nat.new_ip[1],
-                nat.new_ip[2],
-                nat.new_ip[3],
-                nat.new_port
-            );
-        }
         return Ok(Some(xdp_action::XDP_PASS));
     }
 
@@ -6580,23 +6569,6 @@ fn try_load_balance(
     );
     apply_nat(ctx, &nat, false, proto)?;
     bump(Counter::LoadBalanced);
-    if log {
-        info!(
-            ctx,
-            "DNAT {}.{}.{}.{}:{} -> {}.{}.{}.{}:{}",
-            dst_addr[0],
-            dst_addr[1],
-            dst_addr[2],
-            dst_addr[3],
-            dst_port,
-            nat.new_ip[0],
-            nat.new_ip[1],
-            nat.new_ip[2],
-            nat.new_ip[3],
-            nat.new_port,
-        );
-    }
-
     Ok(Some(xdp_action::XDP_PASS))
 }
 
@@ -7405,7 +7377,7 @@ fn reject_icmp_unreachable(
 /// interface. Writes go through one freshly bounds-checked `data` pointer at
 /// constant offsets (the verifier-friendly packet-write pattern).
 #[inline(always)]
-fn forward(ctx: &XdpContext, rewrite: Rewrite, log: bool) -> Result<u32, ()> {
+fn forward(ctx: &XdpContext, rewrite: Rewrite) -> Result<u32, ()> {
     let data = ctx.data();
     let data_end = ctx.data_end();
 
@@ -7431,9 +7403,6 @@ fn forward(ctx: &XdpContext, rewrite: Rewrite, log: bool) -> Result<u32, ()> {
     }
 
     bump(Counter::Forwarded);
-    if log {
-        info!(ctx, "FWD -> ifindex {}", rewrite.out_ifindex);
-    }
     // `redirect` returns `XDP_REDIRECT` on success; if the devmap has no entry
     // for this ifindex we abort (the control plane always mirrors live routes).
     Ok(ha_redirect(rewrite.out_ifindex))
