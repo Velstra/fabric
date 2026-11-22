@@ -213,10 +213,12 @@ async fn respond(
                 // The agent's own log health rides along: records dropped
                 // because the log output (journald) stopped reading.
                 Ok(stats) => format!(
-                    "{}  {:<20} {:>14}\n",
+                    "{}  {:<20} {:>14}\n  {:<20} {:>14}\n",
                     stats.render(),
                     "log_lines_dropped",
-                    crate::logwriter::dropped()
+                    crate::logwriter::dropped(),
+                    "log_lines_suppressed",
+                    crate::dplog::suppressed()
                 ),
                 Err(e) => format!("error: reading statistics: {e:#}\n"),
             }

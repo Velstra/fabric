@@ -4,6 +4,15 @@
 
 ### Fixed
 
+- **Logged drops are rate-limited.** A SYN flood or a scan against a zone with
+  `log = true` offers a log line for every dropped packet; on an appliance's
+  small journal a few hundred a second rotate the security, audit and HA
+  history out within the hour. The agent now passes the data plane's records
+  through a budget — a burst of 100, then 10 a second
+  (`VELSTRA_DATAPATH_LOG_BURST`, `VELSTRA_DATAPATH_LOG_RATE`) — and writes one
+  `suppressed N data-plane log record(s)` warning per 10 s in which it held
+  some back. The per-reason drop counters stay exact; the `stats` query
+  reports the held-back total as `log_lines_suppressed`.
 - **`log` no longer logs every packet of admitted flows.** With a policy's
   `log = true` the data plane wrote a line for each reverse-NAT packet
   (`NAT(ct)`), each forwarded one (`FWD`), each encapsulated one (`ENCAP`,

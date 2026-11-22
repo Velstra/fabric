@@ -3381,7 +3381,28 @@ fn bump_memlock_rlimit() {
 /// Forward `aya-log` messages emitted by the eBPF program to the user-space
 /// logger. Best effort: a program with no log statements simply yields no init.
 fn spawn_log_forwarder(ebpf: &mut Ebpf) {
-    match aya_log::EbpfLogger::init(ebpf) {
+    // The data plane's records go through a rate budget: a flood of logged
+    // drops must not rotate the appliance's journal out (see `dplog`).
+    let budget = crate::dplog::Budgeted::new(
+        log::logger(),
+        crate::dplog::setting(
+            std::env::var("VELSTRA_DATAPATH_LOG_BURST").ok().as_deref(),
+            crate::dplog::DEFAULT_BURST,
+        ),
+        crate::dplog::setting(
+            std::env::var("VELSTRA_DATAPATH_LOG_RATE").ok().as_deref(),
+            crate::dplog::DEFAULT_RATE,
+        ),
+    );
+    let summaries = budget.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            summaries.summarise();
+        }
+    });
+    match aya_log::EbpfLogger::init_with_logger(ebpf, budget) {
         Ok(logger) => {
             // SAFETY: EbpfLogger owns its RingBuf<MapData> and therefore the
             // registered map FD. AsyncFd owns the logger until deregistration;
