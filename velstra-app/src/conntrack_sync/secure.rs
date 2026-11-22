@@ -67,11 +67,14 @@ enum Record {
     Firewall(FirewallKey, FirewallState),
     SynProxy(FlowKey, SynFlow),
     Wireguard(ha::wireguard::Endpoint),
+    /// The owner's wall clock (see [`ha::wireguard::PeerClock`]).
+    Clock(ha::wireguard::PeerClock),
 }
 
 impl Record {
     fn key(self) -> Key {
         match self {
+            Self::Clock(_) => vec![6],
             Self::Wireguard(endpoint) => {
                 let mut key = vec![5];
                 key.extend_from_slice(&endpoint.interface);
@@ -100,6 +103,12 @@ impl Record {
         // The parent codec intentionally excludes ages over seven days. Such
         // entries are omitted by the producer before calling this method.
         match self {
+            Self::Clock(clock) => {
+                let mut wire = b"VWC1".to_vec();
+                wire.extend_from_slice(&clock.wall_ns.to_le_bytes());
+                wire.push(u8::from(clock.synchronised));
+                wire
+            }
             Self::Wireguard(endpoint) => {
                 let mut wire = b"VWG1".to_vec();
                 wire.extend_from_slice(&endpoint.interface);
@@ -133,6 +142,15 @@ impl Record {
         }
     }
     fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.starts_with(b"VWC1") {
+            ensure!(bytes.len() == 13, "invalid clock record length");
+            let wall_ns = u64::from_le_bytes(bytes[4..12].try_into()?);
+            ensure!(wall_ns > 0 && bytes[12] <= 1, "invalid clock record");
+            return Ok(Self::Clock(ha::wireguard::PeerClock {
+                wall_ns,
+                synchronised: bytes[12] == 1,
+            }));
+        }
         if bytes.starts_with(b"VWG1") {
             ensure!(
                 bytes.len() == 71,
@@ -185,7 +203,7 @@ impl Record {
     }
     fn received(self, now: u64) -> Self {
         match self {
-            Self::SynProxy(_, _) | Self::Wireguard(_) => self,
+            Self::SynProxy(_, _) | Self::Wireguard(_) | Self::Clock(_) => self,
             Self::Nat(key, state) => Self::Nat(
                 key,
                 FlowState {
@@ -219,6 +237,7 @@ struct Store {
     firewall: HashMap<MapData, FirewallKey, FirewallState>,
     synproxy: HashMap<MapData, FlowKey, SynFlow>,
     endpoints: BTreeMap<Key, ha::wireguard::Endpoint>,
+    peer_clock: Option<ha::wireguard::ClockObservation>,
     imported: BTreeMap<Key, Imported>,
     policy: Option<[u8; 32]>,
     local_addresses: BTreeSet<IpAddr>,
@@ -309,6 +328,15 @@ impl Store {
             return Ok(());
         }
 
+        if let Record::Clock(clock) = record {
+            ensure!(authoritative, "HA clock requires witness authority");
+            self.peer_clock = (kind != DELETE).then(|| ha::wireguard::ClockObservation {
+                wall_ns: clock.wall_ns,
+                synchronised: clock.synchronised,
+                observed_ns: ha::now_ns(),
+            });
+            return Ok(());
+        }
         if let Record::Wireguard(endpoint) = record {
             ensure!(
                 authoritative,
@@ -327,7 +355,7 @@ impl Store {
         }
         let mut nat = self.nat.lock().await;
         let local = match record {
-            Record::Wireguard(_) => unreachable!("handled above"),
+            Record::Wireguard(_) | Record::Clock(_) => unreachable!("handled above"),
             Record::SynProxy(k, _) => self
                 .synproxy
                 .get(&k, 0)
@@ -352,7 +380,7 @@ impl Store {
         if kind == DELETE {
             if ours || authoritative && local.is_some() {
                 match record {
-                    Record::Wireguard(_) => unreachable!("handled above"),
+                    Record::Wireguard(_) | Record::Clock(_) => unreachable!("handled above"),
                     Record::SynProxy(k, _) => self.synproxy.remove(&k)?,
                     Record::Nat(k, _) => nat.remove(&k)?,
                     Record::Firewall(k, _) => self.firewall.remove(&k)?,
@@ -373,7 +401,7 @@ impl Store {
             }
             let record = record.received(monotonic_ns());
             match record {
-                Record::Wireguard(_) => unreachable!("handled above"),
+                Record::Wireguard(_) | Record::Clock(_) => unreachable!("handled above"),
                 Record::SynProxy(k, v) => self.synproxy.insert(k, v, 0)?,
                 Record::Nat(k, v) => nat.insert(k, v, 0)?,
                 Record::Firewall(k, v) => self.firewall.insert(k, v, 0)?,
@@ -413,6 +441,7 @@ impl Store {
         }
         self.imported.clear();
         self.endpoints.clear();
+        self.peer_clock = None;
         for record in records.into_values() {
             self.apply_inner(peer, UPSERT, record, true).await?;
         }
@@ -921,7 +950,7 @@ async fn receive(
                             authority.as_ref().map_or(0, |a| a.term)
                         );
                     }
-                    endpoints_changed |= matches!(record, Record::Wireguard(_));
+                    endpoints_changed |= matches!(record, Record::Wireguard(_) | Record::Clock(_));
                     if let Some(seen) = &mut seen {
                         ensure!(kind == UPSERT, "deletion inside snapshot");
                         seen.insert(record.key());
@@ -943,6 +972,7 @@ async fn receive(
                         &ha,
                         authority,
                         store.endpoints.values().copied().collect(),
+                        store.peer_clock,
                     )?;
                 }
             }
@@ -965,6 +995,7 @@ async fn receive(
                         &ha,
                         authority,
                         store.endpoints.values().copied().collect(),
+                        store.peer_clock,
                     )?;
                     ha.snapshot_ready(authority);
                 } else {
@@ -1045,6 +1076,7 @@ pub async fn run(
         firewall: flows,
         synproxy,
         endpoints: BTreeMap::new(),
+        peer_clock: None,
         imported: BTreeMap::new(),
         policy: None,
         local_addresses: initial_scope,
@@ -1061,6 +1093,7 @@ pub async fn run(
         .collect();
     let idle_timeout = IO_TIMEOUT.max(Duration::from_millis(config.interval_ms.saturating_mul(3)));
     let mut ticker = tokio::time::interval(Duration::from_millis(config.interval_ms));
+    let mut clock: Option<(ha::wireguard::PeerClock, u64)> = None;
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut export_authority = None;
     loop {
@@ -1116,6 +1149,13 @@ pub async fn run(
                             log::debug!("conntrack-sync: exporting HA snapshot term={} records={} syn={}",a.term,snapshot.entries.len(),snapshot.entries.values().filter(|r|matches!(r,Record::SynProxy(..))).count());
                         }
                         for endpoint in endpoints {let record=Record::Wireguard(endpoint);snapshot.entries.insert(record.key(),record);}
+                        // The owner's wall clock rides along for a WireGuard pair (PeerClock).
+                        if authority.is_none() || wg_interfaces.is_empty() {
+                            clock = None;
+                        } else if clock_due(clock.map(|(_, at)| at), ha::now_ns()) {
+                            clock = ha::wireguard::PeerClock::sample().map(|c| (c, ha::now_ns()));
+                        }
+                        if let Some((sample, _)) = clock {let record=Record::Clock(sample);snapshot.entries.insert(record.key(),record);}
                         let fw = firewall.lock().await;
                         ensure!(fw.sync_generation()? == generation, "policy changed during state dump");
                         ensure!(ha.lock().await.authority_for_send(policy)? == authority, "HA authority changed during state dump");
@@ -1130,6 +1170,12 @@ pub async fn run(
             }
         }
     }
+}
+
+/// Whether the owner's replicated clock sample, taken at CLOCK_BOOTTIME
+/// `previous`, is due for a refresh at `now`.
+fn clock_due(previous: Option<u64>, now: u64) -> bool {
+    previous.is_none_or(|at| now < at || now - at >= ha::wireguard::CLOCK_REFRESH_NS)
 }
 
 /// One rule's digest record, in the field order the digest has always used.
@@ -1321,6 +1367,7 @@ mod tests {
             firewall: kernel_map(),
             synproxy: kernel_map(),
             endpoints: BTreeMap::new(),
+            peer_clock: None,
             imported: BTreeMap::new(),
             policy: None,
             local_addresses: BTreeSet::new(),
@@ -1537,6 +1584,46 @@ mod tests {
         target.apply(peer, UPSERT, syn_record()).await.unwrap();
         target.finish_snapshot(peer, &HashSet::new()).await.unwrap();
         assert!(target.synproxy.get(&key, 0).is_err());
+    }
+
+    #[test]
+    fn clock_records_roundtrip_and_reject_malformed_samples() {
+        let clock = ha::wireguard::PeerClock {
+            wall_ns: 1_795_312_020_353_569_926,
+            synchronised: true,
+        };
+        let record = Record::Clock(clock);
+        let bytes = record.encode(0);
+        assert_eq!(bytes.len(), 13);
+        assert_eq!(Record::decode(&bytes).unwrap(), record);
+        assert_eq!(unpack(&pack(&[record], 0)).unwrap(), vec![record]);
+        // One clock per snapshot, whatever it says.
+        let unsynced = Record::Clock(ha::wireguard::PeerClock {
+            wall_ns: 1,
+            synchronised: false,
+        });
+        assert_eq!(record.key(), unsynced.key());
+        assert_eq!(Record::decode(&unsynced.encode(0)).unwrap(), unsynced);
+        for n in 0..bytes.len() {
+            assert!(Record::decode(&bytes[..n]).is_err());
+        }
+        let mut flag = bytes.clone();
+        flag[12] = 2;
+        assert!(Record::decode(&flag).is_err());
+        let mut zero = bytes;
+        zero[4..12].copy_from_slice(&[0; 8]);
+        assert!(Record::decode(&zero).is_err());
+    }
+
+    #[test]
+    fn the_owner_refreshes_its_replicated_clock_once_a_second() {
+        let second = ha::wireguard::CLOCK_REFRESH_NS;
+        assert!(clock_due(None, 5));
+        assert!(!clock_due(Some(5), 5));
+        assert!(!clock_due(Some(5), 5 + second - 1));
+        assert!(clock_due(Some(5), 5 + second));
+        // A clock that went backwards (a restarted agent's stale state) refreshes.
+        assert!(clock_due(Some(10), 5));
     }
 
     #[test]
@@ -1842,6 +1929,7 @@ mod tests {
             firewall: flows,
             synproxy,
             endpoints: BTreeMap::new(),
+            peer_clock: None,
             imported: BTreeMap::new(),
             policy: None,
             local_addresses: BTreeSet::new(),
