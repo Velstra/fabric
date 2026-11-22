@@ -788,6 +788,17 @@ async fn push_available(
     stream.set_nodelay(true)?;
     let key = timeout(IO_TIMEOUT, handshake(&mut stream, secret.as_bytes(), true)).await??;
     let features = peer_features(&mut stream, &key).await;
+    if features & FEATURE_CLOCK == 0 {
+        // Once per session: an older standby, or one that did not answer in
+        // time. It still receives everything it can decode.
+        log::info!(
+            "conntrack-sync: {} announced no HA clock support within {} ms; withholding the owner's clock record from it",
+            stream
+                .peer_addr()
+                .map_or_else(|_| "peer".into(), |a| a.ip().to_string()),
+            FEATURE_WAIT.as_millis()
+        );
+    }
     let mut session = Session { key, sequence: 0 };
     let mut previous: Option<Arc<Snapshot>> = None;
     loop {
@@ -1030,6 +1041,9 @@ async fn receive(
                         &ha,
                         authority,
                         store.endpoints.values().copied().collect(),
+                    )?;
+                    ha::wireguard::publish_clock(
+                        std::path::Path::new(ha::wireguard::CLOCK_DIR),
                         store.peer_clock,
                     )?;
                 }
@@ -1053,6 +1067,9 @@ async fn receive(
                         &ha,
                         authority,
                         store.endpoints.values().copied().collect(),
+                    )?;
+                    ha::wireguard::publish_clock(
+                        std::path::Path::new(ha::wireguard::CLOCK_DIR),
                         store.peer_clock,
                     )?;
                     ha.snapshot_ready(authority);

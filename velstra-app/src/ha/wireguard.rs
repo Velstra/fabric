@@ -111,6 +111,12 @@ fn kernel_synchronised() -> bool {
     state >= 0 && timex.maxerror < MAX_ERROR_US
 }
 
+/// Where the agent publishes the predecessor's clock for the clock-step helper.
+/// Not under /run/velstra/ha: Wren may write there, and the helper must not
+/// act on a reading Wren could forge. Wren's unit cannot see this directory.
+pub const CLOCK_DIR: &str = "/run/velstra/ha-clock";
+pub const CLOCK_FILE: &str = "peer.json";
+
 /// A replicated [`PeerClock`] with the local CLOCK_BOOTTIME of its receipt, so
 /// a reader can project the owner's wall clock to its own present.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,8 +135,6 @@ pub struct Cache {
     pub policy: String,
     pub authority: Authority,
     pub endpoints: Vec<Endpoint>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer_clock: Option<ClockObservation>,
 }
 
 pub async fn scan(interfaces: &[String]) -> Result<Vec<Endpoint>> {
@@ -198,13 +202,7 @@ pub async fn scan(interfaces: &[String]) -> Result<Vec<Endpoint>> {
     Ok(result)
 }
 
-pub fn publish(
-    state: &State,
-    authority: &Authority,
-    endpoints: Vec<Endpoint>,
-    peer_clock: Option<ClockObservation>,
-) -> Result<()> {
-    use std::io::Write;
+pub fn publish(state: &State, authority: &Authority, endpoints: Vec<Endpoint>) -> Result<()> {
     let config = state.config.as_ref().context("HA config absent")?;
     for e in &endpoints {
         e.validate()?;
@@ -219,13 +217,41 @@ pub fn publish(
         policy: config.wireguard_policy.clone(),
         authority: authority.clone(),
         endpoints,
-        peer_clock,
     };
+    replace_private(Path::new(PATH), &serde_json::to_vec(&cache)?)
+}
+
+/// Publish the predecessor's clock into `dir` (0700) as [`CLOCK_FILE`], or
+/// remove it when there is none.
+pub fn publish_clock(dir: &Path, observation: Option<ClockObservation>) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let path = dir.join(CLOCK_FILE);
+    let Some(observation) = observation else {
+        return match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        };
+    };
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    replace_private(&path, &serde_json::to_vec(&observation)?)
+}
+
+/// Write `bytes` to `path` through a 0600, exclusively created, unfollowed
+/// stage file and an atomic rename.
+fn replace_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
     let mut random = [0; 16];
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut random)
         .map_err(|_| anyhow::anyhow!("HA randomness unavailable"))?;
-    let stage = Path::new(PATH).with_file_name(format!(
-        ".wireguard-{}",
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("HA state file name")?;
+    let stage = path.with_file_name(format!(
+        ".{name}-{}",
         random
             .iter()
             .map(|b| format!("{b:02x}"))
@@ -238,8 +264,8 @@ pub fn publish(
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&stage)?;
-        file.write_all(&serde_json::to_vec(&cache)?)?;
-        std::fs::rename(&stage, PATH)?;
+        file.write_all(bytes)?;
+        std::fs::rename(&stage, path)?;
         Ok(())
     })();
     let _ = std::fs::remove_file(stage);
@@ -258,30 +284,31 @@ mod tests {
     }
 
     #[test]
-    fn a_cache_without_a_peer_clock_still_parses_and_omits_it() {
-        let cache: Cache = serde_json::from_str(
-            r#"{"cluster":"c","node":1,"policy":"p","authority":{"term":1,"owner":1,"boot":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"policy":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]},"endpoints":[]}"#,
-        )
-        .unwrap();
-        assert!(cache.peer_clock.is_none());
-        assert!(
-            !serde_json::to_string(&cache)
-                .unwrap()
-                .contains("peer_clock")
-        );
+    fn the_peer_clock_is_published_privately_outside_wrens_directory() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = std::env::temp_dir().join(format!("velstra-ha-clock-{}", std::process::id()));
         let observed = ClockObservation {
             wall_ns: 5,
             synchronised: true,
             observed_ns: 7,
         };
-        let with = Cache {
-            peer_clock: Some(observed),
-            ..cache
-        };
-        let text = serde_json::to_string(&with).unwrap();
-        assert!(
-            text.contains(r#""peer_clock":{"wall_ns":5,"synchronised":true,"observed_ns":7}"#),
-            "{text}"
+        publish_clock(&dir, Some(observed)).unwrap();
+        let file = dir.join(CLOCK_FILE);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            r#"{"wall_ns":5,"synchronised":true,"observed_ns":7}"#
         );
+        assert_eq!(std::fs::metadata(&file).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        // No predecessor: no reading at all, never a stale one.
+        publish_clock(&dir, None).unwrap();
+        assert!(!file.exists());
+        publish_clock(&dir, None).unwrap();
+        // The WireGuard snapshot Wren reads no longer carries a clock.
+        assert!(!Path::new(CLOCK_DIR).starts_with(Path::new(PATH).parent().unwrap()));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
