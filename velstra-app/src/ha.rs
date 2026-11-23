@@ -138,6 +138,26 @@ impl State {
             false
         }
     }
+    /// Whether this node runs leased HA (an enabled `[ha]`), the only mode in
+    /// which it knows whether it is the active member.
+    pub fn leased(&self) -> bool {
+        self.config.as_ref().is_some_and(|config| config.enabled)
+    }
+    /// Whether this node may end SYN-proxy splices no live connection claims
+    /// (the agent's splice sweep): always without leased HA, and with it only
+    /// while this node is the fresh lease owner. A standby's copies of the
+    /// owner's state arrive record by record, a splice possibly before the
+    /// state that claims it; it never sweeps, and the owner's removals reach
+    /// it as conntrack-sync deletions.
+    pub fn owns_state(&self, now: u64) -> bool {
+        let Some(config) = self.config.as_ref().filter(|config| config.enabled) else {
+            return true;
+        };
+        role_fresh(config, self.role.updated_ns, now)
+            && self.active_term > 0
+            && self.role.authority.owner == config.node
+            && self.role.deadline_ns > now
+    }
     /// Local forwarding authority and replica freshness, never inferred from
     /// link presence. The active node cannot measure remote apply latency from
     /// the one-way VCS2 feed; report that measurement as unknown, not zero.
@@ -146,10 +166,7 @@ impl State {
             return serde_json::json!({"role":"standalone","sync_age_ms":null});
         };
         let fresh_role = role_fresh(config, self.role.updated_ns, now);
-        let master = fresh_role
-            && self.active_term > 0
-            && self.role.authority.owner == config.node
-            && self.role.deadline_ns > now;
+        let master = self.owns_state(now);
         serde_json::json!({"role":if master {"Master"} else if fresh_role {"Backup"} else {"Fenced"},
             "node":config.node,"cluster":config.cluster,"term":self.role.authority.term,
             "owner":self.role.authority.owner,"lease_remaining_ms":self.role.deadline_ns.saturating_sub(now)/1_000_000,
@@ -985,6 +1002,44 @@ mod tests {
         assert_eq!(state.telemetry(now + 200_000_000)["role"], "Fenced");
         state.config = None;
         assert_eq!(state.telemetry(now)["role"], "standalone");
+    }
+    #[tokio::test]
+    async fn only_a_standalone_node_or_the_fresh_lease_owner_owns_its_state() {
+        let shared = State::new(Some(config())).unwrap();
+        let mut state = shared.lock().await;
+        let now = 5_000_000_000;
+        assert!(state.leased());
+        assert!(!state.owns_state(now), "fenced");
+        state.role.updated_ns = now;
+        state.ready_term = 7;
+        assert!(!state.owns_state(now), "a standby never sweeps");
+        state.role.authority.owner = 1;
+        state.active_term = 7;
+        state.role.deadline_ns = now + 100_000_000;
+        assert!(state.owns_state(now), "the lease owner sweeps");
+        // Each condition on its own withdraws ownership.
+        state.active_term = 0;
+        assert!(!state.owns_state(now), "not yet forwarding");
+        state.active_term = 7;
+        state.role.authority.owner = 2;
+        assert!(!state.owns_state(now), "the peer owns the lease");
+        state.role.authority.owner = 1;
+        state.role.updated_ns = 0;
+        assert!(!state.owns_state(now), "a stale role report");
+        state.role.updated_ns = now;
+        assert!(
+            !state.owns_state(now + 200_000_000),
+            "an expired lease is not ownership"
+        );
+        state.config.as_mut().expect("config").enabled = false;
+        assert!(!state.leased(), "a disabled [ha] is not a lease");
+        assert!(state.owns_state(now), "nor does it fence the node");
+        state.config = None;
+        assert!(!state.leased());
+        assert!(
+            state.owns_state(now),
+            "without leased HA the node owns its state"
+        );
     }
     #[tokio::test]
     async fn a_standby_reports_why_it_cannot_take_over() {

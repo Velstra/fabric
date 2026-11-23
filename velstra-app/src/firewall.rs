@@ -1367,6 +1367,26 @@ impl Firewall {
         self.applied.conntrack
     }
 
+    /// The ports servers of SYN-proxied connections use: the server-side
+    /// `SYNPROXY` entries of the applied configuration, which name exactly
+    /// the ports the data plane keys splices on. Empty with no SYN proxy.
+    pub fn splice_service_ports(&self) -> HashSet<u16> {
+        let policy_ids: Vec<PolicyId> = self.applied.policies.iter().map(|p| p.id).collect();
+        server_side_ports(&synproxy_entries(
+            &self.applied.synproxy,
+            &self.applied.port_forwards,
+            &policy_ids,
+        ))
+    }
+
+    /// The HA conntrack-sync push interval, when this node is in a pair.
+    pub fn sync_interval(&self) -> Option<std::time::Duration> {
+        self.applied
+            .conntrack_sync
+            .as_ref()
+            .map(|sync| std::time::Duration::from_millis(sync.interval_ms))
+    }
+
     pub fn reconcile_links(&mut self) -> Result<()> {
         let present = std::fs::read_dir("/sys/class/net")?
             .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
@@ -4653,6 +4673,16 @@ fn synproxy_entries(
     out
 }
 
+/// The ports of the server-side entries among `entries`: those the data
+/// plane keys splices on.
+fn server_side_ports(entries: &[(SynProxyKey, SynProxyCfg)]) -> HashSet<u16> {
+    entries
+        .iter()
+        .filter(|(key, _)| key.policy == SynProxyKey::SERVER_SIDE)
+        .map(|(key, _)| key.port)
+        .collect()
+}
+
 /// Resolve live masquerade targets. Explicit SNAT/HA VIP addresses always win
 /// over a member's DHCP address. Missing interfaces/addresses are retried by
 /// the normal two-second interface reconciliation loop.
@@ -6691,6 +6721,17 @@ mod tests {
                 SynProxyKey::server_side(443),
             ])
         );
+    }
+
+    #[test]
+    fn splices_are_keyed_on_the_server_side_ports_including_a_forwards_target() {
+        let entries = synproxy_entries(
+            &[proxied(8080, 1460, Some(7)), proxied(443, 1460, None)],
+            &[forward(7, 8080, 80)],
+            &[0, 7],
+        );
+        assert_eq!(server_side_ports(&entries), HashSet::from([8080, 80, 443]));
+        assert!(server_side_ports(&synproxy_entries(&[], &[], &[0, 7])).is_empty());
     }
 
     #[test]

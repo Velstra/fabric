@@ -243,13 +243,87 @@ struct Imported {
     peer: IpAddr,
     record: Record,
 }
+
+/// The SYN-proxy splice keys this agent holds as imported from a peer,
+/// shared with the agent's splice sweep: a peer's splice can arrive a dump
+/// before the state that claims it, so a node must not judge a splice it
+/// only holds on the peer's behalf (see `crate::reclaim`).
+pub type ImportedSplices = Arc<std::sync::Mutex<HashSet<FlowKey>>>;
+
+/// The imported records, with their SYN-proxy keys mirrored into an
+/// [`ImportedSplices`] set on every change.
+struct ImportedRecords {
+    map: BTreeMap<Key, Imported>,
+    splices: ImportedSplices,
+}
+
+impl ImportedRecords {
+    fn new(splices: ImportedSplices) -> Self {
+        if let Ok(mut set) = splices.lock() {
+            set.clear();
+        }
+        Self {
+            map: BTreeMap::new(),
+            splices,
+        }
+    }
+    fn splices(&self) -> std::sync::MutexGuard<'_, HashSet<FlowKey>> {
+        // A poisoned lock still holds a usable set; never lose the mirror.
+        self.splices.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    fn get(&self, key: &Key) -> Option<&Imported> {
+        self.map.get(key)
+    }
+    fn contains_key(&self, key: &Key) -> bool {
+        self.map.contains_key(key)
+    }
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+    fn iter(&self) -> impl Iterator<Item = (&Key, &Imported)> {
+        self.map.iter()
+    }
+    fn insert(&mut self, key: Key, imported: Imported) {
+        if let Record::SynProxy(splice, _) = imported.record {
+            self.splices().insert(splice);
+        }
+        self.map.insert(key, imported);
+    }
+    fn remove(&mut self, key: &Key) {
+        if let Some(Imported {
+            record: Record::SynProxy(splice, _),
+            ..
+        }) = self.map.remove(key)
+        {
+            self.splices().remove(&splice);
+        }
+    }
+    fn retain(&mut self, mut keep: impl FnMut(&Key, &Imported) -> bool) {
+        let mut gone = Vec::new();
+        self.map.retain(|key, imported| {
+            let kept = keep(key, imported);
+            if !kept && let Record::SynProxy(splice, _) = imported.record {
+                gone.push(splice);
+            }
+            kept
+        });
+        let mut set = self.splices();
+        for splice in gone {
+            set.remove(&splice);
+        }
+    }
+    fn clear(&mut self) {
+        self.map.clear();
+        self.splices().clear();
+    }
+}
 struct Store {
     nat: NatMap,
     firewall: HashMap<MapData, FirewallKey, FirewallState>,
     synproxy: HashMap<MapData, FlowKey, SynFlow>,
     endpoints: BTreeMap<Key, ha::wireguard::Endpoint>,
     peer_clock: Option<ha::wireguard::ClockObservation>,
-    imported: BTreeMap<Key, Imported>,
+    imported: ImportedRecords,
     policy: Option<[u8; 32]>,
     local_addresses: BTreeSet<IpAddr>,
 }
@@ -1130,6 +1204,7 @@ pub async fn run(
     synproxy: HashMap<MapData, FlowKey, SynFlow>,
     ha: ha::Shared,
     config: ResolvedConntrackSync,
+    imported_splices: ImportedSplices,
 ) {
     let secret = Arc::new(
         config
@@ -1152,7 +1227,7 @@ pub async fn run(
         synproxy,
         endpoints: BTreeMap::new(),
         peer_clock: None,
-        imported: BTreeMap::new(),
+        imported: ImportedRecords::new(imported_splices),
         policy: None,
         local_addresses: initial_scope,
     }));
@@ -1443,7 +1518,7 @@ mod tests {
             synproxy: kernel_map(),
             endpoints: BTreeMap::new(),
             peer_clock: None,
-            imported: BTreeMap::new(),
+            imported: ImportedRecords::new(ImportedSplices::default()),
             policy: None,
             local_addresses: BTreeSet::new(),
         }
@@ -2005,7 +2080,7 @@ mod tests {
             synproxy,
             endpoints: BTreeMap::new(),
             peer_clock: None,
-            imported: BTreeMap::new(),
+            imported: ImportedRecords::new(ImportedSplices::default()),
             policy: None,
             local_addresses: BTreeSet::new(),
         }));
@@ -2702,6 +2777,61 @@ mod tests {
         let records = exported_records(false).await;
         assert_eq!(records.len(), 1, "{records:?}");
         assert!(matches!(records[0], Record::Wireguard(_)));
+    }
+
+    #[test]
+    fn a_new_import_store_starts_with_no_held_splices() {
+        // A restarted sync task holds nothing yet: a key left from before
+        // would shield a splice from the sweep for good.
+        let set = ImportedSplices::default();
+        set.lock()
+            .unwrap()
+            .insert(FlowKey::new(0, [10, 2, 0, 10], [0; 4], 1, 8443, 6));
+        let records = ImportedRecords::new(set.clone());
+        assert_eq!(records.len(), 0);
+        assert!(set.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn imported_splice_keys_are_mirrored_through_every_change() {
+        let set = ImportedSplices::default();
+        let mut records = ImportedRecords::new(set.clone());
+        let peer: IpAddr = "10.3.0.2".parse().unwrap();
+        let splice = |port| {
+            Record::SynProxy(
+                FlowKey::new(0, [10, 2, 0, 10], [0; 4], port, 8443, 6),
+                SynFlow::pending(1, 2),
+            )
+        };
+        let firewall = Record::Firewall(
+            FirewallKey::ipv4(FlowKey::new(7, [10, 2, 0, 10], [10, 1, 0, 10], 1, 8443, 6)),
+            FirewallState::UNTRACKED,
+        );
+        for record in [splice(1), splice(2), firewall] {
+            records.insert(record.key(), Imported { peer, record });
+        }
+        let key = |record: Record| match record {
+            Record::SynProxy(k, _) => k,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            *set.lock().unwrap(),
+            HashSet::from([key(splice(1)), key(splice(2))])
+        );
+        records.remove(&splice(1).key());
+        assert_eq!(*set.lock().unwrap(), HashSet::from([key(splice(2))]));
+        records.retain(|k, _| *k != splice(2).key());
+        assert!(set.lock().unwrap().is_empty());
+        records.insert(
+            splice(3).key(),
+            Imported {
+                peer,
+                record: splice(3),
+            },
+        );
+        records.clear();
+        assert!(set.lock().unwrap().is_empty());
+        assert_eq!(records.len(), 0);
     }
 
     #[tokio::test]

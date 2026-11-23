@@ -76,7 +76,9 @@
 //!
 //! Everything here is pure arithmetic and is unit-tested without a kernel.
 
-use crate::{forward::ipv4_checksum, reject::tcp_checksum};
+use crate::{
+    FirewallKey, FirewallState, FlowKey, FlowState, forward::ipv4_checksum, reject::tcp_checksum,
+};
 
 /// The MSS values a cookie can encode, since only three bits survive in it.
 ///
@@ -591,9 +593,140 @@ unsafe impl aya::Pod for SynProxyCfg {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for SynFlow {}
 
+/// The policy namespace splices live in: the policy-independent one, like
+/// conntrack's router-NAT entries, because the two directions of a proxied
+/// connection arrive through different zones. The data plane asserts that its
+/// `ROUTER_NAT_POLICY` is this value.
+pub const SPLICE_POLICY: u32 = 0;
+
+/// The `SYN_FLOWS` key of a proxied connection: the client's address and
+/// port and the port the SERVER uses (a port-forward's target port when it
+/// changes the port), the server address zeroed so the key is the same on
+/// both sides of a destination NAT. The data plane keys splices with exactly
+/// this function, so user space can name them.
+#[inline(always)]
+pub const fn splice_key(client: [u8; 4], client_port: u16, service_port: u16) -> FlowKey {
+    FlowKey::new(
+        SPLICE_POLICY,
+        client,
+        [0; 4],
+        client_port,
+        service_port,
+        crate::ip_proto::TCP,
+    )
+}
+
+/// The splice a stateful-firewall entry claims for its connection: the
+/// entry's key read in the initiator's direction (the initiator is the
+/// client; `reply` is the entry's own direction flag). `None` for anything
+/// but IPv4 TCP.
+///
+/// Every identity of a routed connection carries the server's own port. Of a
+/// translated one, the inside zone's copy does; the client zone's copy and the
+/// router-NAT canonical one carry the public port, which [`nat_claim`] maps.
+/// An identity that names no splice claims nothing that exists.
+#[inline]
+pub fn firewall_claim(key: &FirewallKey, state: &FirewallState) -> Option<FlowKey> {
+    if key.family != 4 || key.proto != crate::ip_proto::TCP {
+        return None;
+    }
+    let src = [key.src[0], key.src[1], key.src[2], key.src[3]];
+    let dst = [key.dst[0], key.dst[1], key.dst[2], key.dst[3]];
+    Some(if state.reply & 1 == 0 {
+        splice_key(src, key.src_port, key.dst_port)
+    } else {
+        splice_key(dst, key.dst_port, key.src_port)
+    })
+}
+
+/// The splice a destination-NAT binding claims for its connection: the
+/// client's address and port with the port the binding translates the
+/// destination to — what maps a port-forward's public port to the inside one
+/// (the port the data plane keys the splice on, its `server_port`). `None` for
+/// reverse and source-NAT (origin) entries and for anything but TCP.
+///
+/// A load balancer whose backend port differs from its VIP port is claimed on
+/// the backend port, while the data plane keys its splice on the VIP port (it
+/// maps ports only for port-forwards); the claim then names no splice, which
+/// is harmless here: its client-zone firewall entry claims the VIP port. (Such
+/// a load balancer cannot be SYN-proxied today anyway: the server's half
+/// looks its splice up by the backend port and misses.)
+#[inline]
+pub fn nat_claim(key: &FlowKey, state: &FlowState) -> Option<FlowKey> {
+    if key.proto != crate::ip_proto::TCP || state.is_reverse() || state.is_origin() {
+        return None;
+    }
+    let service_port = if state.nat_port != 0 {
+        state.nat_port
+    } else {
+        key.dst_port
+    };
+    Some(splice_key(key.src_ip, key.src_port, service_port))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn established(reply: u32) -> FirewallState {
+        FirewallState {
+            phase: FirewallState::ESTABLISHED,
+            reply,
+            ..FirewallState::UNTRACKED
+        }
+    }
+
+    #[test]
+    fn a_firewall_entry_claims_its_connections_splice_from_either_direction() {
+        let initiator = FirewallKey::ipv4(FlowKey::new(7, CLIENT, SERVER, 40_000, 443, 6));
+        let expected = splice_key(CLIENT, 40_000, 443);
+        assert_eq!(firewall_claim(&initiator, &established(0)), Some(expected));
+        assert_eq!(
+            firewall_claim(&initiator.reverse(), &established(1)),
+            Some(expected)
+        );
+        assert_eq!(expected.dst_ip, [0; 4]);
+        assert_eq!(expected.policy, SPLICE_POLICY);
+    }
+
+    #[test]
+    fn only_ipv4_tcp_firewall_entries_claim_a_splice() {
+        let udp = FirewallKey::ipv4(FlowKey::new(7, CLIENT, SERVER, 40_000, 443, 17));
+        assert_eq!(firewall_claim(&udp, &established(0)), None);
+        let mut v6 = FirewallKey::ipv4(FlowKey::new(7, CLIENT, SERVER, 40_000, 443, 6));
+        v6.family = 6;
+        assert_eq!(firewall_claim(&v6, &established(0)), None);
+    }
+
+    #[test]
+    fn a_port_changing_forward_binding_claims_the_inside_port() {
+        // F4: public 8080 -> inside 80. The splice is keyed on 80.
+        let public = [203, 0, 113, 1];
+        let binding = FlowKey::new(0, CLIENT, public, 40_000, 8080, 6);
+        let forward = FlowState::forward(SERVER, 80);
+        assert_eq!(
+            nat_claim(&binding, &forward),
+            Some(splice_key(CLIENT, 40_000, 80))
+        );
+        // A forward that keeps the port claims the port itself.
+        let same = FlowState {
+            nat_port: 0,
+            ..forward
+        };
+        assert_eq!(
+            nat_claim(&binding, &same),
+            Some(splice_key(CLIENT, 40_000, 8080))
+        );
+    }
+
+    #[test]
+    fn reverse_and_source_nat_entries_claim_nothing() {
+        let key = FlowKey::new(0, SERVER, CLIENT, 80, 40_000, 6);
+        assert_eq!(nat_claim(&key, &FlowState::reverse(CLIENT, 40_000)), None);
+        let origin = FlowState::masquerade(CLIENT, 40_000);
+        assert!(origin.is_origin());
+        assert_eq!(nat_claim(&key, &origin), None);
+    }
 
     const SECRET: [u64; 2] = [0x0f0e_0d0c_0b0a_0908, 0x0706_0504_0302_0100];
     const CLIENT: [u8; 4] = [198, 51, 100, 7];
