@@ -1367,10 +1367,19 @@ impl Firewall {
         self.applied.conntrack
     }
 
+    /// Apply the host's interfaces and addresses as they are now, instead of
+    /// at the next inventory poll (`config_attach_loop`, every 2 s). A changed
+    /// local address set is applied with the datapath gate closed, so when it
+    /// happens matters: an HA takeover calls this before it opens forwarding
+    /// (see `ha::monitor`). An unchanged inventory writes nothing.
+    pub fn refresh_host_inventory(&mut self) -> Result<()> {
+        let present = kernel_interfaces()?;
+        self.reconcile_config_interfaces(&present, self.attach_mode);
+        Ok(())
+    }
+
     pub fn reconcile_links(&mut self) -> Result<()> {
-        let present = std::fs::read_dir("/sys/class/net")?
-            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
-            .collect::<std::io::Result<Vec<String>>>()?;
+        let present = kernel_interfaces()?;
         self.reconcile_config_interfaces(&present, self.attach_mode);
         let desired = self.applied.clone();
         self.sync_egress_attachments(&desired)?;
@@ -3718,6 +3727,14 @@ impl AppliedIntent {
     fn allows_address_refresh(&self, state: Option<u32>, hooks_unchanged: bool) -> bool {
         self.current && state == Some(CONFIG_READY) && hooks_unchanged
     }
+}
+
+/// The interface names the kernel has now.
+fn kernel_interfaces() -> Result<Vec<String>> {
+    std::fs::read_dir("/sys/class/net")?
+        .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+        .collect::<std::io::Result<Vec<String>>>()
+        .context("listing host interfaces")
 }
 
 /// Plan a host-only refresh for the *same applied intent*. Every exclusion must
