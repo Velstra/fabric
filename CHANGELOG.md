@@ -2,8 +2,175 @@
 
 ## [Unreleased]
 
-### Fixed
+## [0.5.0] — 2026-11-24
 
+This is the state shipped in Sentinel 1.0.0: the tag `sentinel-v1.0.0` names
+the same commit. It is a minor release rather than a patch because HA
+behaviour changed — state replication is authenticated and fenced, a standby
+judges its own state and policy differently, and a takeover now applies its
+addresses before it forwards. It covers everything since
+`release: fabric 0.4.1` (the `v0.4.1` tag names a commit outside main's history
+whose tree is identical to that one).
+
+### Breaking and behaviour changes
+
+- **HA state replication requires authenticated peers.** Replication runs over
+  authenticated TCP with explicit peers; missing or invalid secrets and
+  listen-only configurations are refused, and the legacy unauthenticated UDP
+  transport is disabled. Before upgrading both members, configure a valid
+  shared secret and peer addresses, or remove `[conntrack_sync]` to disable
+  replication. Obsolete policy generations are fenced.
+- **The REST gateway serves HTTPS whenever `--tls-cert`/`--tls-key` are
+  configured**, inheriting the agent channel's certificates, and requires a
+  client certificate when `--client-ca` is set. `--rest-plaintext` opts back
+  out for development or loopback use.
+- **A `[[synproxy]]` entry must cover only stateful policies.** The agent now
+  refuses a SYN proxy on a policy without `stateful = true`: a proxied
+  connection lives as long as its connection state, and a stateless policy
+  keeps none. An entry without `policy` covers every policy, the top-level one
+  included, and the top-level `stateful` defaults to `false`: a hand-written
+  config with an unscoped `[[synproxy]]` and no top-level `stateful = true` is
+  now refused. Add `stateful = true` at the top level (and to every
+  `[[policy]]` the port covers), or scope the entry with `policy = <id>`.
+- **`SYN_FLOWS` is sized at two records per connection** (it was one per two),
+  for every proxied connection plus the records the sweep has yet to end. On
+  the same memory the default sizing therefore holds about 7 % fewer
+  connections (an explicit `connections` count takes about 12 % more state
+  memory), and because the table layout changed, the first agent restart
+  after the upgrade does not adopt pinned state (`[state] persist`) but starts
+  fresh.
+- **`log` no longer logs every packet of admitted flows.** With a policy's
+  `log = true` the data plane wrote a line for each reverse-NAT packet
+  (`NAT(ct)`), each forwarded one (`FWD`), each encapsulated one (`ENCAP`,
+  `SRV6 ENCAP`) and each new load-balanced flow (`DNAT`). On a busy WAN that
+  flooded the journal until the box stalled (a NAT stress run lost 844 packets
+  and held connections timed out), and it contradicted the documented meaning:
+  the policy flag logs drops and rejects, a rule's own `log` additionally each
+  new flow it accepts. Those fast-path lines are gone — the same events are
+  counted (`lb_established`, `lb_reverse`, `forwarded`, `overlay_encap`,
+  `srv6_encap`, `load_balanced`) — and nothing replaces them. Drop and reject
+  lines are unchanged; their path is lossy end to end (a bounded ring buffer,
+  then the agent's non-blocking writer), so a flood of logged drops loses lines
+  instead of slowing the box.
+- **IPv6 is judged by IPv6 rules only (DP-11).** The IPv6 path used to consult
+  the IPv4 rule tries with address `0`, so any IPv4 prefix containing
+  `0.0.0.0` matched IPv6 traffic too (a `0.0.0.0/8` bogon drop killed all
+  IPv6). An address-less rule is now programmed into both source tries
+  (`0.0.0.0/0` and `::/0`), honouring `family`.
+- **`block-icmp` refuses new ICMP, not answers (DP-10).** An established echo
+  reply and a RELATED error are admitted; ICMPv6 neighbour discovery and MLD
+  in their RFC shape pass before the policy, and egress applies `block-icmp`
+  only on a tenant tap.
+- **A stateful policy refuses TCP and UDP carrying IPv4 options (DP-34)**, which
+  were judged statelessly and bypassed the SYN proxy; ICMP and IGMP keep their
+  options. With fail-closed set, frames of non-IP EtherTypes other than link
+  control and re-classified encapsulations are dropped (DP-22).
+- **A rule naming an interface that cannot be resolved is refused** instead of
+  resolving to `0`, which the data plane reads as "any interface".
+- **The agent starts when its uplink does not exist yet.** Sentinel names the
+  first zoned link as the agent's uplink; when a commit creates that link (a
+  GRE tunnel, a VLAN, a bridge), the agent could restart before networkd had
+  made the device, and start-up failed with `interface "tun0" not found`, so
+  the commit's readiness probe failed and the commit rolled back. The
+  `--iface` contract is now: an interface that does not exist at start-up is
+  skipped with a warning and attached when it appears — by the link
+  reconciliation a commit runs once the network is applied, or by the 2 s
+  interface poll; while it is still missing the agent warns again every
+  minute and lists it in the new `missing-interfaces` query (one name per
+  line, empty when every primary is attached). Any other failure to look an
+  interface up still stops the agent.
+- **`dst-local = true` on a port rule** names this member's own addresses,
+  expanded at run time from the live host inventory (DP-16). An older agent
+  refuses the key, so a mismatched pair fails closed.
+- **`verify-ebpf` refuses a program above `--max-insns`** (default 700,000, 30 %
+  of the kernel limit in reserve), and prints `verifier-insns <name> <count>`
+  for every program it loads.
+
+### HA
+
+- **A takeover applies its addresses before it opens forwarding.** The VIPs a
+  takeover adds change the local-destination set whenever a policy has
+  `dst-local` rules, and the 2 s inventory poll used to rewrite the rule tries
+  with the datapath gate closed up to 2 s after the new owner had opened
+  forwarding, dropping what arrived meanwhile (a lost first WireGuard
+  handshake in about 1 in 24 takeovers). The HA monitor now applies the
+  inventory before it opens forwarding, reporting first so Wren's 100 ms
+  freshness bound is not starved, and stamps that report when it is written.
+- **`virtual_addresses`** (VRRP/HA VIPs) are counted as local destinations on
+  every member whether or not it holds them, so a takeover changes no rule-trie
+  entry and grows `LOCAL_EGRESS_ADDRS` through the additive path without
+  closing the gate. The field is optional, member-local and not part of the
+  policy fingerprint. Every full closed-gate transaction is now logged once at
+  info with its cause.
+- **The owner's wall clock is replicated to a WireGuard HA standby.** Both
+  members present one WireGuard identity, so a member whose clock lagged (a
+  resumed VM) had its promotion handshake dropped as a replay. The owner adds
+  a clock record (VWC1) to its authenticated snapshot once a second; it is
+  sent only to standbys that announce support in an authenticated FEATURES
+  frame, so an older standby is not cut off during a rolling upgrade. The
+  standby publishes the reading privately as `/run/velstra/ha-clock/peer.json`
+  (0700 directory, 0600 file), outside the directory Wren can write.
+- **The HA policy digest is member-independent (HA-02).** A rule to the
+  appliance itself expanded into one rule per member-own address, so the two
+  members of any real pair never agreed and the standby refused every snapshot
+  and could not take over (HA-03, HA-04). Member-local destinations are hashed
+  by family; a policy without them hashes as before. A refusal for a policy
+  mismatch is now logged as a warning, at most once a minute.
+- **A standby with unusable state becomes cold again (HA-04).** After five
+  seconds of stale or mismatched replicated state with healthy links, it
+  discards the replicated tables and rejoins as a cold member, so a double
+  fault no longer leaves the pair dark until an operator restarts an agent.
+- **HA forwarding is fenced in the kernel**, revoked before agent teardown, and
+  readiness is withdrawn when kernel fence publication fails. The authoritative
+  successor state, complete owner snapshots and the SYN-proxy handshake and
+  TCP sequence splice state are replicated; node-local control connections are
+  preserved; a cold owner publishes an empty complete VPN baseline before it
+  acknowledges forwarding; HA control-policy identity and state sync are
+  checkpointed; HA sender retirement is authenticated.
+- `ha-status` reports standby readiness and `not_ready`, role freshness is
+  checked, and stale HA WireGuard ports are pruned. Dataplane telemetry is
+  bounded so it cannot delay HA.
+- **The agent's logging no longer blocks it.** Log records went through
+  `env_logger` to stderr and the periodic statistics table to stdout, both
+  synchronously; under systemd both are streams to journald. When journald
+  stopped reading, a write blocked the runtime worker it ran on — on a small
+  box the whole agent, HA heartbeat included — and the routing daemon gave up
+  ownership although nothing had failed. Both outputs now go through a bounded
+  queue drained by a dedicated thread (4096 records, `VELSTRA_LOG_QUEUE_LINES`
+  1–65536); while the output is blocked new records are dropped and counted
+  instead of waited for, the count is served as `log_lines_dropped` in the
+  `stats` query (and so in `sentinel show firewall statistics`), and the drop
+  is announced on the log once it drains. An exit waits up to 500 ms for the
+  queued records.
+- The replicated NAPT allocator keeps its legacy eight candidates first and
+  then searches a fixed 64-candidate window (DP-26), so an older peer still
+  finds every binding it could have made.
+
+### Data plane
+
+- **Firewall rules grew.** A rule can name a protocol without ports (ICMP,
+  ICMPv6, VRRP, ESP, AH, GRE, and OSPF and PIM), an ICMP message type, IPv6
+  source and destination addresses (`PORT_RULES6`, `DST_RULES6`), one family
+  and one direction (`direction out` brings the egress hook with it), an
+  `interface-group` and a `source-mac-group`. Each is carried over gRPC and
+  the REST API, not only in the TOML, and `validate` prints it.
+- **TCP MSS clamping lives in the data plane** (`MSS_CLAMP` at TC egress,
+  counted as `MssClamped`) instead of an nftables table; the clamp's checksum
+  operands are passed in wire byte order (DP-09), and IPv6 SYNs are clamped to
+  the ceiling less 20 bytes.
+- **Deny-by-default no longer gags the box.** Egress applied the zone's ingress
+  default action to leaving traffic, and the egress hook was not attached for
+  stateful policies, so flows the box started were never recorded and their
+  replies were dropped.
+- **Connection state is sized, reclaimed, diffed and persisted** (DP-06, DP-07,
+  DP-12, DP-17, DP-27, DP-28, DP-41). `[state] connections` (or a twelfth of
+  RAM) sizes `FW_FLOWS`, `CONNTRACK` and `SYN_FLOWS`, the `capacity` query
+  reports occupancy, a background collector reclaims expired state without
+  closing the gate, the policy tries are written by difference and checked
+  against capacity before the gate closes, and `[state] persist = true` pins
+  links and state so a dead agent leaves the last policy enforcing
+  (`velstra release-datapath` detaches everything). The tail-call program
+  arrays are pinned too, and the gate opens before the swap into adopted links.
 - **SYN-proxy records now end with their connections.** `SYN_FLOWS` records
   were never removed, so once as many proxied connections had come and gone as
   the map holds, its LRU evicted the least recently used record — an idle live
@@ -19,7 +186,16 @@
   state is written at cookie-ACK admission), so a flood of spoofed SYNs to a
   protected port leaves `FW_FLOWS` — and the idle connections in it — alone,
   and no longer reaches HA conntrack sync.
-
+- **The SYN proxy works behind port-forwards and before servers that speak
+  first.** The admitting ACK's rewritten IP header is re-read before DNAT, a
+  remapping forward (8080 to 80) is keyed by the port the server uses, and the
+  server-facing firewall state is advanced for the ACK the proxy sends itself,
+  so SMTP, FTP, POP, IMAP and SSH servers no longer hang.
+- **The SYN proxy is scoped per policy (DP-31).** `[[synproxy]]` takes an
+  optional `policy`; the proxy then answers only SYNs arriving under it.
+  Without one the port is protected on every policy, as before. The
+  `SYNPROXY` key grows to 8 bytes; it is a configuration map, not pinned
+  state, so an upgrade needs no migration.
 - **Logged drops are rate-limited.** A SYN flood or a scan against a zone with
   `log = true` offers a log line for every dropped packet; on an appliance's
   small journal a few hundred a second rotate the security, audit and HA
@@ -29,43 +205,6 @@
   `suppressed N data-plane log record(s)` warning per 10 s in which it held
   some back. The per-reason drop counters stay exact; the `stats` query
   reports the held-back total as `log_lines_suppressed`.
-- **`log` no longer logs every packet of admitted flows.** With a policy's
-  `log = true` the data plane wrote a line for each reverse-NAT packet
-  (`NAT(ct)`), each forwarded one (`FWD`), each encapsulated one (`ENCAP`,
-  `SRV6 ENCAP`) and each new load-balanced flow (`DNAT`). On a busy WAN that
-  flooded the journal until the box stalled (a NAT stress run lost 844 packets
-  and held connections timed out), and it contradicted the documented meaning:
-  the policy flag logs drops and rejects, a rule's own `log` additionally each
-  new flow it accepts. Those fast-path lines are gone — the same events are
-  counted (`lb_established`, `lb_reverse`, `forwarded`, `overlay_encap`,
-  `srv6_encap`, `load_balanced`) — and nothing replaces them. Drop and reject
-  lines are unchanged; their path is lossy end to end (a bounded ring buffer,
-  then the agent's non-blocking writer), so a flood of logged drops loses lines
-  instead of slowing the box.
-- **The agent's logging no longer blocks it.** Log records went through
-  `env_logger` to stderr and the periodic statistics table to stdout, both
-  synchronously; under systemd both are streams to journald. When journald
-  stopped reading, a write blocked the runtime worker it ran on — on a small
-  box the whole agent, HA heartbeat included — and the routing daemon gave up
-  ownership although nothing had failed. Both outputs now go through a bounded
-  queue drained by a dedicated thread (4096 records, `VELSTRA_LOG_QUEUE_LINES`
-  1–65536); while the output is blocked new records are dropped and counted
-  instead of waited for, the count is served as `log_lines_dropped` in the
-  `stats` query (and so in `sentinel show firewall statistics`), and the drop
-  is announced on the log once it drains. An exit waits up to 500 ms for the
-  queued records.
-- **The agent starts when its uplink does not exist yet.** Sentinel names the
-  first zoned link as the agent's uplink; when a commit creates that link (a
-  GRE tunnel, a VLAN, a bridge), the agent could restart before networkd had
-  made the device, and start-up failed with `interface "tun0" not found`, so
-  the commit's readiness probe failed and the commit rolled back. The
-  `--iface` contract is now: an interface that does not exist at start-up is
-  skipped with a warning and attached when it appears — by the link
-  reconciliation a commit runs once the network is applied, or by the 2 s
-  interface poll; while it is still missing the agent warns again every
-  minute and lists it in the new `missing-interfaces` query (one name per
-  line, empty when every primary is attached). Any other failure to look an
-  interface up still stops the agent.
 - **IS-IS and the spanning tree work on fail-closed interfaces.** DP-22 drops
   every frame whose EtherType is not link control, and an IEEE 802.3 length
   frame (a type/length value of at most 1500) has no EtherType at all, so IS-IS
@@ -75,15 +214,6 @@
   its LLC header: `FE FE 03` (IS-IS, ES-IS) and `42 42 03` (spanning-tree
   BPDUs) pass; SNAP, which can carry IP, and every other LLC frame stay
   dropped. Neither admitted protocol carries IP.
-- **GRE tunnels are classified as raw-IP links.** The agent decides from the
-  kernel link type whether a frame starts at an Ethernet header, and its list
-  lacked `gre` (ARPHRD 778) and `ip6gre` (823). A packet on a GRE tunnel was
-  therefore parsed as Ethernet: its IPv4 source bytes were read as the
-  EtherType. Under fail-closed (DP-22) every such packet was dropped, so a
-  zoned GRE tunnel carried nothing; before DP-22 the same misreading let the
-  tunnel's inner traffic past zone policy unfiltered (fail-open). The list is
-  now named and audited against every link kind the datapath attaches to,
-  with a test that fails when a raw-IP type is missing.
 - **Masquerade new-connection rate no longer collapses (PERF-02).** The
   standalone port allocator claims only within a fixed window of 128 probes
   per flow, scattered over the source's port domain (its CGNAT block, or
@@ -114,23 +244,16 @@
   the egress hook no longer matches it against destinations, and a listed
   address may still answer a connection opened towards it. What a listed
   address starts is refused as before. Without the key nothing changes.
-- **The SYN proxy is scoped per policy (DP-31).** `[[synproxy]]` takes an
-  optional `policy`; the proxy then answers only SYNs arriving under it.
-  Without one the port is protected on every policy, as before. The
-  `SYNPROXY` key grows to 8 bytes; it is a configuration map, not pinned
-  state, so an upgrade needs no migration.
+- **ICMPv6 errors are RELATED (DP-21)**, so Packet Too Big no longer
+  black-holes IPv6 path-MTU discovery behind a default-drop zone; MAC-group
+  rules and per-rule rate limits apply to IPv6 (DP-19, DP-20); a rejected IPv6
+  UDP datagram is answered with a port-unreachable, and a reject that cannot be
+  answered is dropped rather than passed (DP-33, DP-35).
 - **ICMPv6 RELATED behind NPTv6 and through extension headers.** An error
   about an NPTv6 flow is recognised by its internal address, and its quote is
   translated with the envelope in both directions, so the host's stack acts
   on it; a quote whose packet carried extension headers is walked to its
   transport header (up to four).
-- **TCP resets are validated before they end a connection (DP-03).** A reset
-  tears down firewall state only when its sequence number equals the
-  receiver's last ACK and, at XDP ingress, its TCP checksum is correct. An
-  in-window but inexact reset is forwarded unchanged so the endpoint answers
-  with a challenge ACK (RFC 5961); an out-of-window or bad-checksum reset is
-  dropped (`tcp_invalid_reset`). `FW_FLOWS` values grow to 40 bytes; the HA
-  wire format is unchanged and imported state starts "sequence unknown".
 - **TCP strictness (DP-25).** A retransmitted SYN-ACK after ESTABLISHED is
   accepted; a SYN reusing a silently dead tuple is forwarded and becomes a new
   connection when the responder answers SYN-ACK; half-closed connections idle
@@ -139,78 +262,49 @@
   translated with its L4 header and records the address rewrite; later
   fragments get the same rewrite (`fragment_nat_translated`). A later fragment
   without a record is refused on a masquerade uplink, never leaked.
-- **Masquerade never leaks an inside source (DP-04).** TCP/UDP with IPv4
-  options are translated; GRE, ESP, SCTP, 6in4 and other portless protocols,
-  ICMP other than echo request or a related error, and ICMP with options are
-  refused from inside sources (`egress_nat_unsupported_dropped`).
-- **Only openers allocate NAT state (DP-08, DP-37).** A TCP segment without SYN
-  that finds no binding no longer allocates one, on masquerade and on port
-  forwards (`nat_opener_required`); NULL/XMAS/SYN+FIN segments without state
-  are refused on stateful hooks (`tcp_invalid_flags`).
 - **NAT bindings expire with their connection (DP-07).** Embryonic TCP
   bindings use `tcp_syn`, a FIN `max(tcp_closing, 120 s)`, a reset
   `tcp_closing`; previously every binding held its public port for
-  `tcp_established`.
+  `tcp_established`. A lost lifetime update can no longer resurrect an
+  embryonic mark, and a reply tuple whose previous state expired is reseeded.
 - **Hairpin flows claim a unique source port (DP-23, DP-24).** Two LAN clients
   using the same source port toward the same reflected service no longer share
   a server-side tuple; the reverse entry is published with `BPF_NOEXIST`.
+  Port-forward and load-balancer reverse entries are claimed the same way and a
+  live foreign entry is never overwritten (`nat_claim_collision`).
 - **UDP NAT writes a zero checksum as 0xFFFF (DP-42).**
-
 - Masquerade targets now follow DHCP acquisition, renewal and address withdrawal
   during normal interface reconciliation, without a configuration resend or
   conntrack reset. Explicit static SNAT and HA VIP targets retain precedence.
+- Local control-plane sources are preserved across masquerade, ordinary ICMP
+  forwarding is preserved through the NAT tail, live NAT tuples are preserved,
+  explicitly declared DHCP clients are admitted, and orchestrator tenant taps
+  stay outside local DHCP admission. A synthesized IPv4 reply's TOS checksum is
+  correct.
+- **A torn interface inventory is retried instead of blocking traffic (DP-32).**
+  A netlink dump racing a DHCP renew, a VIP move or a SLAAC change keeps the
+  last good inventory for up to three polls before failing closed; malformed
+  dumps still block at once.
+- Policy-scoped runtime state is reset under the live packet fence; dataplane
+  updates are guarded and transient reconciliation failures recovered; packet
+  events are a cursor log (`packet-events-since`, `packet-events-tail`); a
+  zoned link is raised only once its hooks, the HA guard and a configuration
+  are in place (`reconcile-links` names links still dark); traffic leaving an
+  unaddressed masquerade uplink is dropped; NPTv6 conntrack keys on the
+  internal destination; VTI and other non-Ethernet links get the right XDP
+  framing. Persistence, IPAM ownership and IPFIX delivery are failure-safe.
+- The IPv4 ingress state stage and the IPv4 egress path are split into
+  separate tail-called programs (`velstra_v4_verdict`, `velstra_egress_v4_state`)
+  and log labels are dispatched as constants, which keeps every program well
+  inside the verifier's instruction limit on Linux 6.6, 6.12, 6.18 and 7.0.
+- **Load balancing: draining and client affinity.** A member marked `draining`
+  takes no new connections and keeps the ones it has; `client_affinity` sends
+  every connection from one client address to the same backend. Both mirror
+  fields have presence on the wire, so an older controller is not read as
+  "off".
 
-### Changed
+### Overlay, SRv6 and EVPN
 
-- **A `[[synproxy]]` entry must cover only stateful policies.** The agent now
-  refuses a SYN proxy on a policy without `stateful = true`: a proxied
-  connection lives as long as its connection state, and a stateless policy
-  keeps none. An entry without `policy` covers every policy, the top-level one
-  included, and the top-level `stateful` defaults to `false`: a hand-written
-  config with an unscoped `[[synproxy]]` and no top-level `stateful = true` is
-  now refused. Add `stateful = true` at the top level (and to every
-  `[[policy]]` the port covers), or scope the entry with `policy = <id>`.
-- **`SYN_FLOWS` is sized at two records per connection** (it was one per two),
-  for every proxied connection plus the records the sweep has yet to end. On
-  the same memory the default sizing therefore holds about 7 % fewer
-  connections (an explicit `connections` count takes about 12 % more state
-  memory), and because the table layout changed, the first agent restart
-  after the upgrade does not adopt pinned state (`[state] persist`) but starts
-  fresh.
-
-### Added
-
-- **IPv6 MSS clamping.** An interface's MSS ceiling also clamps IPv6 SYNs,
-  to the ceiling less the 20 extra bytes of the IPv6 header.
-- **A verifier budget in `verify-ebpf`.** A program that verifies above
-  `--max-insns` (default 700,000, i.e. 30 % of the kernel limit in reserve)
-  is refused by name.
-- **Wren's forwarding table into `ROUTES`, FPM-style.** `--wren-routes` (with
-  `--wren-socket`) subscribes the agent to Wren's `monitor routes` feed and
-  programs what it hears: each learned route's next hop is resolved to a MAC
-  through the kernel's ARP table (an unresolved gateway is nudged and retried
-  on the next pass), written under `--wren-routes-policy`, and removed on
-  withdrawal; `--wren-routes-table` picks the VRF. A static route wins over a
-  learned one for the same destination, on-link routes stay the kernel's,
-  IPv6 prefixes are skipped and said so, and a Wren restart leaves the trie in
-  force until the feed is back. Best-effort like the EVPN advertiser: nothing
-  here can kill the agent.
-
-- **A learned type-5 `End.DT4`/`End.DT6` SID is now refused *visibly*, not
-  silently.** The datapath terminates only the L2 SRv6 behaviours
-  (`End.DT2U`/`End.DT2M`); an RFC 9252 §6 type-5 route advertises an L3 SID whose
-  payload is a bare IP packet, which this single-shared-bridge host model has no way
-  to route into the right tenant VRF. The controller therefore keeps deriving the
-  L3-VNI `End.DT2U` SID for symmetric IRB (the path B9 shipped) and now surfaces the
-  refused L3 SID: `srv6_irb_gated_sids` reports each learned `End.DT4`/`End.DT6` SID
-  the datapath cannot honour and which derived DT2U SID was programmed in its place,
-  exposed at `GET /v1/srv6/irb-gated` (monotonic `total` + live `current`, the
-  sample-not-state contract the SID-divergence surface already uses) and logged once
-  per SID. This is the honest half of the Stage-3 gate (EVPN-over-SRv6 convergence
-  plan, gap G3): standing up L3 interop with a third-party PE no longer falls back to
-  the derived SID with no indication the advertised one was dropped. True
-  `End.DT4`/`End.DT6` decap + L3 encap in XDP — which needs a per-tenant L3
-  delivery path this host model does not yet have — remains the named follow-up.
 - **SRv6 is a complete overlay, not a unicast-only one.** `End.DT2M` frames are
   decapsulated (they were refused outright, so every ARP, ND and DHCP frame on an
   SRv6 segment died), BUM traffic is head-end replicated over SRv6 at the TC layer
@@ -233,6 +327,21 @@
 - `--encap srv6 --srv6-locator <prefix/len>` on `velstra-controller orch
   add-host`, `"encap": "srv6"` + `"srv6_locator"` over REST, and a new
   `srv6_bum_replicated` counter.
+- **A learned type-5 `End.DT4`/`End.DT6` SID is now refused *visibly*, not
+  silently.** The datapath terminates only the L2 SRv6 behaviours
+  (`End.DT2U`/`End.DT2M`); an RFC 9252 §6 type-5 route advertises an L3 SID whose
+  payload is a bare IP packet, which this single-shared-bridge host model has no way
+  to route into the right tenant VRF. The controller therefore keeps deriving the
+  L3-VNI `End.DT2U` SID for symmetric IRB (the path B9 shipped) and now surfaces the
+  refused L3 SID: `srv6_irb_gated_sids` reports each learned `End.DT4`/`End.DT6` SID
+  the datapath cannot honour and which derived DT2U SID was programmed in its place,
+  exposed at `GET /v1/srv6/irb-gated` (monotonic `total` + live `current`, the
+  sample-not-state contract the SID-divergence surface already uses) and logged once
+  per SID. This is the honest half of the Stage-3 gate (EVPN-over-SRv6 convergence
+  plan, gap G3): standing up L3 interop with a third-party PE no longer falls back to
+  the derived SID with no indication the advertised one was dropped. True
+  `End.DT4`/`End.DT6` decap + L3 encap in XDP — which needs a per-tenant L3
+  delivery path this host model does not yet have — remains the named follow-up.
 - **An external (non-topology) EVPN peer is trusted for decap from its learned
   SID alone.** A federated SRv6 speaker that is not a configured fabric host has
   no topology entry to borrow a next-hop MAC from, so this fabric still cannot
@@ -247,9 +356,6 @@
   the decap half of external-peer support; encapsulating toward one still needs
   underlay next-hop resolution EVPN does not carry, and a truly foreign-layout
   peer needs the SID structure on the `monitor evpn` wire — both later chunks.
-
-### Fixed
-
 - **An SRv6 EVPN fabric learned nothing.** wren emits
   `+ evpn vni V mac M vtep VT srv6 SID` once an `srv6-locator` is configured —
   ten tokens, the same count as the `... ip IP vtep VT` form. The monitor parser
@@ -276,11 +382,118 @@
   are keyed by `(vni, ip)` and answered before any encapsulation, so an `[srv6]`
   host satisfies them too; requiring VXLAN specifically made an SRv6 host's
   derived config fail to resolve.
+- SRv6 neighbour resolution is fixed and tenant frames survive restarts;
+  decapsulated overlay traffic is delivered locally; colocated tenant traffic
+  is forwarded with destination policy enforcement; guest ingress policy is
+  enforced across overlay redirects; datapath hooks are reattached when tenant
+  interfaces are replaced; routed subnet gateway and load-balancer VIP
+  neighbour requests are answered; resolved gateway neighbours are refreshed
+  while routing updates are idle.
+
+### Routing and control plane
+
+- **Wren's forwarding table into `ROUTES`, FPM-style.** `--wren-routes` (with
+  `--wren-socket`) subscribes the agent to Wren's `monitor routes` feed and
+  programs what it hears: each learned route's next hop is resolved to a MAC
+  through the kernel's ARP table (an unresolved gateway is nudged and retried
+  on the next pass), written under `--wren-routes-policy`, and removed on
+  withdrawal; `--wren-routes-table` picks the VRF. A static route wins over a
+  learned one for the same destination, on-link routes stay the kernel's,
+  IPv6 prefixes are skipped and said so, and a Wren restart leaves the trie in
+  force until the feed is back. Best-effort like the EVPN advertiser: nothing
+  here can kill the agent. An empty snapshot now clears the trie, and a refused
+  subscription backs off.
+- **Every interface field reaches a controller-managed node.** The interface
+  assignment carried only name, policy and VNI, so port security, the per-port
+  send ceiling, MSS clamping, masquerading and CGNAT never reached an agent the
+  controller configures, and `PortRule` dropped `src_mac`. Removing
+  configuration now removes it from every map the agent writes.
+- A port's send ceiling can be set over gRPC (`LimitPort`) and is replicated
+  and reported in `PortInfo`; the counters nodes report are kept and served
+  (`GetStats`, `/v1/stats`, `/v1/stats/:node`); `add_ip_vrf` and `add_subnet`
+  accept restatements; controller port records are retained until CNI deletion
+  succeeds; controller shutdown is bounded when agent streams stay open; fabric
+  leadership is strengthened; the CLI's large argument groups are bounded
+  parser frames with unchanged flags and help.
+
+### Security fixes
+
+- **TCP resets are validated before they end a connection (DP-03).** A reset
+  tears down firewall state only when its sequence number equals the
+  receiver's last ACK and, at XDP ingress, its TCP checksum is correct. An
+  in-window but inexact reset is forwarded unchanged so the endpoint answers
+  with a challenge ACK (RFC 5961); an out-of-window or bad-checksum reset is
+  dropped (`tcp_invalid_reset`). `FW_FLOWS` values grow to 40 bytes; the HA
+  wire format is unchanged and imported state starts "sequence unknown".
+- **Masquerade never leaks an inside source (DP-04).** TCP/UDP with IPv4
+  options are translated; GRE, ESP, SCTP, 6in4 and other portless protocols
+  are translated address-only, with one inside host owning a (remote, protocol)
+  pair while its binding is live; AH, ICMP other than echo request or a related
+  error, and ICMP with options are refused from inside sources
+  (`egress_nat_unsupported_dropped`).
+- **Only openers allocate NAT state (DP-08, DP-37).** A TCP segment without SYN
+  that finds no binding no longer allocates one, on masquerade and on port
+  forwards (`nat_opener_required`); NULL/XMAS/SYN+FIN segments without state
+  are refused on stateful hooks (`tcp_invalid_flags`).
+- **GRE tunnels are classified as raw-IP links.** The agent decides from the
+  kernel link type whether a frame starts at an Ethernet header, and its list
+  lacked `gre` (ARPHRD 778) and `ip6gre` (823). A packet on a GRE tunnel was
+  therefore parsed as Ethernet: its IPv4 source bytes were read as the
+  EtherType. Under fail-closed (DP-22) every such packet was dropped, so a
+  zoned GRE tunnel carried nothing; before DP-22 the same misreading let the
+  tunnel's inner traffic past zone policy unfiltered (fail-open). The list is
+  now named and audited against every link kind the datapath attaches to,
+  with a test that fails when a raw-IP type is missing.
+- **Raw-IP framing is judged self-consistently (DP-36)**, so a bare IPv4 packet
+  that happens to look like an Ethernet frame is no longer misread, and
+  malformed IPv4 headers are dropped when the firewall fails closed.
+- **The captive-portal seen-table no longer aliases IPv4 and IPv6.** IPv4 keyed
+  in the front bytes collided with an IPv6 source an unauthenticated client can
+  send, letting it inherit a victim's login; IPv4 now keys in v4-mapped form
+  and the data plane refuses to learn from a wire-IPv6 source in that range.
+  Control-socket permissions are pinned to 0600, and a CNI subnet the
+  allocator cannot size is refused.
+- **Port security reaches the wire.** With the interface assignment carrying
+  every field, the port security the orchestrator enables on every tenant tap
+  is enforced on controller-managed nodes, where it had been switched off.
+- Dependency updates for published advisories: TLS and HTTP crates, TLS, QUIC,
+  serialization and Tokio crates, Rustix (zero-length xattr buffer
+  accounting), and `url` 2.5.9 (RUSTSEC-2026-0592, a stack overflow in
+  `Url::origin()`; reached only through `reqwest` in `velstra-controller`).
+  The aya crates are pinned by `rev` to the revision the lockfile already
+  used, and three yanked crates moved to their next patch release.
+
+### Documentation
+
+- A task-oriented operator handbook (mdBook, published to GitHub Pages) with
+  Mermaid diagrams of the configuration flow, the packet path, the live-update
+  gate, HA replication and the overlay; the README gained an overview diagram
+  and a runnable quickstart and was shortened to link focused setup guides.
+- Fabric branding; unsupported CLA-enforcement and relicensing claims removed;
+  the README says routed IPv6 is kernel-delegated on purpose and follows the
+  datapath on MSS clamping; `expiry-maintenance.md` describes the splice sweep.
+
+### CI, supply chain and release tooling
+
+- crates.io release workflow: opt-in single-operator approval mode
+  (`RELEASE_SINGLE_OPERATOR`); the two-person rule stays the default.
+- A `supply-chain` job runs cargo-deny (`deny.toml`) and cargo-audit on every
+  change and nightly.
+- The data plane is compiled with a pinned LLVM-22 nightly
+  (`VELSTRA_EBPF_TOOLCHAIN`, read by `build.rs`), because LLVM 23 emits a
+  register the kernel refuses; bpf-linker is built against the LLVM that
+  toolchain uses, and the LLVM apt key is scoped to its own repository.
+- Verified releases are separated from main-branch integration: only a `v*`
+  tag publishes, after every verification lane. The verifier runner is pinned
+  to the reviewed tool baseline, and the packet probes report exact mismatches
+  on hosted kernels.
+- `crates-release.yml` qualifies the standalone `velstra-proto` crate and
+  publishes it only on an independently approved manual dispatch.
 
 ### Notes
 
-The eBPF object changed (two new maps and three new datapath branches), so an
-appliance pinning it needs an `ebpfHash` bump.
+The eBPF object changed (new maps, new programs and new datapath branches), so
+an appliance pinning it needs an `ebpfHash` bump.
 
 Verified by `checks.srv6` in the sentinel repository: two VMs, a real IPv6
 underlay, a real eBPF load and real frames, asserting the End.DT2U round-trip,

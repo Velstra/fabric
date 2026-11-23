@@ -2,7 +2,7 @@
 name = "velstra-proto"
 publish = ["crates-io"]
 include = ["src/**", "README.md", "build.rs", "proto/velstra.proto"]
-version = "0.4.1"
+version = "0.5.0"
 edition.workspace = true
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
