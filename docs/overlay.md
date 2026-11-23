@@ -6,6 +6,21 @@ Run these exercises from the repository root on a disposable Linux host after [b
 
 When a VM asks for the MAC of a known peer on its tenant segment, the ingress XDP program answers directly on the tenant interface. A VNI scopes the lookup, so two tenants can reuse the same IP. Unknown neighbors follow the usual discovery path.
 
+```mermaid
+sequenceDiagram
+  participant VM as Tenant VM
+  participant X as Ingress XDP
+  participant T as ARP_TABLE / ND_TABLE
+  VM->>X: Who has 192.168.100.2?
+  X->>T: lookup (VNI 5000, IP)
+  alt known
+    T-->>X: 02:00:00:00:0b:02
+    X-->>VM: reply on the tenant interface
+  else unknown
+    X->>X: usual discovery path
+  end
+```
+
 For a node with a compatible overlay and a tenant interface bound to VNI 5000, these two records describe the remote endpoint:
 
 ```toml
@@ -31,6 +46,13 @@ The IPv4 scenario checks both `arp_suppressed` and a reply received by the tenan
 ## Ethernet over SRv6
 
 Fabric can bridge tenant Ethernet frames across an IPv6 underlay. The sending host maps the tenant VNI and destination MAC to a remote service SID. With one SID, the outer IPv6 destination carries it directly. On the receiving host, an `end.dt2u` local SID identifies the tenant segment.
+
+```mermaid
+flowchart LR
+  vmA[VM on host A] -->|frame, VNI 10000| encA[XDP encap<br/>srv6_route]
+  encA -->|IPv6 dst = SID fd00::100| decB[XDP decap<br/>end.dt2u]
+  decB --> vmB[VM on host B]
+```
 
 In the receiving host's node configuration, a local SID binding has this shape:
 
