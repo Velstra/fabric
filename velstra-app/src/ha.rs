@@ -777,10 +777,37 @@ pub fn control_addresses(config: &HaConfig) -> Result<BTreeSet<IpAddr>> {
     }
     Ok(result)
 }
+/// What this agent tells the coordinator, from the state as it is now.
+/// The generation is kept even when stale: reporting zero would falsely
+/// authorize the witness to discard warm state as a two-node cold boot.
+fn agent_report(
+    config: &HaConfig,
+    state: &State,
+    policy: [u8; 32],
+    links_ready: bool,
+    ready: bool,
+    active: bool,
+    now: u64,
+) -> Agent {
+    Agent {
+        cluster: config.cluster.clone(),
+        node: config.node,
+        coordinator_boot: state.role.coordinator_boot,
+        agent_boot: state.agent_boot,
+        policy,
+        ready_term: state.ready_term,
+        forwarding_term: state.active_term,
+        eligible: config.enabled && links_ready && (state.cold || ready || active),
+        updated_ns: now,
+    }
+}
 pub async fn monitor(firewall: Arc<Mutex<Firewall>>, shared: Shared, config: HaConfig) {
     let mut poll = tokio::time::interval(Duration::from_millis(20));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat_timing = timing::Heartbeat::default();
+    // The authority term whose takeover has already had its host
+    // inventory applied (see below).
+    let mut host_applied_term = 0;
     loop {
         let tick_wait_entry = now_ns();
         let scheduled_tick = poll.tick().await;
@@ -859,6 +886,33 @@ pub async fn monitor(firewall: Arc<Mutex<Firewall>>, shared: Shared, config: HaC
             log::warn!("HA cold VPN baseline publish failed: {error:#}");
             continue;
         }
+        // About to open forwarding on a takeover. Wren added the VIPs before
+        // it set `vips_ready`, and with `dst-local` rules they change this
+        // host's local address set, which the firewall applies with its
+        // datapath gate closed. Left to the 2 s inventory poll, that rewrite
+        // ran at an arbitrary moment after forwarding had opened and dropped
+        // whatever arrived meanwhile: a lost WireGuard handshake then waited
+        // 5 s for its retry. Apply the addresses now, while forwarding is
+        // still closed; Wren starts WireGuard only once we acknowledge.
+        //
+        // The rewrite holds this loop, and Wren withdraws the VIPs from an
+        // agent whose report is older than `FRESH_NS` (100 ms). So report
+        // first, still not forwarding, and decide on the next tick with the
+        // role read after the rewrite. Once per term: a takeover whose VIPs
+        // came and went is left to the poll.
+        if active && state.active_term == 0 && host_applied_term != state.role.authority.term {
+            host_applied_term = state.role.authority.term;
+            let report = agent_report(&config, &state, policy, links_ready, ready, active, now);
+            if let Err(error) = write_agent(&report) {
+                log::warn!("HA readiness publish failed: {error:#}");
+            }
+            if let Err(error) = fw.refresh_host_inventory() {
+                log::warn!(
+                    "HA takeover: applying the host's addresses before forwarding failed: {error:#}"
+                );
+            }
+            continue;
+        }
         let deadline = if active { state.role.deadline_ns } else { 0 };
         if active != (state.active_term > 0) {
             log::debug!(
@@ -893,20 +947,7 @@ pub async fn monitor(firewall: Arc<Mutex<Firewall>>, shared: Shared, config: HaC
         } else {
             state.active_term = 0;
         }
-        // Keep the generation even when stale: reporting zero would falsely
-        // authorize the witness to discard warm state as a two-node cold boot.
-        let ready_term = state.ready_term;
-        let agent = Agent {
-            cluster: config.cluster.clone(),
-            node: config.node,
-            coordinator_boot: state.role.coordinator_boot,
-            agent_boot: state.agent_boot,
-            policy,
-            ready_term,
-            forwarding_term: state.active_term,
-            eligible: config.enabled && links_ready && (state.cold || ready || active),
-            updated_ns: now,
-        };
+        let agent = agent_report(&config, &state, policy, links_ready, ready, active, now);
         let published = {
             let _timing = timing::Span::start(timing::Phase::HaPublish);
             write_agent(&agent)
