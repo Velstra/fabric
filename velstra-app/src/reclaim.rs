@@ -512,6 +512,24 @@ pub struct SweepInputs {
 }
 
 impl SweepInputs {
+    /// The inputs of one tick. Without a lease this node cannot know it is
+    /// the active member, so the splices conntrack sync holds as imported
+    /// (`held`) are never judged; a leased owner judges everything it holds.
+    pub fn new(
+        ports: HashSet<u16>,
+        owns: bool,
+        leased: bool,
+        held: &ImportedSplices,
+        sync_interval: Option<Duration>,
+    ) -> Self {
+        Self {
+            ports,
+            owns,
+            held: (!leased).then(|| held.clone()),
+            sync_interval,
+        }
+    }
+
     /// Whether the sweep runs this tick: a sweep exists, this node owns its
     /// state, and some port is SYN-proxied.
     fn sweeping(&self, has_sweep: bool) -> bool {
@@ -587,8 +605,12 @@ impl SweepState {
         }
     }
 
-    /// Account one table's step to the round.
-    fn stepped(&mut self, kind: Kind, stepped: &Stepped) {
+    /// Account one table's step to the round. A step taken while not
+    /// sweeping gathered no claims, so it never counts towards a round.
+    fn stepped(&mut self, kind: Kind, stepped: &Stepped, sweeping: bool) {
+        if !sweeping {
+            return;
+        }
         match kind {
             Kind::Firewall => self.firewall = self.firewall.advance(stepped),
             Kind::Nat => self.nat = self.nat.advance(stepped),
@@ -781,7 +803,7 @@ impl Reclaimer {
                 Ok(stepped) => {
                     reclaimed += stepped.deleted;
                     if let Some(sweep) = &mut self.sweep {
-                        sweep.state.stepped(kind, &stepped);
+                        sweep.state.stepped(kind, &stepped, sweeping);
                     }
                 }
                 Err(error) => {
@@ -903,12 +925,7 @@ pub async fn run(firewall: Arc<Mutex<Firewall>>, ha: crate::ha::Shared, held: Im
             let ha = ha.lock().await;
             (ha.owns_state(crate::ha::now_ns()), ha.leased())
         };
-        let inputs = SweepInputs {
-            ports,
-            owns,
-            held: (!leased).then(|| held.clone()),
-            sync_interval,
-        };
+        let inputs = SweepInputs::new(ports, owns, leased, &held, sync_interval);
         let joined = tokio::task::spawn_blocking(move || {
             let reclaimed = reclaimer.tick(timeouts, SLICE, &inputs);
             (reclaimer, reclaimed)
@@ -1078,16 +1095,51 @@ mod tests {
     fn a_round_completes_only_both_tables_covered_and_only_while_sweeping() {
         // M2: the gate on end_round.
         let mut state = SweepState::default();
-        state.stepped(Kind::Firewall, &stepped(true, true));
+        state.stepped(Kind::Firewall, &stepped(true, true), true);
         assert!(!state.round_complete(true), "CONNTRACK not walked yet");
-        state.stepped(Kind::Syn, &stepped(true, true));
+        state.stepped(Kind::Syn, &stepped(true, true), true);
         assert!(!state.round_complete(true), "SYN_FLOWS walks do not count");
-        state.stepped(Kind::Nat, &stepped(true, true));
+        state.stepped(Kind::Nat, &stepped(true, true), true);
         assert!(state.round_complete(true));
         assert!(
             !state.round_complete(false),
             "never judged while not sweeping"
         );
+    }
+
+    #[test]
+    fn a_step_taken_while_not_sweeping_never_counts_towards_a_round() {
+        // Review A: walks before the sweep runs gathered no claims; the
+        // first judged round must be one whose walks all gathered them.
+        let mut state = SweepState::default();
+        state.begin_tick(false);
+        state.stepped(Kind::Firewall, &stepped(true, true), false);
+        state.stepped(Kind::Nat, &stepped(true, true), false);
+        assert_eq!(
+            (state.firewall, state.nat),
+            (Round::Waiting, Round::Waiting)
+        );
+        state.begin_tick(true);
+        assert!(
+            !state.round_complete(true),
+            "judged on walks without claims"
+        );
+    }
+
+    #[test]
+    fn held_splices_are_skipped_only_without_a_lease() {
+        // M1: a leased owner judges everything, a node without a lease never
+        // judges what conntrack sync holds for a peer.
+        let held = ImportedSplices::default();
+        held.lock().unwrap().insert(splice(1));
+        let unleased = SweepInputs::new(HashSet::from([443]), true, false, &held, None);
+        assert!(
+            unleased
+                .held
+                .is_some_and(|set| set.lock().unwrap().contains(&splice(1)))
+        );
+        let leased = SweepInputs::new(HashSet::from([443]), true, true, &held, None);
+        assert!(leased.held.is_none());
     }
 
     #[test]

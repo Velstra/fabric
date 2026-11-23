@@ -138,17 +138,17 @@ impl State {
             false
         }
     }
+    /// Whether this node runs leased HA (an enabled `[ha]`), the only mode in
+    /// which it knows whether it is the active member.
+    pub fn leased(&self) -> bool {
+        self.config.as_ref().is_some_and(|config| config.enabled)
+    }
     /// Whether this node may end SYN-proxy splices no live connection claims
     /// (the agent's splice sweep): always without leased HA, and with it only
     /// while this node is the fresh lease owner. A standby's copies of the
     /// owner's state arrive record by record, a splice possibly before the
     /// state that claims it; it never sweeps, and the owner's removals reach
     /// it as conntrack-sync deletions.
-    /// Whether this node runs leased HA (an enabled `[ha]`), the only mode in
-    /// which it knows whether it is the active member.
-    pub fn leased(&self) -> bool {
-        self.config.as_ref().is_some_and(|config| config.enabled)
-    }
     pub fn owns_state(&self, now: u64) -> bool {
         let Some(config) = self.config.as_ref().filter(|config| config.enabled) else {
             return true;
@@ -1031,6 +1031,9 @@ mod tests {
             !state.owns_state(now + 200_000_000),
             "an expired lease is not ownership"
         );
+        state.config.as_mut().expect("config").enabled = false;
+        assert!(!state.leased(), "a disabled [ha] is not a lease");
+        assert!(state.owns_state(now), "nor does it fence the node");
         state.config = None;
         assert!(!state.leased());
         assert!(

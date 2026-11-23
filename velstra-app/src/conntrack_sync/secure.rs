@@ -2780,6 +2780,19 @@ mod tests {
     }
 
     #[test]
+    fn a_new_import_store_starts_with_no_held_splices() {
+        // A restarted sync task holds nothing yet: a key left from before
+        // would shield a splice from the sweep for good.
+        let set = ImportedSplices::default();
+        set.lock()
+            .unwrap()
+            .insert(FlowKey::new(0, [10, 2, 0, 10], [0; 4], 1, 8443, 6));
+        let records = ImportedRecords::new(set.clone());
+        assert_eq!(records.len(), 0);
+        assert!(set.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn imported_splice_keys_are_mirrored_through_every_change() {
         let set = ImportedSplices::default();
         let mut records = ImportedRecords::new(set.clone());
