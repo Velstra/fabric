@@ -2,7 +2,17 @@
 
 Velstra Fabric connects tenant interfaces across Linux hosts. A controller turns a topology into per-host policy, neighbor entries and forwarding tables. A host agent loads those tables into the eBPF dataplane.
 
-[Start a local fabric](quickstart.md) to inspect two hosts, two tenant networks and a load balancer. The first exercise runs entirely in userspace.
+```mermaid
+flowchart LR
+  topo[Topology] --> ctl[Controller]
+  ctl -->|host-1 config| a1[Agent host-1]
+  ctl -->|host-2 config| a2[Agent host-2]
+  a1 --> d1[eBPF dataplane]
+  a2 --> d2[eBPF dataplane]
+  d1 <-->|overlay| d2
+```
+
+[Start a local fabric](quickstart.md) to inspect two hosts, two tenant networks and a load balancer. It runs entirely in userspace.
 
 | I want to… | Start here |
 |---|---|

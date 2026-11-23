@@ -24,6 +24,17 @@ The agent reports its attachment and counters. Ctrl-C detaches it. Use `--iface`
 
 During a full policy replacement, the agent closes the packet gate and drains existing kernel readers before changing maps. Arriving packets are dropped, not buffered. If applying a replacement fails, it attempts to restore the previous state. A failed restoration keeps the gate closed. The update barrier requires Linux global membarrier support and a kernel without `nohz_full` isolation. This mechanism applies while the agent runs.
 
+```mermaid
+stateDiagram-v2
+  [*] --> Open
+  Open --> Closed: replacement starts
+  Closed --> Drained: kernel readers drained
+  Drained --> Open: maps applied
+  Drained --> Restoring: apply failed
+  Restoring --> Open: previous state restored
+  Restoring --> HeldClosed: restore failed
+```
+
 ## Routing, NAT and overlays
 
 | Example | Use it to inspect |
