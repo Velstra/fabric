@@ -902,7 +902,17 @@ pub async fn monitor(firewall: Arc<Mutex<Firewall>>, shared: Shared, config: HaC
         // came and went is left to the poll.
         if active && state.active_term == 0 && host_applied_term != state.role.authority.term {
             host_applied_term = state.role.authority.term;
-            let report = agent_report(&config, &state, policy, links_ready, ready, active, now);
+            // Stamp it when it is written: Wren judges its age, and the
+            // rewrite below holds this loop until the next report.
+            let report = agent_report(
+                &config,
+                &state,
+                policy,
+                links_ready,
+                ready,
+                active,
+                now_ns(),
+            );
             if let Err(error) = write_agent(&report) {
                 log::warn!("HA readiness publish failed: {error:#}");
             }
