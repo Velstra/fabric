@@ -4,6 +4,39 @@
 
 ### Fixed
 
+- **SYN-proxy records now end with their connections.** `SYN_FLOWS` records
+  were never removed, so once as many proxied connections had come and gone as
+  the map holds, its LRU evicted the least recently used record — an idle live
+  connection, which then died silently — and a client reusing a source port ran
+  into its old record. The agent's reclaim walk now ends every record no live
+  `FW_FLOWS` or `CONNTRACK` entry claims (see
+  [expiry-maintenance](docs/expiry-maintenance.md)). A proxied connection lives
+  exactly as long as its connection state; a client reconnecting from the same
+  port to a service whose server uses the same port within about 30 s of the old
+  connection's state ending is not admitted until it retries.
+- **A SYN flood no longer evicts protected connections.** A bare SYN the SYN
+  proxy answers with a cookie no longer writes firewall state (its connection's
+  state is written at cookie-ACK admission), so a flood of spoofed SYNs to a
+  protected port leaves `FW_FLOWS` — and the idle connections in it — alone,
+  and no longer reaches HA conntrack sync.
+
+### Changed
+
+- **A `[[synproxy]]` entry must cover only stateful policies.** The agent now
+  refuses a SYN proxy on a policy without `stateful = true`: a proxied
+  connection lives as long as its connection state, and a stateless policy
+  keeps none. An entry without `policy` covers every policy, the top-level one
+  included, and the top-level `stateful` defaults to `false`: a hand-written
+  config with an unscoped `[[synproxy]]` and no top-level `stateful = true` is
+  now refused. Add `stateful = true` at the top level (and to every
+  `[[policy]]` the port covers), or scope the entry with `policy = <id>`.
+- **`SYN_FLOWS` is sized at two records per connection** (it was one per two),
+  for every proxied connection plus the records the sweep has yet to end. On
+  the same memory the default sizing therefore holds about 11 % fewer
+  connections, and because the table layout changed, the first agent restart
+  after the upgrade does not adopt pinned state (`[state] persist`) but starts
+  fresh.
+
 - **Logged drops are rate-limited.** A SYN flood or a scan against a zone with
   `log = true` offers a log line for every dropped packet; on an appliance's
   small journal a few hundred a second rotate the security, audit and HA
