@@ -19,9 +19,10 @@ pub const FW_ENTRIES_PER_CONNECTION: u32 = 6;
 /// `CONNTRACK` (NAT) entries one connection can hold: a DNAT binding has a
 /// forward and a reverse entry.
 pub const CT_ENTRIES_PER_CONNECTION: u32 = 2;
-/// One SYN-proxy record per two connections: only proxied ports create one, and
-/// only until the handshake completes.
-pub const SYN_CONNECTIONS_PER_ENTRY: u32 = 2;
+/// `SYN_FLOWS` records one connection can hold: a proxied connection keeps its
+/// record — the sequence offset every one of its packets is translated by —
+/// for as long as it lives, and any connection may be a proxied one.
+pub const SYN_ENTRIES_PER_CONNECTION: u32 = 1;
 
 /// Kernel bytes per preallocated LRU element besides key and value
 /// (`struct htab_elem` with its LRU node and hash).
@@ -65,7 +66,9 @@ impl Sizing {
             connections,
             fw_flows: connections.saturating_mul(FW_ENTRIES_PER_CONNECTION),
             conntrack: connections.saturating_mul(CT_ENTRIES_PER_CONNECTION),
-            syn_flows: (connections / SYN_CONNECTIONS_PER_ENTRY).max(GRANULE),
+            syn_flows: connections
+                .saturating_mul(SYN_ENTRIES_PER_CONNECTION)
+                .max(GRANULE),
         }
     }
 
@@ -177,7 +180,16 @@ mod tests {
         assert_eq!(sizing.connections, 100_000);
         assert_eq!(sizing.fw_flows, 600_000);
         assert_eq!(sizing.conntrack, 200_000);
-        assert_eq!(sizing.syn_flows, 50_000);
+        assert_eq!(sizing.syn_flows, 100_000);
+    }
+
+    #[test]
+    fn every_connection_can_be_a_proxied_one() {
+        // A splice lives as long as its connection: sizing it for half of
+        // them let the LRU evict live idle ones once the rest came and went.
+        for connections in [1024, 50_000, MAX_DEFAULT_CONNECTIONS] {
+            assert!(Sizing::for_connections(connections).syn_flows >= connections);
+        }
     }
 
     #[test]
