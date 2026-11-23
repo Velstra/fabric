@@ -475,6 +475,8 @@ whose tree is identical to that one).
 
 ### CI, supply chain and release tooling
 
+- crates.io release workflow: opt-in single-operator approval mode
+  (`RELEASE_SINGLE_OPERATOR`); the two-person rule stays the default.
 - A `supply-chain` job runs cargo-deny (`deny.toml`) and cargo-audit on every
   change and nightly.
 - The data plane is compiled with a pinned LLVM-22 nightly

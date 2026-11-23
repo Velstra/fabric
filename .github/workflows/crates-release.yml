@@ -28,6 +28,8 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 4
   REQUESTED_VERSION: ${{ inputs.version }}
+  # Opt-in single-operator approvals (docs/crate-releases.md); only exactly `true` enables it.
+  RELEASE_SINGLE_OPERATOR: ${{ vars.RELEASE_SINGLE_OPERATOR || 'false' }}
 
 jobs:
   check:
