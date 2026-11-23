@@ -180,6 +180,8 @@
 
 ### Added
 
+- crates.io release workflow: opt-in single-operator approval mode
+  (`RELEASE_SINGLE_OPERATOR`).
 - **IPv6 MSS clamping.** An interface's MSS ceiling also clamps IPv6 SYNs,
   to the ceiling less the 20 extra bytes of the IPv6 header.
 - **A verifier budget in `verify-ebpf`.** A program that verifies above
