@@ -641,9 +641,16 @@ pub fn firewall_claim(key: &FirewallKey, state: &FirewallState) -> Option<FlowKe
 
 /// The splice a destination-NAT binding claims for its connection: the
 /// client's address and port with the port the binding translates the
-/// destination to — what maps a port-forward's or load balancer's public port
-/// to the inside one. `None` for reverse and source-NAT (origin) entries and
-/// for anything but TCP.
+/// destination to — what maps a port-forward's public port to the inside one
+/// (the port the data plane keys the splice on, its `server_port`). `None` for
+/// reverse and source-NAT (origin) entries and for anything but TCP.
+///
+/// A load balancer whose backend port differs from its VIP port is claimed on
+/// the backend port, while the data plane keys its splice on the VIP port (it
+/// maps ports only for port-forwards); the claim then names no splice, which
+/// is harmless here: its client-zone firewall entry claims the VIP port. (Such
+/// a load balancer cannot be SYN-proxied today anyway: the server's half
+/// looks its splice up by the backend port and misses.)
 #[inline]
 pub fn nat_claim(key: &FlowKey, state: &FlowState) -> Option<FlowKey> {
     if key.proto != crate::ip_proto::TCP || state.is_reverse() || state.is_origin() {

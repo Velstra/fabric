@@ -407,7 +407,7 @@ async fn run(args: RunArgs) -> Result<()> {
     // DP-07: reclaim expired connection state in the background, so the LRU
     // never has to choose which live connection to evict while dead ones sit
     // in the tables. Never touches the datapath gate.
-    tokio::spawn(reclaim::run(firewall.clone()));
+    tokio::spawn(reclaim::run(firewall.clone(), ha_state.clone()));
 
     // C20: the captive-portal socket, where a portal admits a device it has
     // authenticated. Every session it opens carries a deadline, and the sweep is

@@ -1367,6 +1367,30 @@ impl Firewall {
         self.applied.conntrack
     }
 
+    /// The ports servers of SYN-proxied connections use: the server-side
+    /// `SYNPROXY` entries of the applied configuration, which name exactly
+    /// the ports the data plane keys splices on. Empty with no SYN proxy.
+    pub fn splice_service_ports(&self) -> HashSet<u16> {
+        let policy_ids: Vec<PolicyId> = self.applied.policies.iter().map(|p| p.id).collect();
+        synproxy_entries(
+            &self.applied.synproxy,
+            &self.applied.port_forwards,
+            &policy_ids,
+        )
+        .into_iter()
+        .filter(|(key, _)| key.policy == SynProxyKey::SERVER_SIDE)
+        .map(|(key, _)| key.port)
+        .collect()
+    }
+
+    /// The HA conntrack-sync push interval, when this node is in a pair.
+    pub fn sync_interval(&self) -> Option<std::time::Duration> {
+        self.applied
+            .conntrack_sync
+            .as_ref()
+            .map(|sync| std::time::Duration::from_millis(sync.interval_ms))
+    }
+
     pub fn reconcile_links(&mut self) -> Result<()> {
         let present = std::fs::read_dir("/sys/class/net")?
             .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
