@@ -753,6 +753,9 @@ pub struct Firewall {
     /// Consecutive polls whose host inventory was torn by a concurrent change
     /// even after [`crate::host_inventory::read`]'s own retries (DP-32).
     torn_inventory_polls: u32,
+    /// When the agent last warned that a primary interface is still missing
+    /// (see [`Self::attach_waiting_primaries`]); `None` while none is.
+    missing_primary_warned: Option<std::time::Instant>,
     /// The configuration as it arrived, before the advertised rules were merged
     /// into it.
     ///
@@ -861,7 +864,7 @@ const MAX_RUNTIME_MAPPINGS: usize = 256;
 impl Firewall {
     /// Exercise the real kernel verifier for every shipped XDP/TC entry point.
     /// No packet hook is attached and dropping the object releases all maps.
-    pub fn verify_object(object: Option<&[u8]>) -> Result<()> {
+    pub fn verify_object(object: Option<&[u8]>, max_insns: u32) -> Result<()> {
         bump_memlock_rlimit();
         let object = crate::btf::kernel_object(object.unwrap_or(aya::include_bytes_aligned!(
             concat!(env!("OUT_DIR"), "/velstra")
@@ -888,7 +891,8 @@ impl Firewall {
             match program.load() {
                 Ok(()) => {
                     println!("verified {name}");
-                    report_verified_insns(name, program.info());
+                    let count = report_verified_insns(name, program.info());
+                    rejected.extend(over_budget(name, count, max_insns));
                 }
                 Err(error) => rejected.push(format!("verifying {name}: {error:#}")),
             }
@@ -914,7 +918,8 @@ impl Firewall {
             match program.load() {
                 Ok(()) => {
                     println!("verified {name}");
-                    report_verified_insns(name, program.info());
+                    let count = report_verified_insns(name, program.info());
+                    rejected.extend(over_budget(name, count, max_insns));
                 }
                 Err(error) => rejected.push(format!("verifying {name}: {error:#}")),
             }
@@ -1175,8 +1180,11 @@ impl Firewall {
             .as_ref()
             .map(|persist| persist.pin_program_arrays(&ebpf))
             .transpose()?;
+        // A primary link that does not exist yet is attached when it appears
+        // (`reconcile_links`, which a commit runs once the network is applied).
+        let present = present_interfaces(ifaces, if_nametoindex)?;
         // Link-layer framing before the first packet can reach the program.
-        for name in ifaces {
+        for name in &present {
             program_link_layer(&mut ebpf, name)?;
         }
         // The policy is programmed and every ingress tail call registered, so
@@ -1199,9 +1207,9 @@ impl Firewall {
             .load()
             .context("loading XDP program into the kernel")?;
 
-        let mut attached = Vec::with_capacity(ifaces.len());
+        let mut attached = Vec::with_capacity(present.len());
         let mut xdp_links = BTreeMap::new();
-        for iface in ifaces {
+        for iface in &present {
             if xdp_links.contains_key(iface) {
                 continue;
             }
@@ -1264,6 +1272,7 @@ impl Firewall {
             explicit_egress_ifaces: if egress { ifaces.to_vec() } else { Vec::new() },
             conntrack: None,
             torn_inventory_polls: 0,
+            missing_primary_warned: None,
             tries,
             sizing,
             state_adopted: state_dir.as_ref().is_some_and(|dir| dir.adopted),
@@ -1358,10 +1367,39 @@ impl Firewall {
         self.applied.conntrack
     }
 
+    /// The ports servers of SYN-proxied connections use: the server-side
+    /// `SYNPROXY` entries of the applied configuration, which name exactly
+    /// the ports the data plane keys splices on. Empty with no SYN proxy.
+    pub fn splice_service_ports(&self) -> HashSet<u16> {
+        let policy_ids: Vec<PolicyId> = self.applied.policies.iter().map(|p| p.id).collect();
+        server_side_ports(&synproxy_entries(
+            &self.applied.synproxy,
+            &self.applied.port_forwards,
+            &policy_ids,
+        ))
+    }
+
+    /// The HA conntrack-sync push interval, when this node is in a pair.
+    pub fn sync_interval(&self) -> Option<std::time::Duration> {
+        self.applied
+            .conntrack_sync
+            .as_ref()
+            .map(|sync| std::time::Duration::from_millis(sync.interval_ms))
+    }
+
+    /// Apply the host's interfaces and addresses as they are now, instead of
+    /// at the next inventory poll (`config_attach_loop`, every 2 s). A changed
+    /// local address set is applied with the datapath gate closed, so when it
+    /// happens matters: an HA takeover calls this before it opens forwarding
+    /// (see `ha::monitor`). An unchanged inventory writes nothing.
+    pub fn refresh_host_inventory(&mut self) -> Result<()> {
+        let present = kernel_interfaces()?;
+        self.reconcile_config_interfaces(&present, self.attach_mode);
+        Ok(())
+    }
+
     pub fn reconcile_links(&mut self) -> Result<()> {
-        let present = std::fs::read_dir("/sys/class/net")?
-            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
-            .collect::<std::io::Result<Vec<String>>>()?;
+        let present = kernel_interfaces()?;
         self.reconcile_config_interfaces(&present, self.attach_mode);
         let desired = self.applied.clone();
         self.sync_egress_attachments(&desired)?;
@@ -1377,6 +1415,63 @@ impl Firewall {
             }
         }
         Ok(())
+    }
+
+    /// The primary (`--iface`) interfaces that carry no XDP hook: absent when
+    /// the agent started and not attached since. Served as the
+    /// `missing-interfaces` query.
+    pub fn waiting_primaries(&self) -> Vec<String> {
+        self.primary
+            .iter()
+            .filter(|name| !self.xdp_links.contains_key(*name))
+            .cloned()
+            .collect()
+    }
+
+    /// Attach every waiting primary interface that exists now, and warn about
+    /// those still missing — again every [`MISSING_PRIMARY_WARN_INTERVAL`], so
+    /// a primary that never appears stays visible rather than being one log
+    /// line at start-up. Run by the 2 s config-interface poll after
+    /// [`Self::reconcile_config_interfaces`], which owns (and attaches, with
+    /// their policy) the primaries the configuration also names.
+    pub fn attach_waiting_primaries(&mut self) {
+        let mut missing = Vec::new();
+        for name in self.waiting_primaries() {
+            let configured = self.applied.interfaces.iter().any(|i| i.name == name);
+            match if_nametoindex(&name) {
+                Ok(_) if configured => {}
+                Ok(_) => match self.attach_iface(&name, self.attach_mode, 0) {
+                    Ok(chosen) => {
+                        log::info!("attached primary interface {name} ({chosen:?})");
+                        let desired = self.applied.clone();
+                        if let Err(error) = self.sync_egress_attachments(&desired) {
+                            warn!("egress hooks after attaching {name} failed: {error:#}");
+                        }
+                    }
+                    Err(error) => warn!("attaching primary interface {name} failed: {error:#}"),
+                },
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(interface_missing) =>
+                {
+                    missing.push(name)
+                }
+                Err(error) => warn!("looking up primary interface {name} failed: {error:#}"),
+            }
+        }
+        if missing.is_empty() {
+            self.missing_primary_warned = None;
+            return;
+        }
+        let now = std::time::Instant::now();
+        if missing_primary_warning_due(self.missing_primary_warned, now) {
+            warn!(
+                "primary interface(s) {} still missing; the datapath does not filter them",
+                missing.join(", ")
+            );
+            self.missing_primary_warned = Some(now);
+        }
     }
 
     fn prune_stale_links(&mut self) {
@@ -2159,6 +2254,16 @@ impl Firewall {
         // current again. Never reopen that stale inventory after a failed
         // refresh, even when rewriting the old maps happened to succeed.
         let reopen_rollback = !host_refresh && prepared.ipv4 == previous_host.ipv4;
+        // Every closure is visible: while the gate is closed every attached
+        // link drops everything, the node's own control traffic included.
+        log::info!(
+            "configuration gate closed for a full rewrite ({})",
+            if host_refresh {
+                "host addresses changed"
+            } else {
+                "configuration changed"
+            }
+        );
         self.set_configuration_state(CONFIG_UPDATING)?;
         if reset {
             self.runtime_blocks.clear();
@@ -3182,11 +3287,43 @@ impl Firewall {
 fn report_verified_insns(
     name: &str,
     info: std::result::Result<aya::programs::ProgramInfo, aya::programs::ProgramError>,
-) {
+) -> Option<u32> {
     match info.map(|info| info.verified_instruction_count()) {
-        Ok(Some(count)) => println!("verifier-insns {name} {count}"),
-        Ok(None) | Err(_) => println!("verifier-insns {name} unknown"),
+        Ok(Some(count)) => {
+            println!("verifier-insns {name} {count}");
+            Some(count)
+        }
+        Ok(None) | Err(_) => {
+            println!("verifier-insns {name} unknown");
+            None
+        }
     }
+}
+
+/// The verifier-instruction ceiling `velstra verify-ebpf` holds every program
+/// to unless told otherwise: 70 % of the kernel's 1,000,000-instruction limit.
+///
+/// A program that verifies at 950,000 passes today and fails after the next
+/// unrelated change, or on the next kernel, whose verifier explores the same
+/// code differently: the counts for one object differ by up to a factor of four
+/// between 6.6, 6.12, 6.18 and 7.0. Passing is not enough; the margin is what
+/// a datapath change spends, so it is checked, not only printed.
+pub const VERIFIER_INSN_BUDGET: u32 = 700_000;
+// At least 30 % of the kernel's 1,000,000-instruction limit stays in reserve.
+const _: () = assert!(VERIFIER_INSN_BUDGET <= 1_000_000 / 10 * 7);
+
+/// The refusal for a program that verified but used more of the verifier's
+/// budget than `max_insns`, or `None` when it is within it. A count the kernel
+/// did not report is not a violation: a kernel without the field cannot be
+/// measured, and refusing every program on it would make the check useless.
+fn over_budget(name: &str, count: Option<u32>, max_insns: u32) -> Option<String> {
+    let count = count?;
+    (count > max_insns).then(|| {
+        format!(
+            "verifying {name}: {count} verifier instructions exceeds the budget of \
+             {max_insns} (the kernel limit is 1,000,000; the budget keeps headroom)"
+        )
+    })
 }
 
 /// Hand the memory a large transaction freed back to the kernel (PERF-04).
@@ -3283,7 +3420,28 @@ fn bump_memlock_rlimit() {
 /// Forward `aya-log` messages emitted by the eBPF program to the user-space
 /// logger. Best effort: a program with no log statements simply yields no init.
 fn spawn_log_forwarder(ebpf: &mut Ebpf) {
-    match aya_log::EbpfLogger::init(ebpf) {
+    // The data plane's records go through a rate budget: a flood of logged
+    // drops must not rotate the appliance's journal out (see `dplog`).
+    let budget = crate::dplog::Budgeted::new(
+        log::logger(),
+        crate::dplog::setting(
+            std::env::var("VELSTRA_DATAPATH_LOG_BURST").ok().as_deref(),
+            crate::dplog::DEFAULT_BURST,
+        ),
+        crate::dplog::setting(
+            std::env::var("VELSTRA_DATAPATH_LOG_RATE").ok().as_deref(),
+            crate::dplog::DEFAULT_RATE,
+        ),
+    );
+    let summaries = budget.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            summaries.summarise();
+        }
+    });
+    match aya_log::EbpfLogger::init_with_logger(ebpf, budget) {
         Ok(logger) => {
             // SAFETY: EbpfLogger owns its RingBuf<MapData> and therefore the
             // registered map FD. AsyncFd owns the logger until deregistration;
@@ -3572,9 +3730,10 @@ struct PreparedHostConfig {
     srv6: Srv6Config,
     route_ifindices: BTreeMap<String, u32>,
     ipv4: Ipv4Inventory,
-    /// Every address this host holds, both families, when the configuration
-    /// has a `dst-local` rule to resolve with it; empty otherwise, so a
-    /// configuration without one keeps its old refresh behaviour exactly.
+    /// Every address this host holds, both families, plus every configured
+    /// virtual address, when the configuration has a `dst-local` rule to
+    /// resolve with it; empty otherwise, so a configuration without one keeps
+    /// its old refresh behaviour exactly.
     local: BTreeSet<std::net::IpAddr>,
 }
 
@@ -3599,6 +3758,14 @@ impl AppliedIntent {
     fn allows_address_refresh(&self, state: Option<u32>, hooks_unchanged: bool) -> bool {
         self.current && state == Some(CONFIG_READY) && hooks_unchanged
     }
+}
+
+/// The interface names the kernel has now.
+fn kernel_interfaces() -> Result<Vec<String>> {
+    std::fs::read_dir("/sys/class/net")?
+        .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+        .collect::<std::io::Result<Vec<String>>>()
+        .context("listing host interfaces")
 }
 
 /// Plan a host-only refresh for the *same applied intent*. Every exclusion must
@@ -3694,12 +3861,16 @@ fn prepare_host_config(cfg: &RuntimeConfig) -> Result<PreparedHostConfig> {
 /// every address the host holds.
 fn observe_host(cfg: &RuntimeConfig) -> Result<(Ipv4Inventory, BTreeSet<std::net::IpAddr>)> {
     let _timing = timing::Span::start(timing::Phase::HostObserver);
-    let links = crate::host_inventory::read()?;
-    let local = if crate::local_destination::has_local_rules(cfg) {
-        crate::local_destination::observed(&links)
-    } else {
-        BTreeSet::new()
-    };
+    host_view(cfg, crate::host_inventory::read()?)
+}
+
+/// What one host observation means for `cfg`: the IPv4 inventory and the
+/// local-destination set (observed addresses plus configured virtual ones).
+fn host_view(
+    cfg: &RuntimeConfig,
+    links: Vec<crate::host_inventory::Interface>,
+) -> Result<(Ipv4Inventory, BTreeSet<std::net::IpAddr>)> {
+    let local = crate::local_destination::local_set(cfg, &links);
     Ok((ipv4_inventory_from(links, &cfg.interfaces)?, local))
 }
 
@@ -3875,7 +4046,11 @@ fn apply_config_quiesced(
     program_routes(ebpf, &cfg.routes)?;
     program_services(ebpf, &cfg.services, &cfg.interfaces, &prepared.ipv4)?;
     program_port_forwards(ebpf, &cfg.port_forwards, &cfg.interfaces, &prepared.ipv4)?;
-    program_synproxy(ebpf, &cfg.synproxy)?;
+    let policy_ids: Vec<PolicyId> = cfg.policies.iter().map(|p| p.id).collect();
+    program_synproxy(
+        ebpf,
+        &synproxy_entries(&cfg.synproxy, &cfg.port_forwards, &policy_ids),
+    )?;
     program_masquerade(ebpf, &cfg.interfaces, &prepared.ipv4)?;
     program_mss_clamp(ebpf, &cfg.interfaces)?;
     program_port_bindings(ebpf, &cfg.interfaces)?;
@@ -4118,12 +4293,74 @@ fn admitted_vnis(cfg: &RuntimeConfig) -> BTreeSet<u32> {
         .collect()
 }
 
-/// Map each configured interface to its policy id (`IFACE_POLICY`) and overlay
-/// segment (`IFACE_VNI`). The two are independent: a port's firewall ruleset and
-/// its virtual network are separate concerns.
+/// How often a primary interface that is still missing is warned about again.
+const MISSING_PRIMARY_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether a still-missing primary is due another warning: at once the first
+/// time, then once per [`MISSING_PRIMARY_WARN_INTERVAL`].
+fn missing_primary_warning_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last.is_none_or(|last| now.saturating_duration_since(last) >= MISSING_PRIMARY_WARN_INTERVAL)
+}
+
+/// The primary interfaces that exist right now, in order; `lookup` is
+/// [`if_nametoindex`]. Sentinel names the first zoned link as the agent's
+/// uplink, and in a commit that creates it — a GRE tunnel, a VLAN, a bridge —
+/// the agent restarts before networkd has made the device. Attaching it then
+/// failed start-up outright ("interface \"tun0\" not found"), the readiness
+/// probe failed and the commit rolled back. A missing link is skipped with a
+/// warning and attached once it appears — by [`Firewall::reconcile_links`] (the
+/// commit's link reconciliation) or the 2 s poll
+/// ([`Firewall::attach_waiting_primaries`], which keeps warning while it is
+/// missing; the `missing-interfaces` query lists it). Any other lookup failure
+/// still refuses to start.
+fn present_interfaces(
+    ifaces: &[String],
+    lookup: impl Fn(&str) -> Result<u32>,
+) -> Result<Vec<String>> {
+    let mut present = Vec::with_capacity(ifaces.len());
+    for name in ifaces {
+        match lookup(name) {
+            Ok(_) => present.push(name.clone()),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(interface_missing) =>
+            {
+                warn!("interface {name} does not exist yet; attaching it when it appears");
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(present)
+}
+
+/// Kernel link types (`/sys/class/net/<dev>/type`, `ARPHRD_*` in
+/// `linux/if_arp.h`) whose frames start at the IP header, with no Ethernet
+/// header in front. Every L3 device Sentinel or the fabric agent attaches to
+/// is one of these:
+///
+/// | type    | value | devices                                          |
+/// |---------|-------|--------------------------------------------------|
+/// | PPP     | 512   | PPPoE (`ppp*`), L2TP/PPP                         |
+/// | RAWIP   | 519   | cellular modems (qmi_wwan, rmnet)                |
+/// | TUNNEL  | 768   | `ipip`, `vti`                                    |
+/// | TUNNEL6 | 769   | `ip6tnl`, `vti6`                                 |
+/// | SIT     | 776   | `sit` (6in4, 6to4, ISATAP)                       |
+/// | IPGRE   | 778   | `gre`                                            |
+/// | IP6GRE  | 823   | `ip6gre`                                         |
+/// | NONE    | 65534 | WireGuard, `tun`, `xfrm` (route-based IPsec)     |
+///
+/// `gretap`, `ip6gretap`, ERSPAN, VXLAN, Geneve, MACsec, L2TPv3 pseudowires,
+/// MACVLAN, VLANs, bridges and bonds are Ethernet (1); the loopback (772)
+/// carries a zeroed Ethernet header. A raw-IP link missing from this list is
+/// classified as Ethernet: its IP source address is read as the EtherType, so
+/// it is either dropped as an unknown EtherType or, without fail-closed,
+/// passed without a policy decision. GRE (778) was missing until this list
+/// was audited, and inner GRE traffic bypassed zone policy that way.
+const RAW_IP_LINK_TYPES: [u32; 8] = [512, 519, 768, 769, 776, 778, 823, 65534];
+
 fn raw_ip_link(kind: u32) -> bool {
-    // Linux ARPHRD_PPP, RAWIP, TUNNEL, TUNNEL6, SIT, NONE (WireGuard/TUN).
-    matches!(kind, 512 | 519 | 768 | 769 | 776 | 65534)
+    RAW_IP_LINK_TYPES.contains(&kind)
 }
 
 fn program_link_layer(ebpf: &mut Ebpf, name: &str) -> Result<bool> {
@@ -4146,6 +4383,9 @@ fn program_link_layer(ebpf: &mut Ebpf, name: &str) -> Result<bool> {
     Ok(raw)
 }
 
+/// Map each configured interface to its policy id (`IFACE_POLICY`) and overlay
+/// segment (`IFACE_VNI`). The two are independent: a port's firewall ruleset and
+/// its virtual network are separate concerns.
 fn program_interfaces(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Result<()> {
     let mut raw_links = HashSet::new();
     for iface in interfaces {
@@ -4378,7 +4618,7 @@ fn program_port_forwards(
 /// Rotating it on every reconfigure would be worse than useless: every client
 /// mid-handshake would have its ACK rejected. So it is written once, when it is
 /// still zero.
-fn program_synproxy(ebpf: &mut Ebpf, ports: &[ResolvedSynProxy]) -> Result<()> {
+fn program_synproxy(ebpf: &mut Ebpf, ports: &[(SynProxyKey, SynProxyCfg)]) -> Result<()> {
     // The cookie key is drawn only when a port actually uses it; the port map is
     // reconciled either way, so unprotecting the last port takes effect.
     if !ports.is_empty() {
@@ -4405,17 +4645,74 @@ fn program_synproxy(ebpf: &mut Ebpf, ports: &[ResolvedSynProxy]) -> Result<()> {
         }
     }
 
-    let keep: HashSet<SynProxyKey> = ports.iter().map(|p| SynProxyKey::tcp(p.port)).collect();
+    let keep: HashSet<SynProxyKey> = ports.iter().map(|(key, _)| *key).collect();
     let mut map: HashMap<_, SynProxyKey, SynProxyCfg> = HashMap::try_from(
         ebpf.map_mut("SYNPROXY")
             .ok_or_else(|| anyhow!("SYNPROXY map missing"))?,
     )?;
     drop_unlisted(&mut map, &keep)?;
-    for port in ports {
-        map.insert(SynProxyKey::tcp(port.port), SynProxyCfg::new(port.mss), 0)
-            .context("inserting a synproxy port")?;
+    for (key, value) in ports {
+        map.insert(*key, *value, 0).with_context(|| {
+            format!(
+                "inserting synproxy port {} for policy {:#x}",
+                key.port, key.policy
+            )
+        })?;
     }
     Ok(())
+}
+
+/// The `SYNPROXY` entries a configuration asks for (DP-31): one per policy a
+/// protected port shields its clients on — every policy in `policies` when the
+/// entry names none — plus the [`SynProxyKey::server_side`] entries the
+/// server's half of a proxied connection looks up: the protected port itself,
+/// and the target port of every port-forward that remaps it for a shielded
+/// policy, because that server answers from the port it was forwarded to.
+fn synproxy_entries(
+    ports: &[ResolvedSynProxy],
+    forwards: &[ResolvedPortForward],
+    policies: &[PolicyId],
+) -> Vec<(SynProxyKey, SynProxyCfg)> {
+    let mut out: Vec<(SynProxyKey, SynProxyCfg)> = Vec::new();
+    for port in ports {
+        let value = SynProxyCfg::new(port.mss);
+        let scoped = match port.policy {
+            Some(policy) => vec![policy],
+            None => policies.to_vec(),
+        };
+        let remapped: Vec<u16> = forwards
+            .iter()
+            .filter(|f| {
+                f.proto == velstra_common::ip_proto::TCP
+                    && f.port == port.port
+                    && f.dst_port != 0
+                    && scoped.contains(&f.policy)
+            })
+            .map(|f| f.dst_port)
+            .collect();
+        out.extend(
+            scoped
+                .into_iter()
+                .map(|policy| (SynProxyKey::tcp(policy, port.port), value)),
+        );
+        for server_port in std::iter::once(port.port).chain(remapped) {
+            let server = SynProxyKey::server_side(server_port);
+            if !out.iter().any(|(key, _)| *key == server) {
+                out.push((server, value));
+            }
+        }
+    }
+    out
+}
+
+/// The ports of the server-side entries among `entries`: those the data
+/// plane keys splices on.
+fn server_side_ports(entries: &[(SynProxyKey, SynProxyCfg)]) -> HashSet<u16> {
+    entries
+        .iter()
+        .filter(|(key, _)| key.policy == SynProxyKey::SERVER_SIDE)
+        .map(|(key, _)| key.port)
+        .collect()
 }
 
 /// Resolve live masquerade targets. Explicit SNAT/HA VIP addresses always win
@@ -6369,6 +6666,125 @@ fn is_drop_counter(counter: Counter) -> bool {
 mod tests {
     use super::*;
 
+    fn proxied(port: u16, mss: u16, policy: Option<PolicyId>) -> ResolvedSynProxy {
+        ResolvedSynProxy { port, mss, policy }
+    }
+
+    /// DP-31: a port scoped to a policy is proxied for that policy's clients
+    /// only; the server's half has its own policy-independent entry.
+    #[test]
+    fn a_scoped_synproxy_port_is_written_for_its_policy_and_the_server_side() {
+        let entries = synproxy_entries(&[proxied(443, 1400, Some(7))], &[], &[0, 7, 8]);
+        let keys: HashSet<SynProxyKey> = entries.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            keys,
+            HashSet::from([SynProxyKey::tcp(7, 443), SynProxyKey::server_side(443)])
+        );
+        assert!(entries.iter().all(|(_, v)| v.mss == 1400));
+    }
+
+    #[test]
+    fn an_unscoped_synproxy_port_is_written_for_every_policy() {
+        let entries = synproxy_entries(&[proxied(443, 1460, None)], &[], &[0, 7]);
+        let keys: HashSet<SynProxyKey> = entries.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            keys,
+            HashSet::from([
+                SynProxyKey::tcp(0, 443),
+                SynProxyKey::tcp(7, 443),
+                SynProxyKey::server_side(443),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_port_proxied_for_two_policies_has_one_server_side_entry() {
+        let entries = synproxy_entries(
+            &[proxied(443, 1460, Some(7)), proxied(443, 1460, Some(8))],
+            &[],
+            &[0, 7, 8],
+        );
+        assert_eq!(entries.len(), 3);
+        let servers = entries
+            .iter()
+            .filter(|(k, _)| *k == SynProxyKey::server_side(443))
+            .count();
+        assert_eq!(servers, 1);
+    }
+
+    fn forward(policy: PolicyId, port: u16, dst_port: u16) -> ResolvedPortForward {
+        ResolvedPortForward {
+            policy,
+            proto: velstra_common::ip_proto::TCP,
+            port,
+            dst_ip: [10, 0, 0, 9],
+            dst_port,
+            match_dst: [0; 4],
+            local_destination: true,
+            snat_ip: [0; 4],
+            reply_policy: 0,
+        }
+    }
+
+    /// DP-31: a forward that remaps a protected port (8080 -> 80) has its
+    /// server answer from the target port, so the server's half of the proxy
+    /// must be looked up there; a forward that keeps the port, a forward of an
+    /// unprotected port and one outside the proxy's scope add nothing.
+    #[test]
+    fn a_remapping_port_forward_puts_the_server_side_on_its_target_port() {
+        let entries = synproxy_entries(
+            &[proxied(8080, 1460, Some(7)), proxied(443, 1460, Some(7))],
+            &[
+                forward(7, 8080, 80),
+                forward(7, 443, 0),
+                forward(8, 8080, 81),
+                forward(7, 9000, 90),
+            ],
+            &[0, 7, 8],
+        );
+        let keys: HashSet<SynProxyKey> = entries.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            keys,
+            HashSet::from([
+                SynProxyKey::tcp(7, 8080),
+                SynProxyKey::server_side(8080),
+                SynProxyKey::server_side(80),
+                SynProxyKey::tcp(7, 443),
+                SynProxyKey::server_side(443),
+            ])
+        );
+    }
+
+    #[test]
+    fn splices_are_keyed_on_the_server_side_ports_including_a_forwards_target() {
+        let entries = synproxy_entries(
+            &[proxied(8080, 1460, Some(7)), proxied(443, 1460, None)],
+            &[forward(7, 8080, 80)],
+            &[0, 7],
+        );
+        assert_eq!(server_side_ports(&entries), HashSet::from([8080, 80, 443]));
+        assert!(server_side_ports(&synproxy_entries(&[], &[], &[0, 7])).is_empty());
+    }
+
+    #[test]
+    fn a_program_over_the_verifier_budget_is_refused_by_name() {
+        let refusal = over_budget("velstra_egress_v4_state", Some(700_001), 700_000)
+            .expect("one instruction over the budget is a refusal");
+        assert!(refusal.contains("velstra_egress_v4_state"), "{refusal}");
+        assert!(refusal.contains("700001"), "{refusal}");
+    }
+
+    #[test]
+    fn a_program_at_or_under_the_budget_passes() {
+        assert_eq!(over_budget("velstra", Some(700_000), 700_000), None);
+        assert_eq!(over_budget("velstra", Some(12), 700_000), None);
+    }
+
+    #[test]
+    fn an_unreported_count_is_not_a_refusal() {
+        assert_eq!(over_budget("velstra", None, 1), None);
+    }
+
     #[test]
     fn complete_napt_domain_requires_absence_of_both_ha_and_sync() {
         let base = serde_json::from_value::<velstra_config::FileConfig>(serde_json::json!({}))
@@ -6542,6 +6958,63 @@ mod tests {
         // Unchanged local sets keep the shortcut available.
         observed.local = previous.local.clone();
         assert!(local_address_additions(&previous, &observed).is_some());
+    }
+
+    /// A takeover adds a configured VIP to a link. With the VIP configured as
+    /// a virtual address the local-destination set is the same before and
+    /// after, so the refresh takes the additive shortcut (only
+    /// LOCAL_EGRESS_ADDRS grows) and never closes the configuration gate.
+    /// An address the configuration does not name still takes the rewrite.
+    #[test]
+    fn a_takeover_of_a_configured_virtual_address_takes_the_additive_path() {
+        let config = |vips: &[&str]| {
+            serde_json::from_value::<velstra_config::FileConfig>(serde_json::json!({
+                "default_action": "drop",
+                "virtual_addresses": vips,
+                "policy": [{"id": 1, "name": "lan", "port_rule": [
+                    {"name": "ssh", "proto": "tcp", "port": 22, "action": "pass", "dst-local": true}
+                ]}],
+                "interface": [{"name": "lan0", "policy": 1}]
+            }))
+            .unwrap()
+            .resolve()
+            .unwrap()
+        };
+        let link = |v4: &[[u8; 4]]| crate::host_inventory::Interface {
+            name: "lan0".into(),
+            index: 9,
+            mac: None,
+            addresses: v4.iter().map(|a| (*a, [255, 255, 255, 0])).collect(),
+            addresses6: Vec::new(),
+        };
+        let prepared = |cfg: &RuntimeConfig, v4: &[[u8; 4]]| {
+            let (ipv4, local) = host_view(cfg, vec![link(v4)]).unwrap();
+            PreparedHostConfig {
+                overlay: OverlayConfig::DISABLED,
+                srv6: Srv6Config::DISABLED,
+                route_ifindices: BTreeMap::new(),
+                ipv4,
+                local,
+            }
+        };
+        let (own, vip) = ([192, 0, 2, 1], [192, 0, 2, 100]);
+        let configured = config(&["192.0.2.100"]);
+        assert_eq!(
+            local_address_additions(
+                &prepared(&configured, &[own]),
+                &prepared(&configured, &[own, vip])
+            ),
+            Some(BTreeSet::from([local_egress_address_key(9, vip)])),
+            "a configured VIP arriving closed the configuration gate"
+        );
+        let unnamed = config(&[]);
+        assert_eq!(
+            local_address_additions(
+                &prepared(&unnamed, &[own]),
+                &prepared(&unnamed, &[own, vip])
+            ),
+            None
+        );
     }
 
     #[test]
@@ -7279,14 +7752,88 @@ mod tests {
         assert!(!keys.contains(&local_egress_address_key(11, [10, 1, 0, 1])));
     }
 
+    /// A primary link that does not exist yet is skipped (and attached later by
+    /// `reconcile_links`); one that exists is kept in order; any other lookup
+    /// error still fails start-up.
     #[test]
-    fn raw_ip_kernel_types_do_not_use_ethernet_classification() {
-        for kind in [512, 519, 768, 769, 776, 65534] {
-            assert!(raw_ip_link(kind));
+    fn startup_skips_only_primary_interfaces_that_do_not_exist_yet() {
+        let names = ["eth0", "tun0", "eth1"].map(String::from);
+        let lookup = |name: &str| match name {
+            "tun0" => Err(
+                anyhow::Error::from(std::io::Error::from_raw_os_error(libc::ENODEV))
+                    .context("interface \"tun0\" not found"),
+            ),
+            _ => Ok(7),
+        };
+        assert_eq!(
+            present_interfaces(&names, lookup).unwrap(),
+            vec!["eth0".to_string(), "eth1".to_string()]
+        );
+        let broken =
+            |_: &str| -> Result<u32> { Err(std::io::Error::from_raw_os_error(libc::EPERM).into()) };
+        assert!(present_interfaces(&names, broken).is_err());
+        // The real lookup reports a missing link the same way.
+        // A still-missing primary is warned about at once, then once a minute.
+        let now = std::time::Instant::now();
+        assert!(missing_primary_warning_due(None, now));
+        assert!(!missing_primary_warning_due(Some(now), now));
+        assert!(missing_primary_warning_due(
+            Some(now),
+            now + MISSING_PRIMARY_WARN_INTERVAL
+        ));
+        let absent = ["velstra-absent0".to_string()];
+        assert!(
+            present_interfaces(&absent, if_nametoindex)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Every link kind the datapath attaches to, with the `ARPHRD_*` type the
+    /// kernel gives it (`dev->type`, set in each driver's setup function), and
+    /// whether frames on it start at the IP header. A kind added to the
+    /// appliance belongs here; a raw-IP type missing from `RAW_IP_LINK_TYPES`
+    /// fails this test instead of silently classifying IP bytes as Ethernet.
+    #[test]
+    fn every_appliance_link_kind_is_classified_by_its_kernel_type() {
+        const ETHER: u32 = 1;
+        let kinds: [(&str, u32, bool); 26] = [
+            ("ethernet", ETHER, false),
+            ("vlan", ETHER, false),
+            ("bridge", ETHER, false),
+            ("bond", ETHER, false),
+            ("dummy", ETHER, false),
+            ("macvlan", ETHER, false),
+            ("macsec", ETHER, false),
+            ("veth", ETHER, false),
+            ("vxlan", ETHER, false),
+            ("geneve", ETHER, false),
+            ("gretap", ETHER, false),
+            ("ip6gretap", ETHER, false),
+            ("erspan", ETHER, false),
+            ("l2tpeth", ETHER, false),
+            ("loopback", 772, false),
+            ("ppp", 512, true),
+            ("rawip", 519, true),
+            ("ipip", 768, true),
+            ("vti", 768, true),
+            ("ip6tnl", 769, true),
+            ("vti6", 769, true),
+            ("sit", 776, true),
+            ("gre", 778, true),
+            ("ip6gre", 823, true),
+            ("wireguard", 65534, true),
+            ("xfrm", 65534, true),
+        ];
+        for (kind, arphrd, raw) in kinds {
+            assert_eq!(raw_ip_link(arphrd), raw, "{kind} (ARPHRD {arphrd})");
         }
-        for kind in [1, 772] {
-            assert!(!raw_ip_link(kind));
-        }
+        // `tun` (L3 mode) is ARPHRD_NONE as well, covered by the 65534 row.
+        assert!(
+            RAW_IP_LINK_TYPES
+                .iter()
+                .all(|t| kinds.iter().any(|k| k.1 == *t && k.2))
+        );
     }
 
     #[test]

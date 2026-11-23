@@ -57,6 +57,17 @@ const UPSERT: u8 = 1;
 const DELETE: u8 = 2;
 const END: u8 = 3;
 const HEARTBEAT: u8 = 4;
+/// Receiver to sender, once, right after the handshake: the record kinds this
+/// receiver decodes beyond VCS2's original set. An older receiver sends
+/// nothing; an older sender never reads it. Authenticated with a key derived
+/// from the session key ([`features_key`]), so it cannot collide with the
+/// sender's state frames.
+const FEATURES: u8 = 5;
+/// The receiver decodes the owner's clock record (VWC1).
+const FEATURE_CLOCK: u8 = 1;
+/// How long a sender waits for the announcement before treating its receiver
+/// as one that predates it.
+const FEATURE_WAIT: Duration = Duration::from_millis(500);
 type Key = Vec<u8>;
 type Entries = BTreeMap<Key, Record>;
 type NatMap = Arc<Mutex<HashMap<MapData, FlowKey, FlowState>>>;
@@ -67,11 +78,14 @@ enum Record {
     Firewall(FirewallKey, FirewallState),
     SynProxy(FlowKey, SynFlow),
     Wireguard(ha::wireguard::Endpoint),
+    /// The owner's wall clock (see [`ha::wireguard::PeerClock`]).
+    Clock(ha::wireguard::PeerClock),
 }
 
 impl Record {
     fn key(self) -> Key {
         match self {
+            Self::Clock(_) => vec![6],
             Self::Wireguard(endpoint) => {
                 let mut key = vec![5];
                 key.extend_from_slice(&endpoint.interface);
@@ -100,6 +114,12 @@ impl Record {
         // The parent codec intentionally excludes ages over seven days. Such
         // entries are omitted by the producer before calling this method.
         match self {
+            Self::Clock(clock) => {
+                let mut wire = b"VWC1".to_vec();
+                wire.extend_from_slice(&clock.wall_ns.to_le_bytes());
+                wire.push(u8::from(clock.synchronised));
+                wire
+            }
             Self::Wireguard(endpoint) => {
                 let mut wire = b"VWG1".to_vec();
                 wire.extend_from_slice(&endpoint.interface);
@@ -133,6 +153,15 @@ impl Record {
         }
     }
     fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.starts_with(b"VWC1") {
+            ensure!(bytes.len() == 13, "invalid clock record length");
+            let wall_ns = u64::from_le_bytes(bytes[4..12].try_into()?);
+            ensure!(wall_ns > 0 && bytes[12] <= 1, "invalid clock record");
+            return Ok(Self::Clock(ha::wireguard::PeerClock {
+                wall_ns,
+                synchronised: bytes[12] == 1,
+            }));
+        }
         if bytes.starts_with(b"VWG1") {
             ensure!(
                 bytes.len() == 71,
@@ -185,7 +214,7 @@ impl Record {
     }
     fn received(self, now: u64) -> Self {
         match self {
-            Self::SynProxy(_, _) | Self::Wireguard(_) => self,
+            Self::SynProxy(_, _) | Self::Wireguard(_) | Self::Clock(_) => self,
             Self::Nat(key, state) => Self::Nat(
                 key,
                 FlowState {
@@ -214,12 +243,87 @@ struct Imported {
     peer: IpAddr,
     record: Record,
 }
+
+/// The SYN-proxy splice keys this agent holds as imported from a peer,
+/// shared with the agent's splice sweep: a peer's splice can arrive a dump
+/// before the state that claims it, so a node must not judge a splice it
+/// only holds on the peer's behalf (see `crate::reclaim`).
+pub type ImportedSplices = Arc<std::sync::Mutex<HashSet<FlowKey>>>;
+
+/// The imported records, with their SYN-proxy keys mirrored into an
+/// [`ImportedSplices`] set on every change.
+struct ImportedRecords {
+    map: BTreeMap<Key, Imported>,
+    splices: ImportedSplices,
+}
+
+impl ImportedRecords {
+    fn new(splices: ImportedSplices) -> Self {
+        if let Ok(mut set) = splices.lock() {
+            set.clear();
+        }
+        Self {
+            map: BTreeMap::new(),
+            splices,
+        }
+    }
+    fn splices(&self) -> std::sync::MutexGuard<'_, HashSet<FlowKey>> {
+        // A poisoned lock still holds a usable set; never lose the mirror.
+        self.splices.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    fn get(&self, key: &Key) -> Option<&Imported> {
+        self.map.get(key)
+    }
+    fn contains_key(&self, key: &Key) -> bool {
+        self.map.contains_key(key)
+    }
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+    fn iter(&self) -> impl Iterator<Item = (&Key, &Imported)> {
+        self.map.iter()
+    }
+    fn insert(&mut self, key: Key, imported: Imported) {
+        if let Record::SynProxy(splice, _) = imported.record {
+            self.splices().insert(splice);
+        }
+        self.map.insert(key, imported);
+    }
+    fn remove(&mut self, key: &Key) {
+        if let Some(Imported {
+            record: Record::SynProxy(splice, _),
+            ..
+        }) = self.map.remove(key)
+        {
+            self.splices().remove(&splice);
+        }
+    }
+    fn retain(&mut self, mut keep: impl FnMut(&Key, &Imported) -> bool) {
+        let mut gone = Vec::new();
+        self.map.retain(|key, imported| {
+            let kept = keep(key, imported);
+            if !kept && let Record::SynProxy(splice, _) = imported.record {
+                gone.push(splice);
+            }
+            kept
+        });
+        let mut set = self.splices();
+        for splice in gone {
+            set.remove(&splice);
+        }
+    }
+    fn clear(&mut self) {
+        self.map.clear();
+        self.splices().clear();
+    }
+}
 struct Store {
     nat: NatMap,
     firewall: HashMap<MapData, FirewallKey, FirewallState>,
     synproxy: HashMap<MapData, FlowKey, SynFlow>,
     endpoints: BTreeMap<Key, ha::wireguard::Endpoint>,
-    imported: BTreeMap<Key, Imported>,
+    peer_clock: Option<ha::wireguard::ClockObservation>,
+    imported: ImportedRecords,
     policy: Option<[u8; 32]>,
     local_addresses: BTreeSet<IpAddr>,
 }
@@ -309,6 +413,15 @@ impl Store {
             return Ok(());
         }
 
+        if let Record::Clock(clock) = record {
+            ensure!(authoritative, "HA clock requires witness authority");
+            self.peer_clock = (kind != DELETE).then(|| ha::wireguard::ClockObservation {
+                wall_ns: clock.wall_ns,
+                synchronised: clock.synchronised,
+                observed_ns: ha::now_ns(),
+            });
+            return Ok(());
+        }
         if let Record::Wireguard(endpoint) = record {
             ensure!(
                 authoritative,
@@ -327,7 +440,7 @@ impl Store {
         }
         let mut nat = self.nat.lock().await;
         let local = match record {
-            Record::Wireguard(_) => unreachable!("handled above"),
+            Record::Wireguard(_) | Record::Clock(_) => unreachable!("handled above"),
             Record::SynProxy(k, _) => self
                 .synproxy
                 .get(&k, 0)
@@ -352,7 +465,7 @@ impl Store {
         if kind == DELETE {
             if ours || authoritative && local.is_some() {
                 match record {
-                    Record::Wireguard(_) => unreachable!("handled above"),
+                    Record::Wireguard(_) | Record::Clock(_) => unreachable!("handled above"),
                     Record::SynProxy(k, _) => self.synproxy.remove(&k)?,
                     Record::Nat(k, _) => nat.remove(&k)?,
                     Record::Firewall(k, _) => self.firewall.remove(&k)?,
@@ -373,7 +486,7 @@ impl Store {
             }
             let record = record.received(monotonic_ns());
             match record {
-                Record::Wireguard(_) => unreachable!("handled above"),
+                Record::Wireguard(_) | Record::Clock(_) => unreachable!("handled above"),
                 Record::SynProxy(k, v) => self.synproxy.insert(k, v, 0)?,
                 Record::Nat(k, v) => nat.insert(k, v, 0)?,
                 Record::Firewall(k, v) => self.firewall.insert(k, v, 0)?,
@@ -413,6 +526,7 @@ impl Store {
         }
         self.imported.clear();
         self.endpoints.clear();
+        self.peer_clock = None;
         for record in records.into_values() {
             self.apply_inner(peer, UPSERT, record, true).await?;
         }
@@ -583,6 +697,45 @@ struct Session {
     key: hmac::Key,
     sequence: u64,
 }
+
+/// The key of the receiver's feature announcement: distinct from the state
+/// key, so the two directions never share a sequence space.
+fn features_key(state: &hmac::Key) -> hmac::Key {
+    hmac::Key::new(
+        hmac::HMAC_SHA256,
+        hmac::sign(state, b"VCS2 receiver features").as_ref(),
+    )
+}
+
+/// Receiver side: say which optional records this agent decodes.
+async fn announce_features(stream: &mut TcpStream, state: &hmac::Key) -> Result<()> {
+    let mut session = Session {
+        key: features_key(state),
+        sequence: 0,
+    };
+    write_frame(stream, &mut session, [0; 32], FEATURES, &[FEATURE_CLOCK]).await
+}
+
+/// Sender side: the receiver's feature bits, or none from a receiver that
+/// predates the announcement (or sent anything unauthenticated).
+async fn peer_features(stream: &mut TcpStream, state: &hmac::Key) -> u8 {
+    let Ok(Ok(bytes)) = timeout(FEATURE_WAIT, read_frame(stream)).await else {
+        return 0;
+    };
+    let mut session = Session {
+        key: features_key(state),
+        sequence: 0,
+    };
+    match session.verify(&bytes) {
+        Ok((_, FEATURES, [bits])) => *bits,
+        _ => 0,
+    }
+}
+
+/// Whether a record may go to a receiver with these feature bits.
+fn exportable(record: &Record, features: u8) -> bool {
+    !matches!(record, Record::Clock(_)) || features & FEATURE_CLOCK != 0
+}
 impl Session {
     fn frame(&mut self, policy: [u8; 32], kind: u8, payload: &[u8]) -> Result<Vec<u8>> {
         ensure!(payload.len() <= MAX_FRAME, "state frame exceeds limit");
@@ -708,6 +861,18 @@ async fn push_available(
 ) -> Result<()> {
     stream.set_nodelay(true)?;
     let key = timeout(IO_TIMEOUT, handshake(&mut stream, secret.as_bytes(), true)).await??;
+    let features = peer_features(&mut stream, &key).await;
+    if features & FEATURE_CLOCK == 0 {
+        // Once per session: an older standby, or one that did not answer in
+        // time. It still receives everything it can decode.
+        log::info!(
+            "conntrack-sync: {} announced no HA clock support within {} ms; withholding the owner's clock record from it",
+            stream
+                .peer_addr()
+                .map_or_else(|_| "peer".into(), |a| a.ip().to_string()),
+            FEATURE_WAIT.as_millis()
+        );
+    }
     let mut session = Session { key, sequence: 0 };
     let mut previous: Option<Arc<Snapshot>> = None;
     loop {
@@ -730,7 +895,11 @@ async fn push_available(
                     &mut session,
                     next.policy,
                     UPSERT,
-                    next.entries.values().copied().collect(),
+                    next.entries
+                        .values()
+                        .filter(|r| exportable(r, features))
+                        .copied()
+                        .collect(),
                 )
                 .await?;
                 write_frame(&mut stream, &mut session, next.policy, END, &[]).await?;
@@ -740,12 +909,14 @@ async fn push_available(
                     .iter()
                     .filter(|(key, record)| old.entries.get(*key) != Some(*record))
                     .map(|(_, record)| *record)
+                    .filter(|record| exportable(record, features))
                     .collect();
                 let deleted = old
                     .entries
                     .iter()
                     .filter(|(key, _)| !next.entries.contains_key(*key))
                     .map(|(_, record)| *record)
+                    .filter(|record| exportable(record, features))
                     .collect();
                 send_records(&mut stream, &mut session, next.policy, UPSERT, changed).await?;
                 send_records(&mut stream, &mut session, next.policy, DELETE, deleted).await?;
@@ -874,6 +1045,7 @@ async fn receive(
     } = context;
     stream.set_nodelay(true)?;
     let key = timeout(IO_TIMEOUT, handshake(&mut stream, secret.as_bytes(), false)).await??;
+    announce_features(&mut stream, &key).await?;
     // A reconnect supersedes the previous authenticated stream. Its queued
     // frames cannot roll the new snapshot back, even if both sockets survive.
     let ticket = generation.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
@@ -921,7 +1093,7 @@ async fn receive(
                             authority.as_ref().map_or(0, |a| a.term)
                         );
                     }
-                    endpoints_changed |= matches!(record, Record::Wireguard(_));
+                    endpoints_changed |= matches!(record, Record::Wireguard(_) | Record::Clock(_));
                     if let Some(seen) = &mut seen {
                         ensure!(kind == UPSERT, "deletion inside snapshot");
                         seen.insert(record.key());
@@ -944,6 +1116,10 @@ async fn receive(
                         authority,
                         store.endpoints.values().copied().collect(),
                     )?;
+                    ha::wireguard::publish_clock(
+                        std::path::Path::new(ha::wireguard::CLOCK_DIR),
+                        store.peer_clock,
+                    )?;
                 }
             }
             END => {
@@ -965,6 +1141,10 @@ async fn receive(
                         &ha,
                         authority,
                         store.endpoints.values().copied().collect(),
+                    )?;
+                    ha::wireguard::publish_clock(
+                        std::path::Path::new(ha::wireguard::CLOCK_DIR),
+                        store.peer_clock,
                     )?;
                     ha.snapshot_ready(authority);
                 } else {
@@ -1024,6 +1204,7 @@ pub async fn run(
     synproxy: HashMap<MapData, FlowKey, SynFlow>,
     ha: ha::Shared,
     config: ResolvedConntrackSync,
+    imported_splices: ImportedSplices,
 ) {
     let secret = Arc::new(
         config
@@ -1045,7 +1226,8 @@ pub async fn run(
         firewall: flows,
         synproxy,
         endpoints: BTreeMap::new(),
-        imported: BTreeMap::new(),
+        peer_clock: None,
+        imported: ImportedRecords::new(imported_splices),
         policy: None,
         local_addresses: initial_scope,
     }));
@@ -1061,6 +1243,7 @@ pub async fn run(
         .collect();
     let idle_timeout = IO_TIMEOUT.max(Duration::from_millis(config.interval_ms.saturating_mul(3)));
     let mut ticker = tokio::time::interval(Duration::from_millis(config.interval_ms));
+    let mut clock: Option<(ha::wireguard::PeerClock, u64)> = None;
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut export_authority = None;
     loop {
@@ -1116,6 +1299,13 @@ pub async fn run(
                             log::debug!("conntrack-sync: exporting HA snapshot term={} records={} syn={}",a.term,snapshot.entries.len(),snapshot.entries.values().filter(|r|matches!(r,Record::SynProxy(..))).count());
                         }
                         for endpoint in endpoints {let record=Record::Wireguard(endpoint);snapshot.entries.insert(record.key(),record);}
+                        // The owner's wall clock rides along for a WireGuard pair (PeerClock).
+                        if authority.is_none() || wg_interfaces.is_empty() {
+                            clock = None;
+                        } else if clock_due(clock.map(|(_, at)| at), ha::now_ns()) {
+                            clock = ha::wireguard::PeerClock::sample().map(|c| (c, ha::now_ns()));
+                        }
+                        if let Some((sample, _)) = clock {let record=Record::Clock(sample);snapshot.entries.insert(record.key(),record);}
                         let fw = firewall.lock().await;
                         ensure!(fw.sync_generation()? == generation, "policy changed during state dump");
                         ensure!(ha.lock().await.authority_for_send(policy)? == authority, "HA authority changed during state dump");
@@ -1130,6 +1320,12 @@ pub async fn run(
             }
         }
     }
+}
+
+/// Whether the owner's replicated clock sample, taken at CLOCK_BOOTTIME
+/// `previous`, is due for a refresh at `now`.
+fn clock_due(previous: Option<u64>, now: u64) -> bool {
+    previous.is_none_or(|at| now < at || now - at >= ha::wireguard::CLOCK_REFRESH_NS)
 }
 
 /// One rule's digest record, in the field order the digest has always used.
@@ -1265,7 +1461,12 @@ pub(crate) fn policy_fingerprint(cfg: &RuntimeConfig) -> Result<[u8; 32]> {
         .collect();
     let bytes = json!({"version":if control.is_empty(){5}else{6},"ha":cfg.ha.as_ref().map(|h|json!([h.cluster,h.interfaces,h.wireguard_ports,h.wireguard,h.wireguard_policy])),"policies":policies,"interfaces":interfaces,"forwards":forwards,"services":services,
         "timeouts":[cfg.conntrack.tcp_syn,cfg.conntrack.tcp_established,cfg.conntrack.tcp_closing,cfg.conntrack.udp,cfg.conntrack.udp_stream,cfg.conntrack.icmp],
-        "synproxy":cfg.synproxy.iter().map(|s|(s.port,s.mss)).collect::<Vec<_>>(),"fail_closed":cfg.fail_closed}).to_string();
+        "synproxy":cfg.synproxy.iter().map(|s| match s.policy {
+            // A port proxied on every policy keeps its earlier record, so the
+            // digest of an unscoped configuration does not move (DP-31).
+            None => json!([s.port, s.mss]),
+            Some(policy) => json!([s.port, s.mss, policy]),
+        }).collect::<Vec<_>>(),"fail_closed":cfg.fail_closed}).to_string();
     Ok(digest::digest(&digest::SHA256, bytes.as_bytes())
         .as_ref()
         .try_into()
@@ -1316,7 +1517,8 @@ mod tests {
             firewall: kernel_map(),
             synproxy: kernel_map(),
             endpoints: BTreeMap::new(),
-            imported: BTreeMap::new(),
+            peer_clock: None,
+            imported: ImportedRecords::new(ImportedSplices::default()),
             policy: None,
             local_addresses: BTreeSet::new(),
         }
@@ -1532,6 +1734,46 @@ mod tests {
         target.apply(peer, UPSERT, syn_record()).await.unwrap();
         target.finish_snapshot(peer, &HashSet::new()).await.unwrap();
         assert!(target.synproxy.get(&key, 0).is_err());
+    }
+
+    #[test]
+    fn clock_records_roundtrip_and_reject_malformed_samples() {
+        let clock = ha::wireguard::PeerClock {
+            wall_ns: 1_795_312_020_353_569_926,
+            synchronised: true,
+        };
+        let record = Record::Clock(clock);
+        let bytes = record.encode(0);
+        assert_eq!(bytes.len(), 13);
+        assert_eq!(Record::decode(&bytes).unwrap(), record);
+        assert_eq!(unpack(&pack(&[record], 0)).unwrap(), vec![record]);
+        // One clock per snapshot, whatever it says.
+        let unsynced = Record::Clock(ha::wireguard::PeerClock {
+            wall_ns: 1,
+            synchronised: false,
+        });
+        assert_eq!(record.key(), unsynced.key());
+        assert_eq!(Record::decode(&unsynced.encode(0)).unwrap(), unsynced);
+        for n in 0..bytes.len() {
+            assert!(Record::decode(&bytes[..n]).is_err());
+        }
+        let mut flag = bytes.clone();
+        flag[12] = 2;
+        assert!(Record::decode(&flag).is_err());
+        let mut zero = bytes;
+        zero[4..12].copy_from_slice(&[0; 8]);
+        assert!(Record::decode(&zero).is_err());
+    }
+
+    #[test]
+    fn the_owner_refreshes_its_replicated_clock_once_a_second() {
+        let second = ha::wireguard::CLOCK_REFRESH_NS;
+        assert!(clock_due(None, 5));
+        assert!(!clock_due(Some(5), 5));
+        assert!(!clock_due(Some(5), 5 + second - 1));
+        assert!(clock_due(Some(5), 5 + second));
+        // A clock that went backwards (a restarted agent's stale state) refreshes.
+        assert!(clock_due(Some(10), 5));
     }
 
     #[test]
@@ -1837,7 +2079,8 @@ mod tests {
             firewall: flows,
             synproxy,
             endpoints: BTreeMap::new(),
-            imported: BTreeMap::new(),
+            peer_clock: None,
+            imported: ImportedRecords::new(ImportedSplices::default()),
             policy: None,
             local_addresses: BTreeSet::new(),
         }));
@@ -2471,6 +2714,156 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// The records a receiver gets from one owner snapshot, read off the wire.
+    async fn exported_records(announce: bool) -> Vec<Record> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let clock = Record::Clock(ha::wireguard::PeerClock {
+            wall_ns: 7,
+            synchronised: false,
+        });
+        let endpoint = Record::Wireguard(ha::wireguard::Endpoint {
+            interface: *b"wg0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+            public_key: [9; 32],
+            ip: [10, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            port: 51820,
+            family: 4,
+        });
+        let (_snapshots, receiver) = watch::channel(Some(Arc::new(Snapshot {
+            authority: Some(Authority {
+                term: 1,
+                owner: 1,
+                boot: [3; 16],
+                policy: [7; 32],
+            }),
+            policy: [7; 32],
+            entries: [(clock.key(), clock), (endpoint.key(), endpoint)]
+                .into_iter()
+                .collect(),
+        })));
+        let sender = tokio::spawn(send_peer(
+            listener.local_addr().unwrap(),
+            Arc::new("test secret".into()),
+            receiver,
+        ));
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let key = handshake(&mut peer, b"test secret", false).await.unwrap();
+        if announce {
+            announce_features(&mut peer, &key).await.unwrap();
+        }
+        let mut session = Session { key, sequence: 0 };
+        let mut records = Vec::new();
+        for expected in [BEGIN, UPSERT, END] {
+            let bytes = timeout(IO_TIMEOUT, read_frame(&mut peer))
+                .await
+                .unwrap()
+                .unwrap();
+            let (_, kind, payload) = session.verify(&bytes).unwrap();
+            assert_eq!(kind, expected);
+            if kind == UPSERT {
+                records = unpack(payload).unwrap();
+            }
+        }
+        sender.abort();
+        records
+    }
+
+    /// An older standby rejects a VWC1 record as an invalid state record and
+    /// drops the session, so it never warms (rolling upgrade). It announces
+    /// nothing, and must be sent nothing it cannot decode.
+    #[tokio::test]
+    async fn a_receiver_that_announces_nothing_never_gets_the_clock_record() {
+        let records = exported_records(false).await;
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(matches!(records[0], Record::Wireguard(_)));
+    }
+
+    #[test]
+    fn a_new_import_store_starts_with_no_held_splices() {
+        // A restarted sync task holds nothing yet: a key left from before
+        // would shield a splice from the sweep for good.
+        let set = ImportedSplices::default();
+        set.lock()
+            .unwrap()
+            .insert(FlowKey::new(0, [10, 2, 0, 10], [0; 4], 1, 8443, 6));
+        let records = ImportedRecords::new(set.clone());
+        assert_eq!(records.len(), 0);
+        assert!(set.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn imported_splice_keys_are_mirrored_through_every_change() {
+        let set = ImportedSplices::default();
+        let mut records = ImportedRecords::new(set.clone());
+        let peer: IpAddr = "10.3.0.2".parse().unwrap();
+        let splice = |port| {
+            Record::SynProxy(
+                FlowKey::new(0, [10, 2, 0, 10], [0; 4], port, 8443, 6),
+                SynFlow::pending(1, 2),
+            )
+        };
+        let firewall = Record::Firewall(
+            FirewallKey::ipv4(FlowKey::new(7, [10, 2, 0, 10], [10, 1, 0, 10], 1, 8443, 6)),
+            FirewallState::UNTRACKED,
+        );
+        for record in [splice(1), splice(2), firewall] {
+            records.insert(record.key(), Imported { peer, record });
+        }
+        let key = |record: Record| match record {
+            Record::SynProxy(k, _) => k,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            *set.lock().unwrap(),
+            HashSet::from([key(splice(1)), key(splice(2))])
+        );
+        records.remove(&splice(1).key());
+        assert_eq!(*set.lock().unwrap(), HashSet::from([key(splice(2))]));
+        records.retain(|k, _| *k != splice(2).key());
+        assert!(set.lock().unwrap().is_empty());
+        records.insert(
+            splice(3).key(),
+            Imported {
+                peer,
+                record: splice(3),
+            },
+        );
+        records.clear();
+        assert!(set.lock().unwrap().is_empty());
+        assert_eq!(records.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_receiver_that_announces_the_clock_gets_it() {
+        let records = exported_records(true).await;
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert!(records.iter().any(|r| matches!(r, Record::Clock(_))));
+    }
+
+    #[tokio::test]
+    async fn a_feature_announcement_is_authenticated_and_bounded() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let key = handshake(&mut stream, b"test secret", false).await.unwrap();
+            // A frame under the state key, not the feature key, is refused.
+            write_frame(
+                &mut stream,
+                &mut Session { key, sequence: 0 },
+                [0; 32],
+                FEATURES,
+                &[FEATURE_CLOCK],
+            )
+            .await
+            .unwrap();
+            stream
+        });
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let key = handshake(&mut stream, b"test secret", true).await.unwrap();
+        assert_eq!(peer_features(&mut stream, &key).await, 0);
+        drop(server.await.unwrap());
     }
 
     #[tokio::test]

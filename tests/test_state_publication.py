@@ -5,7 +5,16 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-WRITERS = ("ct_record", "ct_record_wire4", "ct_seed_reply", "ct_router_open", "ct_cookie_admitted")
+WRITERS = (
+    "ct_record",
+    "ct_record_wire4",
+    "ct_seed_reply",
+    "ct_router_open",
+    "ct_cookie_admitted",
+    # The SYN proxy's own handshake ACK (XDP_TX) advances the server-facing
+    # state no egress hook sees (DP-31); it fails closed like the others.
+    "ct_synproxy_acked",
+)
 
 
 def calls(source):
@@ -28,7 +37,7 @@ class PublicationWiring(unittest.TestCase):
             for writer, following in calls(source):
                 observed.append(writer)
                 self.assertTrue(following.startswith(".failed()"), (name, writer))
-        self.assertEqual(len(observed), 17)
+        self.assertEqual(len(observed), 18)
         self.assertEqual(set(observed), set(WRITERS))
 
     def test_all_directional_inserts_use_one_fallible_helper(self):
@@ -44,7 +53,7 @@ class PublicationWiring(unittest.TestCase):
         source = (ROOT / "velstra-ebpf/src/conntrack.rs").read_text()
         for writer in WRITERS:
             self.assertRegex(source, rf"fn {writer}\([^{{]*-> StatePublication")
-        self.assertEqual(source.count("return StatePublication::Failed;"), 5)
+        self.assertEqual(source.count("return StatePublication::Failed;"), 6)
         self.assertIn("return StatePublication::NoChange;", source)
 
     def test_guard_recognizes_discarded_call(self):

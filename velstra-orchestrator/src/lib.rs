@@ -1733,6 +1733,7 @@ impl Topology {
                 // validate against, so it leaves this off.
                 source_validation: SourceValidationName::Disable,
                 blocklist: Vec::new(),
+                blocklist_ingress_only: false,
                 port_rules: Vec::new(),
                 // A captive portal is an appliance feature (C20). A fabric
                 // tenant network has no guests to hold at a gate.
@@ -1796,6 +1797,8 @@ impl Topology {
                     stateful: sg.stateful,
                     source_validation: SourceValidationName::Disable,
                     blocklist: sg.blocklist.clone(),
+                    // A security group's blocklist keeps both directions.
+                    blocklist_ingress_only: false,
                     port_rules: sg.rules.clone(),
                     portal: None,
                 });

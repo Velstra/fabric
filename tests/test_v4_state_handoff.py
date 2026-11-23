@@ -83,14 +83,18 @@ class StateHandoffWiring(unittest.TestCase):
         )[0]
         read = stage.index("let has_port_forward = port_forward_exists(")
         for field in ("src_addr", "dst_addr", "proto", "src_port", "dst_port",
-                      "total_len", "cfg", "blocklisted", "rule"):
+                      "total_len", "cfg", "rule"):
             self.assertIn(f"let {field} = s.{field}", stage[:read])
+        # DP-15: the blocklist bit is frozen as `listed`; whether it refuses
+        # (it may not, for an answer under an ingress-only blocklist) is
+        # decided after connection state, below.
+        self.assertIn("let listed = s.blocklisted != 0", stage[:read])
         self.assertNotIn("s.total_len", stage[read:])
         self.assertIn("PacketMeta::new(src_addr, dst_addr, proto, src_port, dst_port, total_len)", stage)
         self.assertIn("decide(&meta, &cfg, blocklisted, rule_action)", stage)
         order = ["port_forward_exists(", "ct_key4(", "ct_router_normalize(", "ct_control(",
                  "synproxy_cfg(", "ct_classify(", "icmp_related::take_xdp(",
-                 "let verdict = decide(", "rate_limits_allow(", "ct_record(",
+                 "ct_is_answer(", "blocklist_refuses_ingress(", "let verdict = decide(", "rate_limits_allow(", "ct_record(",
                  "ct_record_wire4(", "observe("]
         offsets = [stage.index(call) for call in order]
         self.assertEqual(offsets, sorted(offsets))

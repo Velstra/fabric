@@ -10,15 +10,16 @@ use aya_ebpf::{
     programs::{TcContext, XdpContext},
 };
 use velstra_common::{
-    CgnatLayout, FirewallKey, FirewallState, FlowKey, ICMPV6_ERROR_QUOTE, RelatedChecksums,
-    csum_replace_u16, ip_proto, legacy_napt_seed, napt_binding_matches, napt_port, napt_seed,
-    related_checksum_copy_length, related_checksums, related_hairpin_firewall_candidate,
-    related_icmp_error, related_icmpv6_error, related_icmpv6_key,
+    CgnatLayout, FirewallKey, FirewallState, FlowKey, ICMPV6_ERROR_QUOTE, QUOTE_EXT_MAX, QuoteStep,
+    RelatedChecksums, csum_replace_u16, ip_proto, is_ipv6_ext, legacy_napt_seed,
+    napt_binding_matches, napt_port, napt_seed, quote_ext_step, related_checksum_copy_length,
+    related_checksums, related_hairpin_firewall_candidate, related_icmp_error,
+    related_icmpv6_error, related_icmpv6_key,
 };
 
 use super::{
-    CGNAT, CONNTRACK, FW_FLOWS, IFACE_POLICY, MASQUERADE, ROUTER_NAT_POLICY, conntrack::timeouts,
-    existing_napt_port,
+    CGNAT, CONNTRACK, FW_FLOWS, IFACE_POLICY, MASQUERADE, NPTV6, ROUTER_NAT_POLICY,
+    conntrack::timeouts, existing_napt_port,
 };
 
 #[repr(C)]
@@ -81,6 +82,7 @@ struct Scratch6 {
     quoted: [u8; 40],
     transport: [u8; 8],
     header: [u8; 8],
+    ext: [u8; 4],
 }
 
 #[map]
@@ -91,25 +93,29 @@ static RELATED6_SCRATCH: PerCpuArray<Scratch6> = PerCpuArray::with_max_entries(1
 /// Packet Too Big never reached a sender behind a deny-by-default zone, and
 /// IPv6 path-MTU discovery black-holed).
 ///
-/// Admission only: the error is not translated, creates no state and refreshes
-/// none. IPv6 has no NAT here; NPTv6 rewrites the envelope and leaves the quote
-/// external, so an error about an NPTv6 flow is not recognised (see
-/// `related_icmpv6_key` for what else is refused). Helper loads only, so the
-/// walked offset never becomes a packet pointer the verifier must bound.
+/// Admission only: the error creates no state and refreshes none. The quoted
+/// packet's extension headers are walked ([`quote_ext_step`]) to the transport
+/// header the error is about. On an NPTv6 boundary (`ifindex` carries a rule)
+/// the quote names the inside host by its EXTERNAL address while the flow is
+/// recorded under the internal one, so the quoted source is translated before
+/// the lookup; [`super::npt66_related_quote_in`] rewrites it in the packet once
+/// the error is admitted. See `related_icmpv6_key` for what is refused. Helper
+/// loads only, so the walked offset never becomes a packet pointer the
+/// verifier must bound.
 #[inline(never)]
-pub(super) fn related_v6_xdp(ctx: &XdpContext, policy: u32, off: u32) -> bool {
-    related_v6::<false>(ctx.ctx.cast(), policy, off)
+pub(super) fn related_v6_xdp(ctx: &XdpContext, policy: u32, off: u32, ifindex: u32) -> bool {
+    related_v6::<false>(ctx.ctx.cast(), policy, off, ifindex)
 }
 
 /// The TC-egress form of [`related_v6_xdp`], for a guest-bound error on a
 /// tenant tap whose egress face is its deny-by-default inbound side.
 #[inline(never)]
-pub(super) fn related_v6_tc(ctx: &TcContext, policy: u32, off: u32) -> bool {
-    related_v6::<true>(ctx.skb.skb.cast(), policy, off)
+pub(super) fn related_v6_tc(ctx: &TcContext, policy: u32, off: u32, ifindex: u32) -> bool {
+    related_v6::<true>(ctx.skb.skb.cast(), policy, off, ifindex)
 }
 
 #[inline(always)]
-fn related_v6<const TC: bool>(context: *mut c_void, policy: u32, off: u32) -> bool {
+fn related_v6<const TC: bool>(context: *mut c_void, policy: u32, off: u32, ifindex: u32) -> bool {
     let Some(s) = RELATED6_SCRATCH.get_ptr_mut(0) else {
         return false;
     };
@@ -118,15 +124,32 @@ fn related_v6<const TC: bool>(context: *mut c_void, policy: u32, off: u32) -> bo
         || !related_icmpv6_error(s.header[0], s.header[1])
         || read::<TC, 16>(context, 14 + 24, &mut s.outer_dst).is_err()
         || read::<TC, 40>(context, off + ICMPV6_ERROR_QUOTE as u32, &mut s.quoted).is_err()
-        || read::<TC, 8>(
-            context,
-            off + ICMPV6_ERROR_QUOTE as u32 + 40,
-            &mut s.transport,
-        )
-        .is_err()
-        || !related_icmpv6_key(policy, &s.outer_dst, &s.quoted, &s.transport, &mut s.key)
     {
         return false;
+    }
+    let Some((upper, transport_off)) =
+        quote_upper::<TC>(context, s, off + ICMPV6_ERROR_QUOTE as u32 + 40)
+    else {
+        return false;
+    };
+    if read::<TC, 8>(context, transport_off, &mut s.transport).is_err()
+        || !related_icmpv6_key(
+            policy,
+            &s.outer_dst,
+            &s.quoted,
+            upper,
+            &s.transport,
+            &mut s.key,
+        )
+    {
+        return false;
+    }
+    // NPTv6: the flow was recorded before the egress hook translated its
+    // source, i.e. under the internal address.
+    if let Some(rule) = unsafe { NPTV6.get(&ifindex) }
+        && rule.matches_external(&s.key.src)
+    {
+        s.key.src = rule.translate_in(s.key.src);
     }
     let now = unsafe { bpf_ktime_get_ns() };
     let timeouts = timeouts();
@@ -141,6 +164,34 @@ fn related_v6<const TC: bool>(context: *mut c_void, policy: u32, off: u32) -> bo
     unsafe { FW_FLOWS.get(&s.key) }.is_some_and(|state| {
         state.phase != FirewallState::RESET && !state.expired(proto, now, timeouts)
     })
+}
+
+/// Walk the quoted packet's extension headers, starting with the quote's own
+/// next header at `start`, to the protocol the error is about and the offset
+/// its header starts at. `None` for a later fragment or a chain longer than
+/// [`QUOTE_EXT_MAX`].
+#[inline(always)]
+fn quote_upper<const TC: bool>(
+    context: *mut c_void,
+    s: &mut Scratch6,
+    start: u32,
+) -> Option<(u8, u32)> {
+    let mut proto = s.quoted[6];
+    let mut at = start;
+    for _ in 0..QUOTE_EXT_MAX {
+        if !is_ipv6_ext(proto) {
+            return Some((proto, at));
+        }
+        read::<TC, 4>(context, at, &mut s.ext).ok()?;
+        match quote_ext_step(proto, &s.ext) {
+            QuoteStep::Next { proto: next, len } => {
+                proto = next;
+                at += len;
+            }
+            QuoteStep::Upper | QuoteStep::Refuse => return None,
+        }
+    }
+    (!is_ipv6_ext(proto)).then_some((proto, at))
 }
 
 #[inline(always)]

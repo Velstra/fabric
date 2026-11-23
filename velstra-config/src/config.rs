@@ -714,6 +714,10 @@ pub struct PolicyFile {
     pub egress_default_drop: bool,
     #[serde(default)]
     pub drop_icmp: bool,
+    /// Log every packet this policy drops or rejects, with the reason. Never
+    /// the packets of flows it admitted: forwarding, NAT and encapsulation are
+    /// counted, not logged. Per-rule `log` adds a line for each new flow an
+    /// accepting rule admits.
     #[serde(default)]
     pub log: bool,
     #[serde(default)]
@@ -723,6 +727,11 @@ pub struct PolicyFile {
     pub source_validation: SourceValidationName,
     #[serde(default)]
     pub blocklist: Vec<String>,
+    /// The blocklist names sources only: never matched against a packet's
+    /// destination at egress, and a listed address may still answer a
+    /// connection opened towards it. See [`ConfigFlags::BLOCKLIST_INGRESS_ONLY`].
+    #[serde(default)]
+    pub blocklist_ingress_only: bool,
     #[serde(default, rename = "port_rule")]
     pub port_rules: Vec<PortRule>,
 }
@@ -942,6 +951,9 @@ pub struct StateTables {
 pub struct FileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ha: Option<HaConfig>,
+    /// Virtual addresses (VRRP/HA VIPs) this host may hold at run time. See
+    /// [`RuntimeConfig::virtual_addresses`]. Omitted (empty) by default.
+    pub virtual_addresses: Vec<std::net::IpAddr>,
     pub conntrack: ConntrackConfig,
     /// Connection-state table size and persistence. Spelled `[state]`.
     pub state: StateCfg,
@@ -972,6 +984,9 @@ pub struct FileConfig {
     pub fail_closed: bool,
     /// Source-IP CIDR blocks to drop unconditionally.
     pub blocklist: Vec<String>,
+    /// The default policy's blocklist names sources only. See
+    /// [`PolicyFile::blocklist_ingress_only`].
+    pub blocklist_ingress_only: bool,
     /// Per-`(proto, port)` rules. Spelled `[[port_rule]]` in TOML.
     #[serde(rename = "port_rule")]
     pub port_rules: Vec<PortRule>,
@@ -1208,20 +1223,25 @@ pub struct ResolvedRoute {
 
 /// A TCP port a SYN proxy stands in front of (TOML `[[synproxy]]`).
 ///
-/// Named by port rather than by zone: what is protected is a *service*, and a
-/// service answers on its port whichever zone a client reaches it from. Scoping
-/// this by zone would mean a flood arriving on a zone nobody listed reaches the
-/// server — the failure the feature exists to prevent, reintroduced as a
-/// configuration mistake.
+/// Without `policy` the port is protected for clients arriving under every
+/// policy: what is protected is a *service*, and a flood arriving on a policy
+/// nobody listed would reach the server. With `policy` only SYNs arriving under
+/// that policy are proxied, so a port can be shielded from the outside without
+/// the proxy also answering every connection the inside opens to that port
+/// elsewhere (audit DP-31). One entry per `(policy, port)`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SynProxyPortCfg {
-    /// TCP port to protect. The proxy answers every SYN to it.
+    /// TCP port to protect. The proxy answers every SYN to it arriving under
+    /// [`Self::policy`].
     pub port: u16,
     /// MSS the synthesised SYN-ACK advertises to clients. Defaults to the
     /// largest value an untunnelled Ethernet path carries.
     #[serde(default = "default_synproxy_mss")]
     pub mss: u16,
+    /// The policy whose arriving SYNs are proxied; absent means every policy.
+    #[serde(default)]
+    pub policy: Option<PolicyId>,
 }
 
 /// The MSS a proxy advertises when the config does not say: a 1500-byte
@@ -1237,6 +1257,8 @@ pub struct ResolvedSynProxy {
     pub port: u16,
     /// MSS advertised to clients.
     pub mss: u16,
+    /// The one policy whose clients are proxied, or `None` for every policy.
+    pub policy: Option<PolicyId>,
 }
 
 /// A 1:1 inbound DNAT port-forward (TOML `[[port_forward]]`): rewrite a
@@ -1729,6 +1751,16 @@ impl HaConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {
     pub ha: Option<HaConfig>,
+    /// Virtual addresses (VRRP/HA VIPs) that move between members. Every one
+    /// is a local destination for `dst-local` rules on every member, held or
+    /// not, so a takeover that adds one to a link changes no rule-trie entry
+    /// and the refresh takes the additive path instead of closing the
+    /// configuration gate. On a member that does not hold a VIP the HA guard
+    /// (or, for plain VRRP, the kernel forwarding to the holder) decides what
+    /// happens to a packet for it. Never put into LOCAL_EGRESS_ADDRS by
+    /// configuration: that map keeps following the addresses the kernel holds.
+    /// Member-local: not part of the HA policy fingerprint.
+    pub virtual_addresses: BTreeSet<std::net::IpAddr>,
     pub conntrack: velstra_common::ConntrackTimeouts,
     /// Per-policy firewall config. Always contains policy `0` (the default).
     pub policies: Vec<PolicyConfig>,
@@ -1891,6 +1923,7 @@ impl RuntimeConfig {
     /// invoked without a `--config` file.
     pub fn passthrough() -> Self {
         Self {
+            virtual_addresses: BTreeSet::new(),
             // Pass-everything means pass-everything: an unparseable packet is
             // passed too, matching this config's whole premise.
             conntrack: velstra_common::ConntrackTimeouts::DEFAULT,
@@ -1931,6 +1964,17 @@ impl RuntimeConfig {
 }
 
 /// Parse and validate a `[conntrack_sync]` block into its resolved form.
+/// A virtual address is a unicast address a member can hold on a link.
+fn resolve_virtual_addresses(addresses: &[std::net::IpAddr]) -> Result<BTreeSet<std::net::IpAddr>> {
+    for address in addresses {
+        anyhow::ensure!(
+            !address.is_loopback() && !address.is_unspecified() && !address.is_multicast(),
+            "virtual address {address} is not a unicast host address"
+        );
+    }
+    Ok(addresses.iter().copied().collect())
+}
+
 fn resolve_conntrack_sync(cfg: &ConntrackSyncCfg) -> Result<ResolvedConntrackSync> {
     if let Some(interval) = cfg.interval_ms {
         anyhow::ensure!(
@@ -1972,10 +2016,14 @@ fn resolve_firewall(
     stateful: bool,
     source_validation: SourceValidationName,
     blocklist: &[String],
+    blocklist_ingress_only: bool,
     port_rules: &[PortRule],
     portal: Option<&PortalCfg>,
 ) -> Result<PolicyConfig> {
     let mut flags = source_validation.flags();
+    if blocklist_ingress_only {
+        flags |= ConfigFlags::BLOCKLIST_INGRESS_ONLY;
+    }
     if drop_icmp {
         flags |= ConfigFlags::DROP_ICMP;
     }
@@ -2244,6 +2292,7 @@ impl FileConfig {
             self.stateful,
             self.source_validation,
             &self.blocklist,
+            self.blocklist_ingress_only,
             &self.port_rules,
             self.portal.as_ref(),
         )?];
@@ -2263,6 +2312,7 @@ impl FileConfig {
                 policy.stateful,
                 policy.source_validation,
                 &policy.blocklist,
+                policy.blocklist_ingress_only,
                 &policy.port_rules,
                 policy.portal.as_ref(),
             )?);
@@ -2448,15 +2498,44 @@ impl FileConfig {
                     sp.mss
                 );
             }
-            if synproxy
-                .iter()
-                .any(|s: &ResolvedSynProxy| s.port == sp.port)
+            if let Some(policy) = sp.policy
+                && !policies.iter().any(|p| p.id == policy)
             {
+                bail!("synproxy port {} names unknown policy id {policy}", sp.port);
+            }
+            // Two entries overlap when they share the port and either covers
+            // every policy or both name the same one: the data plane would hold
+            // one of them, silently.
+            if synproxy.iter().any(|s: &ResolvedSynProxy| {
+                s.port == sp.port
+                    && (s.policy.is_none() || sp.policy.is_none() || s.policy == sp.policy)
+            }) {
                 bail!("synproxy port {} is configured twice", sp.port);
+            }
+            // A proxied connection's record (its sequence offset) lives exactly
+            // as long as its connection state, which the agent's splice sweep
+            // reads; a stateless policy keeps none, so every connection it
+            // proxied would lose its splice — and die — once the one state
+            // entry the proxy writes at admission expired.
+            if let Some(stateless) = policies.iter().find(|p| {
+                sp.policy.is_none_or(|id| id == p.id) && !p.global.has_flag(ConfigFlags::STATEFUL)
+            }) {
+                let which = if stateless.id == 0 {
+                    "the top-level policy (0)".to_string()
+                } else {
+                    format!("policy {}", stateless.id)
+                };
+                bail!(
+                    "synproxy port {} covers {which}, which is not stateful: a SYN-proxied \
+                     connection lives only as long as its connection state (set `stateful = \
+                     true` there, or scope the port to stateful policies with `policy`)",
+                    sp.port
+                );
             }
             synproxy.push(ResolvedSynProxy {
                 port: sp.port,
                 mss: sp.mss,
+                policy: sp.policy,
             });
         }
 
@@ -2882,6 +2961,7 @@ impl FileConfig {
         }
 
         let config = RuntimeConfig {
+            virtual_addresses: resolve_virtual_addresses(&self.virtual_addresses)?,
             conntrack: self.conntrack.resolve()?,
             fail_closed: self.fail_closed,
             state: self.state.resolve()?,
@@ -3247,6 +3327,37 @@ impl fmt::Display for RuntimeConfig {
 
 #[cfg(test)]
 mod tests {
+    /// The configured virtual addresses (VRRP/HA VIPs) resolve to a set; an
+    /// older configuration without the key resolves to none.
+    #[test]
+    fn virtual_addresses_are_optional_and_must_be_unicast() {
+        let resolve = |text: &str| toml::from_str::<super::FileConfig>(text).unwrap().resolve();
+        assert!(resolve("").unwrap().virtual_addresses.is_empty());
+        let cfg = resolve("virtual_addresses = [\"10.2.0.100\", \"fd42:2::100\", \"10.2.0.100\"]")
+            .unwrap();
+        assert_eq!(
+            cfg.virtual_addresses,
+            std::collections::BTreeSet::from([
+                "10.2.0.100".parse().unwrap(),
+                "fd42:2::100".parse().unwrap()
+            ])
+        );
+        for bad in [
+            "224.0.0.18",
+            "127.0.0.1",
+            "0.0.0.0",
+            "ff02::12",
+            "::1",
+            "::",
+        ] {
+            let error = resolve(&format!("virtual_addresses = [\"{bad}\"]")).unwrap_err();
+            assert!(
+                error.to_string().contains("virtual address"),
+                "{bad} was accepted: {error:#}"
+            );
+        }
+    }
+
     #[test]
     fn prepared_ha_fences_without_an_enrolled_cluster_or_state_peer() {
         let mut cfg = super::RuntimeConfig::passthrough();
@@ -3440,6 +3551,118 @@ mod tests {
             .resolve()
             .unwrap();
         assert!(cfg.conntrack_sync.is_none());
+    }
+
+    /// DP-15: the source-only blocklist is opt-in per policy and for the
+    /// default policy; nothing else changes meaning.
+    #[test]
+    fn blocklist_ingress_only_sets_its_flag_where_it_is_written() {
+        let cfg = toml::from_str::<FileConfig>(
+            r#"
+            blocklist = ["203.0.113.0/24"]
+            blocklist_ingress_only = true
+            [[policy]]
+            id = 7
+            blocklist = ["198.51.100.0/24"]
+            blocklist_ingress_only = true
+            [[policy]]
+            id = 8
+            blocklist = ["192.0.2.0/24"]
+            "#,
+        )
+        .unwrap()
+        .resolve()
+        .unwrap();
+        let flag = |id| {
+            cfg.policies
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap()
+                .global
+                .has_flag(ConfigFlags::BLOCKLIST_INGRESS_ONLY)
+        };
+        assert!(flag(0));
+        assert!(flag(7));
+        assert!(!flag(8), "a policy that does not ask keeps both directions");
+    }
+
+    fn synproxy(text: &str) -> Result<Vec<ResolvedSynProxy>> {
+        let base = "[[policy]]\nid = 7\nstateful = true\n[[policy]]\nid = 8\nstateful = true\n";
+        synproxy_with(&format!("stateful = true\n{text}"), base)
+    }
+
+    fn synproxy_with(text: &str, base: &str) -> Result<Vec<ResolvedSynProxy>> {
+        Ok(toml::from_str::<FileConfig>(&format!("{text}{base}"))?
+            .resolve()?
+            .synproxy)
+    }
+
+    /// DP-31: a protected port can name the policy whose clients it shields.
+    #[test]
+    fn a_synproxy_port_may_be_scoped_to_one_policy() {
+        let ports = synproxy("[[synproxy]]\nport = 443\npolicy = 7\n").unwrap();
+        assert_eq!(ports[0].policy, Some(7));
+        let ports = synproxy("[[synproxy]]\nport = 443\n").unwrap();
+        assert_eq!(ports[0].policy, None, "absent keeps every policy");
+    }
+
+    #[test]
+    fn one_port_may_be_proxied_for_several_policies() {
+        let ports = synproxy(
+            "[[synproxy]]\nport = 443\npolicy = 7\n[[synproxy]]\nport = 443\npolicy = 8\nmss = 1400\n",
+        )
+        .unwrap();
+        assert_eq!(ports.len(), 2);
+    }
+
+    #[test]
+    fn overlapping_synproxy_entries_are_refused() {
+        for text in [
+            "[[synproxy]]\nport = 443\npolicy = 7\n[[synproxy]]\nport = 443\npolicy = 7\n",
+            "[[synproxy]]\nport = 443\n[[synproxy]]\nport = 443\npolicy = 7\n",
+            "[[synproxy]]\nport = 443\npolicy = 7\n[[synproxy]]\nport = 443\n",
+        ] {
+            let err = synproxy(text).expect_err(text);
+            assert!(format!("{err:#}").contains("twice"), "{err:#}");
+        }
+    }
+
+    /// H1(a): a stateless policy keeps no connection state, so the splice
+    /// sweep would end its proxied connections; refuse instead.
+    #[test]
+    fn a_synproxy_port_on_a_stateless_policy_is_refused() {
+        let stateless_8 = "[[policy]]\nid = 7\nstateful = true\n[[policy]]\nid = 8\n";
+        let err = synproxy_with(
+            "stateful = true\n[[synproxy]]\nport = 443\npolicy = 8\n",
+            stateless_8,
+        )
+        .expect_err("policy 8 is stateless");
+        assert!(format!("{err:#}").contains("not stateful"), "{err:#}");
+        // An unscoped port covers every policy, a stateless one included.
+        let err = synproxy_with("stateful = true\n[[synproxy]]\nport = 443\n", stateless_8)
+            .expect_err("unscoped covers policy 8");
+        assert!(format!("{err:#}").contains("policy 8"), "{err:#}");
+        // Scoped to a stateful policy, a stateless neighbour does not matter.
+        assert!(
+            synproxy_with(
+                "stateful = true\n[[synproxy]]\nport = 443\npolicy = 7\n",
+                stateless_8
+            )
+            .is_ok()
+        );
+        // The default policy is stateless unless the file says otherwise.
+        let base = "[[policy]]\nid = 7\nstateful = true\n[[policy]]\nid = 8\nstateful = true\n";
+        let err = synproxy_with("[[synproxy]]\nport = 443\n", base).expect_err("policy 0");
+        assert!(
+            format!("{err:#}").contains("top-level policy (0)"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_synproxy_policy_must_exist() {
+        let err = synproxy("[[synproxy]]\nport = 443\npolicy = 9\n").expect_err("no policy 9");
+        assert!(format!("{err:#}").contains("unknown policy"), "{err:#}");
     }
 
     #[test]

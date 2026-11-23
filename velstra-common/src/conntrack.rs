@@ -353,8 +353,15 @@ impl FirewallState {
         timeouts: ConntrackTimeouts,
     ) -> bool {
         matches!(proto, ip_proto::TCP | ip_proto::UDP)
-            && self.reply == 1
-            && self.classify(proto, control, now, timeouts) == 1
+            && self.is_answer(proto, control, now, timeouts)
+    }
+
+    /// The packet is valid live traffic in the **responder's** direction: the
+    /// connection was opened by the other side, towards the packet's source.
+    /// What an ingress-only blocklist lets a listed address send (DP-15).
+    #[inline(always)]
+    pub fn is_answer(&self, proto: u8, control: u8, now: u64, timeouts: ConntrackTimeouts) -> bool {
+        self.reply == 1 && self.classify(proto, control, now, timeouts) == 1
     }
 
     /// Validate a protocol transition without materializing a second full
@@ -552,6 +559,29 @@ pub mod nat_lifetime {
             None
         } else {
             Some(new)
+        }
+    }
+
+    /// [`update`] for a segment the INSIDE client sent through its existing
+    /// binding. A bare SYN over a binding that already carries FIN or RESET is
+    /// a new connection on a reused tuple, so it starts the lifetime afresh:
+    /// otherwise an earlier reset would cut a later clean close's hold to the
+    /// closing timeout, below the remote's TIME_WAIT, and the public port
+    /// could go to another client while the server still rejects it. A SYN on
+    /// a live binding changes nothing (DP-25b). Not for packets from outside:
+    /// a SYN aimed at a public port must not shorten its hold.
+    #[inline(always)]
+    pub fn reopen(bits: u16, proto: u8, control: u8) -> Option<u16> {
+        let bare_syn = control
+            & (crate::tcp_flags::SYN
+                | crate::tcp_flags::ACK
+                | crate::tcp_flags::FIN
+                | crate::tcp_flags::RST)
+            == crate::tcp_flags::SYN;
+        if proto == crate::ip_proto::TCP && bare_syn && bits & (FIN | RESET) != 0 {
+            Some(EMBRYONIC)
+        } else {
+            update(bits, proto, control)
         }
     }
 
@@ -794,6 +824,26 @@ mod tests {
             assert!(state.is_routed_reply(6, tcp_flags::ACK, 2, T));
             assert!(!state.is_routed_reply(6, tcp_flags::SYN, 2, T));
         }
+    }
+
+    /// DP-15: what an ingress-only blocklist lets a listed address send — its
+    /// side of a connection opened towards it, for any tracked protocol (the
+    /// echo reply to a ping included), and never the side that opened it.
+    #[test]
+    fn only_the_responders_direction_of_a_live_flow_is_an_answer() {
+        let state = FirewallState {
+            phase: FirewallState::ESTABLISHED,
+            reply: 1,
+            ..closing()
+        };
+        assert!(state.is_answer(6, tcp_flags::ACK, 2, T));
+        assert!(state.is_answer(17, 0, 2, T));
+        assert!(state.is_answer(1, 0, 2, T), "echo reply");
+        let opener = FirewallState { reply: 0, ..state };
+        assert!(!opener.is_answer(6, tcp_flags::ACK, 2, T));
+        assert!(!opener.is_answer(1, 8, 2, T), "echo request");
+        let expired = 1 + T.tcp_established as u64 * 1_000_000_000;
+        assert!(!state.is_answer(6, tcp_flags::ACK, expired, T));
     }
 
     #[test]
@@ -1094,5 +1144,53 @@ mod tests {
         // Unknown bits are discarded, non-TCP never gains bits.
         assert_eq!(observe(0xff00, 6, ACK), 0);
         assert_eq!(observe(0, 17, tcp_flags::FIN), 0);
+    }
+
+    /// A client that reuses its source port reuses the binding, and the new
+    /// connection must not inherit the old one's close bits. Measured on
+    /// checks.nat-cps: an earlier connection on the tuple ended in a reset,
+    /// the next closed cleanly, and the binding kept RESET, so it expired
+    /// after the 30 s closing timeout. The server still held that 4-tuple in
+    /// TIME_WAIT (60 s on Linux) when a different client was given the same
+    /// public port, answered its SYN with a TIME_WAIT ACK, and the connection
+    /// hung.
+    #[test]
+    fn a_reopening_syn_starts_the_bindings_lifetime_afresh() {
+        use super::nat_lifetime::{EMBRYONIC, FIN, RESET, reopen, timeout_ns, update};
+        const REMOTE_TIME_WAIT_S: u32 = 60;
+        let s = |n: u32| n as u64 * 1_000_000_000;
+        // A SYN over a closed incarnation opens a new one.
+        for closed in [FIN, RESET, FIN | RESET] {
+            assert_eq!(reopen(closed, 6, SYN), Some(EMBRYONIC), "{closed:#x}");
+        }
+        // That incarnation's clean close then holds the public port at least
+        // as long as the remote end keeps the 4-tuple in TIME_WAIT.
+        let opened = reopen(FIN | RESET, 6, SYN).unwrap();
+        let established = update(opened, 6, ACK).unwrap();
+        let closed = update(established, 6, tcp_flags::FIN | ACK).unwrap();
+        assert_eq!(closed, FIN);
+        assert!(timeout_ns(closed, 6, T) >= s(REMOTE_TIME_WAIT_S));
+        // Without the reopen the reset bit survives into the clean close.
+        let inherited = update(FIN | RESET, 6, SYN).unwrap_or(FIN | RESET);
+        assert_eq!(timeout_ns(inherited, 6, T), s(T.tcp_closing));
+        // A SYN on a live binding changes nothing: only the responder's
+        // SYN-ACK proves an established connection gone (DP-25b).
+        assert_eq!(reopen(0, 6, SYN), None);
+        assert_eq!(reopen(EMBRYONIC, 6, SYN), None);
+        // Anything but a bare SYN keeps the ordinary update.
+        for control in [
+            SYN | ACK,
+            ACK,
+            SYN | tcp_flags::FIN,
+            SYN | tcp_flags::RST,
+            tcp_flags::RST,
+        ] {
+            assert_eq!(
+                reopen(FIN | RESET, 6, control),
+                update(FIN | RESET, 6, control),
+                "{control:#x}"
+            );
+        }
+        assert_eq!(reopen(FIN, 17, 0), update(FIN, 17, 0));
     }
 }

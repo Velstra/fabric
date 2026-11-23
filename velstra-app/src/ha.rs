@@ -138,6 +138,26 @@ impl State {
             false
         }
     }
+    /// Whether this node runs leased HA (an enabled `[ha]`), the only mode in
+    /// which it knows whether it is the active member.
+    pub fn leased(&self) -> bool {
+        self.config.as_ref().is_some_and(|config| config.enabled)
+    }
+    /// Whether this node may end SYN-proxy splices no live connection claims
+    /// (the agent's splice sweep): always without leased HA, and with it only
+    /// while this node is the fresh lease owner. A standby's copies of the
+    /// owner's state arrive record by record, a splice possibly before the
+    /// state that claims it; it never sweeps, and the owner's removals reach
+    /// it as conntrack-sync deletions.
+    pub fn owns_state(&self, now: u64) -> bool {
+        let Some(config) = self.config.as_ref().filter(|config| config.enabled) else {
+            return true;
+        };
+        role_fresh(config, self.role.updated_ns, now)
+            && self.active_term > 0
+            && self.role.authority.owner == config.node
+            && self.role.deadline_ns > now
+    }
     /// Local forwarding authority and replica freshness, never inferred from
     /// link presence. The active node cannot measure remote apply latency from
     /// the one-way VCS2 feed; report that measurement as unknown, not zero.
@@ -146,10 +166,7 @@ impl State {
             return serde_json::json!({"role":"standalone","sync_age_ms":null});
         };
         let fresh_role = role_fresh(config, self.role.updated_ns, now);
-        let master = fresh_role
-            && self.active_term > 0
-            && self.role.authority.owner == config.node
-            && self.role.deadline_ns > now;
+        let master = self.owns_state(now);
         serde_json::json!({"role":if master {"Master"} else if fresh_role {"Backup"} else {"Fenced"},
             "node":config.node,"cluster":config.cluster,"term":self.role.authority.term,
             "owner":self.role.authority.owner,"lease_remaining_ms":self.role.deadline_ns.saturating_sub(now)/1_000_000,
@@ -760,10 +777,37 @@ pub fn control_addresses(config: &HaConfig) -> Result<BTreeSet<IpAddr>> {
     }
     Ok(result)
 }
+/// What this agent tells the coordinator, from the state as it is now.
+/// The generation is kept even when stale: reporting zero would falsely
+/// authorize the witness to discard warm state as a two-node cold boot.
+fn agent_report(
+    config: &HaConfig,
+    state: &State,
+    policy: [u8; 32],
+    links_ready: bool,
+    ready: bool,
+    active: bool,
+    now: u64,
+) -> Agent {
+    Agent {
+        cluster: config.cluster.clone(),
+        node: config.node,
+        coordinator_boot: state.role.coordinator_boot,
+        agent_boot: state.agent_boot,
+        policy,
+        ready_term: state.ready_term,
+        forwarding_term: state.active_term,
+        eligible: config.enabled && links_ready && (state.cold || ready || active),
+        updated_ns: now,
+    }
+}
 pub async fn monitor(firewall: Arc<Mutex<Firewall>>, shared: Shared, config: HaConfig) {
     let mut poll = tokio::time::interval(Duration::from_millis(20));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat_timing = timing::Heartbeat::default();
+    // The authority term whose takeover has already had its host
+    // inventory applied (see below).
+    let mut host_applied_term = 0;
     loop {
         let tick_wait_entry = now_ns();
         let scheduled_tick = poll.tick().await;
@@ -833,10 +877,50 @@ pub async fn monitor(firewall: Arc<Mutex<Firewall>>, shared: Shared, config: HaC
             && state.cold
             && !config.wireguard.is_empty()
             && let Err(error) = wireguard::publish(&state, &state.role.authority, Vec::new())
+                .and_then(|()| {
+                    wireguard::publish_clock(std::path::Path::new(wireguard::CLOCK_DIR), None)
+                })
         {
             let _ = fw.ha_deadline(0);
             state.active_term = 0;
             log::warn!("HA cold VPN baseline publish failed: {error:#}");
+            continue;
+        }
+        // About to open forwarding on a takeover. Wren added the VIPs before
+        // it set `vips_ready`, and with `dst-local` rules they change this
+        // host's local address set, which the firewall applies with its
+        // datapath gate closed. Left to the 2 s inventory poll, that rewrite
+        // ran at an arbitrary moment after forwarding had opened and dropped
+        // whatever arrived meanwhile: a lost WireGuard handshake then waited
+        // 5 s for its retry. Apply the addresses now, while forwarding is
+        // still closed; Wren starts WireGuard only once we acknowledge.
+        //
+        // The rewrite holds this loop, and Wren withdraws the VIPs from an
+        // agent whose report is older than `FRESH_NS` (100 ms). So report
+        // first, still not forwarding, and decide on the next tick with the
+        // role read after the rewrite. Once per term: a takeover whose VIPs
+        // came and went is left to the poll.
+        if active && state.active_term == 0 && host_applied_term != state.role.authority.term {
+            host_applied_term = state.role.authority.term;
+            // Stamp it when it is written: Wren judges its age, and the
+            // rewrite below holds this loop until the next report.
+            let report = agent_report(
+                &config,
+                &state,
+                policy,
+                links_ready,
+                ready,
+                active,
+                now_ns(),
+            );
+            if let Err(error) = write_agent(&report) {
+                log::warn!("HA readiness publish failed: {error:#}");
+            }
+            if let Err(error) = fw.refresh_host_inventory() {
+                log::warn!(
+                    "HA takeover: applying the host's addresses before forwarding failed: {error:#}"
+                );
+            }
             continue;
         }
         let deadline = if active { state.role.deadline_ns } else { 0 };
@@ -873,20 +957,7 @@ pub async fn monitor(firewall: Arc<Mutex<Firewall>>, shared: Shared, config: HaC
         } else {
             state.active_term = 0;
         }
-        // Keep the generation even when stale: reporting zero would falsely
-        // authorize the witness to discard warm state as a two-node cold boot.
-        let ready_term = state.ready_term;
-        let agent = Agent {
-            cluster: config.cluster.clone(),
-            node: config.node,
-            coordinator_boot: state.role.coordinator_boot,
-            agent_boot: state.agent_boot,
-            policy,
-            ready_term,
-            forwarding_term: state.active_term,
-            eligible: config.enabled && links_ready && (state.cold || ready || active),
-            updated_ns: now,
-        };
+        let agent = agent_report(&config, &state, policy, links_ready, ready, active, now);
         let published = {
             let _timing = timing::Span::start(timing::Phase::HaPublish);
             write_agent(&agent)
@@ -982,6 +1053,44 @@ mod tests {
         assert_eq!(state.telemetry(now + 200_000_000)["role"], "Fenced");
         state.config = None;
         assert_eq!(state.telemetry(now)["role"], "standalone");
+    }
+    #[tokio::test]
+    async fn only_a_standalone_node_or_the_fresh_lease_owner_owns_its_state() {
+        let shared = State::new(Some(config())).unwrap();
+        let mut state = shared.lock().await;
+        let now = 5_000_000_000;
+        assert!(state.leased());
+        assert!(!state.owns_state(now), "fenced");
+        state.role.updated_ns = now;
+        state.ready_term = 7;
+        assert!(!state.owns_state(now), "a standby never sweeps");
+        state.role.authority.owner = 1;
+        state.active_term = 7;
+        state.role.deadline_ns = now + 100_000_000;
+        assert!(state.owns_state(now), "the lease owner sweeps");
+        // Each condition on its own withdraws ownership.
+        state.active_term = 0;
+        assert!(!state.owns_state(now), "not yet forwarding");
+        state.active_term = 7;
+        state.role.authority.owner = 2;
+        assert!(!state.owns_state(now), "the peer owns the lease");
+        state.role.authority.owner = 1;
+        state.role.updated_ns = 0;
+        assert!(!state.owns_state(now), "a stale role report");
+        state.role.updated_ns = now;
+        assert!(
+            !state.owns_state(now + 200_000_000),
+            "an expired lease is not ownership"
+        );
+        state.config.as_mut().expect("config").enabled = false;
+        assert!(!state.leased(), "a disabled [ha] is not a lease");
+        assert!(state.owns_state(now), "nor does it fence the node");
+        state.config = None;
+        assert!(!state.leased());
+        assert!(
+            state.owns_state(now),
+            "without leased HA the node owns its state"
+        );
     }
     #[tokio::test]
     async fn a_standby_reports_why_it_cannot_take_over() {

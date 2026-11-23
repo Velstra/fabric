@@ -27,6 +27,16 @@ ip = "192.168.100.10"
 
 Save this as `topology.toml`. Start the controller as in the [quickstart](quickstart.md#start-the-example), passing this file to `--topology`. Run `velstra-controller orch list-ports` and look for `port-5000-192.168.100.10`.
 
+```mermaid
+flowchart LR
+  host["[[host]]"] --- port["[[port]]"]
+  net["[[network]] VNI"] --- port
+  net --- subnet["[[subnet]]"]
+  sg["[[security_group]]"] -.->|by name| port
+  vrf["[[ip_vrf]]"] -.->|member VNIs| net
+  lb["[[load_balancer]]"] -.->|host + tap| port
+```
+
 | Block | What to set | Important relationship |
 |---|---|---|
 | `[[host]]` | Host ID, underlay interface, IPv4 VTEP and MAC | For a UDP overlay choose VXLAN or Geneve. An SRv6 locator drives service-SID derivation for a configured SRv6 host. |
@@ -39,7 +49,7 @@ Save this as `topology.toml`. Start the controller as in the [quickstart](quicks
 
 ## Northbound API
 
-The `orch` CLI uses the gRPC management service, normally at `127.0.0.1:50052`. Use the live CLI for the flags supported by the installed build:
+The `orch` CLI uses the gRPC management service, normally at `127.0.0.1:50052`. The installed build lists its own flags:
 
 ```sh
 ./target/debug/velstra-controller orch --help
@@ -74,8 +84,6 @@ See [the node configuration examples](https://github.com/Velstra/fabric/tree/mai
 
 ## Field and command reference
 
-These definitions track the implementation at each revision:
-
 | I need the complete… | Reference |
 |---|---|
 | Topology TOML fields, defaults and relationships | [Topology parser](https://github.com/Velstra/fabric/blob/main/velstra-controller/src/topology.rs) and [full two-network topology](https://github.com/Velstra/fabric/blob/main/examples/topology.toml) |
@@ -86,6 +94,27 @@ These definitions track the implementation at each revision:
 
 ### Service pools
 
-The local exercise includes `web-vip` with two member ports. In the TOML file, each `[[load_balancer.member]]` references a host and tap. In the CLI, members use `port-id:backend-port`. For example, `port-5000-192.168.100.10:8080` selects port 8080 on the first example VM. A port must belong to the VIP's network. A duplicate VIP/port/protocol tuple or a VIP colliding with a workload port is rejected.
+The local exercise includes `web-vip` with two member ports:
 
-Use `draining` to stop selecting a member for new flows while its established flows finish. Client affinity selects by source address and can concentrate load when many clients share a NAT address. An empty pool passes traffic through and increments `lb_no_backend`.
+```toml
+[[load_balancer]]
+id    = "web-vip"
+vni   = 5000
+vip   = "192.168.100.200"
+port  = 80
+proto = "tcp"
+
+[[load_balancer.member]]
+host = "host-1"
+tap  = "tap-blue-1"
+port = 8080
+
+[[load_balancer.member]]
+host = "host-2"
+tap  = "tap-blue-2"
+port = 8080
+```
+
+In the TOML file, each `[[load_balancer.member]]` references a host and tap. In the CLI, members use `port-id:backend-port`. For example, `port-5000-192.168.100.10:8080` selects port 8080 on the first example VM. A port must belong to the VIP's network. A duplicate VIP/port/protocol tuple or a VIP colliding with a workload port is rejected.
+
+Set `draining = true` on a member to stop selecting it for new flows while its established flows finish. Client affinity (`client_affinity = true`) selects by source address and can concentrate load when many clients share a NAT address. An empty pool passes traffic through and increments `lb_no_backend`.

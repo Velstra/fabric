@@ -4,6 +4,126 @@
 
 ### Fixed
 
+- **SYN-proxy records now end with their connections.** `SYN_FLOWS` records
+  were never removed, so once as many proxied connections had come and gone as
+  the map holds, its LRU evicted the least recently used record — an idle live
+  connection, which then died silently — and a client reusing a source port ran
+  into its old record. The agent's reclaim walk now ends every record no live
+  `FW_FLOWS` or `CONNTRACK` entry claims (see
+  [expiry-maintenance](docs/expiry-maintenance.md)). A proxied connection lives
+  exactly as long as its connection state; a client reconnecting from the same
+  port to a service whose server uses the same port within about 30 s of the old
+  connection's state ending is not admitted until it retries.
+- **A SYN flood no longer evicts protected connections.** A bare SYN the SYN
+  proxy answers with a cookie no longer writes firewall state (its connection's
+  state is written at cookie-ACK admission), so a flood of spoofed SYNs to a
+  protected port leaves `FW_FLOWS` — and the idle connections in it — alone,
+  and no longer reaches HA conntrack sync.
+
+- **Logged drops are rate-limited.** A SYN flood or a scan against a zone with
+  `log = true` offers a log line for every dropped packet; on an appliance's
+  small journal a few hundred a second rotate the security, audit and HA
+  history out within the hour. The agent now passes the data plane's records
+  through a budget — a burst of 100, then 10 a second
+  (`VELSTRA_DATAPATH_LOG_BURST`, `VELSTRA_DATAPATH_LOG_RATE`) — and writes one
+  `suppressed N data-plane log record(s)` warning per 10 s in which it held
+  some back. The per-reason drop counters stay exact; the `stats` query
+  reports the held-back total as `log_lines_suppressed`.
+- **`log` no longer logs every packet of admitted flows.** With a policy's
+  `log = true` the data plane wrote a line for each reverse-NAT packet
+  (`NAT(ct)`), each forwarded one (`FWD`), each encapsulated one (`ENCAP`,
+  `SRV6 ENCAP`) and each new load-balanced flow (`DNAT`). On a busy WAN that
+  flooded the journal until the box stalled (a NAT stress run lost 844 packets
+  and held connections timed out), and it contradicted the documented meaning:
+  the policy flag logs drops and rejects, a rule's own `log` additionally each
+  new flow it accepts. Those fast-path lines are gone — the same events are
+  counted (`lb_established`, `lb_reverse`, `forwarded`, `overlay_encap`,
+  `srv6_encap`, `load_balanced`) — and nothing replaces them. Drop and reject
+  lines are unchanged; their path is lossy end to end (a bounded ring buffer,
+  then the agent's non-blocking writer), so a flood of logged drops loses lines
+  instead of slowing the box.
+- **The agent's logging no longer blocks it.** Log records went through
+  `env_logger` to stderr and the periodic statistics table to stdout, both
+  synchronously; under systemd both are streams to journald. When journald
+  stopped reading, a write blocked the runtime worker it ran on — on a small
+  box the whole agent, HA heartbeat included — and the routing daemon gave up
+  ownership although nothing had failed. Both outputs now go through a bounded
+  queue drained by a dedicated thread (4096 records, `VELSTRA_LOG_QUEUE_LINES`
+  1–65536); while the output is blocked new records are dropped and counted
+  instead of waited for, the count is served as `log_lines_dropped` in the
+  `stats` query (and so in `sentinel show firewall statistics`), and the drop
+  is announced on the log once it drains. An exit waits up to 500 ms for the
+  queued records.
+- **The agent starts when its uplink does not exist yet.** Sentinel names the
+  first zoned link as the agent's uplink; when a commit creates that link (a
+  GRE tunnel, a VLAN, a bridge), the agent could restart before networkd had
+  made the device, and start-up failed with `interface "tun0" not found`, so
+  the commit's readiness probe failed and the commit rolled back. The
+  `--iface` contract is now: an interface that does not exist at start-up is
+  skipped with a warning and attached when it appears — by the link
+  reconciliation a commit runs once the network is applied, or by the 2 s
+  interface poll; while it is still missing the agent warns again every
+  minute and lists it in the new `missing-interfaces` query (one name per
+  line, empty when every primary is attached). Any other failure to look an
+  interface up still stops the agent.
+- **IS-IS and the spanning tree work on fail-closed interfaces.** DP-22 drops
+  every frame whose EtherType is not link control, and an IEEE 802.3 length
+  frame (a type/length value of at most 1500) has no EtherType at all, so IS-IS
+  — which rides 802.2 LLC with the OSI SAP `FE` — was dropped at XDP ingress
+  and shot at TC egress (the daemon saw `ENOBUFS` sending its hellos), and no
+  adjacency ever formed on a zoned interface. A length frame is now judged by
+  its LLC header: `FE FE 03` (IS-IS, ES-IS) and `42 42 03` (spanning-tree
+  BPDUs) pass; SNAP, which can carry IP, and every other LLC frame stay
+  dropped. Neither admitted protocol carries IP.
+- **GRE tunnels are classified as raw-IP links.** The agent decides from the
+  kernel link type whether a frame starts at an Ethernet header, and its list
+  lacked `gre` (ARPHRD 778) and `ip6gre` (823). A packet on a GRE tunnel was
+  therefore parsed as Ethernet: its IPv4 source bytes were read as the
+  EtherType. Under fail-closed (DP-22) every such packet was dropped, so a
+  zoned GRE tunnel carried nothing; before DP-22 the same misreading let the
+  tunnel's inner traffic past zone policy unfiltered (fail-open). The list is
+  now named and audited against every link kind the datapath attaches to,
+  with a test that fails when a raw-IP type is missing.
+- **Masquerade new-connection rate no longer collapses (PERF-02).** The
+  standalone port allocator claims only within a fixed window of 128 probes
+  per flow, scattered over the source's port domain (its CGNAT block, or
+  32768-65535), and finds a flow's binding by scanning that same window. It
+  used to search up to a global "largest displacement ever" bound that any
+  ICMP echo, port-forward or hairpin NAT write pinned at the whole domain:
+  every new connection then made 32768 conntrack lookups in softirq, about
+  400 connections per second per core, until a reboot. That bound was also
+  not among the persisted state maps, so with `[state] persist` an agent
+  restart adopted the NAT bindings but restarted the bound at zero, and
+  discovery could miss a displaced binding. A full window drops the opener
+  and counts `egress_nat_no_candidate`; measured refusal per new flow to
+  one remote ip:port is 0 at 90 % of its 32768-port domain, 0.15 % at 95 %
+  and 27 % at 99 %. Flows to different endpoints never compete. Replicated
+  (HA) configurations keep their allocator unchanged. No pinned map changes.
+- **A reused client port no longer shortens its masquerade binding's hold.**
+  A binding's lifetime marks (half-open, closed, reset) only accumulated, so
+  after one connection on a client tuple ended in a reset, a later clean
+  close on the same tuple kept the 30 s reset lifetime instead of the 120 s
+  clean-close hold. The public port could then go to another client while
+  the server still held the old connection in TIME_WAIT (60 s), which left
+  the new connection hanging with no SYN-ACK. A bare SYN from the inside
+  client over a closed or reset binding now starts its lifetime afresh, as
+  Linux conntrack does when a SYN reopens a closed entry. A SYN on a live
+  binding, or one arriving from outside, changes nothing.
+- **Source-only blocklists (DP-15).** `blocklist_ingress_only = true` on a
+  `[[policy]]` (or at the top level) makes its blocklist name sources only:
+  the egress hook no longer matches it against destinations, and a listed
+  address may still answer a connection opened towards it. What a listed
+  address starts is refused as before. Without the key nothing changes.
+- **The SYN proxy is scoped per policy (DP-31).** `[[synproxy]]` takes an
+  optional `policy`; the proxy then answers only SYNs arriving under it.
+  Without one the port is protected on every policy, as before. The
+  `SYNPROXY` key grows to 8 bytes; it is a configuration map, not pinned
+  state, so an upgrade needs no migration.
+- **ICMPv6 RELATED behind NPTv6 and through extension headers.** An error
+  about an NPTv6 flow is recognised by its internal address, and its quote is
+  translated with the envelope in both directions, so the host's stack acts
+  on it; a quote whose packet carried extension headers is walked to its
+  transport header (up to four).
 - **TCP resets are validated before they end a connection (DP-03).** A reset
   tears down firewall state only when its sequence number equals the
   receiver's last ACK and, at XDP ingress, its TCP checksum is correct. An
@@ -40,8 +160,31 @@
   during normal interface reconciliation, without a configuration resend or
   conntrack reset. Explicit static SNAT and HA VIP targets retain precedence.
 
+### Changed
+
+- **A `[[synproxy]]` entry must cover only stateful policies.** The agent now
+  refuses a SYN proxy on a policy without `stateful = true`: a proxied
+  connection lives as long as its connection state, and a stateless policy
+  keeps none. An entry without `policy` covers every policy, the top-level one
+  included, and the top-level `stateful` defaults to `false`: a hand-written
+  config with an unscoped `[[synproxy]]` and no top-level `stateful = true` is
+  now refused. Add `stateful = true` at the top level (and to every
+  `[[policy]]` the port covers), or scope the entry with `policy = <id>`.
+- **`SYN_FLOWS` is sized at two records per connection** (it was one per two),
+  for every proxied connection plus the records the sweep has yet to end. On
+  the same memory the default sizing therefore holds about 7 % fewer
+  connections (an explicit `connections` count takes about 12 % more state
+  memory), and because the table layout changed, the first agent restart
+  after the upgrade does not adopt pinned state (`[state] persist`) but starts
+  fresh.
+
 ### Added
 
+- **IPv6 MSS clamping.** An interface's MSS ceiling also clamps IPv6 SYNs,
+  to the ceiling less the 20 extra bytes of the IPv6 header.
+- **A verifier budget in `verify-ebpf`.** A program that verifies above
+  `--max-insns` (default 700,000, i.e. 30 % of the kernel limit in reserve)
+  is refused by name.
 - **Wren's forwarding table into `ROUTES`, FPM-style.** `--wren-routes` (with
   `--wren-socket`) subscribes the agent to Wren's `monitor routes` feed and
   programs what it hears: each learned route's next hop is resolved to a MAC

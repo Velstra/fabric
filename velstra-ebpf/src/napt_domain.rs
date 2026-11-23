@@ -1,80 +1,29 @@
-//! Standalone TCP/UDP NAT discovery. Reverse CONNTRACK is authoritative: scan
-//! every possibly occupied candidate for existing state BEFORE reserving a vacancy.
-//! No cache/index whose eviction could silently change an established tuple.
-//! Replicated configurations retain the legacy allocator until peers negotiate
-//! complete-domain discovery. This does not repair LRU eviction/publication.
+//! Standalone TCP/UDP NAT port allocation and discovery (PERF-02).
+//!
+//! Reverse CONNTRACK is authoritative: a flow's binding is the reverse entry
+//! that names it, and nothing caches or indexes it, so no eviction can
+//! silently change an established tuple. The allocator only ever claims one
+//! of the flow's own [`NaptDomain::probe`] window, so discovery scans exactly
+//! that window — a fixed, small number of lookups decided by the flow tuple
+//! alone. It used to scan as far as a global "largest displacement ever
+//! published" bound; any NAT write outside the allocator (an ICMP echo, a
+//! port-forward, a hairpin claim) pinned that bound at the whole domain, so
+//! every new connection did 32768 lookups in softirq, forever, and the bound
+//! was not even adopted with the persisted tables across an agent restart.
+//! Replicated configurations keep the legacy allocator plus the linear HA
+//! window below, for mixed-version peers.
 
 use core::ffi::c_void;
 
-use aya_ebpf::{
-    helpers::{bpf_ktime_get_ns, bpf_loop},
-    macros::map,
-    maps::Array,
-};
+use aya_ebpf::helpers::{bpf_ktime_get_ns, bpf_loop};
 use velstra_common::{
     CgnatLayout, ConntrackTimeouts, FlowKey, FlowState, NaptClaim, NaptDomain, NaptSlot,
-    napt_binding_matches, napt_claim, napt_search_count, napt_seed, napt_slot,
+    napt_binding_matches, napt_claim, napt_seed, napt_slot,
 };
 
 use crate::{
-    CONNTRACK, NAPT_MODE, account_masquerade_binding, claim_marked_masquerade_nat, conntrack,
+    CONNTRACK, NAPT_MODE, account_masquerade_binding, conntrack, insert_masquerade_binding,
 };
-
-// A monotonic upper bound, NOT a binding cache or allocator authority. OR-ing
-// each candidate index before publication can only overestimate the largest
-// published displacement. Never clear it, including on deletion/expiry/reset.
-// Any non-domain writer invalidates it before writing; non-default domains use
-// complete discovery. Replication never enables this allocator. Fresh unpinned
-// maps start together, so zero covers the only initially possible index (0).
-#[map]
-static NAPT_SEARCH: Array<u64> = Array::with_max_entries(1, 0);
-
-// The pinned BPF target does not expose target_has_atomic=64 through std's
-// AtomicU64 methods. LLVM still supports the native BPF atomic OR instruction.
-// Keep this single intrinsic behind the BPF cfg; kernel verifier tests must
-// load the emitted instruction on every supported kernel.
-#[inline(always)]
-unsafe fn atomic_merge(ptr: *mut u64, value: u64) -> u64 {
-    #[cfg(all(target_arch = "bpf", not(velstra_atomic_or_two_types)))]
-    unsafe {
-        core::intrinsics::atomic_or::<u64, { core::intrinsics::AtomicOrdering::SeqCst }>(ptr, value)
-    }
-    #[cfg(all(target_arch = "bpf", velstra_atomic_or_two_types))]
-    unsafe {
-        core::intrinsics::atomic_or::<u64, u64, { core::intrinsics::AtomicOrdering::SeqCst }>(
-            ptr, value,
-        )
-    }
-    #[cfg(not(target_arch = "bpf"))]
-    unsafe {
-        (&*ptr.cast::<core::sync::atomic::AtomicU64>())
-            .fetch_or(value, core::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-#[inline(always)]
-fn note(index: u64) -> bool {
-    let Some(ptr) = NAPT_SEARCH.get_ptr_mut(0) else {
-        return false;
-    };
-    // Array u64 values are aligned and stable for this program's lifetime. All
-    // dataplane accesses use this atomic type, never mixed non-atomic writes.
-    unsafe { atomic_merge(ptr, index) };
-    true
-}
-
-#[inline(always)]
-pub(super) fn unbounded() -> bool {
-    note(65535)
-}
-
-#[inline(always)]
-fn bound() -> u64 {
-    let Some(ptr) = NAPT_SEARCH.get_ptr_mut(0) else {
-        return 65535;
-    };
-    unsafe { atomic_merge(ptr, 0) }
-}
 
 pub const INSERTED: u32 = 1 << 16;
 pub const FAILED: u32 = 1 << 17;
@@ -93,6 +42,9 @@ struct Search {
     now: u64,
     bytes: u64,
     result: u32,
+    /// Standalone scattered window (`probe`) or the replicated linear one
+    /// (`candidate`).
+    scattered: bool,
 }
 
 impl Search {
@@ -118,6 +70,16 @@ impl Search {
             now: unsafe { bpf_ktime_get_ns() },
             bytes,
             result: 0,
+            scattered: true,
+        }
+    }
+
+    #[inline(always)]
+    fn port(&self, index: u32) -> u16 {
+        if self.scattered {
+            self.domain.probe(index)
+        } else {
+            self.domain.candidate(index)
         }
     }
 }
@@ -125,10 +87,11 @@ impl Search {
 #[inline(never)]
 unsafe extern "C" fn find_owned(index: u32, opaque: *mut c_void) -> i64 {
     let s = unsafe { &mut *opaque.cast::<Search>() };
-    if index >= s.domain.count || s.domain.count == 0 {
+    let port = s.port(index);
+    if port == 0 {
         return 1;
     }
-    s.reverse.dst_port = s.domain.candidate(index);
+    s.reverse.dst_port = port;
     if let Some(entry) = unsafe { CONNTRACK.get(&s.reverse) }
         && napt_binding_matches(entry, s.origin, s.private_port)
         && !entry.expired(s.reverse.proto, s.now, s.timeouts)
@@ -142,10 +105,11 @@ unsafe extern "C" fn find_owned(index: u32, opaque: *mut c_void) -> i64 {
 #[inline(never)]
 unsafe extern "C" fn reserve(index: u32, opaque: *mut c_void) -> i64 {
     let s = unsafe { &mut *opaque.cast::<Search>() };
-    if index >= s.domain.count || s.domain.count == 0 {
+    let port = s.port(index);
+    if port == 0 {
         return 1;
     }
-    s.reverse.dst_port = s.domain.candidate(index);
+    s.reverse.dst_port = port;
     let observed = napt_slot(
         unsafe { CONNTRACK.get(&s.reverse) },
         s.origin,
@@ -154,18 +118,8 @@ unsafe extern "C" fn reserve(index: u32, opaque: *mut c_void) -> i64 {
     let claim = napt_claim(
         observed,
         || {
-            // A different port layout changes the meaning of displacement.
-            // Invalidate permanently before publishing such a binding.
-            let marker = if s.domain.first == 32768 && s.domain.count == 32768 {
-                index as u64
-            } else {
-                65535
-            };
-            if !note(marker) {
-                return Err(-12);
-            }
             let state = FlowState::masquerade(s.origin, s.private_port);
-            match claim_marked_masquerade_nat(&s.reverse, &state, s.bytes) {
+            match insert_masquerade_binding(&s.reverse, &state, s.bytes) {
                 0 => Ok(()),
                 error => Err(error),
             }
@@ -196,101 +150,94 @@ unsafe extern "C" fn reserve(index: u32, opaque: *mut c_void) -> i64 {
     1
 }
 
+/// Scan `count` candidates for this flow's live binding (`s.result`).
 #[inline(always)]
-fn search(s: &mut Search) -> bool {
-    let before = bound();
-    let count = napt_search_count(s.domain, before);
-    let ok = unsafe {
+fn find(s: &mut Search, count: u32) -> bool {
+    unsafe {
         bpf_loop(
             count,
             find_owned as *mut c_void,
             (s as *mut Search).cast(),
             0,
         ) >= 0
-    };
-    if !ok || s.result != 0 {
-        return ok;
     }
-    // A concurrent publication may have expanded the bound during the scan.
-    // Fall back to the original whole-domain search, not an unbounded retry.
-    if bound() != before {
-        return unsafe {
-            bpf_loop(
-                s.domain.count,
-                find_owned as *mut c_void,
-                (s as *mut Search).cast(),
-                0,
-            ) >= 0
-        };
-    }
-    true
 }
 
-/// Read-only companion for ICMP errors quoting a TCP/UDP NAT connection.
-#[inline(never)]
-pub fn existing(flow: &FlowKey, public: [u8; 4], layout: &CgnatLayout) -> u16 {
-    let mut s = Search::new(flow, public, layout, 0);
-    if search(&mut s) { s.result as u16 } else { 0 }
-}
-
-#[inline(never)]
-pub fn allocate(flow: &FlowKey, public: [u8; 4], layout: &CgnatLayout, bytes: u64) -> u32 {
-    let mut s = Search::new(flow, public, layout, bytes);
-    if !search(&mut s) {
-        return FAILED;
-    }
-    if s.result != 0 {
-        if account_masquerade_binding(&s.reverse, s.origin, s.private_port, bytes) {
-            return s.result;
-        }
-        return FAILED;
-    }
-    let count = s.domain.count;
-    if unsafe {
-        bpf_loop(
-            count,
-            reserve as *mut c_void,
-            (&mut s as *mut Search).cast(),
-            0,
-        )
-    } < 0
-    {
+/// Claim the first vacant of `count` candidates, or reuse this flow's own
+/// binding met on the way. Zero result: every candidate is foreign.
+#[inline(always)]
+fn claim(s: &mut Search, count: u32) -> u32 {
+    if unsafe { bpf_loop(count, reserve as *mut c_void, (s as *mut Search).cast(), 0) } < 0 {
         return FAILED;
     }
     s.result
 }
 
-/// Candidates an HA (replicated) allocator examines (DP-26). Replicas cannot
-/// share the standalone displacement bound, so they search a fixed window of
-/// the same cyclic domain instead: its first eight candidates are exactly the
+/// This flow's live standalone binding, or 0: at most `window()` lookups,
+/// fewer the earlier the binding sits. Also the read-only companion for ICMP
+/// errors quoting a TCP/UDP NAT connection.
+#[inline(never)]
+pub fn existing(flow: &FlowKey, public: [u8; 4], layout: &CgnatLayout) -> u16 {
+    let mut s = Search::new(flow, public, layout, 0);
+    let count = s.domain.window();
+    if find(&mut s, count) {
+        s.result as u16
+    } else {
+        0
+    }
+}
+
+/// Claim a standalone binding for a flow [`existing`] has just found none
+/// for. A binding another CPU publishes for the same flow in between is met
+/// by the claim itself (`NaptClaim::Existing`) when it sits no later than the
+/// first vacancy; NOEXIST insertion never replaces another endpoint's state.
+#[inline(never)]
+pub fn allocate(flow: &FlowKey, public: [u8; 4], layout: &CgnatLayout, bytes: u64) -> u32 {
+    let mut s = Search::new(flow, public, layout, bytes);
+    let count = s.domain.window();
+    claim(&mut s, count)
+}
+
+/// Candidates an HA (replicated) allocator examines (DP-26): a fixed linear
+/// window of the cyclic domain, whose first eight candidates are exactly the
 /// legacy eight, so an older peer still finds every binding it could have
 /// made, and a binding beyond them is one the older allocator would have
 /// refused outright.
 pub const HA_WINDOW: u32 = 64;
 
-/// Existing live binding of `flow` within the first `window` candidates.
-#[inline(never)]
-pub fn existing_window(flow: &FlowKey, public: [u8; 4], layout: &CgnatLayout, window: u32) -> u16 {
-    let mut s = Search::new(flow, public, layout, 0);
+#[inline(always)]
+fn linear(
+    flow: &FlowKey,
+    public: [u8; 4],
+    layout: &CgnatLayout,
+    bytes: u64,
+    window: u32,
+) -> (Search, u32) {
+    let mut s = Search::new(flow, public, layout, bytes);
+    s.scattered = false;
     let count = if window < s.domain.count {
         window
     } else {
         s.domain.count
     };
-    let ok = unsafe {
-        bpf_loop(
-            count,
-            find_owned as *mut c_void,
-            (&mut s as *mut Search).cast(),
-            0,
-        ) >= 0
-    };
-    if ok { s.result as u16 } else { 0 }
+    (s, count)
 }
 
-/// `allocate` restricted to the first `window` candidates: reuse this flow's
-/// live binding there, else claim the first free candidate. Same frame shape
-/// as `allocate`, so the masquerade tail's cumulative stack is unchanged.
+/// Existing live binding of `flow` within the first `window` linear
+/// candidates (the replicated allocator's window).
+#[inline(never)]
+pub fn existing_window(flow: &FlowKey, public: [u8; 4], layout: &CgnatLayout, window: u32) -> u16 {
+    let (mut s, count) = linear(flow, public, layout, 0, window);
+    if find(&mut s, count) {
+        s.result as u16
+    } else {
+        0
+    }
+}
+
+/// The replicated allocator restricted to the first `window` linear
+/// candidates: reuse this flow's live binding there, else claim the first
+/// free candidate.
 #[inline(never)]
 pub fn allocate_window(
     flow: &FlowKey,
@@ -299,21 +246,8 @@ pub fn allocate_window(
     bytes: u64,
     window: u32,
 ) -> u32 {
-    let mut s = Search::new(flow, public, layout, bytes);
-    let count = if window < s.domain.count {
-        window
-    } else {
-        s.domain.count
-    };
-    if unsafe {
-        bpf_loop(
-            count,
-            find_owned as *mut c_void,
-            (&mut s as *mut Search).cast(),
-            0,
-        )
-    } < 0
-    {
+    let (mut s, count) = linear(flow, public, layout, bytes, window);
+    if !find(&mut s, count) {
         return FAILED;
     }
     if s.result != 0 {
@@ -322,16 +256,5 @@ pub fn allocate_window(
         }
         return FAILED;
     }
-    if unsafe {
-        bpf_loop(
-            count,
-            reserve as *mut c_void,
-            (&mut s as *mut Search).cast(),
-            0,
-        )
-    } < 0
-    {
-        return FAILED;
-    }
-    s.result
+    claim(&mut s, count)
 }

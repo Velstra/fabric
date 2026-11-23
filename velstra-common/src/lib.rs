@@ -82,8 +82,8 @@ pub use icmp_related::{
     related_hairpin_firewall_candidate, related_icmp_error,
 };
 pub use icmpv6::{
-    ICMPV6_ERROR_QUOTE, MLD_HOP_LIMIT, ND_HOP_LIMIT, icmpv6_link_control, icmpv6_type,
-    related_icmpv6_error, related_icmpv6_key,
+    ICMPV6_ERROR_QUOTE, MLD_HOP_LIMIT, ND_HOP_LIMIT, QUOTE_EXT_MAX, QuoteStep, icmpv6_link_control,
+    icmpv6_type, quote_ext_step, related_icmpv6_error, related_icmpv6_key,
 };
 pub use lb::{
     Backend, FlowKey, FlowState, Nat, PortFwd, ServiceKey, ServiceValue, plan_dnat,
@@ -91,11 +91,11 @@ pub use lb::{
 };
 pub use mac::{MacError, parse_mac};
 pub use masquerade::{
-    MasqueradeCommit, NaptClaim, NaptDomain, NaptSlot, UNADDRESSED, legacy_napt_seed,
-    masquerade_commit, napt_binding_matches, napt_claim, napt_find_existing, napt_port,
-    napt_search_count, napt_seed, napt_slot, nat_entry_replaceable, unaddressed_uplink_drops,
+    MasqueradeCommit, NAPT_WINDOW, NaptClaim, NaptDomain, NaptSlot, UNADDRESSED, legacy_napt_seed,
+    masquerade_commit, napt_binding_matches, napt_claim, napt_find_existing, napt_port, napt_seed,
+    napt_slot, nat_entry_replaceable, unaddressed_uplink_drops,
 };
-pub use mss::mss_clamp_csum_operands;
+pub use mss::{ipv6_mss_ceiling, mss_clamp_csum_operands};
 pub use npt::{Npt66, npt66_rewrite, oc_add};
 pub use overlay::{
     ARP_REPLY, ARP_REQUEST, ArpEntry, ArpKey, ArpReply, ETHERTYPE_ARP, Encap, FloodSet,
@@ -106,21 +106,22 @@ pub use overlay::{
     plan_irb, plan_na_reply, write_encap,
 };
 pub use packet::{
-    ETHERTYPE_IPV4, ETHERTYPE_IPV6, PORT_ENFORCE_MAC, PORT_ENFORCE_V4, PORT_ENFORCE_V6, PacketMeta,
-    PolicyId, PortAddr4, PortAddr6, PortBinding, PortKey, RawFraming, ScopedAddr, ScopedAddr6,
-    ScopedDstPortKey, ScopedDstPortKey6, ScopedMac, ScopedPortKey, ScopedSrcPortKey,
-    ScopedSrcPortKey6, ethertype_passes_unfiltered, icmp_reply_probe, icmp_type_key,
-    icmp_type_probe, ip_proto, ipv4_options_refused, ipv6_ext_len, is_ipv6_ext, lpm_key_addr,
-    raw_ip_framing,
+    ETHERTYPE_IPV4, ETHERTYPE_IPV6, IEEE_8023_MAX_LENGTH, PORT_ENFORCE_MAC, PORT_ENFORCE_V4,
+    PORT_ENFORCE_V6, PacketMeta, PolicyId, PortAddr4, PortAddr6, PortBinding, PortKey, RawFraming,
+    ScopedAddr, ScopedAddr6, ScopedDstPortKey, ScopedDstPortKey6, ScopedMac, ScopedPortKey,
+    ScopedSrcPortKey, ScopedSrcPortKey6, ethertype_passes_unfiltered, icmp_reply_probe,
+    icmp_type_key, icmp_type_probe, ip_proto, ipv4_options_refused, ipv6_ext_len, is_ipv6_ext,
+    llc_passes_unfiltered, lpm_key_addr, raw_ip_framing,
 };
 pub use parse::{ParseResult, parse_frame};
 pub use policy::{
     Action, CONFIG_FAILED, CONFIG_READY, CONFIG_UPDATING, Counter, MAX_BLOCKLIST, MAX_RULE_LIMITS,
     PORT_RULE_IN_ONLY, PORT_RULE_LOG, PORT_RULE_OUT_ONLY, PORT_RULE_PRESENT, PORT_RULE_V4_ONLY,
     PORT_RULE_V6_ONLY, StateFacts, VERDICT_REASONS, Verdict, admit_established_egress_reply,
-    decide, decide_egress, egress_posture, port_rule_action, port_rule_bits, port_rule_denies,
-    port_rule_excluded, port_rule_limit, port_rule_logs, port_rule_present, port_rule_value,
-    port_rule_winner, port_rule_with_limit, stateful_verdict,
+    blocklist_refuses_egress, blocklist_refuses_ingress, decide, decide_egress, egress_posture,
+    port_rule_action, port_rule_bits, port_rule_denies, port_rule_excluded, port_rule_limit,
+    port_rule_logs, port_rule_present, port_rule_value, port_rule_winner, port_rule_with_limit,
+    stateful_verdict,
 };
 pub use portal::{
     PortalClientKey, PortalGate, PortalSeenKey, gate_admits_unauthenticated, v6_source_is_v4_mapped,
@@ -139,9 +140,10 @@ pub use srv6::{
 };
 pub use state_publication::{StatePublication, publish_state_pair};
 pub use synproxy::{
-    EPOCH_SHIFT, MSS_TABLE, SYNTH_WINDOW, SynFlow, SynProxyCfg, SynProxyKey, TcpSynth,
-    check_cookie, csum_replace_u32, epoch_of, make_cookie, mss_index, plan_server_ack,
-    plan_server_syn, plan_syn_ack, seq_delta, translate_to_client, translate_to_server,
+    EPOCH_SHIFT, MSS_TABLE, SPLICE_POLICY, SYNTH_WINDOW, SynFlow, SynProxyCfg, SynProxyKey,
+    TcpSynth, check_cookie, csum_replace_u32, epoch_of, firewall_claim, make_cookie, mss_index,
+    nat_claim, plan_server_ack, plan_server_syn, plan_syn_ack, seq_delta, splice_key,
+    translate_to_client, translate_to_server,
 };
 pub use tcp_key::TcpSessionKey;
 pub use tcp_packet::{TcpChecksumState, TcpPacket, TcpPacketError, parse_tcp_packet};

@@ -16,6 +16,7 @@ mod btf;
 mod capacity;
 mod conntrack_sync;
 mod controller_client;
+mod dplog;
 mod firewall;
 mod flows;
 mod flowspec;
@@ -23,6 +24,7 @@ mod ha;
 mod host_inventory;
 mod ipfix;
 mod local_destination;
+mod logwriter;
 mod mapping;
 mod packet_events;
 mod persist;
@@ -77,7 +79,12 @@ enum Command {
 struct RunArgs {
     /// Network interface to attach to. Repeat `--iface` to attach to several
     /// (e.g. the client-facing and backend-facing NICs) so bidirectional NAT
-    /// state is shared across them. Required unless `--auto-attach` is set.
+    /// state is shared across them. At least one is required unless
+    /// `--auto-attach` or `--controller` is set. One that does not exist yet at
+    /// start (a VLAN, bridge or tunnel still being created) is not an error:
+    /// the agent warns, attaches it when it appears, warns again every minute
+    /// while it is missing and lists it in the `missing-interfaces` query. Any
+    /// other failure to look an interface up still stops the agent.
     #[arg(short, long, num_args = 1..)]
     iface: Vec<String>,
 
@@ -236,6 +243,10 @@ struct ValidateArgs {
 struct VerifyEbpfArgs {
     /// ELF object to verify; omit to verify the embedded release object.
     object: Option<PathBuf>,
+    /// Refuse a program that verifies but uses more verifier instructions than
+    /// this. The default keeps 30 % of the kernel's 1,000,000 in reserve.
+    #[arg(long, default_value_t = firewall::VERIFIER_INSN_BUDGET)]
+    max_insns: u32,
 }
 
 /// Encapsulation advertised when the agent self-registers its host.
@@ -260,8 +271,14 @@ impl EncapArg {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // `RUST_LOG=info` (or finer) controls verbosity; default to `info`.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // `RUST_LOG=info` (or finer) controls verbosity; default to `info`. Records
+    // go through a bounded, lossy queue: a journal that stops reading must not
+    // stall the agent (see `logwriter`).
+    let outputs = logwriter::installed();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .target(env_logger::Target::Pipe(Box::new(outputs.log.clone())))
+        .init();
+    let _flush_logs = logwriter::FlushOnExit(vec![outputs.log.clone(), outputs.stats.clone()]);
 
     let cli = Cli::parse();
     match cli.command {
@@ -269,7 +286,7 @@ async fn main() -> Result<()> {
         Command::HaGuard(args) => ha::prepare_guard(&velstra_config::load_file(&args.config)?),
         Command::VerifyEbpf(args) => {
             let object = args.object.map(std::fs::read).transpose()?;
-            Firewall::verify_object(object.as_deref())
+            Firewall::verify_object(object.as_deref(), args.max_insns)
         }
         Command::Run(args) => run(args).await,
         Command::ReleaseDatapath => {
@@ -390,7 +407,14 @@ async fn run(args: RunArgs) -> Result<()> {
     // DP-07: reclaim expired connection state in the background, so the LRU
     // never has to choose which live connection to evict while dead ones sit
     // in the tables. Never touches the datapath gate.
-    tokio::spawn(reclaim::run(firewall.clone()));
+    // The SYN-proxy splices conntrack sync holds as imported, which the
+    // splice sweep must leave alone where this node cannot know it is active.
+    let imported_splices = conntrack_sync::secure::ImportedSplices::default();
+    tokio::spawn(reclaim::run(
+        firewall.clone(),
+        ha_state.clone(),
+        imported_splices.clone(),
+    ));
 
     // C20: the captive-portal socket, where a portal admits a device it has
     // authenticated. Every session it opens carries a deadline, and the sweep is
@@ -425,7 +449,9 @@ async fn run(args: RunArgs) -> Result<()> {
     // before the CNI creates it, and a file-config appliance (e.g. a
     // firewall/router) names every zoned NIC + VLAN it must filter and NAT on,
     // which `--iface` alone (one primary) would otherwise miss.
-    if !args.controllers.is_empty() || args.config.is_some() {
+    // The same poll attaches a primary `--iface` that did not exist at start.
+    let primary_waiting = !firewall.lock().await.waiting_primaries().is_empty();
+    if !args.controllers.is_empty() || args.config.is_some() || primary_waiting {
         tokio::spawn(config_attach_loop(firewall.clone(), args.xdp_mode));
     }
 
@@ -581,6 +607,7 @@ async fn run(args: RunArgs) -> Result<()> {
                             synproxy,
                             ha_state.clone(),
                             cts,
+                            imported_splices.clone(),
                         ));
                     }
                     Err(error) => warn!("could not start authenticated state sync: {error:#}"),
@@ -764,6 +791,7 @@ async fn config_attach_loop(firewall: Arc<Mutex<Firewall>>, mode: AttachMode) {
         drop(wait);
         let _hold = firewall::timing::Span::start(firewall::timing::Phase::ReconcileLockHold);
         fw.reconcile_config_interfaces(&present, mode);
+        fw.attach_waiting_primaries();
     }
 }
 
@@ -898,13 +926,16 @@ async fn serve(
 }
 
 /// Statistics output must not unwind the firewall if its log consumer closes.
+/// Print a statistics table, one record on the non-blocking stdout queue so a
+/// stalled journal never holds the agent up.
 fn write_statistics(title: &str, stats: &firewall::Stats) {
     use std::io::Write;
-    if let Err(error) = write!(
-        std::io::stdout().lock(),
-        "\n{title} statistics:\n{}",
-        stats.render()
-    ) {
+    let table = format!("\n{title} statistics:\n{}", stats.render());
+    if let Err(error) = logwriter::installed()
+        .stats
+        .clone()
+        .write_all(table.as_bytes())
+    {
         warn!("could not write datapath statistics: {error}");
     }
 }

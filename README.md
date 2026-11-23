@@ -5,29 +5,54 @@
   <img src=".github/brand/logo.svg" alt="Velstra Fabric" height="72">
 </picture>
 
-An eBPF/XDP dataplane, per-host agent, topology controller and Kubernetes CNI for tenant networks on Linux. Use it to answer neighbor requests on the host, carry tenant Ethernet over SRv6, or apply per-port policy. For a complete firewall appliance, see [Velstra Sentinel](https://github.com/Velstra/sentinel).
+An eBPF/XDP dataplane, per-host agent, topology controller and Kubernetes CNI for tenant networks on Linux. Answer neighbor requests on the host, carry tenant Ethernet over SRv6, or apply per-port policy. For a complete firewall appliance, see [Velstra Sentinel](https://github.com/Velstra/sentinel).
+
+```mermaid
+flowchart LR
+  op[Operator or CNI] -->|orch API| ctl[velstra-controller]
+  ctl -->|per-host config, gRPC| agent[velstra agent]
+  agent -->|kernel maps| bpf[XDP and TC programs]
+  nic[(Interface)] <--> bpf
+```
 
 ## Try it
 
-Build the controller and inspect a two-host topology without root, virtual machines or an eBPF toolchain. The [local fabric quickstart](https://velstra.github.io/fabric/quickstart.html) includes the expected result.
+Build the controller and inspect a two-host topology. No root, virtual machines or eBPF toolchain needed.
 
 ```sh
 git clone https://github.com/Velstra/fabric.git
 cd fabric
 cargo test -p velstra-common --locked
 cargo build -p velstra-controller --locked
+
+lab_dir=$(mktemp -d)
+cp examples/topology.toml "$lab_dir/topology.toml"
+./target/debug/velstra-controller serve \
+  --topology "$lab_dir/topology.toml" \
+  --listen 127.0.0.1:50051 --admin-listen 127.0.0.1:50052
 ```
+
+In a second terminal:
+
+```sh
+./target/debug/velstra-controller orch list-ports
+```
+
+The [local fabric quickstart](https://velstra.github.io/fabric/quickstart.html) shows the expected result.
 
 ## Operator handbook
 
-- [Start a local fabric](docs/quickstart.md)
-- [Verify local neighbor discovery and Ethernet over SRv6](docs/overlay.md)
-- [Configure and operate the agent](docs/agent.md)
-- [Manage topology and workload ports](docs/CONFIGURATION.md)
-- [Deploy the Kubernetes CNI](docs/kubernetes.md)
-- [Build the agent](docs/development.md) and [verify the dataplane](docs/TESTING.md)
+| Task | Page |
+|---|---|
+| Start a local fabric | [Quickstart](docs/quickstart.md) |
+| Local neighbor discovery and Ethernet over SRv6 | [Overlay](docs/overlay.md) |
+| Configure and run the agent | [Agent](docs/agent.md) |
+| Manage topology and workload ports | [Configuration](docs/CONFIGURATION.md) |
+| Deploy the Kubernetes CNI | [Kubernetes](docs/kubernetes.md) |
+| Build the agent and verify the dataplane | [Development](docs/development.md), [Testing](docs/TESTING.md) |
+| See how the parts fit | [Architecture](docs/ARCHITECTURE.md) |
 
-[Browse the GitHub Pages handbook](https://velstra.github.io/fabric/) · [Source examples](examples/) · [Release qualification](docs/RELEASE-POLICY.md)
+[Browse the handbook](https://velstra.github.io/fabric/) · [Source examples](examples/) · [Release qualification](docs/RELEASE-POLICY.md)
 
 ## License
 

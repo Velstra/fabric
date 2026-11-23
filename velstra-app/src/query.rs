@@ -210,10 +210,28 @@ async fn respond(
         "stats" => {
             let fw = firewall.lock().await;
             match fw.read_stats() {
-                Ok(stats) => stats.render(),
+                // The agent's own log health rides along: records dropped
+                // because the log output (journald) stopped reading.
+                Ok(stats) => format!(
+                    "{}  {:<20} {:>14}\n  {:<20} {:>14}\n",
+                    stats.render(),
+                    "log_lines_dropped",
+                    crate::logwriter::dropped(),
+                    "log_lines_suppressed",
+                    crate::dplog::suppressed()
+                ),
                 Err(e) => format!("error: reading statistics: {e:#}\n"),
             }
         }
+        // A primary `--iface` without its hook, one name per line; empty when
+        // every primary is attached.
+        "missing-interfaces" => firewall
+            .lock()
+            .await
+            .waiting_primaries()
+            .into_iter()
+            .map(|name| format!("{name}\n"))
+            .collect(),
         "capacity" => format!("{}\n", crate::capacity::query(firewall.clone()).await),
         "firewall-states" => {
             let fw = firewall.lock().await;

@@ -15,14 +15,44 @@
 /// sends from before it has a lease, which is the traffic that must still leave.
 pub const UNADDRESSED: [u8; 4] = [0; 4];
 
-/// A complete finite port domain, visited once in cyclic seed order. Unlike
-/// wrapping the seed before modulo, this also covers non-power-of-two CGNAT
-/// blocks when the seed is close to u32::MAX. This is NOT the legacy allocator.
+/// Candidates the standalone allocator may claim for one flow, and so the
+/// only candidates discovery ever has to visit (PERF-02).
+///
+/// The window is a property of the flow alone, never of table history: a
+/// flow's binding is always among its own first `NAPT_WINDOW` probes, so the
+/// cost of finding it — or of proving there is none before claiming — is
+/// bounded by this constant whatever the table held before. A whole-domain
+/// scan per new flow in softirq is what collapsed masquerade to a few hundred
+/// connections per second. With scattered probes, a full window at domain
+/// occupancy `a` happens with probability about `a^128`: 1e-12 at 80 %,
+/// 2e-6 at 90 %, so a refusal means the remote endpoint's domain is
+/// effectively full, and it is counted (`egress_nat_no_candidate`).
+pub const NAPT_WINDOW: u32 = 128;
+
+/// Probe strides for a domain whose size is not a power of two: primes above
+/// every possible domain size (a domain has at most 65535 ports), so each is
+/// coprime with any domain and a flow's probes never repeat inside it.
+/// Power-of-two domains (the default 32768 and usual CGNAT blocks) take any
+/// odd stride instead, which gives every flow its own probe chain; sixteen
+/// shared chains measurably cluster (0.33 % instead of 0.14 % refused at
+/// 95 % fill, see `refusal_rate_by_domain_fill`).
+const NAPT_STRIDES: [u32; 16] = [
+    0x22e1bd, 0x23e783, 0x10a155, 0x167629, 0x3cd553, 0x5350cd, 0x7e85df, 0x53f2f1, 0x67e485,
+    0x28949b, 0x3e460b, 0x53c20f, 0x11f72b, 0xdf0037, 0xe38cf7, 0xce61df,
+];
+
+/// One source's finite port domain (its CGNAT block, or 32768..=65535) and a
+/// flow's position in it. `candidate` walks it cyclically from the seed's
+/// offset (the replicated allocator's window, unchanged for mixed-version
+/// peers); `probe` is the standalone allocator's scattered window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NaptDomain {
     pub first: u32,
     pub count: u32,
     pub offset: u32,
+    /// Distance between consecutive standalone probes, already reduced
+    /// modulo `count`; coprime with `count`.
+    pub stride: u32,
 }
 
 impl NaptDomain {
@@ -34,13 +64,23 @@ impl NaptDomain {
                 first: 0,
                 count: 0,
                 offset: 0,
+                stride: 0,
             };
         }
         let count = last as u32 - first as u32 + 1;
+        // The offset uses the seed's low bits (at most 15 of them for a
+        // power-of-two domain); the stride the bits above, so the two are
+        // independent.
+        let stride = if count & (count - 1) == 0 {
+            ((seed >> 15) % count) | 1
+        } else {
+            NAPT_STRIDES[(seed >> 28) as usize & (NAPT_STRIDES.len() - 1)] % count
+        };
         Self {
             first: first as u32,
             count,
             offset: seed % count,
+            stride,
         }
     }
 
@@ -53,83 +93,191 @@ impl NaptDomain {
         }
         (self.first + (self.offset + index) % self.count) as u16
     }
-}
 
-/// Count for a monotonic displacement summary of the default domain. The
-/// summary is the atomic OR of indices published BEFORE reverse-map insertion.
-/// Missing/invalid metadata and other layouts always retain complete search.
-#[inline(always)]
-pub fn napt_search_count(domain: NaptDomain, summary: u64) -> u32 {
-    if domain.first != 32768 || domain.count != 32768 || summary >= 32768 {
-        domain.count
-    } else {
-        summary as u32 + 1
+    /// How many standalone probes this domain has: the whole domain when it
+    /// is no larger than the window, so a small CGNAT block stays complete.
+    #[inline(always)]
+    pub fn window(&self) -> u32 {
+        if self.count < NAPT_WINDOW {
+            self.count
+        } else {
+            NAPT_WINDOW
+        }
+    }
+
+    /// Standalone probe `index` (< [`Self::window`]), or 0 outside it.
+    /// Probe 0 is `candidate(0)` — the legacy allocator's first port — so a
+    /// binding an older image made there is still this flow's own. The rest
+    /// step by the flow's stride; being coprime with the domain, the first
+    /// `window()` probes are all distinct.
+    #[inline(always)]
+    pub fn probe(&self, index: u32) -> u16 {
+        if self.count == 0 || index >= self.window() {
+            return 0;
+        }
+        let step = (index as u64 * self.stride as u64) % self.count as u64;
+        (self.first + ((self.offset as u64 + step) % self.count as u64) as u32) as u16
     }
 }
 
 #[cfg(test)]
-mod search_bound_tests {
+mod window_tests {
     use super::*;
 
+    fn layout(base: u16, block: u16) -> crate::CgnatLayout {
+        crate::CgnatLayout::new(base, block)
+    }
+
+    fn domains() -> impl Iterator<Item = NaptDomain> {
+        let layouts = [
+            crate::CgnatLayout::default(),
+            layout(32768, 512),
+            layout(1024, 1000),
+            layout(40000, 97),
+            layout(2000, 128),
+            layout(2000, 129),
+            layout(60000, 3),
+        ];
+        layouts.into_iter().flat_map(|layout| {
+            (0..64u32).map(move |i| {
+                let seed = napt_seed(
+                    [10, 0, (i >> 3) as u8, i as u8],
+                    [192, 0, 2, 1],
+                    40000 + i as u16,
+                    443,
+                ) ^ (i << 28);
+                NaptDomain::new([10, 0, 0, i as u8], seed, &layout)
+            })
+        })
+    }
+
     #[test]
-    fn every_published_displacement_is_inside_the_monotonic_search() {
-        let domain = NaptDomain::new([10, 0, 0, 1], 27, &crate::CgnatLayout::default());
-        let mut summary = 0;
-        // Visit all positions in non-monotonic order; OR never loses a bit.
-        for i in 0..32768u64 {
-            let index = (i * 7919) % 32768;
-            let previous = summary;
-            summary |= index;
-            assert!(summary >= previous);
-            assert!(napt_search_count(domain, summary) > index as u32);
+    fn window_probes_are_distinct_and_inside_the_domain() {
+        for domain in domains() {
+            assert!(domain.count > 0, "{domain:?}");
+            let mut seen = std::collections::BTreeSet::new();
+            for index in 0..domain.window() {
+                let port = domain.probe(index) as u32;
+                assert!(
+                    port >= domain.first && port < domain.first + domain.count,
+                    "{domain:?} {index}"
+                );
+                assert!(
+                    seen.insert(port),
+                    "probe {index} repeats a port in {domain:?}"
+                );
+            }
+            assert_eq!(domain.probe(domain.window()), 0, "{domain:?}");
         }
     }
 
     #[test]
-    fn unknown_writer_or_layout_cannot_shorten_discovery() {
-        let domain = NaptDomain {
-            first: 32768,
-            count: 32768,
-            offset: 17,
-        };
-        for summary in [32768, 65535, u64::MAX] {
-            assert_eq!(napt_search_count(domain, summary), domain.count);
-        }
-        for domain in [
-            NaptDomain {
-                first: 1000,
-                count: 100,
-                offset: 4,
-            },
-            NaptDomain {
-                first: 32768,
-                count: 64,
-                offset: 0,
-            },
-            NaptDomain {
-                first: 0,
-                count: 0,
-                offset: 0,
-            },
-        ] {
-            assert_eq!(napt_search_count(domain, 0), domain.count);
+    fn a_domain_no_larger_than_the_window_is_probed_completely() {
+        for domain in domains().filter(|d| d.count <= NAPT_WINDOW) {
+            assert_eq!(domain.window(), domain.count);
+            let ports: std::collections::BTreeSet<u32> = (0..domain.window())
+                .map(|i| domain.probe(i) as u32)
+                .collect();
+            assert_eq!(ports, (domain.first..domain.first + domain.count).collect());
         }
     }
 
     #[test]
-    fn deletions_and_failed_claims_must_not_reduce_the_summary() {
-        let domain = NaptDomain {
-            first: 32768,
-            count: 32768,
-            offset: 0,
+    fn the_first_probe_is_the_legacy_first_candidate() {
+        for domain in domains() {
+            assert_eq!(domain.probe(0), domain.candidate(0));
+        }
+        let seed = napt_seed([10, 0, 0, 9], [198, 51, 100, 7], 51515, 80);
+        let domain = NaptDomain::new([10, 0, 0, 9], seed, &crate::CgnatLayout::default());
+        assert_eq!(domain.probe(0), napt_port(seed, 0));
+    }
+
+    /// The window's refusal rate, measured: one remote endpoint's default
+    /// domain filled to a fraction by the allocator itself (so its own
+    /// clustering counts), then fresh flows that would each need a port.
+    /// Expected about `fill^128`: none at 80 % and 90 %, ~0.14 % at 95 %,
+    /// ~28 % at 99 %. This is the capacity statement for flows to ONE remote
+    /// ip:port from one public address; different endpoints never compete.
+    #[test]
+    fn refusal_rate_by_domain_fill() {
+        let layout = crate::CgnatLayout::default();
+        let flow = |n: u32| {
+            let src = [10, (n >> 16) as u8, (n >> 8) as u8, n as u8];
+            let sport = 1024 + (n % 64000) as u16;
+            (src, napt_seed(src, [203, 0, 113, 5], sport, 443))
         };
-        let summary = 8 | 2; // including a failed claim only overestimates
-        assert_eq!(napt_search_count(domain, summary), 11);
-        let owned_late = domain.candidate(8);
-        assert!(
-            (0..napt_search_count(domain, summary))
-                .any(|index| domain.candidate(index) == owned_late)
-        );
+        let mut occupied = std::collections::HashSet::new();
+        let mut next = 0u32;
+        let trials = 20_000u32;
+        let mut measured = Vec::new();
+        for (fill, ceiling) in [(0.80, 0.0), (0.90, 0.0), (0.95, 0.0025), (0.99, 0.32)] {
+            while (occupied.len() as f64) < 32768.0 * fill {
+                let (src, seed) = flow(next);
+                next += 1;
+                let domain = NaptDomain::new(src, seed, &layout);
+                if let Some(port) = (0..domain.window())
+                    .map(|i| domain.probe(i))
+                    .find(|port| !occupied.contains(port))
+                {
+                    occupied.insert(port);
+                }
+            }
+            let refused = (0..trials)
+                .filter(|t| {
+                    let (src, seed) = flow(1_000_000 + t);
+                    let domain = NaptDomain::new(src, seed, &layout);
+                    (0..domain.window()).all(|i| occupied.contains(&domain.probe(i)))
+                })
+                .count();
+            let rate = refused as f64 / trials as f64;
+            measured.push((fill, rate));
+            assert!(
+                rate <= ceiling,
+                "fill {fill}: refusal {rate} above {ceiling}"
+            );
+        }
+        // 99 % fill refuses often enough to be measured, and less often than
+        // a uniformly random window would allow to be off by much.
+        let (_, at_99) = measured[3];
+        assert!(at_99 > 0.15, "99 % refusal implausibly low: {measured:?}");
+    }
+
+    /// Model of the allocator over one remote endpoint's domain: claim the
+    /// first vacant probe, discover by scanning the window. Every live
+    /// binding is found by its own flow, no two flows share a port, and at
+    /// 80 % occupancy no flow is refused.
+    #[test]
+    fn model_allocation_finds_every_binding_and_never_shares_a_port() {
+        let layout = crate::CgnatLayout::default();
+        let mut owner: std::collections::HashMap<u16, (u32, u16)> =
+            std::collections::HashMap::new();
+        let mut bindings = Vec::new();
+        let target = (32768.0 * 0.8) as u32;
+        let mut refused = 0;
+        for flow in 0..target {
+            let src = [10, 1, (flow >> 8) as u8, flow as u8];
+            let sport = 1024 + (flow % 60000) as u16;
+            let seed = napt_seed(src, [203, 0, 113, 5], sport, 443);
+            let domain = NaptDomain::new(src, seed, &layout);
+            let port = (0..domain.window())
+                .map(|i| domain.probe(i))
+                .find(|port| !owner.contains_key(port));
+            match port {
+                Some(port) => {
+                    owner.insert(port, (flow, sport));
+                    bindings.push((flow, sport, seed, src, port));
+                }
+                None => refused += 1,
+            }
+        }
+        assert_eq!(refused, 0, "a flow was refused at 80 % occupancy");
+        for (flow, sport, seed, src, port) in bindings {
+            let domain = NaptDomain::new(src, seed, &layout);
+            let found = (0..domain.window())
+                .map(|i| domain.probe(i))
+                .find(|p| owner.get(p) == Some(&(flow, sport)));
+            assert_eq!(found, Some(port));
+        }
     }
 }
 
@@ -385,8 +533,11 @@ mod tests {
             first: 0,
             count: 0,
             offset: 0,
+            stride: 0,
         };
         assert_eq!(empty.candidate(0), 0);
+        assert_eq!(empty.window(), 0);
+        assert_eq!(empty.probe(0), 0);
         let domain = NaptDomain::new([10, 0, 0, 1], 0, &crate::CgnatLayout::default());
         assert_eq!(domain.candidate(domain.count), 0);
         assert_eq!(domain.candidate(u32::MAX), 0);

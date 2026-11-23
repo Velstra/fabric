@@ -12,3 +12,4 @@ site-url = "/fabric/"
 git-repository-url = "https://github.com/Velstra/fabric"
 edit-url-template = "https://github.com/Velstra/fabric/edit/main/{path}"
 additional-css = ["theme/fabric.css"]
+additional-js = ["docs/mermaid/mermaid.min.js", "docs/mermaid/mermaid-init.js"]
