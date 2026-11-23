@@ -951,6 +951,9 @@ pub struct StateTables {
 pub struct FileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ha: Option<HaConfig>,
+    /// Virtual addresses (VRRP/HA VIPs) this host may hold at run time. See
+    /// [`RuntimeConfig::virtual_addresses`]. Omitted (empty) by default.
+    pub virtual_addresses: Vec<std::net::IpAddr>,
     pub conntrack: ConntrackConfig,
     /// Connection-state table size and persistence. Spelled `[state]`.
     pub state: StateCfg,
@@ -1748,6 +1751,16 @@ impl HaConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {
     pub ha: Option<HaConfig>,
+    /// Virtual addresses (VRRP/HA VIPs) that move between members. Every one
+    /// is a local destination for `dst-local` rules on every member, held or
+    /// not, so a takeover that adds one to a link changes no rule-trie entry
+    /// and the refresh takes the additive path instead of closing the
+    /// configuration gate. On a member that does not hold a VIP the HA guard
+    /// (or, for plain VRRP, the kernel forwarding to the holder) decides what
+    /// happens to a packet for it. Never put into LOCAL_EGRESS_ADDRS by
+    /// configuration: that map keeps following the addresses the kernel holds.
+    /// Member-local: not part of the HA policy fingerprint.
+    pub virtual_addresses: BTreeSet<std::net::IpAddr>,
     pub conntrack: velstra_common::ConntrackTimeouts,
     /// Per-policy firewall config. Always contains policy `0` (the default).
     pub policies: Vec<PolicyConfig>,
@@ -1910,6 +1923,7 @@ impl RuntimeConfig {
     /// invoked without a `--config` file.
     pub fn passthrough() -> Self {
         Self {
+            virtual_addresses: BTreeSet::new(),
             // Pass-everything means pass-everything: an unparseable packet is
             // passed too, matching this config's whole premise.
             conntrack: velstra_common::ConntrackTimeouts::DEFAULT,
@@ -1950,6 +1964,17 @@ impl RuntimeConfig {
 }
 
 /// Parse and validate a `[conntrack_sync]` block into its resolved form.
+/// A virtual address is a unicast address a member can hold on a link.
+fn resolve_virtual_addresses(addresses: &[std::net::IpAddr]) -> Result<BTreeSet<std::net::IpAddr>> {
+    for address in addresses {
+        anyhow::ensure!(
+            !address.is_loopback() && !address.is_unspecified() && !address.is_multicast(),
+            "virtual address {address} is not a unicast host address"
+        );
+    }
+    Ok(addresses.iter().copied().collect())
+}
+
 fn resolve_conntrack_sync(cfg: &ConntrackSyncCfg) -> Result<ResolvedConntrackSync> {
     if let Some(interval) = cfg.interval_ms {
         anyhow::ensure!(
@@ -2936,6 +2961,7 @@ impl FileConfig {
         }
 
         let config = RuntimeConfig {
+            virtual_addresses: resolve_virtual_addresses(&self.virtual_addresses)?,
             conntrack: self.conntrack.resolve()?,
             fail_closed: self.fail_closed,
             state: self.state.resolve()?,
@@ -3301,6 +3327,37 @@ impl fmt::Display for RuntimeConfig {
 
 #[cfg(test)]
 mod tests {
+    /// The configured virtual addresses (VRRP/HA VIPs) resolve to a set; an
+    /// older configuration without the key resolves to none.
+    #[test]
+    fn virtual_addresses_are_optional_and_must_be_unicast() {
+        let resolve = |text: &str| toml::from_str::<super::FileConfig>(text).unwrap().resolve();
+        assert!(resolve("").unwrap().virtual_addresses.is_empty());
+        let cfg = resolve("virtual_addresses = [\"10.2.0.100\", \"fd42:2::100\", \"10.2.0.100\"]")
+            .unwrap();
+        assert_eq!(
+            cfg.virtual_addresses,
+            std::collections::BTreeSet::from([
+                "10.2.0.100".parse().unwrap(),
+                "fd42:2::100".parse().unwrap()
+            ])
+        );
+        for bad in [
+            "224.0.0.18",
+            "127.0.0.1",
+            "0.0.0.0",
+            "ff02::12",
+            "::1",
+            "::",
+        ] {
+            let error = resolve(&format!("virtual_addresses = [\"{bad}\"]")).unwrap_err();
+            assert!(
+                error.to_string().contains("virtual address"),
+                "{bad} was accepted: {error:#}"
+            );
+        }
+    }
+
     #[test]
     fn prepared_ha_fences_without_an_enrolled_cluster_or_state_peer() {
         let mut cfg = super::RuntimeConfig::passthrough();

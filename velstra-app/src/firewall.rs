@@ -3720,9 +3720,10 @@ struct PreparedHostConfig {
     srv6: Srv6Config,
     route_ifindices: BTreeMap<String, u32>,
     ipv4: Ipv4Inventory,
-    /// Every address this host holds, both families, when the configuration
-    /// has a `dst-local` rule to resolve with it; empty otherwise, so a
-    /// configuration without one keeps its old refresh behaviour exactly.
+    /// Every address this host holds, both families, plus every configured
+    /// virtual address, when the configuration has a `dst-local` rule to
+    /// resolve with it; empty otherwise, so a configuration without one keeps
+    /// its old refresh behaviour exactly.
     local: BTreeSet<std::net::IpAddr>,
 }
 
@@ -3850,12 +3851,16 @@ fn prepare_host_config(cfg: &RuntimeConfig) -> Result<PreparedHostConfig> {
 /// every address the host holds.
 fn observe_host(cfg: &RuntimeConfig) -> Result<(Ipv4Inventory, BTreeSet<std::net::IpAddr>)> {
     let _timing = timing::Span::start(timing::Phase::HostObserver);
-    let links = crate::host_inventory::read()?;
-    let local = if crate::local_destination::has_local_rules(cfg) {
-        crate::local_destination::observed(&links)
-    } else {
-        BTreeSet::new()
-    };
+    host_view(cfg, crate::host_inventory::read()?)
+}
+
+/// What one host observation means for `cfg`: the IPv4 inventory and the
+/// local-destination set (observed addresses plus configured virtual ones).
+fn host_view(
+    cfg: &RuntimeConfig,
+    links: Vec<crate::host_inventory::Interface>,
+) -> Result<(Ipv4Inventory, BTreeSet<std::net::IpAddr>)> {
+    let local = crate::local_destination::local_set(cfg, &links);
     Ok((ipv4_inventory_from(links, &cfg.interfaces)?, local))
 }
 
@@ -6943,6 +6948,63 @@ mod tests {
         // Unchanged local sets keep the shortcut available.
         observed.local = previous.local.clone();
         assert!(local_address_additions(&previous, &observed).is_some());
+    }
+
+    /// A takeover adds a configured VIP to a link. With the VIP configured as
+    /// a virtual address the local-destination set is the same before and
+    /// after, so the refresh takes the additive shortcut (only
+    /// LOCAL_EGRESS_ADDRS grows) and never closes the configuration gate.
+    /// An address the configuration does not name still takes the rewrite.
+    #[test]
+    fn a_takeover_of_a_configured_virtual_address_takes_the_additive_path() {
+        let config = |vips: &[&str]| {
+            serde_json::from_value::<velstra_config::FileConfig>(serde_json::json!({
+                "default_action": "drop",
+                "virtual_addresses": vips,
+                "policy": [{"id": 1, "name": "lan", "port_rule": [
+                    {"name": "ssh", "proto": "tcp", "port": 22, "action": "pass", "dst-local": true}
+                ]}],
+                "interface": [{"name": "lan0", "policy": 1}]
+            }))
+            .unwrap()
+            .resolve()
+            .unwrap()
+        };
+        let link = |v4: &[[u8; 4]]| crate::host_inventory::Interface {
+            name: "lan0".into(),
+            index: 9,
+            mac: None,
+            addresses: v4.iter().map(|a| (*a, [255, 255, 255, 0])).collect(),
+            addresses6: Vec::new(),
+        };
+        let prepared = |cfg: &RuntimeConfig, v4: &[[u8; 4]]| {
+            let (ipv4, local) = host_view(cfg, vec![link(v4)]).unwrap();
+            PreparedHostConfig {
+                overlay: OverlayConfig::DISABLED,
+                srv6: Srv6Config::DISABLED,
+                route_ifindices: BTreeMap::new(),
+                ipv4,
+                local,
+            }
+        };
+        let (own, vip) = ([192, 0, 2, 1], [192, 0, 2, 100]);
+        let configured = config(&["192.0.2.100"]);
+        assert_eq!(
+            local_address_additions(
+                &prepared(&configured, &[own]),
+                &prepared(&configured, &[own, vip])
+            ),
+            Some(BTreeSet::from([local_egress_address_key(9, vip)])),
+            "a configured VIP arriving closed the configuration gate"
+        );
+        let unnamed = config(&[]);
+        assert_eq!(
+            local_address_additions(
+                &prepared(&unnamed, &[own]),
+                &prepared(&unnamed, &[own, vip])
+            ),
+            None
+        );
     }
 
     #[test]

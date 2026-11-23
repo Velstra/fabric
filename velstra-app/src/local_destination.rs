@@ -53,6 +53,22 @@ pub(crate) fn observed(links: &[crate::host_inventory::Interface]) -> BTreeSet<I
     v4.chain(v6).collect()
 }
 
+/// The local-destination set the rule tries are written from: every address
+/// the host holds plus every configured virtual address, held or not (see
+/// [`RuntimeConfig::virtual_addresses`]). Empty without a local-destination
+/// rule, so a configuration that does not use the feature keeps none.
+pub(crate) fn local_set(
+    cfg: &RuntimeConfig,
+    links: &[crate::host_inventory::Interface],
+) -> BTreeSet<IpAddr> {
+    if !has_local_rules(cfg) {
+        return BTreeSet::new();
+    }
+    let mut local = observed(links);
+    local.extend(cfg.virtual_addresses.iter().copied());
+    local
+}
+
 /// One local-destination rule as one host-route rule per local address it
 /// applies to. A family-scoped rule takes only that family's addresses.
 fn expand(rule: &ResolvedRule, local: &BTreeSet<IpAddr>) -> Vec<ResolvedRule> {
@@ -257,6 +273,37 @@ action = "pass"
         let member = concrete(&local, &super::tests::local(&["10.92.0.2"]));
         assert!(matches!(member, Cow::Owned(_)));
         assert_eq!(before, fingerprint(&local).unwrap());
+    }
+
+    /// A configured virtual address is a local destination on every member,
+    /// held or not, so a takeover that adds it to a link does not change the
+    /// set the rule tries were written from.
+    #[test]
+    fn a_configured_virtual_address_is_local_whether_or_not_it_is_held() {
+        let mut config = cfg(LOCAL_SSH);
+        config.virtual_addresses = local(&["192.0.2.100", "2001:db8::100"]);
+        let standby = [link(&["192.0.2.1"])];
+        let owner = [link(&["192.0.2.1", "192.0.2.100"])];
+        let expected = local(&["192.0.2.1", "192.0.2.100", "2001:db8::100"]);
+        assert_eq!(local_set(&config, &standby), expected);
+        assert_eq!(local_set(&config, &owner), expected);
+        // Without a local-destination rule nothing is kept, as before.
+        let mut plain = cfg("default_action = \"pass\"");
+        plain.virtual_addresses = config.virtual_addresses.clone();
+        assert!(local_set(&plain, &owner).is_empty());
+    }
+
+    fn link(v4: &[&str]) -> crate::host_inventory::Interface {
+        crate::host_inventory::Interface {
+            name: "lan0".into(),
+            index: 9,
+            mac: None,
+            addresses: v4
+                .iter()
+                .map(|a| (a.parse::<Ipv4Addr>().unwrap().octets(), [255, 255, 255, 0]))
+                .collect(),
+            addresses6: Vec::new(),
+        }
     }
 
     #[test]
