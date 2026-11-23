@@ -2254,6 +2254,16 @@ impl Firewall {
         // current again. Never reopen that stale inventory after a failed
         // refresh, even when rewriting the old maps happened to succeed.
         let reopen_rollback = !host_refresh && prepared.ipv4 == previous_host.ipv4;
+        // Every closure is visible: while the gate is closed every attached
+        // link drops everything, the node's own control traffic included.
+        log::info!(
+            "configuration gate closed for a full rewrite ({})",
+            if host_refresh {
+                "host addresses changed"
+            } else {
+                "configuration changed"
+            }
+        );
         self.set_configuration_state(CONFIG_UPDATING)?;
         if reset {
             self.runtime_blocks.clear();
