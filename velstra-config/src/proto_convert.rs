@@ -385,6 +385,9 @@ pub fn file_config_to_proto(cfg: &FileConfig, version: u64) -> proto::NodeConfig
 /// out-of-range port numbers (clamped to `u16`), which protobuf cannot express.
 pub fn file_config_from_proto(cfg: &proto::NodeConfig) -> FileConfig {
     FileConfig {
+        // VRRP/HA virtual addresses are an appliance setting; the fabric
+        // controller assigns none.
+        virtual_addresses: Vec::new(),
         default_action: action_from_proto(cfg.default_action()),
         drop_icmp: cfg.drop_icmp,
         log: cfg.log,
