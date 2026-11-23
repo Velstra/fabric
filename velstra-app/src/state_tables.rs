@@ -19,10 +19,18 @@ pub const FW_ENTRIES_PER_CONNECTION: u32 = 6;
 /// `CONNTRACK` (NAT) entries one connection can hold: a DNAT binding has a
 /// forward and a reverse entry.
 pub const CT_ENTRIES_PER_CONNECTION: u32 = 2;
-/// `SYN_FLOWS` records one connection can hold: a proxied connection keeps its
-/// record — the sequence offset every one of its packets is translated by —
-/// for as long as it lives, and any connection may be a proxied one.
-pub const SYN_ENTRIES_PER_CONNECTION: u32 = 1;
+/// `SYN_FLOWS` records per connection. A proxied connection keeps its record —
+/// the sequence offset every one of its packets is translated by — for as
+/// long as it lives, and any connection may be a proxied one: that is one.
+/// The second is headroom for records of ended connections the agent's splice
+/// sweep has not removed yet. It removes one within three sweep rounds of the
+/// connection state ending, a round being at most two walks of a table and a
+/// walk at most `crate::reclaim::PASS_TICKS` one-second ticks: 30 s, or ten
+/// HA sync intervals if that is longer. So even with every connection slot
+/// in use, the LRU evicts no live record while proxied connections end at up
+/// to `connections / 30` per second (about 8,700/s on a box sized for 256k
+/// connections, 70,000/s at the 2M ceiling).
+pub const SYN_ENTRIES_PER_CONNECTION: u32 = 2;
 
 /// Kernel bytes per preallocated LRU element besides key and value
 /// (`struct htab_elem` with its LRU node and hash).
@@ -180,15 +188,17 @@ mod tests {
         assert_eq!(sizing.connections, 100_000);
         assert_eq!(sizing.fw_flows, 600_000);
         assert_eq!(sizing.conntrack, 200_000);
-        assert_eq!(sizing.syn_flows, 100_000);
+        assert_eq!(sizing.syn_flows, 200_000);
     }
 
     #[test]
     fn every_connection_can_be_a_proxied_one() {
         // A splice lives as long as its connection: sizing it for half of
         // them let the LRU evict live idle ones once the rest came and went.
+        // And the same again as headroom for ended connections the sweep
+        // has not yet removed (see SYN_ENTRIES_PER_CONNECTION).
         for connections in [1024, 50_000, MAX_DEFAULT_CONNECTIONS] {
-            assert!(Sizing::for_connections(connections).syn_flows >= connections);
+            assert!(Sizing::for_connections(connections).syn_flows >= 2 * connections);
         }
     }
 
