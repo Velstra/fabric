@@ -4027,9 +4027,21 @@ fn try_velstra_v4_state(ctx: &XdpContext, s: &V4StateScratch) -> Result<u32, ()>
     // A cookie-protected ACK is authenticated downstream by the SYN proxy.
     // Requiring a SYN-ACK in FW_FLOWS here would drop it before verification:
     // the proxy answered that SYN with XDP_TX, outside the ordinary hooks.
-    let cookie_ack = proto == ip_proto::TCP
-        && control & tcp_flags::ACK != 0
-        && synproxy_cfg(policy_id, dst_port).is_some();
+    let proxied = proto == ip_proto::TCP && synproxy_cfg(policy_id, dst_port).is_some();
+    let cookie_ack = proxied && control & tcp_flags::ACK != 0;
+    // A bare SYN the forwarding tail answers with a cookie (the conditions of
+    // `try_synproxy`) never reaches the server and opens nothing: its state is
+    // written at cookie-ACK admission (`ct_cookie_admitted`). Recording it
+    // here let a SYN flood — the attack the proxy exists for — fill FW_FLOWS
+    // with one NEW pair per spoofed tuple, evicting idle protected
+    // connections' state, and with it (through the agent's splice sweep)
+    // their splices.
+    let cookie_syn = proxied
+        && control & (tcp_flags::SYN | tcp_flags::ACK | tcp_flags::RST | tcp_flags::FIN)
+            == tcp_flags::SYN
+        && ihl_bytes == Ipv4Hdr::LEN
+        && !link_layer::raw_ip(ifindex)
+        && syn_secret().is_some();
     let ct = if stateful && !cookie_ack {
         ct_classify(&fwkey, control)
     } else {
@@ -4106,6 +4118,7 @@ fn try_velstra_v4_state(ctx: &XdpContext, s: &V4StateScratch) -> Result<u32, ()>
     let (action, fw_counter) = if action == Action::Pass
         && !local_dhcp
         && stateful
+        && !cookie_syn
         && (!(proto == ip_proto::ICMP && icmp_related::error_probe(icmp_type))
             && ct_record(&fwkey, control).failed()
             || fwkey.policy == ROUTER_NAT_POLICY
