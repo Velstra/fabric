@@ -471,15 +471,11 @@ fn syn_secret() -> Option<[u64; 2]> {
 /// are — the two directions arrive through different zones.
 #[inline(always)]
 fn syn_flow_key(client: [u8; 4], client_port: u16, service_port: u16) -> FlowKey {
-    FlowKey::new(
-        ROUTER_NAT_POLICY,
-        client,
-        [0; 4],
-        client_port,
-        service_port,
-        ip_proto::TCP,
-    )
+    velstra_common::splice_key(client, client_port, service_port)
 }
+
+// The agent's splice sweep names splices by the same function and namespace.
+const _: () = assert!(ROUTER_NAT_POLICY == velstra_common::SPLICE_POLICY);
 
 /// Look a flow up in `CONNTRACK` and, on a hit, **account this packet to it**.
 ///

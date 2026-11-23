@@ -140,9 +140,10 @@ pub use srv6::{
 };
 pub use state_publication::{StatePublication, publish_state_pair};
 pub use synproxy::{
-    EPOCH_SHIFT, MSS_TABLE, SYNTH_WINDOW, SynFlow, SynProxyCfg, SynProxyKey, TcpSynth,
-    check_cookie, csum_replace_u32, epoch_of, make_cookie, mss_index, plan_server_ack,
-    plan_server_syn, plan_syn_ack, seq_delta, translate_to_client, translate_to_server,
+    EPOCH_SHIFT, MSS_TABLE, SPLICE_POLICY, SYNTH_WINDOW, SynFlow, SynProxyCfg, SynProxyKey,
+    TcpSynth, check_cookie, csum_replace_u32, epoch_of, firewall_claim, make_cookie, mss_index,
+    nat_claim, plan_server_ack, plan_server_syn, plan_syn_ack, seq_delta, splice_key,
+    translate_to_client, translate_to_server,
 };
 pub use tcp_key::TcpSessionKey;
 pub use tcp_packet::{TcpChecksumState, TcpPacket, TcpPacketError, parse_tcp_packet};
