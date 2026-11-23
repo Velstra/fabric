@@ -20,6 +20,7 @@
 //! no timestamp, so it is counted but left to its LRU.
 
 use std::{
+    collections::{HashMap as StdHashMap, HashSet},
     io,
     os::fd::{AsFd, AsRawFd},
     sync::{Arc, OnceLock},
@@ -179,32 +180,77 @@ impl Table {
     /// Walk up to `slice` entries from where the last call stopped, deleting
     /// expired ones. Returns the number deleted.
     pub fn step(&mut self, timeouts: ConntrackTimeouts, slice: usize) -> Result<usize> {
+        Ok(self.step_claiming(timeouts, slice, None)?.deleted)
+    }
+
+    /// [`Self::step`], also adding to `claims` the splice every live entry of
+    /// a firewall or NAT walk claims (see [`SpliceSweep`]).
+    fn step_claiming(
+        &mut self,
+        timeouts: ConntrackTimeouts,
+        slice: usize,
+        mut claims: Option<&mut HashSet<FlowKey>>,
+    ) -> Result<Stepped> {
+        let began = self.cursor.is_none();
         let mut examined = 0;
         let mut reclaimed = 0;
+        let mut completed = false;
         while examined < slice {
             let (seen, deleted, done) = match &mut self.contents {
                 Contents::Firewall(map) => walk_batch(
                     map,
                     &mut self.cursor,
                     |k: &FirewallKey, v: &FirewallState, now| v.expired(k.proto, now, timeouts),
+                    |k, v, expired| {
+                        if let (false, Some(claims), Some(splice)) = (
+                            expired,
+                            claims.as_deref_mut(),
+                            velstra_common::firewall_claim(k, v),
+                        ) {
+                            claims.insert(splice);
+                        }
+                    },
                 )?,
-                Contents::Nat(map) => {
-                    walk_batch(map, &mut self.cursor, |k: &FlowKey, v: &FlowState, now| {
-                        v.expired(k.proto, now, timeouts)
-                    })?
-                }
-                Contents::Syn(map) => walk_batch(map, &mut self.cursor, |_, _: &SynFlow, _| false)?,
+                Contents::Nat(map) => walk_batch(
+                    map,
+                    &mut self.cursor,
+                    |k: &FlowKey, v: &FlowState, now| v.expired(k.proto, now, timeouts),
+                    |k, v, expired| {
+                        if let (false, Some(claims), Some(splice)) = (
+                            expired,
+                            claims.as_deref_mut(),
+                            velstra_common::nat_claim(k, v),
+                        ) {
+                            claims.insert(splice);
+                        }
+                    },
+                )?,
+                Contents::Syn(map) => walk_batch(
+                    map,
+                    &mut self.cursor,
+                    |_, _: &SynFlow, _| false,
+                    |_, _, _| {},
+                )?,
             };
             examined += seen;
             reclaimed += deleted;
             self.counted += seen as u64;
             if done {
                 self.finish_pass();
+                completed = true;
                 break;
             }
         }
         self.observation.reclaimed_expired += reclaimed as u64;
-        Ok(reclaimed)
+        Ok(Stepped {
+            deleted: reclaimed,
+            began,
+            completed,
+        })
+    }
+
+    fn claims_splices(&self) -> bool {
+        matches!(self.contents, Contents::Firewall(_) | Contents::Nat(_))
     }
 
     fn finish_pass(&mut self) {
@@ -242,15 +288,29 @@ impl Table {
     }
 }
 
+/// What one [`Table::step_claiming`] did.
+struct Stepped {
+    deleted: usize,
+    /// The step started a new walk of the table.
+    began: bool,
+    /// The step finished a walk.
+    completed: bool,
+}
+
 /// Read one batch from `cursor`, delete the expired entries in it, and move the
-/// cursor on. Returns `(entries seen, entries deleted, walk complete)`.
+/// cursor on; `each` sees every entry read with its expiry verdict. Returns
+/// `(entries seen, entries deleted, walk complete)`.
 fn walk_batch<K: Pod, V: Pod>(
     map: &mut Handle<K, V>,
     cursor: &mut Option<u32>,
     expired: impl Fn(&K, &V, u64) -> bool,
+    mut each: impl FnMut(&K, &V, bool),
 ) -> Result<(usize, usize, bool)> {
     let batch = lookup_batch::<K, V>(&map.raw, *cursor, BATCH)?;
     let now = monotonic_ns()?;
+    for (k, v) in &batch.entries {
+        each(k, v, expired(k, v, now));
+    }
     let candidates: Vec<K> = batch
         .entries
         .iter()
@@ -366,15 +426,163 @@ fn monotonic_ns() -> Result<u64> {
     Ok(value.tv_sec as u64 * 1_000_000_000 + value.tv_nsec as u64)
 }
 
-/// The collector's whole state: every table it walks.
+/// How far one claiming table is into the current sweep round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Round {
+    /// Its walk under way began before the round: its claims do not cover
+    /// the whole table for this round.
+    Waiting,
+    /// A walk that began inside the round is under way.
+    Walking,
+    /// A walk that began inside the round has finished.
+    Covered,
+}
+
+impl Round {
+    fn advance(self, stepped: &Stepped) -> Self {
+        let walking = match self {
+            Self::Waiting if stepped.began => Self::Walking,
+            other => other,
+        };
+        if walking == Self::Walking && stepped.completed {
+            Self::Covered
+        } else {
+            walking
+        }
+    }
+}
+
+/// Ends the SYN-proxy splices no live connection claims any more.
+///
+/// `SYN_FLOWS` holds no timestamp and the data plane never removes a splice,
+/// so the map used to be left to its LRU — which, once as many proxied
+/// connections had come and gone as it holds, evicted the least recently used
+/// record: an idle live connection, which then died silently.
+///
+/// A live proxied connection always has live connection state: its firewall
+/// entries, and for a translated one its destination-NAT binding. While the
+/// reclaim walk passes over FW_FLOWS and CONNTRACK it collects the splice key
+/// every live entry claims ([`velstra_common::firewall_claim`],
+/// [`velstra_common::nat_claim`], the latter mapping a port-forward's or load
+/// balancer's public port to the inside one). A round ends once both tables
+/// have been walked completely since it began; every splice no claim names is
+/// then a suspect, and a suspect still unclaimed, with the same value, at the
+/// end of the next round is removed after one more read of its current value.
+/// The extra round is the grace for a handshake in flight, whose splice the
+/// data plane writes an instant before its connection state, and for a
+/// client that reused the tuple meanwhile (its record has a new value).
+///
+/// Only removal from evidence of absence: a forged packet can at most keep a
+/// dead splice claimed. Removal is local. On an HA owner, the next snapshot
+/// omits the splice and its standbys delete it through the existing
+/// SYN-proxy DELETE; a standby exports nothing (the ours/authoritative gate of
+/// conntrack sync), so its own sweep never deletes the owner's records.
+struct SpliceSweep {
+    splices: Handle<FlowKey, SynFlow>,
+    claims: HashSet<FlowKey>,
+    suspects: StdHashMap<FlowKey, SynFlow>,
+    firewall: Round,
+    nat: Round,
+    ended: u64,
+}
+
+impl SpliceSweep {
+    fn new(splices: MapData) -> Result<Self> {
+        Ok(Self {
+            splices: Handle::open(splices)?,
+            claims: HashSet::new(),
+            suspects: StdHashMap::new(),
+            firewall: Round::Waiting,
+            nat: Round::Waiting,
+            ended: 0,
+        })
+    }
+
+    /// The round is complete: judge every splice. Returns how many ended.
+    fn end_round(&mut self) -> Result<usize> {
+        let claims = std::mem::take(&mut self.claims);
+        let mut suspects = StdHashMap::new();
+        let mut removed = 0;
+        let mut cursor = None;
+        loop {
+            let batch = lookup_batch::<FlowKey, SynFlow>(&self.splices.raw, cursor, BATCH)?;
+            for (key, value) in batch.entries {
+                match judge(&claims, &self.suspects, &key, &value) {
+                    Judgement::Claimed => {}
+                    Judgement::Ended
+                        // Re-read at the last moment: a client that reused
+                        // the tuple since has a new record, not a suspect.
+                        if self.splices.typed.get(&key, 0).is_ok_and(|now| now == value)
+                            && self.splices.typed.remove(&key).is_ok() =>
+                    {
+                        removed += 1;
+                    }
+                    Judgement::Ended | Judgement::Suspect => {
+                        suspects.insert(key, value);
+                    }
+                }
+            }
+            cursor = batch.next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        self.suspects = suspects;
+        self.firewall = Round::Waiting;
+        self.nat = Round::Waiting;
+        self.ended += removed as u64;
+        Ok(removed)
+    }
+}
+
+/// What a sweep round makes of one splice.
+#[derive(Debug, PartialEq, Eq)]
+enum Judgement {
+    /// A live connection claims it.
+    Claimed,
+    /// Unclaimed for the first time, or changed since it was last unclaimed.
+    Suspect,
+    /// Unclaimed for two rounds running with the same value: its connection
+    /// is over.
+    Ended,
+}
+
+fn judge(
+    claims: &HashSet<FlowKey>,
+    suspects: &StdHashMap<FlowKey, SynFlow>,
+    key: &FlowKey,
+    value: &SynFlow,
+) -> Judgement {
+    if claims.contains(key) {
+        Judgement::Claimed
+    } else if suspects.get(key) == Some(value) {
+        Judgement::Ended
+    } else {
+        Judgement::Suspect
+    }
+}
+
+/// The collector's whole state: every table it walks, and the splice sweep
+/// the firewall and NAT walks drive.
 pub struct Reclaimer {
     tables: Vec<Table>,
+    sweep: Option<SpliceSweep>,
 }
 
 impl Reclaimer {
     pub fn new(tables: Vec<Table>) -> Self {
         publish(&tables);
-        Self { tables }
+        Self {
+            tables,
+            sweep: None,
+        }
+    }
+
+    /// Also end the splices in `splices` (SYN_FLOWS) no live connection
+    /// claims (see [`SpliceSweep`]).
+    pub fn with_splice_sweep(mut self, splices: MapData) -> Result<Self> {
+        self.sweep = Some(SpliceSweep::new(splices)?);
+        Ok(self)
     }
 
     /// One tick: a bounded slice of every table. Errors are recorded per table
@@ -382,16 +590,45 @@ impl Reclaimer {
     pub fn tick(&mut self, timeouts: ConntrackTimeouts, slice: usize) -> usize {
         let mut reclaimed = 0;
         for table in &mut self.tables {
-            match table.step(timeouts, slice) {
-                Ok(n) => reclaimed += n,
+            let claims = match (&mut self.sweep, table.claims_splices()) {
+                (Some(sweep), true) => Some(&mut sweep.claims),
+                _ => None,
+            };
+            match table.step_claiming(timeouts, slice, claims) {
+                Ok(stepped) => {
+                    reclaimed += stepped.deleted;
+                    if let Some(sweep) = &mut self.sweep {
+                        match table.contents {
+                            Contents::Firewall(_) => {
+                                sweep.firewall = sweep.firewall.advance(&stepped)
+                            }
+                            Contents::Nat(_) => sweep.nat = sweep.nat.advance(&stepped),
+                            Contents::Syn(_) => {}
+                        }
+                    }
+                }
                 Err(error) => {
                     warn!(
                         "reclaiming expired {} entries failed: {error:#}",
                         table.observation.name
                     );
                     table.fail(&error);
+                    // A walk that failed covers nothing: start the round over.
+                    if let Some(sweep) = &mut self.sweep {
+                        sweep.firewall = Round::Waiting;
+                        sweep.nat = Round::Waiting;
+                    }
                 }
             }
+        }
+        if let Some(sweep) = &mut self.sweep
+            && sweep.firewall == Round::Covered
+            && sweep.nat == Round::Covered
+            && let Err(error) = sweep.end_round()
+        {
+            warn!("ending unclaimed SYN-proxy splices failed: {error:#}");
+            sweep.firewall = Round::Waiting;
+            sweep.nat = Round::Waiting;
         }
         publish(&self.tables);
         reclaimed
@@ -461,7 +698,15 @@ pub async fn run(firewall: Arc<Mutex<Firewall>>) {
             }
         }
     };
-    let mut reclaimer = Reclaimer::new(tables);
+    let reclaimer = Reclaimer::new(tables);
+    let splices = firewall.lock().await.state_map("SYN_FLOWS");
+    let mut reclaimer = match splices.and_then(|map| reclaimer.with_splice_sweep(map)) {
+        Ok(reclaimer) => reclaimer,
+        Err(e) => {
+            warn!("SYN-proxy splice sweep disabled: {e:#}");
+            return;
+        }
+    };
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -485,6 +730,73 @@ pub async fn run(firewall: Arc<Mutex<Firewall>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn splice(port: u16) -> FlowKey {
+        velstra_common::splice_key([198, 51, 100, 7], port, 443)
+    }
+
+    #[test]
+    fn a_claimed_splice_is_never_a_suspect() {
+        let claims = HashSet::from([splice(1)]);
+        let suspects = StdHashMap::from([(splice(1), SynFlow::pending(1, 2))]);
+        let verdict = judge(&claims, &suspects, &splice(1), &SynFlow::pending(1, 2));
+        assert_eq!(verdict, Judgement::Claimed);
+    }
+
+    #[test]
+    fn a_splice_ends_only_when_unclaimed_and_unchanged_for_two_rounds() {
+        let none = HashSet::new();
+        let value = SynFlow::pending(1, 2);
+        assert_eq!(
+            judge(&none, &StdHashMap::new(), &splice(1), &value),
+            Judgement::Suspect
+        );
+        let suspects = StdHashMap::from([(splice(1), value)]);
+        assert_eq!(
+            judge(&none, &suspects, &splice(1), &value),
+            Judgement::Ended
+        );
+        // Replaced since (a client reused the tuple): a fresh suspect again.
+        let replaced = SynFlow::pending(3, 4);
+        assert_eq!(
+            judge(&none, &suspects, &splice(1), &replaced),
+            Judgement::Suspect
+        );
+        // Another connection's splice is judged on its own.
+        assert_eq!(
+            judge(&none, &suspects, &splice(2), &value),
+            Judgement::Suspect
+        );
+    }
+
+    fn stepped(began: bool, completed: bool) -> Stepped {
+        Stepped {
+            deleted: 0,
+            began,
+            completed,
+        }
+    }
+
+    #[test]
+    fn a_round_counts_only_a_walk_that_began_inside_it() {
+        // A walk already under way when the round began does not cover the
+        // table for it, even when it finishes: its first part was claimed
+        // before the round's claims started.
+        let round = Round::Waiting.advance(&stepped(false, true));
+        assert_eq!(round, Round::Waiting);
+        // The next walk begins inside the round and covers it when done.
+        let round = round.advance(&stepped(true, false));
+        assert_eq!(round, Round::Walking);
+        assert_eq!(round.advance(&stepped(false, false)), Round::Walking);
+        assert_eq!(round.advance(&stepped(false, true)), Round::Covered);
+        // A small table begun and finished in one step covers it at once.
+        assert_eq!(Round::Waiting.advance(&stepped(true, true)), Round::Covered);
+        // Covered stays covered until the round ends.
+        assert_eq!(
+            Round::Covered.advance(&stepped(true, false)),
+            Round::Covered
+        );
+    }
 
     #[test]
     fn staleness_is_unknown_before_the_first_pass_and_after_the_bound() {
