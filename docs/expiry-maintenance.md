@@ -25,10 +25,13 @@ for two complete rounds of both tables, and for at least 2 s (or ten
 conntrack-sync intervals), is removed. A proxied connection therefore lives
 exactly as long as its connection state. The sweep runs only while some port
 is SYN-proxied and only on a node that owns its state (always without leased
-HA, otherwise the lease owner), and it never judges a record conntrack sync
-holds as imported from a peer. Removals are counted as the `SYN_FLOWS` table's
-`reclaimed_expired`. At the largest table sizes a round costs roughly a second
-of CPU and a few hundred MB of transient memory every ten seconds.
+HA, otherwise the lease owner). Without leased HA it never judges a record
+conntrack sync holds as imported from a peer; a leased owner owns everything
+it holds and judges all of it. Removals are counted as the `SYN_FLOWS` table's
+`reclaimed_expired`. A round reads all of `SYN_FLOWS` once (about 36 bytes of
+transient memory per record, some 150 MB at the 2M-connection ceiling) and
+walks `FW_FLOWS` and `CONNTRACK` in five ticks each; its CPU cost at the
+largest sizes has not been measured.
 
 ## On demand
 

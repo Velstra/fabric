@@ -28,8 +28,8 @@ pub const CT_ENTRIES_PER_CONNECTION: u32 = 2;
 /// than the grace (`crate::reclaim`: 2 s, or ten HA sync intervals): at most
 /// about three rounds plus the grace, a round being two walks of
 /// `crate::reclaim::PASS_TICKS` ticks, so some 30 s while ticks keep their
-/// one-second pace (at the 2M-connection ceiling a tick's larger walk itself
-/// takes a good part of a second, which stretches this). With every
+/// one-second pace (a tick whose larger walk outlasts that pace, which has not
+/// been measured at the 2M-connection ceiling, stretches this). With every
 /// connection slot in use the LRU then evicts no live record while proxied
 /// connections end at up to about `connections / 30` per second (8,700/s at
 /// 256k connections).
