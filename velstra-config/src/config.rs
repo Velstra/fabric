@@ -2495,11 +2495,16 @@ impl FileConfig {
             if let Some(stateless) = policies.iter().find(|p| {
                 sp.policy.is_none_or(|id| id == p.id) && !p.global.has_flag(ConfigFlags::STATEFUL)
             }) {
+                let which = if stateless.id == 0 {
+                    "the top-level policy (0)".to_string()
+                } else {
+                    format!("policy {}", stateless.id)
+                };
                 bail!(
-                    "synproxy port {} covers policy {}, which is not stateful: a SYN-proxied \
-                     connection lives only as long as its connection state",
-                    sp.port,
-                    stateless.id
+                    "synproxy port {} covers {which}, which is not stateful: a SYN-proxied \
+                     connection lives only as long as its connection state (set `stateful = \
+                     true` there, or scope the port to stateful policies with `policy`)",
+                    sp.port
                 );
             }
             synproxy.push(ResolvedSynProxy {
@@ -3591,7 +3596,10 @@ mod tests {
         // The default policy is stateless unless the file says otherwise.
         let base = "[[policy]]\nid = 7\nstateful = true\n[[policy]]\nid = 8\nstateful = true\n";
         let err = synproxy_with("[[synproxy]]\nport = 443\n", base).expect_err("policy 0");
-        assert!(format!("{err:#}").contains("policy 0"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("top-level policy (0)"),
+            "{err:#}"
+        );
     }
 
     #[test]

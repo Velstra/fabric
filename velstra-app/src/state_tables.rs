@@ -23,13 +23,16 @@ pub const CT_ENTRIES_PER_CONNECTION: u32 = 2;
 /// the sequence offset every one of its packets is translated by — for as
 /// long as it lives, and any connection may be a proxied one: that is one.
 /// The second is headroom for records of ended connections the agent's splice
-/// sweep has not removed yet. It removes one within three sweep rounds of the
-/// connection state ending, a round being at most two walks of a table and a
-/// walk at most `crate::reclaim::PASS_TICKS` one-second ticks: 30 s, or ten
-/// HA sync intervals if that is longer. So even with every connection slot
-/// in use, the LRU evicts no live record while proxied connections end at up
-/// to `connections / 30` per second (about 8,700/s on a box sized for 256k
-/// connections, 70,000/s at the 2M ceiling).
+/// sweep has not removed yet. After the last claim on a record lapses it is
+/// removed at the end of the second complete round after that, and no sooner
+/// than the grace (`crate::reclaim`: 2 s, or ten HA sync intervals): at most
+/// about three rounds plus the grace, a round being two walks of
+/// `crate::reclaim::PASS_TICKS` ticks, so some 30 s while ticks keep their
+/// one-second pace (at the 2M-connection ceiling a tick's larger walk itself
+/// takes a good part of a second, which stretches this). With every
+/// connection slot in use the LRU then evicts no live record while proxied
+/// connections end at up to about `connections / 30` per second (8,700/s at
+/// 256k connections).
 pub const SYN_ENTRIES_PER_CONNECTION: u32 = 2;
 
 /// Kernel bytes per preallocated LRU element besides key and value

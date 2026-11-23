@@ -38,7 +38,7 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 use velstra_common::{ConntrackTimeouts, FirewallKey, FirewallState, FlowKey, FlowState, SynFlow};
 
-use crate::{firewall::Firewall, state_tables};
+use crate::{conntrack_sync::secure::ImportedSplices, firewall::Firewall, state_tables};
 
 /// How often the collector runs.
 const TICK: Duration = Duration::from_secs(1);
@@ -58,7 +58,8 @@ pub struct TableObservation {
     /// Entries seen in the last complete walk, expired ones included until
     /// they are reclaimed. `None` until one walk has completed.
     pub observed_entries: Option<u64>,
-    /// Expired entries deleted since the agent started.
+    /// Entries deleted since the agent started: expired ones, and for
+    /// SYN_FLOWS the splices the splice sweep ended.
     pub reclaimed_expired: u64,
     /// Complete walks since the agent started.
     pub passes: u64,
@@ -242,8 +243,12 @@ impl Table {
         })
     }
 
-    fn claims_splices(&self) -> bool {
-        matches!(self.contents, Contents::Firewall(_) | Contents::Nat(_))
+    fn kind(&self) -> Kind {
+        match self.contents {
+            Contents::Firewall(_) => Kind::Firewall,
+            Contents::Nat(_) => Kind::Nat,
+            Contents::Syn(_) => Kind::Syn,
+        }
     }
 
     fn finish_pass(&mut self) {
@@ -420,10 +425,11 @@ fn monotonic_ns() -> Result<u64> {
 }
 
 /// How far one claiming table is into the current sweep round.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Round {
     /// Its walk under way began before the round: its claims do not cover
     /// the whole table for this round.
+    #[default]
     Waiting,
     /// A walk that began inside the round is under way.
     Walking,
@@ -445,19 +451,51 @@ impl Round {
     }
 }
 
-/// A walk of any table takes at most this many ticks: the per-tick slice
-/// grows with the table (see [`Reclaimer::tick`]). A sweep round needs a walk
-/// of FW_FLOWS and of CONNTRACK that began inside it, so it lasts at most
-/// twice this many seconds however large the box is sized
+/// Which map a [`Table`] walks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Firewall,
+    Nat,
+    Syn,
+}
+
+impl Kind {
+    /// Whether this table's live entries claim splices.
+    fn claims(self) -> bool {
+        matches!(self, Self::Firewall | Self::Nat)
+    }
+}
+
+/// While the sweep runs, a walk of a claiming table takes at most this many
+/// ticks: the per-tick slice grows with the table ([`table_slice`]). A sweep
+/// round needs a walk of FW_FLOWS and of CONNTRACK that began inside it, so it
+/// lasts at most twice this many ticks however large the box is sized
 /// (`state_tables::SYN_ENTRIES_PER_CONNECTION` depends on it).
 pub const PASS_TICKS: usize = 5;
+
+/// The entries one tick walks in a table: the base `slice`, and while the
+/// sweep runs enough of a claiming table that its walk takes at most
+/// [`PASS_TICKS`] ticks. Plain expiry is content with the base slice.
+fn table_slice(base: usize, kind: Kind, max_entries: u32, sweeping: bool) -> usize {
+    if sweeping && kind.claims() {
+        base.max((max_entries as usize).div_ceil(PASS_TICKS))
+    } else {
+        base
+    }
+}
+
+/// The index of the SYN_FLOWS table, whose observation counts the splices
+/// the sweep ends.
+fn syn_table(kinds: impl IntoIterator<Item = Kind>) -> Option<usize> {
+    kinds.into_iter().position(|kind| kind == Kind::Syn)
+}
 
 /// The shortest time a splice stays unclaimed before the sweep ends it, on
 /// top of its two rounds.
 const MIN_GRACE: Duration = Duration::from_secs(2);
 
-/// What the agent's configuration and HA role say about sweeping, read each
-/// tick.
+/// What the agent's configuration, HA role and conntrack sync say about
+/// sweeping, read each tick.
 pub struct SweepInputs {
     /// The ports servers of proxied connections use (a splice's key names
     /// one); empty when no port is SYN-proxied, and the sweep is then off.
@@ -465,17 +503,22 @@ pub struct SweepInputs {
     /// Whether this node owns its connection state
     /// ([`crate::ha::State::owns_state`]).
     pub owns: bool,
+    /// The splices conntrack sync holds as imported from a peer, which the
+    /// sweep leaves alone; `None` on a leased HA owner, which owns everything
+    /// it holds ([`crate::ha::State::leased`]).
+    pub held: Option<ImportedSplices>,
     /// The HA conntrack-sync push interval, when this node is in a pair.
     pub sync_interval: Option<Duration>,
 }
 
 impl SweepInputs {
-    fn active(&self) -> bool {
-        self.owns && !self.ports.is_empty()
+    /// Whether the sweep runs this tick: a sweep exists, this node owns its
+    /// state, and some port is SYN-proxied.
+    fn sweeping(&self, has_sweep: bool) -> bool {
+        has_sweep && self.owns && !self.ports.is_empty()
     }
 
-    /// How long a splice must have been unclaimed: a peer's splice and the
-    /// state that claims it can arrive several pushes apart.
+    /// How long a splice must have been unclaimed.
     fn grace(&self) -> Duration {
         self.sync_interval
             .map_or(MIN_GRACE, |interval| MIN_GRACE.max(interval * 10))
@@ -502,14 +545,16 @@ impl SweepInputs {
 /// the next round and at least [`SweepInputs::grace`] after it was first
 /// unclaimed is removed after one more read of its current value. The extra
 /// round and the grace cover a handshake in flight (its splice is written an
-/// instant before its connection state), a client that reused the tuple
-/// meanwhile (its record has a new value), and state that arrives from an HA
-/// peer a few pushes after the splice it claims.
+/// instant before its connection state) and a client that reused the tuple
+/// meanwhile (its record has a new value).
 ///
 /// Only removal from evidence of absence: a forged packet can at most keep a
-/// dead splice claimed. Only a node that owns its state sweeps: an HA standby
-/// keeps every imported splice and receives the owner's removals as
-/// conntrack-sync deletions (it exports nothing itself).
+/// dead splice claimed. Only a node that owns its state sweeps — an HA
+/// standby on a lease keeps every imported splice and receives the owner's
+/// removals as conntrack-sync deletions — and without a lease (pairs that
+/// fail over by VRRP alone, where the agent cannot tell which member is
+/// active) a node never judges a splice conntrack sync holds as imported: a
+/// peer's splice can arrive a dump before the state that claims it.
 struct SpliceSweep {
     splices: Handle<FlowKey, SynFlow>,
     state: SweepState,
@@ -522,37 +567,47 @@ struct SweepState {
     /// Splices no claim named at the end of the last round: the value they
     /// had and when they were first found unclaimed.
     suspects: StdHashMap<FlowKey, (SynFlow, Instant)>,
-    firewall: RoundSlot,
-    nat: RoundSlot,
-}
-
-/// [`Round`] with a default for [`SweepState`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RoundSlot(Round);
-
-impl Default for RoundSlot {
-    fn default() -> Self {
-        Self(Round::Waiting)
-    }
+    firewall: Round,
+    nat: Round,
 }
 
 impl SweepState {
-    /// Forget everything: the sweep is off, or a walk failed. The next round
-    /// starts from scratch, so nothing judged before counts afterwards.
+    /// Forget everything: the next round starts from scratch, so nothing
+    /// judged before counts afterwards.
     fn reset(&mut self) {
         *self = Self::default();
     }
 
-    fn covered(&self) -> bool {
-        self.firewall.0 == Round::Covered && self.nat.0 == Round::Covered
+    /// The start of a tick: a sweep that does not run this tick forgets its
+    /// rounds, so a node that starts owning its state again waits two full
+    /// rounds before it ends anything.
+    fn begin_tick(&mut self, sweeping: bool) {
+        if !sweeping {
+            self.reset();
+        }
+    }
+
+    /// Account one table's step to the round.
+    fn stepped(&mut self, kind: Kind, stepped: &Stepped) {
+        match kind {
+            Kind::Firewall => self.firewall = self.firewall.advance(stepped),
+            Kind::Nat => self.nat = self.nat.advance(stepped),
+            Kind::Syn => {}
+        }
+    }
+
+    /// Whether the round is complete and may be judged this tick.
+    fn round_complete(&self, sweeping: bool) -> bool {
+        sweeping && self.firewall == Round::Covered && self.nat == Round::Covered
     }
 
     /// Judge every splice of a complete round: returns the ended ones (to be
     /// removed after a last read) and keeps the rest of the unclaimed as
-    /// suspects.
+    /// suspects. A splice in `held` is never judged.
     fn judge_round(
         &mut self,
         splices: impl IntoIterator<Item = (FlowKey, SynFlow)>,
+        held: &HashSet<FlowKey>,
         now: Instant,
         grace: Duration,
     ) -> Vec<(FlowKey, SynFlow)> {
@@ -560,6 +615,9 @@ impl SweepState {
         let mut suspects = StdHashMap::new();
         let mut ended = Vec::new();
         for (key, value) in splices {
+            if held.contains(&key) {
+                continue;
+            }
             match judge(&claims, &self.suspects, &key, &value, now, grace) {
                 Judgement::Claimed => {}
                 Judgement::Ended => ended.push((key, value)),
@@ -569,8 +627,8 @@ impl SweepState {
             }
         }
         self.suspects = suspects;
-        self.firewall = RoundSlot::default();
-        self.nat = RoundSlot::default();
+        self.firewall = Round::Waiting;
+        self.nat = Round::Waiting;
         ended
     }
 }
@@ -614,7 +672,7 @@ fn judge(
 impl SpliceSweep {
     /// The round is complete: judge every splice and remove the ended ones.
     /// Returns how many were removed.
-    fn end_round(&mut self, grace: Duration) -> Result<usize> {
+    fn end_round(&mut self, held: Option<&ImportedSplices>, grace: Duration) -> Result<usize> {
         let mut splices = Vec::new();
         let mut cursor = None;
         loop {
@@ -625,8 +683,14 @@ impl SpliceSweep {
                 break;
             }
         }
+        let held = held
+            .map(|set| set.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            .unwrap_or_default();
         let mut removed = 0;
-        for (key, value) in self.state.judge_round(splices, Instant::now(), grace) {
+        for (key, value) in self
+            .state
+            .judge_round(splices, &held, Instant::now(), grace)
+        {
             // Re-read at the last moment: a client that reused the tuple
             // since has a new record, which is not ended.
             if self
@@ -688,32 +752,26 @@ impl Reclaimer {
         Ok(())
     }
 
-    /// One tick: a bounded slice of every table — `slice` entries, and while
-    /// the splice sweep runs enough that no firewall or NAT walk takes more
-    /// than [`PASS_TICKS`] ticks. Errors
-    /// are recorded per table and never stop the others, and never touch the
-    /// datapath gate.
+    /// One tick: a bounded slice of every table ([`table_slice`]), feeding
+    /// the splice sweep while it runs. Errors are recorded per table and
+    /// never stop the others, and never touch the datapath gate. The policy
+    /// lives in the helpers this calls, which are tested on their own.
     pub fn tick(
         &mut self,
         timeouts: ConntrackTimeouts,
         slice: usize,
         inputs: &SweepInputs,
     ) -> usize {
-        let active = inputs.active();
-        if !active && let Some(sweep) = &mut self.sweep {
-            sweep.state.reset();
+        let sweeping = inputs.sweeping(self.sweep.is_some());
+        if let Some(sweep) = &mut self.sweep {
+            sweep.state.begin_tick(sweeping);
         }
         let mut reclaimed = 0;
         for table in &mut self.tables {
-            // Only while the sweep runs: a round must stay short whatever
-            // the table size; plain expiry is content with the base slice.
-            let slice = if active && table.claims_splices() {
-                slice.max((table.observation.max_entries as usize).div_ceil(PASS_TICKS))
-            } else {
-                slice
-            };
-            let claims = match (&mut self.sweep, active && table.claims_splices()) {
-                (Some(sweep), true) => Some(Claims {
+            let kind = table.kind();
+            let slice = table_slice(slice, kind, table.observation.max_entries, sweeping);
+            let claims = match &mut self.sweep {
+                Some(sweep) if sweeping && kind.claims() => Some(Claims {
                     into: &mut sweep.state.claims,
                     ports: &inputs.ports,
                 }),
@@ -722,19 +780,8 @@ impl Reclaimer {
             match table.step_claiming(timeouts, slice, claims) {
                 Ok(stepped) => {
                     reclaimed += stepped.deleted;
-                    if let Some(sweep) = &mut self.sweep
-                        && active
-                    {
-                        let state = &mut sweep.state;
-                        match table.contents {
-                            Contents::Firewall(_) => {
-                                state.firewall = RoundSlot(state.firewall.0.advance(&stepped))
-                            }
-                            Contents::Nat(_) => {
-                                state.nat = RoundSlot(state.nat.0.advance(&stepped))
-                            }
-                            Contents::Syn(_) => {}
-                        }
+                    if let Some(sweep) = &mut self.sweep {
+                        sweep.state.stepped(kind, &stepped);
                     }
                 }
                 Err(error) => {
@@ -751,17 +798,12 @@ impl Reclaimer {
             }
         }
         if let Some(sweep) = &mut self.sweep
-            && active
-            && sweep.state.covered()
+            && sweep.state.round_complete(sweeping)
         {
-            match sweep.end_round(inputs.grace()) {
+            match sweep.end_round(inputs.held.as_ref(), inputs.grace()) {
                 Ok(removed) => {
-                    if let Some(syn) = self
-                        .tables
-                        .iter_mut()
-                        .find(|t| matches!(t.contents, Contents::Syn(_)))
-                    {
-                        syn.observation.reclaimed_expired += removed as u64;
+                    if let Some(index) = syn_table(self.tables.iter().map(Table::kind)) {
+                        self.tables[index].observation.reclaimed_expired += removed as u64;
                     }
                 }
                 Err(error) => {
@@ -819,7 +861,7 @@ pub async fn expire_now(
 }
 
 /// Run the collector for the life of the agent.
-pub async fn run(firewall: Arc<Mutex<Firewall>>, ha: crate::ha::Shared) {
+pub async fn run(firewall: Arc<Mutex<Firewall>>, ha: crate::ha::Shared, held: ImportedSplices) {
     let tables = {
         let fw = firewall.lock().await;
         let sizing = fw.state_tables().0;
@@ -857,9 +899,14 @@ pub async fn run(firewall: Arc<Mutex<Firewall>>, ha: crate::ha::Shared) {
                 fw.sync_interval(),
             )
         };
+        let (owns, leased) = {
+            let ha = ha.lock().await;
+            (ha.owns_state(crate::ha::now_ns()), ha.leased())
+        };
         let inputs = SweepInputs {
             ports,
-            owns: ha.lock().await.owns_state(crate::ha::now_ns()),
+            owns,
+            held: (!leased).then(|| held.clone()),
             sync_interval,
         };
         let joined = tokio::task::spawn_blocking(move || {
@@ -941,51 +988,158 @@ mod tests {
     fn a_round_keeps_suspects_and_returns_only_the_ended() {
         let mut state = SweepState::default();
         let start = Instant::now();
+        let none = HashSet::new();
         let live = (splice(1), SynFlow::pending(1, 1));
         let dead = (splice(2), SynFlow::pending(2, 2));
         state.claims.insert(live.0);
-        assert!(state.judge_round([live, dead], start, GRACE).is_empty());
+        assert!(
+            state
+                .judge_round([live, dead], &none, start, GRACE)
+                .is_empty()
+        );
         assert!(state.claims.is_empty(), "claims are per round");
         assert_eq!(state.suspects.len(), 1);
-        // The next round: the live one claimed again, the dead one ends.
         state.claims.insert(live.0);
-        let ended = state.judge_round([live, dead], start + GRACE, GRACE);
+        let ended = state.judge_round([live, dead], &none, start + GRACE, GRACE);
         assert_eq!(ended, vec![dead]);
         assert!(state.suspects.is_empty());
     }
 
     #[test]
-    fn a_reset_forgets_suspects_so_a_new_owner_waits_two_rounds_again() {
-        // H2/H7: a node that stops owning its state (or whose walk failed)
-        // must not end a splice on the strength of rounds judged before.
+    fn a_splice_held_for_a_peer_is_never_judged() {
+        // M1: without a lease a node cannot tell whether it is active, and a
+        // peer's splice can arrive a dump before its claim.
         let mut state = SweepState::default();
         let start = Instant::now();
-        let dead = (splice(2), SynFlow::pending(2, 2));
-        assert!(state.judge_round([dead], start, GRACE).is_empty());
-        state.reset();
-        assert!(state.judge_round([dead], start + GRACE, GRACE).is_empty());
+        let imported = (splice(3), SynFlow::pending(3, 3));
+        let held = HashSet::from([imported.0]);
+        for round in 0..4 {
+            let now = start + GRACE * round;
+            assert!(state.judge_round([imported], &held, now, GRACE).is_empty());
+        }
+        assert!(state.suspects.is_empty());
+        // No longer held: judged like any other, from scratch.
+        let none = HashSet::new();
+        assert!(
+            state
+                .judge_round([imported], &none, start + GRACE * 5, GRACE)
+                .is_empty()
+        );
         assert_eq!(
-            state.judge_round([dead], start + GRACE * 2, GRACE),
+            state.judge_round([imported], &none, start + GRACE * 6, GRACE),
+            vec![imported]
+        );
+    }
+
+    #[test]
+    fn a_reset_forgets_suspects_so_a_new_owner_waits_two_rounds_again() {
+        let mut state = SweepState::default();
+        let none = HashSet::new();
+        let start = Instant::now();
+        let dead = (splice(2), SynFlow::pending(2, 2));
+        assert!(state.judge_round([dead], &none, start, GRACE).is_empty());
+        state.reset();
+        assert!(
+            state
+                .judge_round([dead], &none, start + GRACE, GRACE)
+                .is_empty()
+        );
+        assert_eq!(
+            state.judge_round([dead], &none, start + GRACE * 2, GRACE),
             vec![dead]
         );
+    }
+
+    #[test]
+    fn a_tick_without_the_sweep_forgets_the_round() {
+        // M2: the reset while inactive.
+        let mut state = SweepState::default();
+        state.claims.insert(splice(1));
+        state
+            .suspects
+            .insert(splice(2), (SynFlow::pending(2, 2), Instant::now()));
+        state.firewall = Round::Covered;
+        state.begin_tick(true);
+        assert_eq!(
+            state.firewall,
+            Round::Covered,
+            "a running sweep keeps its round"
+        );
+        assert_eq!(state.claims.len(), 1);
+        state.begin_tick(false);
+        assert!(state.claims.is_empty() && state.suspects.is_empty());
+        assert_eq!(
+            (state.firewall, state.nat),
+            (Round::Waiting, Round::Waiting)
+        );
+    }
+
+    #[test]
+    fn a_round_completes_only_both_tables_covered_and_only_while_sweeping() {
+        // M2: the gate on end_round.
+        let mut state = SweepState::default();
+        state.stepped(Kind::Firewall, &stepped(true, true));
+        assert!(!state.round_complete(true), "CONNTRACK not walked yet");
+        state.stepped(Kind::Syn, &stepped(true, true));
+        assert!(!state.round_complete(true), "SYN_FLOWS walks do not count");
+        state.stepped(Kind::Nat, &stepped(true, true));
+        assert!(state.round_complete(true));
+        assert!(
+            !state.round_complete(false),
+            "never judged while not sweeping"
+        );
+    }
+
+    #[test]
+    fn the_sweep_runs_only_with_a_sweep_owning_and_a_proxied_port() {
+        // M2/L2: the active gate, including a sweep that could not be set up.
+        let base = inputs(&[443], true, None);
+        assert!(base.sweeping(true));
+        assert!(!base.sweeping(false), "no sweep set up");
+        assert!(
+            !inputs(&[443], false, None).sweeping(true),
+            "an HA standby never sweeps"
+        );
+        assert!(
+            !inputs(&[], true, None).sweeping(true),
+            "no SYN proxy, no sweep"
+        );
+    }
+
+    #[test]
+    fn a_claiming_table_gets_a_larger_slice_only_while_sweeping() {
+        // M2: the slice size.
+        let max = 12_600_000;
+        assert_eq!(table_slice(SLICE, Kind::Firewall, max, false), SLICE);
+        assert_eq!(table_slice(SLICE, Kind::Firewall, max, true), 2_520_000);
+        assert_eq!(table_slice(SLICE, Kind::Nat, 4_200_000, true), 840_000);
+        assert_eq!(
+            table_slice(SLICE, Kind::Syn, max, true),
+            SLICE,
+            "SYN_FLOWS claims nothing"
+        );
+        assert_eq!(
+            table_slice(SLICE, Kind::Firewall, 6144, true),
+            SLICE,
+            "never below the base"
+        );
+    }
+
+    #[test]
+    fn removals_are_counted_on_the_syn_flows_table() {
+        // M2: the removal counting goes to SYN_FLOWS, wherever it is listed.
+        assert_eq!(syn_table([Kind::Firewall, Kind::Nat, Kind::Syn]), Some(2));
+        assert_eq!(syn_table([Kind::Syn, Kind::Firewall]), Some(0));
+        assert_eq!(syn_table([Kind::Firewall, Kind::Nat]), None);
     }
 
     fn inputs(ports: &[u16], owns: bool, sync: Option<Duration>) -> SweepInputs {
         SweepInputs {
             ports: ports.iter().copied().collect(),
             owns,
+            held: None,
             sync_interval: sync,
         }
-    }
-
-    #[test]
-    fn the_sweep_runs_only_owning_and_with_a_proxied_port() {
-        assert!(inputs(&[443], true, None).active());
-        assert!(
-            !inputs(&[443], false, None).active(),
-            "an HA standby never sweeps"
-        );
-        assert!(!inputs(&[], true, None).active(), "no SYN proxy, no sweep");
     }
 
     #[test]

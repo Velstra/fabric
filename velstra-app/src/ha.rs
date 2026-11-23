@@ -144,6 +144,11 @@ impl State {
     /// owner's state arrive record by record, a splice possibly before the
     /// state that claims it; it never sweeps, and the owner's removals reach
     /// it as conntrack-sync deletions.
+    /// Whether this node runs leased HA (an enabled `[ha]`), the only mode in
+    /// which it knows whether it is the active member.
+    pub fn leased(&self) -> bool {
+        self.config.as_ref().is_some_and(|config| config.enabled)
+    }
     pub fn owns_state(&self, now: u64) -> bool {
         let Some(config) = self.config.as_ref().filter(|config| config.enabled) else {
             return true;
@@ -1003,6 +1008,7 @@ mod tests {
         let shared = State::new(Some(config())).unwrap();
         let mut state = shared.lock().await;
         let now = 5_000_000_000;
+        assert!(state.leased());
         assert!(!state.owns_state(now), "fenced");
         state.role.updated_ns = now;
         state.ready_term = 7;
@@ -1011,11 +1017,22 @@ mod tests {
         state.active_term = 7;
         state.role.deadline_ns = now + 100_000_000;
         assert!(state.owns_state(now), "the lease owner sweeps");
+        // Each condition on its own withdraws ownership.
+        state.active_term = 0;
+        assert!(!state.owns_state(now), "not yet forwarding");
+        state.active_term = 7;
+        state.role.authority.owner = 2;
+        assert!(!state.owns_state(now), "the peer owns the lease");
+        state.role.authority.owner = 1;
+        state.role.updated_ns = 0;
+        assert!(!state.owns_state(now), "a stale role report");
+        state.role.updated_ns = now;
         assert!(
             !state.owns_state(now + 200_000_000),
             "an expired lease is not ownership"
         );
         state.config = None;
+        assert!(!state.leased());
         assert!(
             state.owns_state(now),
             "without leased HA the node owns its state"
