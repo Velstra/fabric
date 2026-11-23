@@ -2487,6 +2487,21 @@ impl FileConfig {
             }) {
                 bail!("synproxy port {} is configured twice", sp.port);
             }
+            // A proxied connection's record (its sequence offset) lives exactly
+            // as long as its connection state, which the agent's splice sweep
+            // reads; a stateless policy keeps none, so every connection it
+            // proxied would lose its splice — and die — once the one state
+            // entry the proxy writes at admission expired.
+            if let Some(stateless) = policies.iter().find(|p| {
+                sp.policy.is_none_or(|id| id == p.id) && !p.global.has_flag(ConfigFlags::STATEFUL)
+            }) {
+                bail!(
+                    "synproxy port {} covers policy {}, which is not stateful: a SYN-proxied \
+                     connection lives only as long as its connection state",
+                    sp.port,
+                    stateless.id
+                );
+            }
             synproxy.push(ResolvedSynProxy {
                 port: sp.port,
                 mss: sp.mss,
@@ -3510,7 +3525,11 @@ mod tests {
     }
 
     fn synproxy(text: &str) -> Result<Vec<ResolvedSynProxy>> {
-        let base = "[[policy]]\nid = 7\n[[policy]]\nid = 8\n";
+        let base = "[[policy]]\nid = 7\nstateful = true\n[[policy]]\nid = 8\nstateful = true\n";
+        synproxy_with(&format!("stateful = true\n{text}"), base)
+    }
+
+    fn synproxy_with(text: &str, base: &str) -> Result<Vec<ResolvedSynProxy>> {
         Ok(toml::from_str::<FileConfig>(&format!("{text}{base}"))?
             .resolve()?
             .synproxy)
@@ -3544,6 +3563,35 @@ mod tests {
             let err = synproxy(text).expect_err(text);
             assert!(format!("{err:#}").contains("twice"), "{err:#}");
         }
+    }
+
+    /// H1(a): a stateless policy keeps no connection state, so the splice
+    /// sweep would end its proxied connections; refuse instead.
+    #[test]
+    fn a_synproxy_port_on_a_stateless_policy_is_refused() {
+        let stateless_8 = "[[policy]]\nid = 7\nstateful = true\n[[policy]]\nid = 8\n";
+        let err = synproxy_with(
+            "stateful = true\n[[synproxy]]\nport = 443\npolicy = 8\n",
+            stateless_8,
+        )
+        .expect_err("policy 8 is stateless");
+        assert!(format!("{err:#}").contains("not stateful"), "{err:#}");
+        // An unscoped port covers every policy, a stateless one included.
+        let err = synproxy_with("stateful = true\n[[synproxy]]\nport = 443\n", stateless_8)
+            .expect_err("unscoped covers policy 8");
+        assert!(format!("{err:#}").contains("policy 8"), "{err:#}");
+        // Scoped to a stateful policy, a stateless neighbour does not matter.
+        assert!(
+            synproxy_with(
+                "stateful = true\n[[synproxy]]\nport = 443\npolicy = 7\n",
+                stateless_8
+            )
+            .is_ok()
+        );
+        // The default policy is stateless unless the file says otherwise.
+        let base = "[[policy]]\nid = 7\nstateful = true\n[[policy]]\nid = 8\nstateful = true\n";
+        let err = synproxy_with("[[synproxy]]\nport = 443\n", base).expect_err("policy 0");
+        assert!(format!("{err:#}").contains("policy 0"), "{err:#}");
     }
 
     #[test]
