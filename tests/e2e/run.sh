@@ -378,12 +378,15 @@ scenario_srv6_roundtrip() {
 	via_mac = "$bmac"
 	out_iface = "uplink0"
 	EOF
-  # Host B: instantiate that SID and decapsulate End.DT2U into vni 10000.
+  # Host B: instantiate that SID and decapsulate End.DT2U into vni 10000. B
+  # decapsulates only from trusted peers (`[srv6] peers`, fail-closed when
+  # empty), so it must list host A's outer source, A's `local_src`.
   cat >"$WORKDIR/srv6-b.toml" <<-EOF
 	default_action = "pass"
 	[srv6]
 	local_src = "fc00:0:2::1"
 	underlay_iface = "under0"
+	peers = ["fc00:0:1::1"]
 	[[srv6_local_sid]]
 	sid = "$sid"
 	vni = 10000
