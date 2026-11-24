@@ -90,7 +90,7 @@ pub(crate) fn run_bounded<T: Send, R: Send>(
         for n in 1..threads.min(order.len()) {
             let spawned = std::thread::Builder::new()
                 .name(format!("ebpf-load-{n}"))
-                .spawn_scoped(scope, &work);
+                .spawn_scoped(scope, work);
             if spawned.is_err() {
                 break;
             }
