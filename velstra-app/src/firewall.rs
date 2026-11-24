@@ -870,67 +870,48 @@ impl Firewall {
             concat!(env!("OUT_DIR"), "/velstra")
         )))?;
         let mut ebpf = Ebpf::load(&object).context("loading eBPF object for verification")?;
-        let mut rejected = Vec::new();
-        for name in [
-            "velstra",
-            "velstra_main",
-            "velstra_v4_state",
-            "velstra_v4_verdict",
-            "velstra_guest_delivery",
-            "velstra_forward",
-            "velstra_v6",
-            "velstra_local",
-            "velstra_v6_state",
-            "velstra_icmp_nat",
-            "velstra_related",
-        ] {
-            let program: &mut Xdp = ebpf
-                .program_mut(name)
+        // Every entry point must exist with its type before any is verified.
+        for name in VERIFIED_XDP {
+            let _: &Xdp = ebpf
+                .program(name)
                 .ok_or_else(|| anyhow!("missing {name}"))?
                 .try_into()?;
-            match program.load() {
-                Ok(()) => {
-                    println!("verified {name}");
-                    let count = report_verified_insns(name, program.info());
-                    rejected.extend(over_budget(name, count, max_insns));
-                }
-                Err(error) => rejected.push(format!("verifying {name}: {error:#}")),
-            }
         }
-        for name in [
-            "velstra_egress",
-            "velstra_egress_v4",
-            "velstra_egress_v6",
-            "velstra_egress_v6_state",
-            "velstra_egress_v4_state",
-            "velstra_masquerade",
-            "velstra_egress_icmp",
-            "velstra_deferred_snat",
-            "velstra_related_egress",
-            "velstra_related_egress_apply",
-            "velstra_bum",
-            "velstra_ha_guard",
-        ] {
-            let program: &mut SchedClassifier = ebpf
-                .program_mut(name)
+        for name in VERIFIED_TC {
+            let _: &SchedClassifier = ebpf
+                .program(name)
                 .ok_or_else(|| anyhow!("missing {name}"))?
                 .try_into()?;
-            match program.load() {
-                Ok(()) => {
-                    println!("verified {name}");
-                    let count = report_verified_insns(name, program.info());
-                    rejected.extend(over_budget(name, count, max_insns));
-                }
-                Err(error) => rejected.push(format!("verifying {name}: {error:#}")),
-            }
         }
-        let exit: &mut aya::programs::RawTracePoint = ebpf
-            .program_mut("velstra_ha_exit")
+        let _: &aya::programs::RawTracePoint = ebpf
+            .program("velstra_ha_exit")
             .ok_or_else(|| anyhow!("missing velstra_ha_exit"))?
             .try_into()?;
-        match exit.load() {
-            Ok(()) => println!("verified velstra_ha_exit"),
-            Err(error) => rejected.push(format!("verifying velstra_ha_exit: {error:#}")),
+        // Verified concurrently, as the agent loads them; reported in this order.
+        let names: Vec<&'static str> = VERIFIED_XDP
+            .into_iter()
+            .chain(VERIFIED_TC)
+            .chain(["velstra_ha_exit"])
+            .collect();
+        let threads = crate::parallel_load::thread_count(
+            std::thread::available_parallelism().ok(),
+            names.len(),
+        );
+        let mut rejected = Vec::new();
+        for (name, result) in load_programs(&mut ebpf, &names, threads) {
+            match result {
+                Ok(()) => {
+                    println!("verified {name}");
+                    if name != "velstra_ha_exit" {
+                        let info = ebpf
+                            .program(name)
+                            .map_or(Err(ProgramError::NotLoaded), aya::programs::Program::info);
+                        let count = report_verified_insns(name, info);
+                        rejected.extend(over_budget(name, count, max_insns));
+                    }
+                }
+                Err(error) => rejected.push(format!("verifying {name}: {error:#}")),
+            }
         }
         // Report every rejected entry point, not just the first. Never attach
         // anything, and never convert partial load success into exit status 0.
@@ -1052,6 +1033,19 @@ impl Firewall {
             &mut tries,
         )?;
 
+        // Verify every program this start loads before any of them is used, on
+        // several threads: verification is most of the start's time, and the
+        // loads below then find each program already in the kernel. The program
+        // arrays are still filled, and the hooks attached, in the order below.
+        // A rejection fails the start here, before anything is attached.
+        // Whether egress is preloaded is decided from the interfaces present
+        // now; the attach below looks again. If an egress interface vanishes in
+        // between, the egress programs sit loaded and unattached until it comes
+        // back (`reconcile_links`, as before); if one appears, `attach_egress`
+        // loads them itself, as it always did.
+        let egress_at_start = !present_egress_interfaces(cfg, ifaces, egress).is_empty();
+        preload_programs(&mut ebpf, &startup_programs(egress_at_start))?;
+
         // Load the tail-call target (`velstra_forward`) and register it in the
         // `VELSTRA_PROGS` program array, so the main program's
         // `tail_call(PROG_FORWARD)` resolves. It is loaded but never attached to
@@ -1063,8 +1057,7 @@ impl Firewall {
                 .program_mut("velstra_forward")
                 .ok_or_else(|| anyhow!("eBPF object has no `velstra_forward` program"))?
                 .try_into()?;
-            flow.load()
-                .context("loading XDP forward program into the kernel")?;
+            loaded(flow.load()).context("loading XDP forward program into the kernel")?;
         }
         // Clone the program fd to an owned handle so the immutable borrow on
         // `ebpf` ends before the map is borrowed mutably below.
@@ -1085,8 +1078,7 @@ impl Firewall {
                 .program_mut("velstra_main")
                 .ok_or_else(|| anyhow!("eBPF object has no `velstra_main` program"))?
                 .try_into()?;
-            main.load()
-                .context("loading XDP datapath program into the kernel")?;
+            loaded(main.load()).context("loading XDP datapath program into the kernel")?;
         }
         let main_fd = {
             let main: &Xdp = ebpf
@@ -1100,8 +1092,7 @@ impl Firewall {
                 .program_mut("velstra_guest_delivery")
                 .ok_or_else(|| anyhow!("eBPF object has no `velstra_guest_delivery` program"))?
                 .try_into()?;
-            delivery
-                .load()
+            loaded(delivery.load())
                 .context("loading XDP guest delivery program into the kernel")?;
         }
         let delivery_fd = {
@@ -1129,19 +1120,13 @@ impl Firewall {
                 .context("registering guest delivery in VELSTRA_PROGS")?;
         }
 
-        for (slot, name) in [
-            (2, "velstra_v6"),
-            (3, "velstra_local"),
-            (4, "velstra_v6_state"),
-            (5, "velstra_icmp_nat"),
-            (7, "velstra_related"),
-        ] {
+        for (slot, name) in XDP_TAIL_PROGRAMS {
             let fd = {
                 let program: &mut Xdp = ebpf
                     .program_mut(name)
                     .ok_or_else(|| anyhow!("missing {name}"))?
                     .try_into()?;
-                program.load().with_context(|| format!("loading {name}"))?;
+                loaded(program.load()).with_context(|| format!("loading {name}"))?;
                 program.fd()?.try_clone()?
             };
             let mut programs = ProgramArray::try_from(
@@ -1155,16 +1140,13 @@ impl Firewall {
         // before attaching ingress. A missing stage is fatal: skipping it would
         // bypass the final verdict and conntrack publication rather than merely
         // an optional transform.
-        for (slot, name, what) in [
-            (0, "velstra_v4_state", "IPv4 state-admission stage"),
-            (1, "velstra_v4_verdict", "IPv4 verdict stage"),
-        ] {
+        for (slot, name, what) in V4_STATE_STAGES {
             let fd = {
                 let program: &mut Xdp = ebpf
                     .program_mut(name)
                     .ok_or_else(|| anyhow!("missing {name}"))?
                     .try_into()?;
-                program.load().with_context(|| format!("loading {what}"))?;
+                loaded(program.load()).with_context(|| format!("loading {what}"))?;
                 program.fd()?.try_clone()?
             };
             let mut programs = ProgramArray::try_from(
@@ -1203,9 +1185,7 @@ impl Firewall {
             .program_mut("velstra")
             .ok_or_else(|| anyhow!("eBPF object has no `velstra` program"))?
             .try_into()?;
-        program
-            .load()
-            .context("loading XDP program into the kernel")?;
+        loaded(program.load()).context("loading XDP program into the kernel")?;
 
         let mut attached = Vec::with_capacity(present.len());
         let mut xdp_links = BTreeMap::new();
@@ -1221,10 +1201,7 @@ impl Firewall {
         // Which interfaces need the TC egress hook, and why — see
         // [`egress_interfaces`]. Kept out of here so the rule can be read and
         // tested without loading an eBPF object.
-        let egress_ifaces: Vec<String> = egress_interfaces(cfg, ifaces, egress)
-            .into_iter()
-            .filter(|n| if_nametoindex(n).is_ok())
-            .collect();
+        let egress_ifaces = present_egress_interfaces(cfg, ifaces, egress);
         let egress_attached = if egress_ifaces.is_empty() {
             BTreeMap::new()
         } else {
@@ -6294,6 +6271,154 @@ fn egress_interfaces(cfg: &RuntimeConfig, ifaces: &[String], egress: bool) -> Ve
     out
 }
 
+/// `VELSTRA_PROGS` slots of the XDP stages loaded after the gate and the
+/// datapath (slots 0, 1 and 6 are `velstra_forward`, `velstra_main` and
+/// `velstra_guest_delivery`).
+const XDP_TAIL_PROGRAMS: [(u32, &str); 5] = [
+    (2, "velstra_v6"),
+    (3, "velstra_local"),
+    (4, "velstra_v6_state"),
+    (5, "velstra_icmp_nat"),
+    (7, "velstra_related"),
+];
+
+/// `V4_STATE_PROGS` slots: the IPv4 state-admission continuation and its
+/// verdict stage, with what a failed load reports.
+const V4_STATE_STAGES: [(u32, &str, &str); 2] = [
+    (0, "velstra_v4_state", "IPv4 state-admission stage"),
+    (1, "velstra_v4_verdict", "IPv4 verdict stage"),
+];
+
+/// `EGRESS_PROGS` slots of the stages `velstra_egress` tail-calls.
+const EGRESS_TAIL_PROGRAMS: [(u32, &str); 9] = [
+    (0, "velstra_egress_v4"),
+    (1, "velstra_egress_v6"),
+    (2, "velstra_egress_icmp"),
+    (3, "velstra_deferred_snat"),
+    (4, "velstra_masquerade"),
+    (5, "velstra_egress_v6_state"),
+    (6, "velstra_related_egress"),
+    (7, "velstra_related_egress_apply"),
+    (8, "velstra_egress_v4_state"),
+];
+
+/// The XDP entry points `verify-ebpf` verifies.
+const VERIFIED_XDP: [&str; 11] = [
+    "velstra",
+    "velstra_main",
+    "velstra_v4_state",
+    "velstra_v4_verdict",
+    "velstra_guest_delivery",
+    "velstra_forward",
+    "velstra_v6",
+    "velstra_local",
+    "velstra_v6_state",
+    "velstra_icmp_nat",
+    "velstra_related",
+];
+
+/// The TC entry points `verify-ebpf` verifies.
+const VERIFIED_TC: [&str; 12] = [
+    "velstra_egress",
+    "velstra_egress_v4",
+    "velstra_egress_v6",
+    "velstra_egress_v6_state",
+    "velstra_egress_v4_state",
+    "velstra_masquerade",
+    "velstra_egress_icmp",
+    "velstra_deferred_snat",
+    "velstra_related_egress",
+    "velstra_related_egress_apply",
+    "velstra_bum",
+    "velstra_ha_guard",
+];
+
+/// The programs [`Firewall::load_and_attach`] loads, in the order it loads
+/// them: the XDP gate's tail-call targets and the gate itself, then, when it
+/// attaches egress, the egress stages and their entry point.
+fn startup_programs(egress: bool) -> Vec<&'static str> {
+    let mut names = vec!["velstra_forward", "velstra_main", "velstra_guest_delivery"];
+    names.extend(XDP_TAIL_PROGRAMS.map(|(_, name)| name));
+    names.extend(V4_STATE_STAGES.map(|(_, name, _)| name));
+    names.push("velstra");
+    if egress {
+        names.extend(EGRESS_TAIL_PROGRAMS.map(|(_, name)| name));
+        names.push("velstra_egress");
+    }
+    names
+}
+
+/// The interfaces start-up attaches the egress hook to: those
+/// [`egress_interfaces`] asks for that exist right now.
+fn present_egress_interfaces(cfg: &RuntimeConfig, ifaces: &[String], egress: bool) -> Vec<String> {
+    egress_interfaces(cfg, ifaces, egress)
+        .into_iter()
+        .filter(|n| if_nametoindex(n).is_ok())
+        .collect()
+}
+
+/// A program's `load()` where [`preload_programs`] may already have loaded it.
+fn loaded(result: std::result::Result<(), ProgramError>) -> std::result::Result<(), ProgramError> {
+    match result {
+        Err(ProgramError::AlreadyLoaded) => Ok(()),
+        other => other,
+    }
+}
+
+/// Load one program of a type the agent ships; already loaded counts as done.
+fn load_program(program: &mut aya::programs::Program) -> Result<()> {
+    use aya::programs::Program;
+    let result = match program {
+        Program::Xdp(program) => program.load(),
+        Program::SchedClassifier(program) => program.load(),
+        Program::RawTracePoint(program) => program.load(),
+        other => bail!("the agent does not load {:?} programs", other.prog_type()),
+    };
+    Ok(loaded(result)?)
+}
+
+/// Load the named programs of `ebpf` on up to `threads` threads, the longest
+/// first. Each result comes back with its name, in the order of `names`. A
+/// name the object lacks is left out: the caller's own lookup reports it.
+fn load_programs(
+    ebpf: &mut Ebpf,
+    names: &[&'static str],
+    threads: usize,
+) -> Vec<(&'static str, Result<()>)> {
+    let mut programs: BTreeMap<&str, &mut aya::programs::Program> = ebpf.programs_mut().collect();
+    let found: Vec<(&'static str, &mut aya::programs::Program)> = names
+        .iter()
+        .filter_map(|name| programs.remove(name).map(|program| (*name, program)))
+        .collect();
+    let found_names: Vec<&str> = found.iter().map(|(name, _)| *name).collect();
+    let order = crate::parallel_load::start_order(&found_names);
+    crate::parallel_load::run_bounded(found, &order, threads, |(name, program)| {
+        (name, load_program(program))
+    })
+}
+
+/// Verify `names` before start-up uses them, concurrently. The first program,
+/// in the order given, that the kernel rejects fails the start. A rejection
+/// does not cancel the loads still running: they finish (seconds at most) and
+/// are released with the object, so a failed start reports the same program
+/// whatever order the loads finished in. A name the object lacks is skipped
+/// here and reported by start-up's own lookup.
+fn preload_programs(ebpf: &mut Ebpf, names: &[&'static str]) -> Result<()> {
+    let threads =
+        crate::parallel_load::thread_count(std::thread::available_parallelism().ok(), names.len());
+    let started = Instant::now();
+    let results = load_programs(ebpf, names, threads);
+    let count = results.len();
+    for (name, result) in results {
+        result.with_context(|| format!("loading {name}"))?;
+    }
+    log::info!(
+        "loaded {count} eBPF programs on {threads} threads in {} ms",
+        started.elapsed().as_millis()
+    );
+    Ok(())
+}
+
 /// Load the `velstra_egress` TC classifier and attach it at **egress** on each
 /// interface. Requires a `clsact` qdisc, which we create first (ignoring the
 /// "already exists" case so a restart is idempotent).
@@ -6302,17 +6427,7 @@ fn attach_egress(
     ifaces: &[String],
     persist: Option<&crate::persist::Persist>,
 ) -> Result<BTreeMap<String, InterfaceLink<SchedClassifierLink>>> {
-    for (slot, name) in [
-        (0, "velstra_egress_v4"),
-        (1, "velstra_egress_v6"),
-        (2, "velstra_egress_icmp"),
-        (3, "velstra_deferred_snat"),
-        (4, "velstra_masquerade"),
-        (5, "velstra_egress_v6_state"),
-        (6, "velstra_related_egress"),
-        (7, "velstra_related_egress_apply"),
-        (8, "velstra_egress_v4_state"),
-    ] {
+    for (slot, name) in EGRESS_TAIL_PROGRAMS {
         let fd = {
             let program: &mut SchedClassifier = ebpf
                 .program_mut(name)
@@ -6665,6 +6780,69 @@ fn is_drop_counter(counter: Counter) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_preloads_exactly_the_xdp_programs_start_up_loads() {
+        let names = startup_programs(false);
+        let mut expected = vec!["velstra_forward", "velstra_main", "velstra_guest_delivery"];
+        expected.extend(["velstra_v6", "velstra_local", "velstra_v6_state"]);
+        expected.extend(["velstra_icmp_nat", "velstra_related"]);
+        expected.extend(["velstra_v4_state", "velstra_v4_verdict", "velstra"]);
+        assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn startup_preloads_the_egress_stages_only_when_it_attaches_egress() {
+        let without = startup_programs(false);
+        let with = startup_programs(true);
+        assert_eq!(&with[..without.len()], &without[..]);
+        let mut egress: Vec<&str> = EGRESS_TAIL_PROGRAMS.map(|(_, name)| name).to_vec();
+        egress.push("velstra_egress");
+        assert_eq!(&with[without.len()..], &egress[..]);
+    }
+
+    #[test]
+    fn startup_programs_are_distinct_and_all_gated_by_verify_ebpf() {
+        let names = startup_programs(true);
+        let distinct: BTreeSet<&str> = names.iter().copied().collect();
+        assert_eq!(distinct.len(), names.len(), "{names:?}");
+        for name in names {
+            assert!(
+                VERIFIED_XDP.contains(&name) || VERIFIED_TC.contains(&name),
+                "{name} is loaded at start-up but not verified by verify-ebpf"
+            );
+        }
+    }
+
+    #[test]
+    fn program_array_slots_are_distinct() {
+        let xdp: BTreeSet<u32> = XDP_TAIL_PROGRAMS
+            .map(|(slot, _)| slot)
+            .into_iter()
+            .chain([0, 1, 6])
+            .collect();
+        assert_eq!(xdp.len(), XDP_TAIL_PROGRAMS.len() + 3);
+        let egress: BTreeSet<u32> = EGRESS_TAIL_PROGRAMS
+            .map(|(slot, _)| slot)
+            .into_iter()
+            .collect();
+        assert_eq!(egress.len(), EGRESS_TAIL_PROGRAMS.len());
+        let v4: BTreeSet<u32> = V4_STATE_STAGES
+            .map(|(slot, _, _)| slot)
+            .into_iter()
+            .collect();
+        assert_eq!(v4.len(), V4_STATE_STAGES.len());
+    }
+
+    #[test]
+    fn a_reload_of_a_preloaded_program_is_not_an_error() {
+        assert!(loaded(Err(ProgramError::AlreadyLoaded)).is_ok());
+        assert!(loaded(Ok(())).is_ok());
+        assert!(matches!(
+            loaded(Err(ProgramError::NotLoaded)),
+            Err(ProgramError::NotLoaded)
+        ));
+    }
 
     fn proxied(port: u16, mss: u16, policy: Option<PolicyId>) -> ResolvedSynProxy {
         ResolvedSynProxy { port, mss, policy }

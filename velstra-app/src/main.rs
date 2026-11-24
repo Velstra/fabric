@@ -27,6 +27,7 @@ mod local_destination;
 mod logwriter;
 mod mapping;
 mod packet_events;
+mod parallel_load;
 mod persist;
 mod policy_tries;
 mod portal;

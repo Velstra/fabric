@@ -46,16 +46,32 @@ class StateHandoffWiring(unittest.TestCase):
         self.assertLess(main.index("reset_v4_state();"), main.index("ha_permits("))
 
     def test_registered_and_verified_before_attach(self):
-        registered = self.agent.index('(0, "velstra_v4_state",')
-        ingress = self.agent.index('program_mut("velstra")', registered)
-        setup = self.agent[registered:ingress]
-        self.assertIn('(1, "velstra_v4_verdict",', setup)
+        # The stage table start-up registers: slot 0 the state stage, slot 1
+        # its verdict stage.
+        stages = self.agent.split("const V4_STATE_STAGES:", 1)[1].split("];", 1)[0]
+        self.assertIn('(0, "velstra_v4_state",', stages)
+        self.assertIn('(1, "velstra_v4_verdict",', stages)
+        # Start-up verifies every program it uses (the concurrent preload,
+        # which includes both stages), then registers both stages in
+        # V4_STATE_PROGS, and only then loads the ingress gate it attaches.
+        start = self.agent.split("pub fn load_and_attach(", 1)[1]
+        preload = start.index("preload_programs(&mut ebpf, &startup_programs(")
+        registered = start.index("in V4_STATE_STAGES {")
+        ingress = start.index('program_mut("velstra")', registered)
+        self.assertLess(preload, registered)
+        setup = start[registered:ingress]
         self.assertIn("program_mut(name)", setup)
         self.assertIn('map_mut("V4_STATE_PROGS")', setup)
         self.assertIn("programs.set(slot, &fd, 0)?;", setup)
-        verification = self.agent.split("pub fn verify_object(", 1)[1].split("let exit:", 1)[0]
-        self.assertIn('"velstra_v4_state",', verification)
-        self.assertIn('"velstra_v4_verdict",', verification)
+        startup = self.agent.split("fn startup_programs(", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn("V4_STATE_STAGES", startup)
+        self.assertLess(startup.index("V4_STATE_STAGES"), startup.index('names.push("velstra")'))
+        # verify-ebpf verifies both stages.
+        verification = self.agent.split("pub fn verify_object(", 1)[1].split("pub fn load_and_attach(", 1)[0]
+        self.assertIn("VERIFIED_XDP", verification)
+        verified = self.agent.split("const VERIFIED_XDP:", 1)[1].split("];", 1)[0]
+        self.assertIn('"velstra_v4_state",', verified)
+        self.assertIn('"velstra_v4_verdict",', verified)
 
     def test_verdict_consumed_before_any_packet_action(self):
         stage = self.packet.split("pub fn velstra_v4_verdict(", 1)[1].split(

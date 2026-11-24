@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **The agent verifies its eBPF programs on several threads at start-up.**
+  Loading a program is the kernel verifier walking it, and that walk is most
+  of an agent start; on 6.18 the same object costs about 1.4x the verifier time
+  of 6.12. Start-up now loads every program it will use on up to four threads
+  (no more than the CPUs it may run on), the longest first, before anything is
+  attached. The program arrays are still filled and the hooks attached in the
+  same order, and a rejected program still fails the start, now before anything
+  is attached, naming the first rejected program in start-up order.
+  `velstra verify-ebpf` uses the same loader and prints the same lines in the
+  same order. Warm starts measured in VMs (6.12 / 6.18): 4.1 / 4.5 s at 2 vCPUs
+  became 2.0 / 2.8 s, and 5.5 / 7.2 s at 4 vCPUs became 1.7 / 2.0 s. On one CPU
+  nothing changes. Verified-instruction counts are identical to serial loading
+  on 6.12, 6.18 and 7.3.
+
 ## [0.5.0] — 2026-11-24
 
 This is the state shipped in Sentinel 1.0.0: the tag `sentinel-v1.0.0` names
